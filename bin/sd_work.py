@@ -1232,16 +1232,51 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
                      for line in (asked["body"] or "").splitlines())
         if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:") and (
                 offers or getattr(args, "option", None) is not None):
-            return _rule_batch(review, workflow, connection, args, body, who, revision)
-        if getattr(args, "option", None) is not None:
-            raise WorkRefusal(f"sd:{args.item} is not a review batch, so --option rules nothing: drop it")
+            if _is_batch(review, connection, args.item):
+                return _rule_batch(review, workflow, connection, args, body, who, revision)
+        ruling = body if getattr(args, "option", None) is None else _plain_ruling(review, asked["body"], args, body)
         ruled = workflow.add_item_note(connection, args.item, kind="decision", who=who,
-                                       body=f"Ruling on note #{args.answers}: {body}",
+                                       body=f"Ruling on note #{args.answers}: {ruling}",
                                        expected_revision=revision, session=_session(who))
         state = workflow.resolve_item_note(connection, args.answers, who=who,
                                            expected_revision=ruled["revision"])
         state["note"] = ruled["note"]
         return state
+
+
+def _is_batch(review: Any, connection: Any, item: int) -> bool:
+    """Whether `review.read` reads the item: a lane review files its findings with a `review:` ref
+    and no batch header (sd:10097), and such an item is answered as any other is."""
+    try:
+        review.read(connection, item)
+    except review.ReviewError:
+        return False
+    return True
+
+
+def _plain_ruling(review: Any, asked: str | None, args: argparse.Namespace, body: str) -> str:
+    """The ruling `--option` names on a question outside a review batch: its label, then TEXT when it differs."""
+    labels = [_label(tag[2]) for line in (asked or "").splitlines()
+              if (tag := review.TAGGED.match(line)) and tag[1] == "Option"]
+    option = _pick(labels, _label(args.option))
+    if option is None:
+        raise WorkRefusal(f"--option {args.option!r} is not an option of note {args.answers}"
+                          + (f"; its options are {', '.join(labels)}" if labels
+                             else "; it has no Option: lines, so drop --option"))
+    return option if body.strip().casefold() == option.casefold() else f"{option}: {body}"
+
+
+def _pick(options: list[str], wanted: str) -> str | None:
+    """The option `wanted` names: its exact spelling first, then one equal case aside. With `Use Foo` and
+    `Use foo`, a case-folded match alone picked the first (review of build/sd-1624)."""
+    if wanted in options:
+        return wanted
+    return next((held for held in options if held.casefold() == wanted.casefold()), None)
+
+
+def _label(option: str) -> str:
+    """An `Option:` line's label: its text less a trailing `(Recommended)` mark, case kept."""
+    return re.sub(r"\s*\(recommended\)\s*$", "", option.strip(), flags=re.IGNORECASE)
 
 
 def _rule_batch(review: Any, workflow: Any, connection: Any, args: argparse.Namespace, body: str, who: str,
@@ -1261,7 +1296,7 @@ def _rule_batch(review: Any, workflow: Any, connection: Any, args: argparse.Name
     named = f", one of {', '.join(options)}" if options else ""
     if args.option is None:
         raise WorkRefusal(f"sd:{args.item} is a review batch: name the ruling with --option LABEL{named}")
-    option = next((held for held in options if held.casefold() == args.option.casefold()), None)
+    option = _pick(options, args.option)
     if option is None:
         raise WorkRefusal(f"--option {args.option!r} is not an option of note {args.answers}"
                           + (f"; its options are {', '.join(options)}" if options else ""))
@@ -1837,9 +1872,10 @@ def register(groups: Any, store: Any) -> None:
     note.add_argument("--answers", type=note_id, metavar="NOTE",
                       help="with --kind decision: the question note this rules on, resolved in the same write")
     note.add_argument("--option", metavar="LABEL",
-                      help="with --answers on a review batch question: the option it rules, such as Approve or "
-                           "Reject; Approve on an Approve-or-Reject question files a task, and TEXT other than "
-                           "the label is kept as the question's comment")
+                      help="with --answers: the question's option it rules, its `(Recommended)` mark optional. "
+                           "On a review batch, Approve on an Approve-or-Reject question files a task, and TEXT "
+                           "other than the label is kept as the question's comment; elsewhere TEXT follows the "
+                           "label in the ruling")
     _output(note, "note", revision=True)
     # A read alias (sd:1112): the same operation as `sd store item`, which
     # stays the canonical read for every kind, so both print the same thing.
