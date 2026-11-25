@@ -3094,7 +3094,8 @@ def settle_post_merge(queue: Queue, items: list[Any], ran: str) -> str:
     them open and is said in the answer; the merge stands either way.
     """
     def resolve_earlier(connection: Any) -> list[int]:
-        from sd_db import workflow  # noqa: PLC0415 -- `on_hub` made sd_db importable
+        sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+        from sd_db import workflow  # noqa: PLC0415
         return workflow.resolve_post_merge(connection, items)
 
     try:
