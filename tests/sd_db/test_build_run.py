@@ -6057,6 +6057,39 @@ class Drafts(Case):
             build.queue_again(self.db, [second], who="operator")
         self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
 
+    def test_a_rebuild_claimed_at_the_block_stamp_does_not_hide_the_question(self):
+        """Class pass of build/sd-1867: Build found the run that blocked an item by time, so a lane rebuild
+        claimed in the block's own second read as that run and hid the question. The block's reason names
+        its run, and that run is the one read."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?", (bundle["id"],))
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:01Z' WHERE id = ?", (asked,))
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        ended = self.db.execute("SELECT ended FROM assignment WHERE item = ? AND status = 'blocked'",
+                                (second,)).fetchone()[0]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix", stamp=ended)
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
+    def test_a_block_that_names_no_run_reads_every_question(self):
+        """Class pass of build/sd-1867: a build block whose reason names no run of its bundle has no run to
+        read questions from, so no time stands in for one: every pending question holds the Build."""
+        self.assertEqual(build._blocking_run(self.db, 1, "refused; not built"), None)
+        self.assertEqual(build._blocking_run(self.db, 1, "build run " + "f" * 32 + " ended"), None,
+                         "a run id no run of this bundle holds")
+
     def test_build_reads_only_the_questions_its_blocking_run_raised(self):
         """Lane review of build/sd-1867: Build refused a run-blocked item on any pending question, so an
         unrelated one asked before that build was queued held a Build that worked before."""

@@ -1313,11 +1313,11 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
 
 
 def _build_blocked(connection, item: int) -> str | None:
-    """When the newest build run of `item`'s bundle reads questions from (`asked_since`), if `item`'s block
+    """When the build run that blocked `item` reads questions from (`asked_since`), if `item`'s block
     is that build's, which a Build lifts; else None. The block is the build's while that assignment ended
     blocked and the item's latest status change is the build's move to blocked with that assignment's
     reason. A block someone wrote after it, an operator's hold, is not the build's (review of build/sd-1867)."""
-    row = connection.execute("SELECT id, parent, status, result, ended FROM assignment WHERE item = ? AND scope = ? "
+    row = connection.execute("SELECT id, parent, status, result FROM assignment WHERE item = ? AND scope = ? "
                              "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
     if row is None or row["status"] != "blocked" or not row["result"]:
         return None
@@ -1327,12 +1327,20 @@ def _build_blocked(connection, item: int) -> str | None:
                                      moved["body"] or "", re.DOTALL) is None:
         return None
     lead = row["parent"] or row["id"]
-    # The run that blocked it, the newest begun by its block: a later run of the bundle, a lane Fix's,
-    # did not build this item, so its start would hide the question it waits on (review of build/sd-1867).
-    number = connection.execute("SELECT MAX(run) FROM runner_run WHERE assignment = ? AND created_at <= ?",
-                                (lead, row["ended"] or "")).fetchone()[0]
-    # A block with no run recorded before it reads every question, as before.
+    number = _blocking_run(connection, lead, row["result"])
+    # A block that names no run of its bundle reads every question: no time stands in for the run.
     return asked_since(connection, lead, number) if number is not None else ""
+
+
+def _blocking_run(connection, lead: int, reason: str) -> int | None:
+    """The number of the run of `lead` that a build block's `reason` names, or None. Every block a run writes
+    (`_block`) begins `build run <id> `, so the run is read by its id, never by time or as the newest: a
+    lane Fix runs the bundle again after it, even in the block's own second, and did not build the blocked
+    item, so its start would hide the question the item waits on (class pass of build/sd-1867)."""
+    named = re.match(r"build run ([0-9a-f]{32}) ", reason)
+    row = named and connection.execute("SELECT run FROM runner_run WHERE id = ? AND assignment = ?",
+                                       (named.group(1), lead)).fetchone()
+    return row["run"] if row else None
 
 
 def _retry_row(connection, item: int):
