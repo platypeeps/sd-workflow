@@ -2217,6 +2217,27 @@ class CancelParks(Case):
         self.press_unran(items[1], "blocked")
         self.assert_whole_retry(build.queue_again(self.db, items[:2], who="operator"), old)
 
+    def test_build_refuses_a_member_the_retry_it_reads_leaves_unbuilt(self):
+        """Lane review of build/sd-1654 (build.py:1182): blocked bundle A, B, C whose lead A waits on B. Build C
+        read the bundle, whose Retry frees B alone, and dropped C from the press: B queued, C stayed blocked, and
+        nothing said so. A member the Retry leaves unbuilt, here or parked as waiting on another bundle item,
+        refuses the press before it writes."""
+        from sd_db.workflow import edit_item
+        items, old = self.blocked_bundle()
+        edit_item(self.db, items[0], {"blocked_by": [items[1]]}, who="operator")
+        # Named with its lead, C is a part whose Retry refuses the waiting lead: that refusal writes nothing too.
+        for named, said in (([items[2]], f"would not build sd:{items[2]}"), (items[::2], "waits on")):
+            with self.subTest(named=named), self.assertRaisesRegex(build.BuildRefused, said):
+                build.queue_again(self.db, named, who="operator")
+            self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
+        edit_item(self.db, items[0], {"blocked_by": []}, who="operator")
+        edit_item(self.db, items[2], {"blocked_by": [items[0]]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"would not build sd:{items[2]}"):
+            build.queue_again(self.db, [items[2]], who="operator")
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
+        queued = build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), old[:2], "the lead's Retry parks C, as before")
+
     def test_a_subset_build_reads_the_held_split_of_the_bundle_it_narrowed_to(self):
         """Class pass, review of build/sd-1654: bundle A, B, C is held after a subset Retry left D out, and a newer
         build owns C. Build A B read the bundle narrowed to A and B, but the held split on each item's newest row,

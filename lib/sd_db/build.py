@@ -1180,6 +1180,18 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             parts[lead] = _part(connection, lead, state["status"], items)
             takes = {member["item"] for member in _open_members(connection, lead, state["status"])}
             fresh = [item for item in fresh if parts[lead] is not None or item not in takes]
+            # A named bundle item that Retry leaves unbuilt refuses the press before any write, or the press drops
+            # it unsaid: Retry frees only what its lead waits on, or parks a member that waits on another bundle
+            # item (`_inside`). The lead that waits is Retry's own case: its dependencies build first (sd:10022).
+            part = parts[lead]
+            members = [member for member in _open_members(connection, lead, state["status"])
+                       if part is None or member["item"] in part]
+            left = sorted(set(items) & {member["item"] for member in members}
+                          - _retry_queues(connection, state["item"], members) - {state["item"]})
+            if left:
+                raise BuildRefused(f"a Retry of the bundle of sd:{state['item']} would not build "
+                                   f"{', '.join(f'sd:{item}' for item in left)}: it waits on its lead or on what "
+                                   "its lead waits on; Build those first")
         if finding and fresh:
             raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
                                "would be a fresh build, with no builder to send it to")
@@ -2622,6 +2634,17 @@ def _inside(connection, lead: int, members: list[dict]) -> tuple[list[dict], lis
     behind = [member for member in members if member["item"] != lead and member not in ahead
               and _needed(connection, [member["item"]]) & bundle]
     return ahead, behind
+
+
+def _retry_queues(connection, lead: int, members: list[dict]) -> set[int]:
+    """The items `retry` queues of an ended bundle's `members`, as it filters them, whose lead's item is `lead`:
+    with members the lead waits on (`_inside`), those of them that wait on nothing (`_free`); otherwise every
+    member but `behind`, which it parks. `queue_again` reads it before Retry writes."""
+    ahead, behind = _inside(connection, lead, [member for member in members if _current(connection, member)])
+    if ahead:
+        return {member["item"] for member in ahead if not waiting_on(connection, connection.execute(
+            "SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone())}
+    return {member["item"] for member in members if member not in behind}
 
 
 def _leave(connection, members: list[dict], *, who: str, run: str, note: str, parked: bool) -> None:
