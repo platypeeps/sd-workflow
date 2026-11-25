@@ -44,9 +44,14 @@ const sweepText = w => !w || w.error ? '' : w.running ? `sweep running${w.last?.
   : !w.last || w.last.state === 'never' ? 'sweep not run yet' : w.last.state === 'done' ? `last sweep done${w.last.finished ? ` ${w.last.finished.slice(0, 16).replace('T', ' ')} UTC` : ''}`
   : `last sweep ${w.last.state}${w.last.exit != null ? `, exit ${w.last.exit}` : ''}${w.last.reason ? `: ${w.last.reason}` : ''}`;
 // A download's run, in words: while it runs, its phase; after, how it ended. The row reads it as the sweep row reads its run.
+// sd:10616: a failed run names its source, the last good download and the act that tries again; the reason, which says
+// what broke and not what to do, is in the row's Details (downloadBlock).
+const utc = t => t ? `${String(t).slice(0, 16).replace('T', ' ')} UTC` : '';
+const lastGood = d => d.last_done ? `last good download ${utc(d.last_done)}` : 'no good download on record';
 const downloadText = d => !d ? '' : d.running ? (d.phase === 'waiting' ? 'waiting for you to log in' : d.phase === 'downloading' ? 'downloading'
-  : `opening ${d.label} in Chrome`) : d.state === 'done' ? `last download done${d.finished ? ` ${d.finished.slice(0, 16).replace('T', ' ')} UTC` : ''}`
-  : d.state === 'unavailable' ? `last download not possible: ${d.reason}` : d.state === 'failed' ? `last download failed${d.reason ? `: ${d.reason}` : ''}` : '';
+  : `opening ${d.label} in Chrome`) : d.state === 'done' ? `last download done${d.finished ? ` ${utc(d.finished)}` : ''}`
+  : d.state === 'unavailable' ? `last download not possible: ${d.reason}`
+  : d.state === 'failed' ? `${d.label} download failed · ${lastGood(d)} · Download from ${d.label} tries again` : '';
 const sweepState = w => !w || w.error || w.last?.state === 'unknown' ? 'unknown' : w.running || !w.last || w.last.state === 'never' ? 'queued' : w.last.state === 'done' ? 'ok' : 'warning';
 // While a refresh job runs, HOA reads again every SRC_POLL ms, so the lamps follow the run to its end.
 const SRC_POLL = 15000;
@@ -156,7 +161,9 @@ let polling = 0;
     const [vx, vy, vw, vh] = view(), u = vw / (box.clientWidth || W);
     const ring = r => `M${r.map(([x, y]) => `${P.x(x).toFixed(1)},${P.y(y).toFixed(1)}`).join('L')}Z`;
     // sd:4964: a lot is a tap target (data-lot) titled by its address; zoomed in to LABEL_ZOOM, the address is drawn on it.
-    const key = l => l.kind === 'tract' ? html` data-tract="${l.ain || l.label}"` : l.kind === 'lot' ? html` data-lot="${l.index}"` : '';
+    // sd:10612: a lot or tract is a named keyboard stop, as an asset is; Enter or Space selects it as a tap does.
+    const key = l => l.kind === 'tract' ? html` data-tract="${l.ain || l.label}" tabindex="0" role="button" aria-label="${parcelName(l)}"`
+      : l.kind === 'lot' ? html` data-lot="${l.index}" tabindex="0" role="button" aria-label="${parcelName(l)}"` : '';
     const mid = r => [r.reduce((a, p) => a + p[0], 0) / r.length, r.reduce((a, p) => a + p[1], 0) / r.length];
     const labels = zoom >= LABEL_ZOOM ? LOTS.filter(l => l.kind === 'lot' && l.address).map(l => { const [x, y] = mid(l.rings[0].slice(0, -1));
       return html`<text class="lot-label" x="${P.x(x).toFixed(1)}" y="${P.y(y).toFixed(1)}" font-size="${(11 * u).toFixed(2)}">${l.address}</text>`; }) : '';
@@ -260,6 +267,9 @@ let polling = 0;
       button.disabled = false; button.removeAttribute('aria-busy');
     }
   }
+  // A parcel's accessible name: its address or label, then what it is.
+  const parcelName = l => l.kind === 'lot' ? `${l.address || `Lot ${l.index + 1}`}, lot`
+    : `${l.label || `Tract ${l.ain}`}, ${owned(l) ? 'HOA-owned tract' : 'tract'}`;
   function selectTract(key, open) {
     const l = LOTS.find(x => (x.ain || x.label) === key); if (!l) return;
     show(html`<div class="kind"><span class="label">Tract</span></div><h2>${l.label || `Tract ${l.ain}`}</h2>${dl([['AIN', l.ain], ['Land use', l.luc], ['Acres', l.acres], ['Source', 'base.geojson']])}`, null, open);
@@ -295,6 +305,10 @@ let polling = 0;
     ['Refresh job', !r.job ? '' : r.job.error || `${r.job.name} · ${refreshText(r.job)}`]])}`;
   // sd:5680: a source with a Download shows the end of that download's start.log, as Management shows a job's log; a log
   // that was not read is unknown with its reason, a missing one says so.
+  // sd:10616: the last run's outcome, the last good download and, for a failure, its technical reason.
+  const downloadBlock = k => { const d = DL[k]; if (!d || d.state === 'never') return '';
+    return html`<h3 class="label">Download</h3>${dl([['Source', d.label], ['Last run', d.running ? downloadText(d) : d.state],
+      ['Last good download', d.last_done ? utc(d.last_done) : 'none on record'], ['Technical details', d.state === 'failed' ? d.reason : '']])}`; };
   const logBlock = k => { const d = DL[k], g = d?.tail; if (!d) return '';
     const head = html`<h3 class="label">Log${g?.cut ? ' · last lines' : ''}</h3><p class="note">${d.log}</p>`;
     return !g || g.state === 'unread' ? html`${head}${unknownBlock(g ? g.reason : 'this reading carries no log')}`
@@ -306,7 +320,7 @@ let polling = 0;
     selected = id; mark();
     show(html`<div class="kind"><span class="g-${st}" aria-hidden="true">${GLYPH[st]}</span><span class="label">Source</span></div>
       <h2>${r.label}</h2>${ageBlock(r)}
-      <h3 class="label">Act</h3>${window.shell.commands.bar(id)}${logBlock(r.source)}`, id, open);
+      <h3 class="label">Act</h3>${window.shell.commands.bar(id)}${downloadBlock(r.source)}${logBlock(r.source)}`, id, open);
   }
   function selectSource(open) {
     const m = DOC.mission;
@@ -317,7 +331,7 @@ let polling = 0;
       ${dl([['Path', m.dir], ['Cadence', 'daily export, one row per day'], ['State', m.state === 'unknown' ? 'unknown: a daily feed is not read' : `${m.state} · every daily feed through ${m.latest} · ${m.age_days} d old`]])}
       <h3 class="label">Files in this page</h3>${dl(m.files.map(f => [f.name, f.state ? `${feedText(f)}${f.error ? '' : ` · ${f.rows} rows`}` : f.error ? `not read: ${f.error}` : `${f.rows} rows · latest ${f.latest.slice(0, 10)}`]))}
       <p class="note">Tank level and Aquifer read analog-daily.csv; Pumps reads pump-daily.csv; Alarms reads alarm-events.csv. The pump export lags the analog export by one day.</p>
-      ${ageBlock(srcOf('mission'))}<h3 class="label">Act</h3>${window.shell.commands.bar('source:mission')}${logBlock('mission')}`, 'source:mission', open);
+      ${ageBlock(srcOf('mission'))}<h3 class="label">Act</h3>${window.shell.commands.bar('source:mission')}${downloadBlock('mission')}${logBlock('mission')}`, 'source:mission', open);
   }
   function selectDay(d, open, series) {
     const m = DOC.mission, a = m.analog.find(r => r.date === d), p = m.pump.find(r => r.date === d);
@@ -520,8 +534,16 @@ let polling = 0;
   // Read again (sd:5638): the shell's head button reads /api/hoa and the shown Briefs or Reports
   // view again. Download from Mission, on Data sources, starts a download.
   window.PAGE_AGAIN = { title: 'Read the HOA readings and the shown view again', run: () => Promise.all([load(), window.places.again()]) };
-  // One timer at a time; each read that still sees a running job sets the next.
-  function poll() { if (!polling) polling = setTimeout(() => { polling = 0; reader.reread(); }, SRC_POLL); }
+  // One timer at a time; each read that still sees a running job sets the next. sd:10610: the timer reads the small
+  // /api/hoa/status, and reads the whole document (its trends near a megabyte) only when that status moved from the
+  // last full read's, the run ended, or the status did not read.
+  function poll() { if (!polling) polling = setTimeout(check, SRC_POLL); }
+  async function check() {
+    const now = await window.shell.getJSON('/api/hoa/status').catch(() => null);
+    polling = 0;
+    if (now?.running && DOC?.status && JSON.stringify(now.parts) === JSON.stringify(DOC.status.parts)) return poll();
+    reader.reread();
+  }
   const spec = {
     source: '/api/hoa', what: 'the HOA readings',
     adopt: doc => {
@@ -611,15 +633,16 @@ let polling = 0;
       if (k.startsWith('day:')) $('trends').scrollIntoView({ behavior: reduce() ? 'auto' : 'smooth' });
       select(k, true);
     });
-    $('map').addEventListener('click', e => {
-      if (dragged) return;
-      const a = e.target.closest('[data-asset]'); if (a) { select(`asset:${a.dataset.asset}`, true); return; }
-      const t = e.target.closest('[data-tract]'); if (t) { selectTract(t.dataset.tract, true); return; }
-      const l = e.target.closest('[data-lot]'); if (l) selectLot(l.dataset.lot, true);
-    });
+    // One selection path for a tap and a key (sd:10612): the asset, tract or lot under the target; false for none.
+    const pick = target => {
+      const a = target.closest('[data-asset]'); if (a) { select(`asset:${a.dataset.asset}`, true); return true; }
+      const t = target.closest('[data-tract]'); if (t) { selectTract(t.dataset.tract, true); return true; }
+      const l = target.closest('[data-lot]'); if (l) { selectLot(l.dataset.lot, true); return true; }
+      return false;
+    };
+    $('map').addEventListener('click', e => { if (!dragged) pick(e.target); });
     $('map').addEventListener('keydown', e => {
-      const a = e.target.closest('[data-asset]');
-      if (a && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); e.stopPropagation(); select(`asset:${a.dataset.asset}`, true); }
+      if ((e.key === 'Enter' || e.key === ' ') && pick(e.target)) { e.preventDefault(); e.stopPropagation(); }
     });
     // Drag pans: a pointer move turns into viewBox units at the map's drawn width.
     let drag = null, dragged = false;
