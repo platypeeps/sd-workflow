@@ -3339,6 +3339,24 @@ class Supervise(Case):
         self.assertIn(f"- sd:{member}: pin the clock", prompt)
         self.assertNotIn("a cancelled build's order", prompt)
 
+    def test_a_lead_queued_earlier_does_not_revive_a_member_s_cancelled_finding(self):
+        """Review of build/sd-1782, round 3: a member's window opened at the earlier of its own queue note and the
+        lead's, so a lead queued first took in the finding of the member's cancelled build."""
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (lead,))
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        gone = build.queue_again(self.db, [member], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        self.db.execute("UPDATE note SET timestamp = '2026-01-02T00:00:00+00:00' WHERE item = ?", (member,))
+        build.queue(self.db, [member], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertNotIn("a cancelled build's order", prompt)
+
     def test_a_plain_retry_briefs_review_blockers_as_the_reviewer_s_not_the_operator_s(self):
         """Lead review of pack sd:9498: a plain Retry noted the parked run's blockers as Send to builder, which the
         brief presents as the operator's findings. They are the reviewer's text; only Send to builder is the

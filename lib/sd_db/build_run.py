@@ -2500,15 +2500,16 @@ class Supervisor:
             f"SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? UNION ALL "
             f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ?)",
             (lead, *items, f"Build assignment {lead} queued %")).fetchone()[0]
-        # Each item's window opens at its own assignment's queue note in this bundle, if that is earlier: a fresh
-        # member queued with its finding before a later item that leads. Its own, not the bundle's earliest: that
-        # took in the finding of another member's cancelled build (class pass, review of build/sd-1782).
+        # A member's window opens at its own assignment's queue note in this bundle: a fresh member queued with
+        # its finding before a later item that leads. Its own alone, not the bundle's earliest nor the earlier of
+        # its own and the lead's: each took in the finding of a member's cancelled build (review of
+        # build/sd-1782, rounds 2 and 3). The lead keeps `first`; a member with no queue note falls back to it.
         opens = dict.fromkeys(items, first)
-        for row in self.db.execute("SELECT id, item FROM assignment WHERE id = ? OR parent = ?", (lead, lead)):
+        for row in self.db.execute("SELECT id, item FROM assignment WHERE parent = ?", (lead,)):
             own = self.db.execute("SELECT MIN(timestamp) FROM note WHERE item = ? AND body LIKE ?",
                                   (row["item"], f"Build assignment {row['id']} queued %")).fetchone()[0]
-            if row["item"] in opens and own is not None:
-                opens[row["item"]] = min(filter(None, (opens[row["item"]], own)))
+            if row["item"] in opens and row["item"] != self.lead and own is not None:
+                opens[row["item"]] = own
 
         def listed(prefix: str, *, latest: bool = False) -> str:
             notes = [note for note in self.db.execute(
