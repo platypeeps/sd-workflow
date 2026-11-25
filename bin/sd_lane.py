@@ -3058,21 +3058,26 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
     """
     token, landed = secrets.token_hex(16), [row for row in answer.get("ran", []) if row.get("status") == "merged"]
     try:
-        taken = update(queue, lambda entries: take_owed(entries, token))
+        taken, unsettled = update(queue, lambda entries: (take_owed(entries, token), owes_settle(entries)))
     except LaneError as error:  # unknown: a claim may have landed, which the next run takes once this pid is gone
         if not landed:
             return answer
         return {**answer, "post_merge": (f"make post-merge not run: the owed entries could not be claimed ({error}); "
                                          "the next run runs it")[:1200]}
+    main = sd_lib.main_worktree_root(root).resolve()
     if not taken:
-        return answer
+        # A pass whose settle did not land, or a run that died before it: settled now, the target not run again.
+        settled = settle_post_merge(queue, main, None) if unsettled else None
+        return {**answer, "post_merge": settled} if settled else answer
     # This run's last landing, else the newest owed entry's, says whether a branch checkout moved.
     last = (landed or sorted(taken, key=lambda row: str(row.get("finished_at") or "")))[-1]
-    main = sd_lib.main_worktree_root(root).resolve()
     ran = make_post_merge(main, environ, str(last.get("fast_forward") or ""))
     retry = (ran or "").startswith(NOT_STARTED)
+    # The commit the pass ran at, recorded with its result: the followups it answers are settled
+    # against it, by this run or, if that write is lost, by the next (sd:10407).
+    passed_at, ran = passed_commit(main, ran)
     try:
-        update(queue, lambda entries: record_post_merge(entries, token, ran, retry))
+        update(queue, lambda entries: record_post_merge(entries, token, ran, retry, passed_at))
     except LaneError as error:
         if ran is not None:
             ran = (f"{ran}; its result could not be recorded ({error}), so a later run may run the target "
@@ -3082,34 +3087,70 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
     # Its first try noted a target that did not start; a retry notes only a run.
     noted = [row for row in taken if not retry or row["item"] in {merged.get("item") for merged in landed}]
     ran = note_post_merge(noted, ran, main)
-    if ran.startswith(POST_MERGE_PASSED):
-        ran = settle_post_merge(queue, [row["item"] for row in taken], ran, main)
-    return {**answer, "post_merge": ran}
+    return {**answer, "post_merge": settle_post_merge(queue, main, ran) or ran}
 
 
-def settle_post_merge(queue: Queue, items: list[Any], ran: str, main: pathlib.Path) -> str:
-    """`ran`, after a passing target in `main` resolved the open `Post-merge:` followups it covers (sd:10407).
+def passed_commit(main: pathlib.Path, ran: str | None) -> tuple[str | None, str | None]:
+    """`(commit, ran)`: the commit a passing target ran at in `main`, None for any other answer or
+    one git cannot read, which `ran` then says."""
+    if ran is None or not ran.startswith(POST_MERGE_PASSED):
+        return None, ran
+    done = publish_git(main, "rev-parse", "--verify", "HEAD")
+    head = done.stdout.strip() if done is not None and done.returncode == 0 else ""
+    if re.fullmatch(r"[0-9a-f]{40,64}", head):
+        return head, ran
+    return None, f"{ran}; its commit could not be read, so no earlier post-merge followup is resolved"[:1200]
 
-    One is covered when `main`'s HEAD, read after the pass, holds its item's delivered commit: a pass
-    at an older pin answers no newer failure, and a git that cannot answer covers nothing. A failed
-    write leaves them open and is said in the answer; the merge stands either way.
+
+def unsettled(row: dict[str, Any]) -> str | None:
+    """The commit a recorded pass on `row` ran at whose followups are not settled yet, or None."""
+    mark = row.get("post_merge")
+    return mark["settle"] if isinstance(mark, dict) and isinstance(mark.get("settle"), str) else None
+
+
+def owes_settle(entries: list[dict[str, Any]]) -> bool:
+    return any(unsettled(row) for row in entries)
+
+
+def settle_post_merge(queue: Queue, main: pathlib.Path, ran: str | None) -> str | None:
+    """`ran`, after each recorded pass resolved the open `Post-merge:` followups it covers (sd:10407).
+
+    Each entry a pass settled carries the commit it ran at (`unsettled`); one hub transaction
+    resolves the followups whose merge that commit holds and clears the marks, so a failed write
+    leaves both for the next run, which settles without running the target again. A pass at an
+    older pin answers no newer failure, and a git that cannot answer covers nothing. None when
+    there was nothing to say; the merge stands either way.
     """
-    def covered(commit: str) -> bool:
-        done = publish_git(main, "merge-base", "--is-ancestor", commit, "HEAD")
+    def pass_holds(commit: str, head: str) -> bool:
+        if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+            return False
+        done = publish_git(main, "merge-base", "--is-ancestor", commit, head)
         return done is not None and done.returncode == 0
 
-    def resolve_earlier(connection: Any) -> list[int]:
+    def resolve_covered(connection: Any) -> list[int]:
         sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
         from sd_db import workflow  # noqa: PLC0415
-        return workflow.resolve_post_merge(connection, items, covered)
+        marked = [(row, unsettled(row)) for row in stored(connection, queue.repository)]
+        resolved: list[int] = []
+        for head in sorted({head for _, head in marked if head}):
+            items = [row["item"] for row, at in marked if at == head]
+            resolved += workflow.resolve_post_merge(connection, items,
+                                                    lambda commit, head=head: pass_holds(commit, head))
+        for row, head in marked:
+            if head:
+                row["post_merge"] = {key: value for key, value in row["post_merge"].items() if key != "settle"}
+                store(connection, queue.repository, row)
+        return resolved
 
     try:
-        resolved = on_hub(queue, resolve_earlier)
+        resolved = on_hub(queue, resolve_covered)
     except LaneError as error:
-        return f"{ran}; earlier post-merge followups stay open: {error}"[:1200]
-    if not resolved:
-        return ran
-    return f"{ran}; resolved earlier post-merge followups {', '.join(f'#{note}' for note in resolved)}"[:1200]
+        said = f"earlier post-merge followups stay open: {error}"
+    else:
+        if not resolved:
+            return ran
+        said = f"resolved earlier post-merge followups {', '.join(f'#{note}' for note in resolved)}"
+    return (f"{ran}; {said}" if ran else said)[:1200]
 
 
 def release_chain(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer: dict[str, Any]) -> dict[str, Any]:
@@ -3286,15 +3327,18 @@ def take_owed(entries: list[dict[str, Any]], token: str) -> list[dict[str, Any]]
     return taken
 
 
-def record_post_merge(entries: list[dict[str, Any]], token: str, ran: str | None, retry: bool) -> None:
+def record_post_merge(entries: list[dict[str, Any]], token: str, ran: str | None, retry: bool,
+                      passed_at: str | None = None) -> None:
     """Settle each target `token` claimed with what `make_post_merge` answered; None is a Makefile without the rule.
 
     A target that did not start (`retry`) is owed again: an unread Makefile is unknown, not "ran".
+    A pass records `passed_at`, the commit it ran at, as the followups `settle_post_merge` still owes.
     """
     for row in entries:
         mark = row.get("post_merge")
         if isinstance(mark, dict) and mark.get("token") == token:
-            row["post_merge"] = POST_MERGE_OWED if retry else {"ran": ran or "no post-merge rule", "at": stamp_now()}
+            row["post_merge"] = POST_MERGE_OWED if retry else {"ran": ran or "no post-merge rule", "at": stamp_now(),
+                                                              **({"settle": passed_at} if passed_at else {})}
 
 
 def origin_tip(tree: pathlib.Path) -> str | None:

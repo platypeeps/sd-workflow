@@ -4799,6 +4799,42 @@ class PostMergeOwed(RefusingHub):
         self.assertEqual((self.runs(), self.noted(), self.entries()[0]["post_merge"]["ran"]),
                          (1, [], f"make post-merge passed in {self.repo}"))
 
+    def open_followups(self) -> list[int]:
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            return [row[0] for row in connection.execute(
+                "SELECT id FROM note WHERE kind = 'followup' AND resolved_at IS NULL ORDER BY id")]
+        finally:
+            connection.close()
+
+    def test_a_settle_the_hub_refused_is_done_by_the_next_run_without_running_the_target(self) -> None:
+        """Failure table, settle (sd:10407 round 2): the pass was recorded, then the write that resolves the
+        followups it answered failed; no entry owed the target again, so no later run resolved them."""
+        import sd_db
+        from sd_db import workflow
+        self.assertEqual(self.register_items(1), [1])  # the queued entry's item, in this repository
+        held = git(self.repo, "rev-parse", "HEAD")
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            earlier = sd_db.create_item(connection, kind="task", title="earlier", status="done", repo=str(self.repo))
+            failed = sd_db.add_note(connection, earlier, "followup",
+                                    f"Post-merge: make post-merge failed (exit 2)\nMerged at {held}",
+                                    session=sd_lane.LANE_SESSION)
+            connection.commit()
+        finally:
+            connection.close()
+        locked = sqlite3.OperationalError("database is locked")
+        with mock.patch.object(workflow, "resolve_post_merge", side_effect=locked):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn("stay open", answer["post_merge"])
+        self.assertEqual((self.runs(), self.open_followups()), (1, [failed]))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(("post_merge" in answer, self.runs()), (False, 1))
+
     def test_a_merge_the_next_run_applies_from_a_hub_stop_record_runs_the_target_there(self) -> None:
         """Failure table, hub stop (sd:4184): the outcome write was refused, then the run died before the target."""
         self.killed_before_the_target(self.upgrade_after("merge"))
