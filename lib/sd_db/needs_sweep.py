@@ -253,7 +253,8 @@ def sweep(connection: sqlite3.Connection, *, who: str, apply: bool = True) -> di
 #: A ruling, as Decisions writes it (`decisions.RULING`, `review.RULING`), and the two notes that take one back:
 #: Decisions' reversal and a review batch's withdrawal. Each reopens the question it ruled.
 RULING = re.compile(r"\ARuling on note #([0-9]+): ")
-UNDONE = re.compile(r"\A(?:Reversed ruling #([0-9]+)\b|Withdrawn: ruling #([0-9]+) on note #)")
+#: A withdrawal names its ruling's own note, alone or before `review.WITHDRAWN`'s `; sd:N stays filed`.
+UNDONE = re.compile(r"\A(?:Reversed ruling #([0-9]+)\b|Withdrawn: ruling #([0-9]+) on note #([0-9]+)(?:;|\Z))")
 
 
 def standing_ruling(connection: sqlite3.Connection, question) -> int | None:
@@ -264,7 +265,8 @@ def standing_ruling(connection: sqlite3.Connection, question) -> int | None:
         body = decision["body"] or ""
         if (ruled := RULING.match(body)) and int(ruled[1]) == question["id"]:
             standing = decision["id"]
-        elif (undone := UNDONE.match(body)) and standing is not None and int(undone[1] or undone[2]) == standing:
+        elif ((undone := UNDONE.match(body)) and standing is not None and int(undone[1] or undone[2]) == standing
+              and (undone[3] is None or int(undone[3]) == question["id"])):
             standing = None
     return standing
 

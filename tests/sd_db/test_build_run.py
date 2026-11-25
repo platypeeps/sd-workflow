@@ -1789,6 +1789,32 @@ class Supervise(Case):
                 self.assertEqual((chosen or {}).get("subject", {}).get("head"), expected,
                                  "a replay held at the checks lost the delta review's prior")
 
+    def test_a_fresh_claim_reads_no_earlier_attempt_s_review(self):
+        """Review of build/sd-1726 (pack sd:10236): the fallback to an earlier run's reports walked every run of
+        the assignment, so a fresh claim with no report of its own verified an earlier attempt's, leaving the
+        rest of the branch unreviewed. Only a run that resumed one reads back, and no further than a fresh one."""
+        self.press()
+        earlier = self.supervisor()
+        earlier.logs.mkdir(parents=True, exist_ok=True)
+        earlier.out("review").write_text(json.dumps(
+            {**self.PRIOR, "status": "blocking", "scope": "branch"}), encoding="utf-8")
+        ident = "f" * 32
+        self.db.execute("INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                        "start_step, step, model, created_at, updated_at) SELECT ?, assignment, run + 1, repo, branch, "
+                        "owner, work_path, retained_path, ?, step, model, created_at, updated_at FROM runner_run "
+                        "WHERE id = ?", (ident, "claimed", self.bundle["id"]))
+        self.db.commit()
+        fresh = self.supervisor(ident)
+        with mock.patch.object(fresh, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertIsNone(fresh.prior_review("a" * 40), "a fresh claim verified an earlier attempt's review")
+        self.db.execute("UPDATE runner_run SET start_step = 'fixing' WHERE id = ?", (ident,))
+        self.db.commit()
+        resumed = self.supervisor(ident)
+        with mock.patch.object(resumed, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertEqual((resumed.prior_review("a" * 40) or {}).get("subject"), self.PRIOR["subject"])
+
     def test_a_short_blocking_round_is_no_prior_to_verify(self):
         """Review of sd:9769: a blocking round short of a reader read part of the patch; the next round reviews
         the branch in full, not the delta since it."""
@@ -3155,6 +3181,131 @@ class Supervise(Case):
         self.assertEqual(fix[fix.index("--resume") + 1], "session-fixture")
         self.assertIn("- work.txt:1 a blocker", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], 1, "the resumed fix charged no round")
+
+    def test_a_usage_limit_in_a_fix_keeps_the_prior_review_to_verify(self):
+        """pack sd:10236: the resumed fix is a new run, whose own log names hold no review, so the next review
+        lost the blocking round's report and reviewed the branch afresh, clearing without verifying it. The
+        resumed run verifies the report the limited run's round left."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        first = self.supervisor()
+        self.assertEqual(first.run()["outcome"], "rate_limited")
+        blocking = json.loads(first.out("review").read_text(encoding="utf-8"))
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        resumed = self.supervisor(again["id"])
+        self.assertEqual(resumed.run()["step"], "enqueued")
+        review = [call["argv"] for call in self.calls("sd-review")][-1]
+        self.assertIn("--verify-report", review, "the resumed fix's review verified no prior report")
+        self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
+        self.assertEqual(json.loads(resumed.out("prior").read_text(encoding="utf-8")), blocking)
+
+    def resumed_with_broken_report(self, broken: str):
+        """A usage-limited blocking round resumed as a new run whose own review report cannot be read."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        resumed = self.supervisor(again["id"])
+        own = resumed.out("review")
+        own.write_bytes(b'{"subject": "\xff\xfe"}' if broken == "bytes" else b"{}")
+        if broken == "mode":
+            own.chmod(0)
+            self.addCleanup(own.chmod, 0o644)
+        # A fix commit after the blocking round: the older report is then a verifiable prior.
+        (resumed.work / "work.txt").write_text("fixed\n", encoding="utf-8")
+        for argv in (["add", "work.txt"], ["-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-qm", "fix"]):
+            subprocess.run(["git", "-C", str(resumed.work), *argv], check=True)
+        head = subprocess.run(["git", "-C", str(resumed.work), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        return resumed, head
+
+    def test_an_own_report_not_utf8_reviews_in_full_not_an_older_runs(self):
+        """Lane review of build/sd-1726 (pack sd:10235): a resumed run whose own report is not UTF-8 walked on
+        to the earlier run's report and verified those stale findings. Its own report exists: review in full."""
+        resumed, head = self.resumed_with_broken_report("bytes")
+        self.assertIsNone(resumed.prior_review(head), "an older run's report stood in for an unreadable one")
+
+    def resumed_with_no_report(self):
+        """`resumed_with_broken_report` with no own report, after a control: the earlier run's report verifies."""
+        resumed, head = self.resumed_with_broken_report("none")
+        resumed.out("review").unlink()
+        self.assertIsNotNone(resumed.prior_review(head), "control: the earlier run's report did not verify")
+        resumed.out("prior").unlink()
+        return resumed, head
+
+    def test_an_earlier_runs_prior_alone_reviews_in_full(self):
+        """Lane review of build/sd-1726 (pack sd:10235): the archive had moved the newest earlier run's
+        `review.out` but not yet its `prior.out`, so the resume verified that older kept report, which omits
+        the moved round's blockers. A run's prior with no last report beside it is no prior: review in full."""
+        resumed, head = self.resumed_with_no_report()
+        earlier = self.db.execute("SELECT id FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+                                  (resumed.row["assignment"], resumed.row["run"])).fetchone()[0]
+        last, kept = (resumed.logs / f"{earlier}.{name}.out" for name in ("review", "prior"))
+        kept.write_text(last.read_text(encoding="utf-8"), encoding="utf-8")
+        last.unlink()
+        self.assertIsNone(resumed.prior_review(head), "the archived round's older kept report was verified")
+
+    def test_a_walk_stops_at_an_earlier_run_the_archive_may_have_emptied(self):
+        """Lane review of build/sd-1726 (pack sd:10235): a run that ended other than rate_limited may have
+        lost its reports to the archive before the resume; the walk went on to an older run's report.
+        Only a rate_limited run, whose files the archive keeps while it is the last, lets the walk pass it."""
+        resumed, head = self.resumed_with_no_report()
+        assignment, number = resumed.row["assignment"], resumed.row["run"]
+        self.db.execute("UPDATE runner_run SET run = ? WHERE id = ?", (number + 1, resumed.ident))
+        columns = [row[1] for row in self.db.execute("PRAGMA table_info(runner_run)") if row[1] not in ("id", "run")]
+        listed = ", ".join(columns)
+        self.db.execute(f"INSERT INTO runner_run (id, run, {listed}) SELECT 'emptied', ?, {listed} FROM runner_run "
+                        f"WHERE assignment = ? AND run = ?", (number, assignment, number - 1))
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', start_step = 'fixing' WHERE id = 'emptied'")
+        self.db.commit()
+        resumed.row = build.run(self.db, resumed.ident)
+        self.assertIsNone(resumed.prior_review(head), "the walk passed a run the archive may have emptied")
+
+    def test_an_own_report_with_no_read_permission_reviews_in_full(self):
+        """Lane review of build/sd-1726 (pack sd:10235): the same walk for a report the run cannot open."""
+        resumed, head = self.resumed_with_broken_report("mode")
+        self.assertIsNone(resumed.prior_review(head), "an older run's report stood in for an unreadable one")
+
+    def test_a_resumed_fix_verifies_the_review_an_archive_tick_passed(self):
+        """Review of build/sd-1726 (pack sd:10236): the archive moves a released run's own files to the bulk
+        root, so a usage-limited run's review left before the resume and the resumed fix reviewed afresh. Its
+        log moves and its review stays, so no `log_path` says where a moved review would be (class pass)."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        first = self.supervisor()
+        self.assertEqual(first.run()["outcome"], "rate_limited")
+        blocking = json.loads(first.out("review").read_text(encoding="utf-8"))
+        bulk = self.root / "archive"  # the fixture's live root is named `bulk`
+        moved = build_run.archive(self.db, self.logs, bulk, settle=-60)
+        self.assertIn(str(bulk / first.log.relative_to(self.logs)), moved, "the limited run's log did not move")
+        self.assertNotIn(str(bulk / first.out("review").relative_to(self.logs)), moved,
+                         "the archive moved a review the resume reads")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        resumed = self.supervisor(again["id"])
+        self.assertEqual(resumed.run()["step"], "enqueued")
+        review = [call["argv"] for call in self.calls("sd-review")][-1]
+        self.assertIn("--verify-report", review, "the resumed fix lost the review an archive tick passed")
+        self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
 
     def test_a_resumed_fix_keeps_every_blocker_whole(self):
         """Review of build/sd-1557: the resumed fix read its blockers back from the 4000-character note, so a
@@ -5184,6 +5335,34 @@ class Archive(Case):
                         "WHERE id = ?", (build_run.now(), str(path), f"refused; log {path}", self.bundle["id"]))
         self.db.commit()
         return path, build_run.log_dir(self.logs, str(self.repo)) / path.name
+
+    def test_a_runs_review_waits_for_every_run_of_its_assignment(self):
+        """Class pass on build/sd-1726 (pack sd:10236): a resumed run reads the review and prior of the run it
+        resumed, which the archive moved once that run alone was released. They wait as the assignment's files
+        do: through the limit, through the resume, until its last run is released; the run's other files do not."""
+        path, target = self.ended("{run}.review.out")
+        prior, errors = path.with_name(path.name.replace("review", "prior")), path.with_name(path.name[:-3] + "err.out")
+        for each in (prior, errors):
+            each.write_text("x")
+            os.utime(each, (0, 0))
+        local = self.root / "local"
+        self.db.execute("UPDATE runner_run SET outcome = ? WHERE id = ?", (build.RATE_LIMITED, self.bundle["id"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [str(target.with_name(errors.name))])
+        resumed = "e" * 32
+        self.db.execute("INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                        "start_step, step, model, created_at, updated_at) SELECT ?, assignment, run + 1, repo, branch, "
+                        "owner, work_path, retained_path, 'fixing', 'fixing', model, created_at, updated_at "
+                        "FROM runner_run WHERE id = ?", (resumed, self.bundle["id"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [], "moved while the resumed run lives")
+        self.assertTrue(path.exists() and prior.exists())
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?",
+                        (build_run.now(), resumed))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs),
+                         [str(target.with_name(prior.name)), str(target)])
+        self.assertFalse(path.exists() or prior.exists())
 
     def test_a_rate_limited_bundles_files_wait_for_its_resume(self):
         """Review of build/sd-1557: a usage limit releases the run and queues the bundle again; the archive
