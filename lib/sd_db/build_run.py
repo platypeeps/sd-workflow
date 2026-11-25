@@ -679,6 +679,24 @@ def function_words(git: Collection[str], work: str, base: str, head: str, *,
     return set(re.findall(r"[A-Za-z_]\w*", diff)), defined
 
 
+def round_words(git: Collection[str], work: str, base: str, head: str, *,
+                env: dict | None = None) -> tuple[set[str], set[str]] | None:
+    """What a ruling round's commits `base..head` changed, for `Supervisor.reaches` (sd:10286): every
+    identifier in the functions they change, each read whole, and the names those changes define: each
+    function changed, and each name a changed line binds at module level. None when git cannot answer.
+    Unlike `function_words`, a change outside any function reads too: its names are what it binds."""
+    try:
+        diff = _read([*git, "-C", work, "diff", "-U0", "--function-context", "--no-renames", "--no-color",
+                      "--no-ext-diff", "--no-textconv", base, head], env=env)
+    except Unread:
+        return None
+    lines = [line for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
+    defined = {name for line in lines for name in defined_names(line[1:])}
+    defined |= {name for line in lines if line[0] in "+-" and not line[1:2].isspace()
+                for name in bound_names(line[1:])}
+    return {name for line in lines for name in re.findall(r"[A-Za-z_]\w*", line[1:])}, defined
+
+
 def defined_names(line: str) -> set[str]:
     """The names one source line defines, in any common form (pack sd:9769): a keyword (`def`, `function`,
     `fn`, `func`, `class`, `sub`, ...), a declaration or assignment (`const x =`, `x := func`, `x = lambda`,
@@ -2071,15 +2089,17 @@ class Supervisor:
         # What the round's own commits changed since the head its rulings judged; None when it does not read.
         reviewed = self.round_head() if found else None
         moved = changed_lines(self.tools.git, str(self.work), reviewed, head, env=self.env) if reviewed else None
-        # The names the round's changed functions define, for a finding that names a caller by function.
-        # ponytail: a change outside any function names none here; its file still lapses a ruling naming it.
-        words = (function_words(self.tools.git, str(self.work), reviewed, head, env=self.env)
+        # The names the round's commits use and define, for a finding that names a changed caller by
+        # function, or that names nothing the round changed and is reached all the same (`reaches`).
+        words = (round_words(self.tools.git, str(self.work), reviewed, head, env=self.env)
                  if reviewed and moved is not None else None)
-        functions = None if moved is None else words[1] if words else set()
         for number, (ruling, reason) in sorted(found.items()):
+            row = blockers[number - 1]
+            reached = (self.reaches(row, words, head)
+                       if ruling in ("reject", "file") and ruleable(row) and words is not None else [])
             self.once(f"ruling:{head}:{number}", functools.partial(
-                self.rule, number, blockers[number - 1], ruling, reason, head, repository, changed,
-                None if moved is None else moved.keys(), functions))
+                self.rule, number, row, ruling, reason, head, repository, changed,
+                None if moved is None else moved.keys(), None if words is None else words[1], reached))
         asked = [(blockers[number - 1], reason) for number, (ruling, reason) in sorted(found.items()) if ruling == "ask"]
         if asked:
             # Kept beside the body until the run ends: a replay of this end reads the same rulings.
@@ -2092,6 +2112,26 @@ class Supervisor:
         # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
         self.rulings.unlink(missing_ok=True)
         return None
+
+    def reaches(self, row: dict, words: tuple[set[str], set[str]] | None, head: str) -> list[str]:
+        """How a ruling round's own changes (`round_words`) reach a blocker that names none of them, at each
+        of its places (class pass on sd:10286): a changed function calls the function around the place,
+        directly or through unchanged callers (`called_from`), or that function uses a name the round
+        defines. A ruling judged the code without that change, so `rule` does not apply it. A delta, or a
+        place, git cannot read reaches, fail closed.
+        ponytail: the names a function uses, one level; a changed callee two calls down is not followed."""
+        if words is None:
+            return ["code that did not read"]
+        sources: dict[str, list[str] | None] = {}
+        found = []
+        for path, line in self.locations(row):
+            at = f"{path}:{line}" if line else path
+            if self.called_from(path, line, head, sources, words[0]):
+                found.append(f"a caller of {at}")
+            elif (scope := self.scope(path, line, head, sources)) is None or (
+                    set(re.findall(r"[A-Za-z_]\w*", "\n".join(scope[1]))) & words[1]):
+                found.append(f"a name {at} uses")
+        return found
 
     def round_head(self) -> str | None:
         """The head the last blocking round, whose blockers the ruling round ruled, read, as `blocked_round`
@@ -2141,7 +2181,7 @@ class Supervisor:
 
     def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str,
              changed: Collection[str] | None = (), moved: Collection[str] | None = (),
-             functions: Collection[str] | None = ()) -> None:
+             functions: Collection[str] | None = (), reached: Collection[str] = ()) -> None:
         """One ruling's writes in one transaction: the decision note, a filed item, the rebuttal (sd:10286).
 
         A reject or file judged the code at the reviewed head. `moved` is what the round's own commits changed
@@ -2156,7 +2196,7 @@ class Supervisor:
         # A file the finding or its evidence names: a fixed caller its repro runs through (lead ruling).
         # Or a function the round changed that its words name as code (`forward()`): a fixed caller by name.
         touched = (sorted({path for path, _ in self.locations(row)} & set(moved) | set(names_in(finding_words(row), moved))
-                          | callable_words(finding_words(row)) & set(functions))
+                          | callable_words(finding_words(row)) & set(functions) | set(reached))
                    if moved is not None and functions is not None else None)
         lapsed = ("" if ruling not in ("reject", "file") or not finding else
                   "; not applied: the review gate's own blocker, no code it judged" if not ruleable(row) else

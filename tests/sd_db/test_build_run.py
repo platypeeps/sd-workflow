@@ -151,7 +151,12 @@ FAKE = textwrap.dedent('''
         # A function per round: a change outside any function holds every later blocker (sd:9769).
         added = f"def {mode}(): pass\\n"
         # `rule_apart`: a ruling round whose fix commits to a file no blocker names (sd:10286)
-        target = Path("apart.txt" if mode == "rule_apart" else "work.txt")
+        # `rule_caller`: one whose fix adds, in another file, a caller of the function at work.txt:2
+        if mode == "rule_caller":
+            added = "def rule_caller(): fix1()\\n"
+        if mode == "rule_apart":  # no `pass`: the first round's function has that name, and a call is a caller
+            added = "def rule_apart(): return 0\\n"
+        target = Path("apart.txt" if mode in ("rule_apart", "rule_caller") else "work.txt")
         target.write_text(target.read_text() + added if target.exists() else added)
         git("add", str(target))
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
@@ -172,7 +177,7 @@ FAKE = textwrap.dedent('''
         prompt = sys.argv[sys.argv.index("-p") + 1]
         # `rule`: the ruling round's builder writes plans/rulings.txt to the file its brief names (sd:10286).
         named = re.search(r"JSON list to `([^`]+)`", prompt)
-        if mode in ("rule", "rule_apart") and named and (plans / "rulings.txt").exists():
+        if mode in ("rule", "rule_apart", "rule_caller") and named and (plans / "rulings.txt").exists():
             Path(named.group(1)).write_bytes((plans / "rulings.txt").read_bytes())
         items = re.findall(r"^- sd:(\\d+)", prompt, re.M)
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
@@ -1346,6 +1351,57 @@ class Supervise(Case):
         self.assertIn("not applied: the round changed forward", first)
         self.assertNotIn("not applied", second)
         self.assertIn("not applied: the round's own changes did not read", third)
+
+    def test_a_ruling_lapses_when_its_round_adds_a_caller_no_finding_names(self):
+        """Class pass on sd:10286: the round's fix adds, in a file the blocker does not name, a caller of
+        the function the blocker sits in. The reject judged the code without that caller, so it clears
+        nothing: the repeat parks the run."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",), rule="rule_caller")
+        self.assertIn("not applied: the round changed a caller of work.txt:2", self.decisions()[1])
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.rebuttals(), [])
+
+    def test_a_rounds_reach_is_a_caller_or_a_name_the_blocker_uses(self):
+        """Class pass on sd:10286, each instance from the code: a round that changes a caller of the
+        blocker's function, direct or through an unchanged one, or a module name that function uses,
+        reaches it; one that changes unrelated code does not, and a delta git cannot read reaches all."""
+        self.press()
+        supervisor = self.supervisor()
+        work = Path(self.bundle["work_path"])
+        work.mkdir(parents=True, exist_ok=True)
+        support.git(work, "init", "-q")
+
+        def commit(files):
+            for name, text in files.items():
+                (work / name).parent.mkdir(parents=True, exist_ok=True)
+                (work / name).write_text(text)
+            support.git(work, "add", "-A")
+            support.git(work, "-c", "user.name=operator", "-c", "user.email=operator@example.test",
+                        "-c", "commit.gpgsign=false", "commit", "-qm", "fix: a round")
+            return support.git(work, "rev-parse", "HEAD")
+
+        base = commit({"src/parse.py": "import limits\n\ndef parse_count(text):\n    return int(text) + limits.LIMIT\n",
+                       "src/limits.py": "LIMIT = 3\n",
+                       "src/dispatch.py": "def forward(text):\n    return text\n",
+                       "src/route.py": "def route(text):\n    return middle(text)\n",
+                       "src/middle.py": "def middle(text):\n    return parse_count(text)\n",
+                       "src/far.py": "def far():\n    return 1\n"})
+        row = {"path": "src/parse.py", "line": 4, "summary": "an empty count raises"}
+        cases = {"src/dispatch.py": ("def forward(text):\n    return parse_count(text or '')\n", "a caller of"),
+                 "src/route.py": ("def route(text):\n    return middle(text or '')\n", "a caller of"),
+                 "src/limits.py": ("LIMIT = ''\n", "a name"),
+                 "src/far.py": ("def far():\n    return 2\n", None)}
+        for name, (text, said) in cases.items():
+            with self.subTest(name):
+                support.git(work, "reset", "-q", "--hard", base)
+                head = commit({name: text})
+                reach = supervisor.reaches(row, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
+                self.assertEqual(bool(reach), said is not None, reach)
+                if said:
+                    self.assertIn(said, reach[0])
+        self.assertTrue(supervisor.reaches(row, None, base), "an unread delta reaches every blocker")
 
     def test_a_ruling_clears_no_gate_blocker(self):
         """Review of sd:10286: the review gate's own blocker (a response past its byte limit, a finding it could
