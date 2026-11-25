@@ -154,6 +154,19 @@ class TheDocument(ScreenCase):
         self.assertEqual(doc["attention"], {"state": "warning", "n": 1, "what": "reports want you"})
         self.assertEqual(reports_screen._attention(None), {"state": "unknown", "n": 0, "what": "reports not read"})
 
+    def test_an_open_report_behind_the_history_limit_still_shows_once_and_counts(self):
+        # sd:10432: 200 newer quiet reports pushed the open one out of the list, its badge and its filter.
+        for n in range(200):
+            reporting.ingest(self.connection, job=f"quiet-{n}", run_id="q", started="2026-09-09T00:00:00Z",
+                             ended="2026-09-09T00:01:00Z", exit_code=0, text="fine", source_path="sd-db scan",
+                             attention=False)
+        doc = self.doc()
+        ids = [r["id"] for r in doc["reports"]]
+        self.assertEqual(ids.count(self.ids["failed"]), 1)
+        self.assertEqual(len(ids), 201)
+        self.assertEqual(ids[-1], self.ids["failed"])
+        self.assertEqual(doc["attention"], {"state": "warning", "n": 1, "what": "reports want you"})
+
     def test_truncated_reads_the_kept_body_not_the_first_run(self):
         # sd:4652: pack sd:4641 lets a later whole body replace a cut first run, and `repeats.body_truncated` says
         # what the kept body is; `report.truncated` stays the first run's and is only the fallback.
