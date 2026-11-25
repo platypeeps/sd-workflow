@@ -6095,6 +6095,23 @@ class Importing(SharedQueue):
         [kept] = self.imported_files()
         self.assertEqual((kept.read_bytes(), self.file.exists()), (original, False))
 
+    def test_lane_list_reads_and_leaves_the_file_to_the_runner(self) -> None:
+        """sd:10420: a view changes no ref, file or row; only the runner imports."""
+        import argparse  # noqa: PLC0415
+        tree = self.worktree("topic")
+        original = self.write_file(self.old(1, tree))
+        bodies = sorted(path.name for path in self.bodies.iterdir())
+        refs = git(self.origin, "for-each-ref")
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        with contextlib.chdir(self.repo), mock.patch.dict(os.environ, self.environ), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", "list"])), 0)
+        self.assertEqual(json.loads(said.getvalue())["entries"], [])
+        self.assertEqual((self.file.read_bytes(), self.imported_files(), self.rows()), (original, [], []))
+        self.assertEqual((sorted(path.name for path in self.bodies.iterdir()), self.git_verbs), (bodies, []))
+        self.assertEqual(git(self.origin, "for-each-ref"), refs)
+
     def test_a_busy_runner_lock_skips_the_import(self) -> None:
         """An older runner mid-entry holds the lock and keeps its file until the next pass."""
         self.write_file(self.old(1, self.feature))

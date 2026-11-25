@@ -198,9 +198,9 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
     The functions `sd-ship lane list` calls -- `stored`, then `enqueue_order`, `item_rounds`, `shown` and
     `queue_revision` -- with no process per repository. Two inputs come without git: the repository is the registered
     `remote`'s GitHub name, which the pack reads from the checkout's origin, and the lane folder is named after the
-    registered checkout, the main one. None where either could differ or `lane list` does more than read: a remote
-    that names no GitHub repository, a `.git` that is not a folder, an earlier version's queue file, which `lane list`
-    imports, or no pack `bin/` beside the library. The caller runs `lane list` for those. A failed read is
+    registered checkout, the main one. None where either could differ: a remote that names no GitHub repository, a
+    `.git` that is not a folder, or no pack `bin/` beside the library. The caller runs `lane list` for those. An
+    earlier version's queue file stays for the runner to import (sd:10420). A failed read is
     `{"ok": False, "error": ...}`, never an empty lane.
     """
     from sd_db.protection import github_slug
@@ -218,8 +218,6 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
         queue = lane.lane_root(dict(os.environ)) / Path(path).resolve().name / "lane" / "queue" / "queue.json"
     except lane.sd_lib.ConfigError as error:
         return {"ok": False, "error": f"the lane root was not read: {error}"}
-    if queue.exists():
-        return None
     repository = "/".join(found).lower()
     try:
         # `stored` first: an entry written between the two reads is then in the order, never missing from it.

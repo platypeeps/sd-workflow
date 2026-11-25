@@ -1469,8 +1469,8 @@ class RealLane(BrowserSession):
     """The pinned pack's `sd-ship lane` on a temporary lane root, seeded with `seeds()`.
 
     The pack keeps the queue in the hub database (pack sd:3282), so the entries go there through its own writer:
-    a `<lane>/queue/queue.json` is only an earlier version's file, which `lane list` imports by publishing each
-    pending head to `origin`. The checkout's origin names a GitHub repository, as every lane's must.
+    a `<lane>/queue/queue.json` is only an earlier version's file, which the runner alone imports by publishing each
+    pending head to `origin` (sd:10420). The checkout's origin names a GitHub repository, as every lane's must.
     """
 
     #: A move runs `lane list` and then the verb, each in a real `sd-ship` under the server's own bound; past both, the
@@ -1742,14 +1742,16 @@ class TheInProcessRead(RealLane):
         self.assertEqual(satellite["host"], "build-2")
         self.assertEqual(satellite, {**hub, "host": "build-2"})
 
-    def test_a_queue_file_an_earlier_version_left_is_read_by_lane_list(self):
-        # `lane list` imports an earlier version's queue file into the database once; the page lets it.
+    def test_a_queue_file_an_earlier_version_left_stays_for_the_runner(self):
+        # sd:10420: only the runner imports that file; the page reads the database and leaves it in place.
         queue = Path(os.environ["SD_LANE_ROOT"]) / "system" / "lane" / "queue" / "queue.json"
-        queue.write_text(json.dumps({"entries": []}))
-        with mock.patch.object(queue_screen, "lane_list", wraps=queue_screen.lane_list) as listing:
+        queue.write_text(json.dumps({"entries": [{"item": 9, "status": "pending", "branch": "topic"}]}))
+        original = queue.read_bytes()
+        with mock.patch.object(queue_screen, "lane_list", side_effect=AssertionError("lane list ran")):
             lane = queue_screen.document(self.connection, now=NOW)["lanes"][0]
-        listing.assert_called_once_with(str(self.checkout))
         self.assertEqual(len(lane["rows"]), 6)
+        self.assertEqual((queue.read_bytes(), sorted(p.name for p in queue.parent.iterdir())),
+                         (original, ["queue.json"]))
 
     def test_without_the_packs_bin_lane_list_answers(self):
         with mock.patch.object(queue_screen, "pack_module", side_effect=ImportError("no bin")), \
