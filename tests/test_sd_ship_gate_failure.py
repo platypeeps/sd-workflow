@@ -794,16 +794,20 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
                                       "FAIL: test_b (tests.test_other.Case.test_b)\nOK\n"), encoding="utf-8")
         self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
 
-    def test_an_early_end_line_inside_a_shard_keeps_every_failure(self):
+    def test_an_early_end_line_inside_a_shard_hides_no_failure(self):
         """Lane review of sd:9866: a test that prints its own shard's end line mid-run must not hide a later
-        failure; the ids come from the block validation counted, so both failing tests rerun."""
+        failure. Since the class pass of sd:9862 a quoted marker makes the gate no flake at all, so the gate
+        failure stands with both failures in it."""
         log = pathlib.Path(self.row["output_path"])
         other = "tests.test_example.Case.test_b"
         log.write_text(OUTPUT.replace("Ran 3 tests\nFAILED (failures=1)\n",
                                       "shard tests.test_example: 0s exit=0\n"
                                       f"FAIL: test_b ({other})\nRan 3 tests\nFAILED (failures=2)\n"),
                        encoding="utf-8")
-        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST, other])
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
 
     def test_a_multiline_assertion_that_prints_runner_lines_is_no_flake(self):
         """Lane review of sd:9862: a failing test's message spans lines, as one that quotes a runner's output
@@ -826,6 +830,63 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
                 self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
         log.write_text(OUTPUT, encoding="utf-8")
         self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+
+    def test_no_quoted_runner_marker_makes_a_flake(self):
+        """Class pass of the lane review of sd:9862: a test's output can quote any line the parser trusts, in the
+        failing shard's block, in a shard logged before it or in one logged after it. Each marker each block
+        relies on must appear once and in runner order, and the headers must add up to the one summary; any
+        quote breaks that, so the gate is no flake. One row each of the failure table in the PR body."""
+        log = pathlib.Path(self.row["output_path"])
+        planned, ok = "test runner: workers=2 shards=3", "OK\n"
+        before = "shard tests.test_other: start\n{quote}OK\nshard tests.test_other: 2s exit=0\n"
+        failing = (f"shard tests.test_example: start\nFAIL: test_a ({FLAKY_TEST})\nAssertionError: git failed\n"
+                   "{quote}Ran 3 tests\nFAILED (failures=1)\n" + SHARD + "\n")
+        after = "shard tests.test_last: start\n{quote}" + ok + "shard tests.test_last: 1s exit=0\n"
+
+        def output(place, quote):
+            parts = {"before": before, "failing": failing, "after": after}
+            return planned + "\n" + "".join(text.format(quote=quote if name == place else "")
+                                            for name, text in parts.items()) + "make: *** [test] Error 1\n"
+
+        log.write_text(output(None, ""), encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+        header = "FAIL: test_b (tests.test_example.Case.test_b)\n"
+        quotes = {
+            "the failing shard's start line": "shard tests.test_example: start\n",
+            "the failing shard's start line and a header": "shard tests.test_example: start\n" + header,
+            "the failing shard's end line, passing": "shard tests.test_example: 4s exit=0\n",
+            "the failing shard's end line": SHARD + "\n",
+            "the failing shard's end line and a later header": f"{SHARD}\n{header}",
+            "another shard's start line": "shard tests.test_other: start\n",
+            "another shard's end line, failing": "shard tests.test_other: 2s exit=1\n",
+            "a shard the runner never planned": "shard tests.test_fake: start\nshard tests.test_fake: 1s exit=0\n",
+            "the planned line": planned + "\n",
+            "a header": header,
+            "a summary": "FAILED (failures=1)\n",
+            "a header and a summary": header + "FAILED (failures=1)\n",
+            "a skip summary": "OK (skipped=1)\n",
+        }
+        for marker, quote in quotes.items():
+            for place in ("failing", "before", "after"):
+                if place != "failing" and ("header" in marker or marker == "a summary"):
+                    continue  # a passing shard's headers and summary are never read (sd:9866)
+                with self.subTest(marker=marker, place=place):
+                    log.write_text(output(place, quote), encoding="utf-8")
+                    self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        # Two failing shards, the gate's step only `make target test`: a quoted passing end line of the first,
+        # printed by the second, hid the first's failure, and a rerun of the second's test alone cleared both.
+        first = "tests.test_other.Case.test_c"
+        both = output(None, "").replace(
+            "OK\nshard tests.test_other: 2s exit=0\n",
+            f"FAIL: test_c ({first})\nRan 1 test\nFAILED (failures=1)\nshard tests.test_other: 2s exit=1\n")
+        row = {**self.row, "failed_steps": ["make target test"]}
+        log.write_text(both, encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [first, FLAKY_TEST])
+        log.write_text(both.replace("AssertionError: git failed\n",
+                                    "AssertionError: git failed\nshard tests.test_other: 2s exit=0\n"),
+                       encoding="utf-8")
+        with self.subTest(marker="an earlier failing shard's end line, passing", place="failing"):
+            self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
 
     def test_only_a_failure_of_tests_alone_is_rerun(self):
         lint = {**self.row, "failed_steps": [SHARD, "make target lint"]}

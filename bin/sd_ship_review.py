@@ -1814,24 +1814,35 @@ def row_tests(row: dict) -> list[str]:
 
 def unittest_failed_shards(text: str) -> dict[str, str]:
     """The shards in `run-tests.sh` output `text` that finished with unittest's own failure exit and printed a FAIL
-    or ERROR header, each with the block validation read (its last start line before its last end line); empty
-    when any shard did not write its complete end line (killed or hung), ended with any other non-zero exit (137
-    for a kill), or failed with no header: then more than a test failed. Empty too when a start line repeats: a
-    test's multiline message that quotes one would move the block past the real header (lane review of sd:9862)."""
-    started = SHARD_START.findall(text)
-    ended = {match.group(1): match for match in SHARD_END.finditer(text)}
+    or ERROR header, each with its block, from its start line to its end line; empty when any shard did not write
+    its complete end line (killed or hung), ended with any other non-zero exit (137 for a kill), or failed with no
+    header: then more than a test failed.
+
+    Empty too unless the markers read as `run-tests.sh` writes them: one
+    planned line, then each planned shard's start line and end line once,
+    each pair whole before the next starts. A test's output can quote any
+    of them (a multiline assertion, a captured runner log), in its own
+    block or another's, and a quoted one could move a block or its exit:
+    then no block is trusted, and no flake (class pass of the lane review
+    of sd:9862).
+    """
     planned = SHARDS_PLANNED.findall(text)
+    marks = sorted([*SHARD_START.finditer(text), *SHARD_END.finditer(text)], key=lambda match: match.start())
+    starts, ends = marks[0::2], marks[1::2]
+    names = [match.group(1) for match in starts]
     # Every planned shard finished: one that never launched left no log to count (review of sd:9768).
-    if any(name not in ended for name in started) or planned != [str(len(ended))] or len(set(started)) < len(started):
+    if (planned != [str(len(starts))] or len(starts) != len(ends) or len(set(names)) < len(names)
+            or any(start.re is not SHARD_START or end.re is not SHARD_END or end.group(1) != start.group(1)
+                   for start, end in zip(starts, ends, strict=True))):
         return {}
     failing: dict[str, str] = {}
-    for name, match in ended.items():
-        if match.group(2) == "0":
+    for start, end in zip(starts, ends, strict=True):
+        if end.group(2) == "0":
             continue
-        opened = text.rfind(f"shard {name}: start\n", 0, match.start())
-        if match.group(2) != UNITTEST_FAILED or opened < 0 or not read_failures(text[opened:match.start()]):
+        block = text[start.start():end.start()]
+        if end.group(2) != UNITTEST_FAILED or not read_failures(block):
             return {}
-        failing[name] = text[opened:match.start()]
+        failing[start.group(1)] = block
     return failing
 
 
