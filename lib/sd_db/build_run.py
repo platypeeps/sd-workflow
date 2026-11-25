@@ -1592,8 +1592,9 @@ class Supervisor:
         unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
         # `sd-review` runs no gate on a blocking report: a pass made from one here runs the checks (sd:10286).
         ungated = unmanaged or answer["status"] == "blocking"
-        # Read before `file_new_findings` rebuilds the answer: only a whole report may settle to a pass.
-        whole = bool(answer.get("complete")) and (not prior or bool(answer.get("covers")))
+        # Read before `file_new_findings` rebuilds the answer: only a whole report may settle to a pass. A
+        # full-branch one with no `covers_from` read patches only, as a delta's does (sd:10286).
+        whole = bool(answer.get("complete")) and bool(answer.get("covers"))
         # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
         if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
             new, blockers = self.deferred(answer, prior, head)

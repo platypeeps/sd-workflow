@@ -253,10 +253,11 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
-        # repeat2_short, repeat2_uncovered: repeat2 in a report one reviewer missed, or that covers no delta
+        # repeat2_short, repeat2_uncovered: repeat2 in a report one reviewer missed, or that covers no delta;
+        # blocking2_uncovered: blocking2 read from patches only, so the next round reviews the branch whole
         short = mode == "repeat2_short"
-        uncovered = mode == "repeat2_uncovered"
-        mode = "repeat2" if short or uncovered else mode
+        uncovered = mode in ("repeat2_uncovered", "blocking2_uncovered")
+        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered else mode
         if mode in ("blocking2", "repeat2", "moved2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
                       "evidence": "the original evidence"}
@@ -1258,6 +1259,17 @@ class Supervise(Case):
                                           after=(after,))
                 self.assertEqual(ended.get("outcome"), "blocked", ended)
                 self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_ruled_repeat_in_an_uncovered_full_branch_review_is_no_pass(self):
+        """Review of sd:10286: the review after the ruling round reads the whole branch (the last round
+        covered none), and its report read patches only (no `covers_from`). Clearing the ruled repeat
+        turns it into no pass: it proves nothing else clean."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  last="blocking2_uncovered", after=("repeat2_uncovered",))
+        self.assertNotIn("--verify-report", self.calls("sd-review")[-1]["argv"], "a delta, not the branch")
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
 
     def test_a_ruling_lapses_when_its_round_changes_the_ruled_file(self):
         """Class pass 3 on sd:10286: a ruling judged the code at the reviewed head. A fix in the same round
