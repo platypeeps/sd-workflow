@@ -94,7 +94,7 @@ def sweep(connection: sqlite3.Connection, *, who: str, now: datetime) -> dict:
     held: list[tuple[int, str]] = []
     for item in stale:
         try:
-            workflow.change_status(connection, item["id"], "done", who=who,
+            workflow.change_status(connection, item["id"], "done", who=who, resolve_followups=True,
                                    reason=f"{CLOSE_REASON}: no priority {CLOSE_DAYS} days after filing; reopen "
                                           f"with `sd task status {item['id']} planning` and "
                                           f"`sd task edit {item['id']} --priority N`")

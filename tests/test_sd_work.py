@@ -170,6 +170,47 @@ class TaskCLI(unittest.TestCase):
         refused = self.call("task", "status", item, "done", code=1)
         self.assertIn(f"`sd reports acknowledge {item} --resolve-followups`", refused.stderr)
 
+    def test_task_status_done_refuses_an_open_followup_until_asked_to_resolve_it(self):
+        """sd:10407: `done` resolved a person's followup unasked; it refuses now and names the flag."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "A task", "--json").stdout)["item"]["id"]
+        note = json.loads(self.call("task", "note", item, "Ask example.test", "--kind", "followup",
+                                    "--json").stdout)["note"]["id"]
+        refused = self.call("task", "status", item, "done", code=1)
+        self.assertIn(f"resolve followup {note}", refused.stderr)
+        self.assertIn(f"`sd task status {item} done --resolve-followups`", refused.stderr)
+        self.assertIn("--resolve-followups closes followups with done",
+                      self.call("task", "status", item, "blocked", "--resolve-followups", code=1).stderr)
+        # sd:10407 class pass: a person's followup that opens like the lane's is still a person's.
+        pasted = json.loads(self.call("task", "note", item, "Post-merge: check by hand", "--kind", "followup",
+                                      "--json").stdout)["note"]["id"]
+        self.call("note", "resolve", note)
+        self.assertIn(f"resolve followup {pasted}", self.call("task", "status", item, "done", code=1).stderr)
+        closed = json.loads(self.call("task", "status", item, "done", "--resolve-followups", "--json").stdout)
+        self.assertEqual(closed["item"]["status"], "done")
+        self.assertTrue(next(row for row in closed["notes"] if row["id"] == pasted)["resolved_at"])
+
+    def test_the_suggested_retry_keeps_the_evidence_and_the_revision_guard(self):
+        """sd:10407 review: the refusal suggested a bare `done --resolve-followups`, which dropped
+        `--reason`, `--delivered-by`, `--delivered-in` and `--if-revision` the caller gave."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "A task", "--json").stdout)["item"]
+        self.call("task", "note", item["id"], "Ask example.test", "--kind", "followup")
+        revision = json.loads(self.call("task", "show", item["id"], "--json").stdout)["revision"]
+        reason = "shipped by hand; it's <b>done</b>"
+        refused = self.call("task", "status", item["id"], "done", "--reason", reason,
+                            "--if-revision", revision, code=1).stderr
+        suggested = shlex.split(re.search(r"`(sd task status [^`]+)`", refused).group(1))
+        self.assertEqual(suggested, ["sd", "task", "status", str(item["id"]), "done", "--reason", reason,
+                                     "--if-revision", revision, "--resolve-followups"])
+        # `--delivered-by` is verified before the close, so its retry is read from the helper.
+        given = argparse.Namespace(item=7, reason=None, delivered_by="a" * 40,
+                                   delivered_in="/repos/example dir", if_revision=None)
+        self.assertEqual(shlex.split(sd_work._retry_with_resolve(given)),
+                         ["sd", "task", "status", "7", "done", "--delivered-by", "a" * 40,
+                          "--delivered-in", "/repos/example dir", "--resolve-followups"])
+        closed = json.loads(self.call("task", *suggested[2:], "--json").stdout)
+        self.assertEqual(closed["item"]["status"], "done")
+        self.assertIn(reason, closed["notes"][-1]["body"])
+
     def test_an_edit_with_no_field_names_the_edit_command(self):
         """sd:5065: the refusal names the command that fixes it."""
         item = json.loads(self.call("task", "add", "--priority", "3", "A task", "--json").stdout)["item"]["id"]
@@ -1875,7 +1916,7 @@ class TodayIsTheDashboardsToday(unittest.TestCase):
         self.call("task", "note", open_item, "--body", "Chase the vendor", "--kind", "followup")
         closed = self.task("Done with a followup")
         self.call("task", "note", closed, "--body", "Owed on a done item", "--kind", "followup")
-        self.call("task", "status", closed, "done", "--reason", "test")
+        self.call("task", "status", closed, "done", "--reason", "test", "--resolve-followups")
         asked = json.loads(self.call("task", "note", open_item, "--kind", "question", "--json",
                                      "--body", "Which store?\nOption: Pack store (Recommended)\nOption: Database rows").stdout)
         log = self.home / "run.log"

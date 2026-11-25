@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import stat
 import sys
 from typing import Any
@@ -815,17 +816,38 @@ def _change_status(workflow: Any, connection: Any, args: argparse.Namespace,
     (sd:5065), after `--delivered-by` is refused with its own reason; the
     library's refusal names the action, never a verb (sd:3503).
     """
+    if getattr(args, "resolve_followups", False) and args.status != "done":
+        raise WorkRefusal("--resolve-followups closes followups with done; give it only with done")
     reason = _status_reason(workflow, connection, args)
     if args.status == "done" and workflow.item_state(connection, args.item)["item"]["kind"] == "report":
         raise WorkRefusal(
             f"item {args.item} is a report, and a report closes by acknowledgement: "
             f"`sd reports acknowledge {args.item} --resolve-followups` also resolves its open followups")
-    result = workflow.change_status(
-        connection, args.item, args.status, who=who, session=_session(who),
-        expected_revision=getattr(args, "if_revision", None), reason=reason)
+    try:
+        result = workflow.change_status(
+            connection, args.item, args.status, who=who, session=_session(who),
+            expected_revision=getattr(args, "if_revision", None), reason=reason,
+            resolve_followups=bool(getattr(args, "resolve_followups", False)))
+    except workflow.TransitionRefused as refused:
+        if not str(refused).startswith(f"item {args.item} has open followups; "):
+            raise
+        raise WorkRefusal(f"{refused}; or close with `{_retry_with_resolve(args)}`, "
+                          f"which resolves them too") from None
     spawned = result.get("next_occurrence")
     following = None if spawned is None else workflow.item_state(connection, spawned)["item"]
     return result, following
+
+
+def _retry_with_resolve(args: argparse.Namespace) -> str:
+    """The caller's own `sd task status N done`, every option it gave kept, plus `--resolve-followups`.
+
+    A bare retry dropped the delivery evidence and the revision guard (sd:10407)."""
+    words = ["sd", "task", "status", str(args.item), "done"]
+    for flag, value in (("--reason", args.reason), ("--delivered-by", args.delivered_by),
+                        ("--delivered-in", args.delivered_in), ("--if-revision", args.if_revision)):
+        if value is not None:
+            words += [flag, value]
+    return shlex.join([*words, "--resolve-followups"])
 
 
 def _refuse_task_delivery(workflow: Any, connection: Any, args: argparse.Namespace) -> None:
@@ -923,7 +945,7 @@ def _deliver(progress: Any, workflow: Any, connection: Any, args: argparse.Names
             return _delivered_again(state, args.commit)
         sentence = _delivery_reason(row, args.commit, trailer="Item")
         return workflow.change_status(
-            connection, args.item, "done", who=who, expected_revision=args.if_revision,
+            connection, args.item, "done", who=who, expected_revision=args.if_revision, resolve_followups=True,
             reason=f"{sentence} (after the fact: {args.reason.strip()})")
     deliver = getattr(progress, "deliver_associated_work", None)
     if deliver is None:
@@ -1849,6 +1871,9 @@ def register(groups: Any, store: Any) -> None:
     status.add_argument("--delivered-in", metavar="PATH",
                         help="registered checkout the --delivered-by commit landed in, "
                              "when it is not the item's own; the item keeps its checkout")
+    status.add_argument("--resolve-followups", action="store_true",
+                        help="with done: resolve every open followup too; without it, done refuses "
+                             "while a followup the machine did not write is open (sd:10407)")
     _output(status, "status", revision=True)
 
     cancel = verbs.add_parser(

@@ -171,6 +171,25 @@ class WorkCompletion(ProgressCase):
         deliver_work(self.db, self.item, commit, who="sd-ship")
         self.assertEqual([row["id"] for row in reads.open_followups(self.db)], [waiting])
 
+    def test_a_delivery_resolves_the_machines_followups(self):
+        """sd:10407: a delivery kept a `Build blocked:` followup open on a done item; 642 open
+        followups sat on done items. The machine's own the delivery answers; a person's stays."""
+        from sd_db import reads
+        from sd_db.writes import add_note
+        waiting = add_note(self.db, self.item, "followup", "Waits on an outside reply")
+        blocked = add_note(self.db, self.item, "followup", "Build blocked: gate red. Look at the log")
+        pasted = add_note(self.db, self.item, "followup", "Build blocked: the vendor must answer", session="operator")
+        # B2: no close answers the lane's `Post-merge: `; a passing refresh does (sd:10529).
+        refresh = add_note(self.db, self.item, "followup", "Post-merge: make post-merge failed (exit 2)",
+                           session="sd-lane")
+        self.remote()
+        commit = self.commit(f"Delivers: sd:{self.item}")
+        self.git("push", "origin", "main")
+        result = deliver_work(self.db, self.item, commit, who="sd-ship")
+        self.assertEqual([row["id"] for row in reads.open_followups(self.db)], [waiting, pasted, refresh])
+        self.assertEqual(json.loads(result["item"]["fields"])["kept_followups"], [waiting, pasted, refresh])
+        self.assertIsNotNone(self.db.execute("SELECT resolved_at FROM note WHERE id = ?", (blocked,)).fetchone()[0])
+
     def notes(self, kind="status_change"):
         return [row["body"] for row in self.db.execute(
             "SELECT body FROM note WHERE item = ? AND kind = ? ORDER BY id", (self.item, kind))]
