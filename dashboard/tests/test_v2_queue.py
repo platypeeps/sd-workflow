@@ -1750,6 +1750,7 @@ class TheInProcessRead(RealLane):
         with mock.patch.object(queue_screen, "lane_list", side_effect=AssertionError("lane list ran")):
             lane = queue_screen.document(self.connection, now=NOW)["lanes"][0]
         self.assertEqual(len(lane["rows"]), 6)
+        self.assertIn("sd:9", lane["legacy"])  # sd:10420 review: the next runner pass imports it, so the page says so
         self.assertEqual((queue.read_bytes(), sorted(p.name for p in queue.parent.iterdir())),
                          (original, ["queue.json"]))
 

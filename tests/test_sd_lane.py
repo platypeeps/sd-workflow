@@ -6159,13 +6159,51 @@ class Importing(SharedQueue):
             fcntl.flock(held, fcntl.LOCK_EX)
             self.refused_writers("a runner holds the lock")
 
-    def test_a_writer_refuses_a_file_the_import_could_not_read(self) -> None:
-        """sd:10420 review, failure table: import stopped on the file's bytes or shape."""
-        for text, why in (("{", "cannot read"), ('{"entries": 7}', "holds no entry list"), ("[]", "cannot read")):
+    def lane(self, *argv: str) -> tuple[int, dict]:
+        """`lane_main` on `argv` from the feature worktree: its exit code and answer."""
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        with contextlib.chdir(self.feature), mock.patch.dict(os.environ, self.environ), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            code = sd_lane.lane_main(parser.parse_args(["lane", *argv]))
+        return code, json.loads(said.getvalue())
+
+    def test_an_unreadable_file_blocks_no_writer_on_a_queued_entry(self) -> None:
+        """sd:10420 review: the runner claims a queued entry past a corrupt file, so cancel and hold reach it."""
+        sd_lane.enqueue_entry(self.feature, 3, "fix: t", self.body, self.environ, claim="deliver")
+        self.file.parent.mkdir(parents=True, exist_ok=True)
+        for text in ("{", '{"entries": 7}', "[]"):
             with self.subTest(text=text):
-                self.file.parent.mkdir(parents=True, exist_ok=True)
                 self.file.write_text(text, encoding="utf-8")
-                self.refused_writers(why)
+                for argv in (["hold", "3"], ["release", "3"], ["move", "3", "top"]):
+                    code, answer = self.lane(*argv)
+                    self.assertEqual(code, 0, answer)
+                self.assertEqual(self.file.read_text(encoding="utf-8"), text)
+        code, answer = self.lane("cancel", "3")
+        self.assertEqual((code, self.statuses()), (0, [(3, "cancelled")]), answer)
+
+    def test_a_writer_on_an_item_the_unimported_file_does_not_hold_proceeds(self) -> None:
+        """sd:10420 review: an import a runner lock holds back blocks only the items the file holds."""
+        sd_lane.enqueue_entry(self.feature, 3, "fix: t", self.body, self.environ, claim="deliver")
+        self.write_file(self.old(1, self.feature))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane("cancel", "3")
+        self.assertEqual((code, self.statuses()), (0, [(3, "cancelled")]), answer)
+
+    def test_lane_list_names_the_files_waiting_entries(self) -> None:
+        """sd:10420 review: the view shows what the next runner pass imports, never an empty lane alone."""
+        self.write_file(self.old(1, self.feature), self.old(2, self.feature, status="merged"))
+        code, answer = self.lane("list")
+        self.assertEqual((code, answer["entries"]), (0, []))
+        self.assertIn("sd:1", answer["legacy"])
+        self.assertNotIn("sd:2", answer["legacy"])
+        self.file.write_text("{", encoding="utf-8")
+        self.assertIn("is not imported: cannot read", self.lane("list")[1]["legacy"])
+        self.file.unlink()
+        self.assertNotIn("legacy", self.lane("list")[1])
 
     def test_a_writer_refuses_when_a_pending_head_was_not_published(self) -> None:
         """sd:10420 review, failure table: import stopped on an unknown publish answer; nothing was written."""

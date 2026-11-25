@@ -1890,6 +1890,42 @@ def import_file_queue(root: pathlib.Path, queue: Queue, *, runner_locked: bool =
     return report
 
 
+def legacy_pending(path: pathlib.Path) -> list[int] | str | None:
+    """The items an earlier version's queue file still holds pending, read with no lock and no write (sd:10420):
+    None with no file, or why it cannot be read, which the runner's import also stops on."""
+    try:
+        old = json.loads(path.read_text(encoding="utf-8")).get("entries")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, AttributeError) as error:
+        return f"cannot read {path}: {error}"
+    if not isinstance(old, list):
+        return f"{path} holds no entry list"
+    return [entry["item"] for entry in old if isinstance(entry, dict) and entry.get("status") == "pending"
+            and isinstance(entry.get("item"), int) and not isinstance(entry.get("item"), bool)]
+
+
+def legacy_waiting(path: pathlib.Path) -> str | None:
+    """What `lane list` and the Queue page say of an earlier version's queue file the runner has not imported yet."""
+    pending = legacy_pending(path)
+    if pending is None:
+        return None
+    if isinstance(pending, str):
+        return f"an earlier version's queue file is not imported: {pending}"
+    items = ", ".join(f"sd:{item}" for item in pending) or "no pending entry"
+    return f"an earlier version's queue file, {path}, waits for the next `lane run` to import it: {items}"
+
+
+def file_holds(queue: Queue, path: pathlib.Path, item: int) -> bool:
+    """Whether a writer on `item` would miss a file entry: the file holds it pending and the shared queue has no
+    pending or running entry for it, which the import would cancel as a duplicate. An unreadable file holds
+    nothing a runner can claim, so it blocks no writer (sd:10420)."""
+    pending = legacy_pending(path)
+    if not isinstance(pending, list) or item not in pending:
+        return False
+    return not any(row.get("item") == item and row.get("status") in ("pending", "running") for row in read_queue(queue))
+
+
 def import_locked(root: pathlib.Path, queue: Queue, path: pathlib.Path) -> dict[str, Any]:
     host = this_host()
     with queue_lock(path):
@@ -5094,10 +5130,8 @@ def lane_main(args: Any) -> int:
         if args.lane_command == "prune":
             return lane_prune(root, environ, dry_run=args.dry_run, as_json=args.json)
         if args.lane_command not in ("run", "list"):  # a view stays read-only; a writer reaches file entries (sd:10420)
-            imported = import_file_queue(root, queue_for(root, environ))
-            if not_done := imported.get("stopped") or imported.get("skipped"):  # its entries are not in the queue yet
-                raise LaneError(f"{queue_path(root, environ)}, an earlier version's queue, is not imported: {not_done}; "
-                                f"`lane {args.lane_command}` would miss its entries, so run it again once it is")
+            import_for_writer(root, environ, args.lane_command,
+                              args.items[0] if args.lane_command == "enqueue" else args.item)
         if args.lane_command == "enqueue":
             result: Any = enqueue_entry(root, args.items[0], args.title, args.body_file, environ,
                                         expected_head=args.expected_head, manual=args.manual, claim=args.claim,
@@ -5110,7 +5144,8 @@ def lane_main(args: Any) -> int:
             rounds = item_rounds(entries, order)
             result = {"queue": str(queue_path(root, environ)), "revision": queue_revision(entries),
                       "entries": [{**shown(row), "enqueue_seq": order[row["id"]], "round": rounds[row["id"]]}
-                                  for row in entries]}
+                                  for row in entries],
+                      **({"legacy": said} if (said := legacy_waiting(queue_path(root, environ))) else {})}
         elif args.lane_command == "retry":
             result = retry(root, args.item, environ, manual=args.manual, expected_head=args.expected_head)
         elif args.lane_command == "cancel":
@@ -5127,6 +5162,16 @@ def lane_main(args: Any) -> int:
         print(json.dumps({"ok": False, **refusal(error)}, indent=2, sort_keys=True))
         return 3
     return succeed(shown(result))
+
+
+def import_for_writer(root: pathlib.Path, environ: dict[str, str], verb: str, item: int) -> None:
+    """Import the file queue before a writing verb, or refuse when it stays and holds `item` (sd:10420)."""
+    queue = queue_for(root, environ)
+    imported = import_file_queue(root, queue)
+    not_done = imported.get("stopped") or imported.get("skipped")  # its entries are not in the queue yet
+    if not_done and file_holds(queue, queue_path(root, environ), item):
+        raise LaneError(f"{queue_path(root, environ)}, an earlier version's queue, is not imported: {not_done}; "
+                        f"it holds sd:{item} pending, which `lane {verb}` would miss, so run it again once it is")
 
 
 def run_deadline(args: Any) -> float | None:

@@ -200,7 +200,7 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
     `remote`'s GitHub name, which the pack reads from the checkout's origin, and the lane folder is named after the
     registered checkout, the main one. None where either could differ: a remote that names no GitHub repository, a
     `.git` that is not a folder, or no pack `bin/` beside the library. The caller runs `lane list` for those. An
-    earlier version's queue file stays for a writer to import (sd:10420). A failed read is
+    earlier version's queue file stays for the runner to import; `legacy` says what it holds (sd:10420). A failed read is
     `{"ok": False, "error": ...}`, never an empty lane.
     """
     from sd_db.protection import github_slug
@@ -227,7 +227,9 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
         listed = [{**lane.shown(row), "enqueue_seq": order[row["id"]], "round": rounds[row["id"]]} for row in entries]
     except READ_FAILURES as error:
         return {"ok": False, "error": f"the lane was not read: {type(error).__name__}: {error}"}
-    return {"ok": True, "queue": str(queue), "revision": lane.queue_revision(entries), "entries": listed}
+    said = lane.legacy_waiting(queue) if callable(getattr(lane, "legacy_waiting", None)) else None
+    return {"ok": True, "queue": str(queue), "revision": lane.queue_revision(entries), "entries": listed,
+            **({"legacy": said} if said else {})}
 
 
 #: How long one `sd-ship` answer to `lane retry --help` serves (pack sd:10077): each probe is a subprocess, ~0.1 s.
@@ -749,7 +751,7 @@ def document(connection, *, now: str = "") -> dict:
         lanes.append({"repo": Path(path).name, "path": path, "key": managed[path]["path"], "realm": realm_of(path, "lane", rules, hoa), "lane": str(lane),
                       "revision": revision(entries),
                       "runner_merge": repos.policy_merge(managed[path]["declarations"]), "host": managed[path]["lane_host"] or "hub",
-                      "rows": shown})
+                      "rows": shown, "legacy": answer.get("legacy")})
     return {"read": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock)), "load": _load(), "gates": gates,
             "lanes": lanes, "problems": problems, "root": str(root) if root else None, "edits": EDITS,
             "managed": len(managed), "prs": pr_rows(connection, lanes, clock),
