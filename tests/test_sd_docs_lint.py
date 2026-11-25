@@ -657,6 +657,30 @@ class PullRequestPrivacyTests(LintFixture):
         self.assertEqual(len(report.failures), 1, report.failures)
         self.assertIn("holds no privacy pattern, so the body is unchecked", report.failures[0])
 
+    def test_an_alternative_naming_this_repo_does_not_apply_in_it(self) -> None:
+        """sd:10720: a site repo's short-name pattern refused its own image names, `shop-web:scan`."""
+        self.patterns.write_text("operator|shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        body = "## Summary\n\n- scan the shop-web:scan image\n"
+        self.assertEqual(self.run_lint(body, body_only=True).failures, [])
+        report = self.run_lint(body + "- ask the operator\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 4 matches a privacy pattern in {self.patterns}"])
+
+    def test_a_pattern_splits_only_at_a_top_level_bar(self) -> None:
+        cases = {"a|b": ["a", "b"], "(a|b)|c": ["(a|b)", "c"], "[|]|x": ["[|]", "x"],
+                 "[^]|]|x": ["[^]|]", "x"], "a\\|b|c": ["a\\|b", "c"], "[abc": ["[abc"]}
+        self.assertEqual({p: lint.alternatives(p) for p in cases}, cases)
+        # An empty match, or one Python cannot read, names no repo: it stays.
+        self.assertEqual([lint.names_repo(alt, "shop") for alt in ("sho", "x*", "(")], [True, False, False])
+
+    def test_an_alternative_naming_another_repo_still_applies(self) -> None:
+        self.patterns.write_text("operator|shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "https://github.com/example/other-site")
+        report = self.run_lint("## Summary\n\n- scan the shop-web:scan image\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 3 matches a privacy pattern in {self.patterns}"])
+
     def test_green_no_body_needs_no_pattern_file(self) -> None:
         self.patterns.unlink()
         self.assertEqual(self.run_lint().failures, [])
