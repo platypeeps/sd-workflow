@@ -3460,7 +3460,8 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "pending",
-                                                           "enqueue_seq": 1, "expected_head": head}]))
+                                                           "enqueue_seq": 1, "expected_head": head,
+                                                           "branch": self.bundle["branch"]}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
@@ -4428,16 +4429,18 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
-    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False):
+    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
         support.git(self.repo, "checkout", "-q", "-b", run["branch"])
         (self.repo / "work.txt").write_text("the bundle's work\n", encoding="utf-8")
         support.git(self.repo, "add", "work.txt")
-        support.git(self.repo, "commit", "-qm", "feat: the bundle's work")
+        trailers = "".join(f"\nCloses: sd:{item}" for item in self.items) if closes else ""
+        support.git(self.repo, "commit", "-qm", f"feat: the bundle's work\n{trailers}")
         head = support.git(self.repo, "rev-parse", "HEAD")
         support.git(self.repo, "checkout", "-q", "main")
+        self.failed_branch = run["branch"]
         if lost:  # the failed branch is gone and its entry names a commit this checkout lacks
             support.git(self.repo, "branch", "-D", run["branch"])
             head = "0" * 40
@@ -4475,6 +4478,21 @@ class Tick(Case):
         branch came back. It starts from the branch's tip now."""
         head, _ = self.rebuilt_after_lane_failure(2, trimmed=True)
         self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_fresh_build_at_the_failed_head_enters_the_lane_again(self):
+        """Review of build/sd-1808: the rebuilt branch starts at the failed head, so the old failed entry matched
+        its head, and the run took it as its own enqueue: it ended lane_failed again, never in the lane. Only an
+        entry of this run's branch is its own."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual([(row["status"], row["expected_head"]) for row in entries],
+                         [("failed", head), ("pending", head)])
 
     def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
         """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""

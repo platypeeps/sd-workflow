@@ -2359,7 +2359,10 @@ class Supervisor:
                                           "for one of the run's items")
         if not unmanaged:
             entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
-            if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
+            # Only this run's branch's entry is its own: a rebuild that starts at a failed bundle's head
+            # (`start_point`) shares that head with the old failed entry (review of build/sd-1808).
+            if (entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head
+                    and entry.get("branch") == self.row["branch"]):
                 return self.lane_done(entry, delivered)
         try:
             title = self.title.read_text(encoding="utf-8").strip()
