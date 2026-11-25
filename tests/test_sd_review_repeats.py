@@ -1859,6 +1859,24 @@ class RebuttalScopeTests(RepeatFixture):
         placed = sd_review.rulings_placed([older], lambda _head, _path, line: (line,))
         self.assertEqual([entry.listed for entry in placed], [False])
 
+    def test_a_non_ascii_digit_is_part_of_a_file_name_not_a_line(self) -> None:
+        """Review of sd:10191 (bin/sd-review:949, :941, :964): `\\d` matches any Unicode digit, so an
+        instance naming the file `b.py:\u0665` was read as b.py line 5, and listed there, where it held back
+        a blocker in another file. Only ASCII digits make a line number."""
+        name = "b.py:\u0665"
+        calls: list[tuple[Any, int | None]] = []
+
+        def kept(_head: str, path: Any, line: int | None) -> tuple[int | None] | None:
+            calls.append((path, line))
+            return None if path == "b.py" else (line,)
+        older = sd_review.Rebuttal("head", "src.py", "s", 10, True, "src.py", "x", "y", ("src.py:10", name))
+        placed = sd_review.rulings_placed([older], kept)
+        self.assertEqual((placed[0].listed, placed[0].instances), (True, ("src.py:10", name)))
+        self.assertIn((name, None), calls)
+        newer = sd_review.Rebuttal("head", "b.py", "s", 7, False, "b.py", "x", "y", ("b.py:7",))
+        placed = sd_review.rulings_placed([newer, older], kept)
+        self.assertEqual([entry.listed for entry in placed], [False, True])
+
     def test_an_untracked_ruled_file_at_worktree_scope_lapses_the_ruling(self) -> None:
         """Failure table of sd:10191: `git diff HEAD` cannot see an untracked file, so a ruled path that is
         untracked in the worktree counts as changed and the ruling lapses; once gone, it holds again."""

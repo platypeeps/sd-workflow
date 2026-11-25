@@ -938,7 +938,7 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
     moved them to; `listed` only for a rebuttal that is still the newest at its place there (`rebuttals`). Each
     path is read in `spelled`'s one spelling first: `./a.py` and `a.py` are one place (bin/sd-review:967)."""
     def _spelled(entry: str) -> str:  # the pattern `_moved` reads, so a line it lapses still lapses
-        found = re.fullmatch(r"(?s)(.*):(\d+)", entry)
+        found = re.fullmatch(r"(?s)(.*):([0-9]+)", entry)
         return f"{spelled(found[1])}:{found[2]}" if found else spelled(entry)
     records = [record._replace(path=spelled(record.path), instances=tuple(map(_spelled, record.instances)))
                for record in records]
@@ -947,7 +947,7 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
         line = kept(record.head, record.path, record.line)
         instances = []
         for entry in record.instances if line is not None else ():
-            found = re.fullmatch(r"(?s)(.*):(\d+)", entry)
+            found = re.fullmatch(r"(?s)(.*):([0-9]+)", entry)
             at = (kept(record.head, found[1], int(found[2])) if len(found[2]) < 10 else None) if found else kept(record.head, entry, None)
             if at is None:
                 return None
@@ -961,7 +961,7 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
         return placed[index]
 
     def _named_files(record: Rebuttal) -> set[str]:
-        return {str(record.path), *(re.sub(r":\d+$", "", entry) for entry in record.instances)}
+        return {str(record.path), *(re.sub(r":[0-9]+$", "", entry) for entry in record.instances)}
 
     # Newest at its place is read where the places are now (sd:10191 review): receipts of two heads number one
     # line differently, so every newer ruling of the summary is placed first. One that cannot be placed may
