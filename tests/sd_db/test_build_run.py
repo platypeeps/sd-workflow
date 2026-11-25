@@ -287,7 +287,9 @@ FAKE = textwrap.dedent('''
         _, args = real("sd-ship")
         assert args.command == "lane", args
         if "list" in sys.argv:
-            print(json.dumps({"ok": mode != "unread", "entries": entries}))
+            legacy = plans / "legacy.json"  # an earlier version's queue file, not imported yet (pack sd:10420)
+            print(json.dumps({"ok": mode != "unread", "entries": entries,
+                              **({"legacy_entries": json.loads(legacy.read_text())} if legacy.exists() else {})}))
             sys.exit(3 if mode == "unread" else 0)
         import sd_lane
         if args.claim not in sd_lane.CLAIMS:  # enqueue_entry's first refusal, which the parser leaves to it
@@ -3419,6 +3421,36 @@ class Supervise(Case):
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
         self.assertEqual(len(json.loads((self.plans / "lane.json").read_text())), 1)
+
+    def test_enqueue_resume_finds_its_head_in_an_unimported_legacy_file(self):
+        """pack sd:10420 review: `lane list` leaves an earlier version's queue file to the runner, so a run
+        whose exact head that file holds pending records `enqueued` from it; no enqueue, which would refuse."""
+        self.press()
+        self.write_pr()
+        work = Path(self.bundle["work_path"])
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(work), "origin/main")
+        (work / "work.txt").write_text("done\n")
+        support.git(work, "add", "work.txt")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
+        head = support.git(work, "rev-parse", "HEAD")
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "cancelled",
+                                                           "enqueue_seq": 1, "expected_head": "f" * 40}]))
+        (self.plans / "legacy.json").write_text(json.dumps([{"id": "import-1", "item": self.items[0],
+                                                             "status": "pending", "legacy": True,
+                                                             "expected_head": head}]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
+
+    def test_a_legacy_entry_yields_to_a_live_shared_entry(self):
+        """pack sd:10420 review: the import cancels a file entry whose item the shared queue holds live."""
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": 7, "status": "pending",
+                                                           "enqueue_seq": 1}]))
+        (self.plans / "legacy.json").write_text(json.dumps([{"id": "import-1", "item": 7, "status": "pending"}]))
+        self.assertEqual((build_run.lane_entry(self.tools.ship, self.repo, [7], env=self.env) or {}).get("id"), "e1")
+        (self.plans / "lane.json").write_text(json.dumps([]))
+        self.assertEqual((build_run.lane_entry(self.tools.ship, self.repo, [7], env=self.env) or {}).get("id"),
+                         "import-1")
 
     def test_an_unread_lane_at_enqueuing_writes_nothing(self):
         """An unknown `lane list` is no answer: the supervisor stops unwritten, and the reap retries it."""

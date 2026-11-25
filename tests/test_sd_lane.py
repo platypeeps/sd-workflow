@@ -6200,6 +6200,11 @@ class Importing(SharedQueue):
         self.assertEqual((code, answer["entries"]), (0, []))
         self.assertIn("sd:1", answer["legacy"])
         self.assertNotIn("sd:2", answer["legacy"])
+        [waiting] = answer["legacy_entries"]  # a build's recovery finds its head here (sd:10420 review)
+        self.assertEqual((waiting["item"], waiting["status"], waiting["expected_head"]),
+                         (1, "pending", git(self.feature, "rev-parse", "HEAD")))
+        self.import_now()
+        self.assertEqual([row["id"] for row in self.entries()][0], waiting["id"])  # the id the import writes
         self.file.write_text("{", encoding="utf-8")
         self.assertIn("is not imported: cannot read", self.lane("list")[1]["legacy"])
         self.file.unlink()

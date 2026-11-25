@@ -811,6 +811,14 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env:
     if not isinstance(entries, list):
         raise Unread("sd-ship lane list gave no entries")
     mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items]
+    # pack sd:10420: an earlier version's queue file the runner has not imported yet; its entry lands newest
+    # unless the shared queue already holds the item pending or running, when the import cancels it.
+    live = {row.get("item") for row in mine if row.get("status") in ("pending", "running")}
+    waiting = answer.get("legacy_entries")
+    waiting = [row for row in waiting if isinstance(row, dict) and row.get("item") in items
+               and row.get("item") not in live] if isinstance(waiting, list) else []
+    if waiting:
+        return waiting[-1]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
 
 

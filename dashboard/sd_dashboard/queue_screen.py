@@ -227,7 +227,7 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
         listed = [{**lane.shown(row), "enqueue_seq": order[row["id"]], "round": rounds[row["id"]]} for row in entries]
     except READ_FAILURES as error:
         return {"ok": False, "error": f"the lane was not read: {type(error).__name__}: {error}"}
-    said = lane.legacy_waiting(queue) if callable(getattr(lane, "legacy_waiting", None)) else None
+    said = lane.legacy_view(queue).get("legacy") if callable(getattr(lane, "legacy_view", None)) else None
     return {"ok": True, "queue": str(queue), "revision": lane.queue_revision(entries), "entries": listed,
             **({"legacy": said} if said else {})}
 

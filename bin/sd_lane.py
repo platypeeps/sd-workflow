@@ -1890,9 +1890,10 @@ def import_file_queue(root: pathlib.Path, queue: Queue, *, runner_locked: bool =
     return report
 
 
-def legacy_pending(path: pathlib.Path) -> list[int] | str | None:
-    """The items an earlier version's queue file still holds pending, read with no lock and no write (sd:10420):
-    None with no file, or why it cannot be read, which the runner's import also stops on."""
+def legacy_pending(path: pathlib.Path) -> list[dict[str, Any]] | str | None:
+    """The pending entries an earlier version's queue file still holds, read with no lock and no write (sd:10420):
+    each under the id its import writes, or why the file cannot be read, which the import also stops on; None
+    with no file."""
     try:
         old = json.loads(path.read_text(encoding="utf-8")).get("entries")
     except FileNotFoundError:
@@ -1901,19 +1902,25 @@ def legacy_pending(path: pathlib.Path) -> list[int] | str | None:
         return f"cannot read {path}: {error}"
     if not isinstance(old, list):
         return f"{path} holds no entry list"
-    return [entry["item"] for entry in old if isinstance(entry, dict) and entry.get("status") == "pending"
+    host = this_host()
+    return [{"id": import_id(host, path, entry), "item": entry["item"], "status": "pending", "legacy": True,
+             **{key: entry[key] for key in ("expected_head", "branch", "enqueued_at")
+                if isinstance(entry.get(key), str)}}
+            for entry in old if isinstance(entry, dict) and entry.get("status") == "pending"
             and isinstance(entry.get("item"), int) and not isinstance(entry.get("item"), bool)]
 
 
-def legacy_waiting(path: pathlib.Path) -> str | None:
-    """What `lane list` and the Queue page say of an earlier version's queue file the runner has not imported yet."""
+def legacy_view(path: pathlib.Path) -> dict[str, Any]:
+    """What `lane list` and the Queue page add for a file the runner has not imported yet: `legacy`, a line to
+    show, and `legacy_entries`, the pending entries a build's recovery finds at their head (sd:10420)."""
     pending = legacy_pending(path)
     if pending is None:
-        return None
+        return {}
     if isinstance(pending, str):
-        return f"an earlier version's queue file is not imported: {pending}"
-    items = ", ".join(f"sd:{item}" for item in pending) or "no pending entry"
-    return f"an earlier version's queue file, {path}, waits for the next `lane run` to import it: {items}"
+        return {"legacy": f"an earlier version's queue file is not imported: {pending}", "legacy_entries": []}
+    items = ", ".join(f"sd:{row['item']}" for row in pending) or "no pending entry"
+    return {"legacy": f"an earlier version's queue file, {path}, waits for the next `lane run` to import it: "
+                      f"{items}", "legacy_entries": pending}
 
 
 def file_holds(queue: Queue, path: pathlib.Path, item: int) -> bool:
@@ -1921,7 +1928,7 @@ def file_holds(queue: Queue, path: pathlib.Path, item: int) -> bool:
     pending or running entry for it, which the import would cancel as a duplicate. An unreadable file holds
     nothing a runner can claim, so it blocks no writer (sd:10420)."""
     pending = legacy_pending(path)
-    if not isinstance(pending, list) or item not in pending:
+    if not isinstance(pending, list) or item not in [row["item"] for row in pending]:
         return False
     return not any(row.get("item") == item and row.get("status") in ("pending", "running") for row in read_queue(queue))
 
@@ -5145,7 +5152,7 @@ def lane_main(args: Any) -> int:
             result = {"queue": str(queue_path(root, environ)), "revision": queue_revision(entries),
                       "entries": [{**shown(row), "enqueue_seq": order[row["id"]], "round": rounds[row["id"]]}
                                   for row in entries],
-                      **({"legacy": said} if (said := legacy_waiting(queue_path(root, environ))) else {})}
+                      **legacy_view(queue_path(root, environ))}
         elif args.lane_command == "retry":
             result = retry(root, args.item, environ, manual=args.manual, expected_head=args.expected_head)
         elif args.lane_command == "cancel":
