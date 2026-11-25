@@ -4363,6 +4363,18 @@ class CargoClean(Case):
         self.assertEqual(self.cargo_calls(), [])
         self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
 
+    def test_a_builder_group_still_alive_is_kept_with_a_note(self):
+        """Review of build/sd-1798: a Survivor ends the run blocked while the child's group still runs."""
+        self.rust()
+        build.write(self.db, self.bundle["id"], builder_pgid=4242)
+        self.supervisor(probe=GoneProbe(alive=True, group=True)).finish("blocked", "group 4242 survived")
+        self.assertEqual(self.cargo_calls(), [])
+        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
+        self.assertTrue(any("4242" in body and "cargo clean" in body for body in self.notes()), self.notes())
+        build.write(self.db, self.bundle["id"], builder_pgid=4243)
+        self.supervisor(probe=GoneProbe(alive=None, group=None)).finish("blocked", "group unread")
+        self.assertEqual(self.cargo_calls(), [], "an unread group keeps target/ too")
+
     def test_a_missing_cargo_notes_and_still_ends(self):
         self.rust()
         self.tools.cargo = [str(self.root / "no-such-cargo")]

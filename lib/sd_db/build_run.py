@@ -1550,7 +1550,11 @@ class Supervisor:
             return ""
         if build.split(self.db, self.row["assignment"]) not in ("", "clear"):
             return ""
-        own = self.fresh()["session_id"]
+        row = self.fresh()
+        pgid = row["builder_pgid"]
+        if pgid and self.probe.group(pgid) is not False:  # a Survivor, or a group no read answers: it may build
+            return f"the builder's process group {pgid} may still run"
+        own = row["session_id"]
         if sessions.holders(self.db, str(self.work), machine=this_host(), exclude=(own,) if own else ()):
             return ""
         if stray:
