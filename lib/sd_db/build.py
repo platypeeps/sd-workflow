@@ -1312,10 +1312,17 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
 
 
 def _build_blocked(connection, item: int) -> bool:
-    """Whether `item`'s newest build assignment ended blocked: its block is the build's, which a Build lifts."""
-    row = connection.execute("SELECT status FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC LIMIT 1",
-                             (item, SCOPE)).fetchone()
-    return row is not None and row["status"] == "blocked"
+    """Whether `item`'s block is its newest build's, which a Build lifts: that assignment ended blocked, and
+    the item's latest status change is the build's move to blocked with that assignment's reason. A block
+    someone wrote after it, an operator's hold, is not the build's (review of build/sd-1867)."""
+    row = connection.execute("SELECT status, result FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    if row is None or row["status"] != "blocked" or not row["result"]:
+        return False
+    moved = connection.execute("SELECT body FROM note WHERE item = ? AND kind = 'status_change' "
+                               "ORDER BY id DESC LIMIT 1", (item,)).fetchone()
+    return moved is not None and re.fullmatch(r"\w+ -> blocked by build: " + re.escape(row["result"]),
+                                              moved["body"] or "", re.DOTALL) is not None
 
 
 def _retry_row(connection, item: int):
