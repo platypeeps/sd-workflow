@@ -47,6 +47,7 @@ pickle is code.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -632,9 +633,14 @@ def socks_proxy(host: str) -> tuple[str, int, bool] | None:
     A sandbox that reaches the network only through its proxy (the Codex
     network proxy) sets `ALL_PROXY`. Only `socks5://` (resolved here) and
     `socks5h://` (the proxy resolves) are read; another scheme, no value or
-    a `NO_PROXY` entry naming the hub leaves the direct dial. A SOCKS value
-    that does not parse is refused: a direct dial would hide it.
+    a `NO_PROXY` entry naming the hub leaves the direct dial. A loopback
+    hub is always dialled directly, as `calls.loopback_url` reads it: the
+    socket stays on this machine, and the local wire suite runs inside a
+    sandbox that sets `ALL_PROXY`. A SOCKS value that does not parse is
+    refused: a direct dial would hide it.
     """
+    if _loopback(host):
+        return None
     proxies = urllib.request.getproxies_environment()
     value = (proxies.get("all") or "").strip()
     scheme = value.partition("://")[0].lower()
@@ -649,6 +655,15 @@ def socks_proxy(host: str) -> tuple[str, int, bool] | None:
         # The value is not echoed: a user's password may be in it.
         raise ProxyRefused(f"ALL_PROXY is not {scheme}://<host>:<port> with no user name or password")
     return parsed.hostname, port, scheme == "socks5h"
+
+
+def _loopback(host: str) -> bool:
+    """`host` is this machine: a loopback address or `localhost`."""
+    host = host.lower()
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
 
 
 def _bypassed(host: str, no_proxy: str) -> bool:

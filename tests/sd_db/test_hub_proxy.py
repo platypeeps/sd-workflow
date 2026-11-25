@@ -21,6 +21,8 @@ from sd_db import remote
 from .test_wire import Served
 
 PROXY_VARS = ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+#: The hub these tests name: not loopback, resolved to the test hub.
+HUB = "hub.example.test"
 
 
 def _exactly(conn: socket.socket, size: int) -> bytes:
@@ -100,7 +102,8 @@ class FakeSocks5:
                 conn.sendall(bytes([5, refuse, 0]) + bound)
                 conn.close()
                 return
-            upstream = socket.create_connection((host, port), timeout=5)
+            # Every hub this fake reaches is the loopback test hub.
+            upstream = socket.create_connection(("127.0.0.1", port), timeout=5)
             # A domain-name bound address, so the client reads every ATYP's length.
             conn.sendall(b"\x05\x00\x00\x03\x09localhost" + struct.pack(">H", 1))
             threading.Thread(target=_pipe, args=(upstream, conn), daemon=True).start()
@@ -120,18 +123,28 @@ class ThroughAProxy(unittest.TestCase):
         self.addCleanup(clean.stop)
         for name in PROXY_VARS:
             os.environ.pop(name, None)
+        # A loopback hub is always dialled directly, so these tests name a
+        # hub that is not loopback and resolve it to the test hub.
+        real = socket.getaddrinfo
+
+        def resolve(host, *args, **kwargs):
+            return real("127.0.0.1" if host == HUB else host, *args, **kwargs)
+
+        resolving = mock.patch.object(remote.socket, "getaddrinfo", side_effect=resolve)
+        resolving.start()
+        self.addCleanup(resolving.stop)
 
     def proxy(self, **options) -> FakeSocks5:
         fake = FakeSocks5(**options)
         self.addCleanup(fake.close)
         return fake
 
-    def dial(self, host: str = "127.0.0.1", token=None) -> remote.Connection:
+    def dial(self, host: str = HUB, token=None) -> remote.Connection:
         return remote.connect(host, self.served.port, self.served.database,
                               token=self.served.token if token is None else token,
                               timeout=5, answer_timeout=10)
 
-    def reach_tokenless(self, host: str = "127.0.0.1") -> None:
+    def reach_tokenless(self, host: str = HUB) -> None:
         """A session with no token reaches the hub, which answers its token refusal.
 
         The loopback test hub admits only by token, and a token is never sent
@@ -142,7 +155,7 @@ class ThroughAProxy(unittest.TestCase):
         self.assertNotIsInstance(raised.exception, remote.HubUnreachable)
         self.assertIn("lacks this server's token", str(raised.exception))
 
-    def read_one(self, host: str = "127.0.0.1") -> int:
+    def read_one(self, host: str = HUB) -> int:
         connection = self.dial(host)
         try:
             return connection.execute("SELECT 1").fetchone()[0]
@@ -152,14 +165,22 @@ class ThroughAProxy(unittest.TestCase):
     def test_a_socks5h_all_proxy_carries_the_hub_session_by_name(self):
         fake = self.proxy()
         os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
-        self.reach_tokenless("localhost")
-        self.assertEqual(fake.requests, [(3, "localhost", self.served.port)])
+        self.reach_tokenless()
+        self.assertEqual(fake.requests, [(3, HUB, self.served.port)])
 
     def test_the_lower_case_name_and_an_ip_hub_send_the_address(self):
         fake = self.proxy()
         os.environ["all_proxy"] = f"socks5://127.0.0.1:{fake.port}"
-        self.reach_tokenless()
-        self.assertEqual(fake.requests, [(1, "127.0.0.1", self.served.port)])
+        self.reach_tokenless("192.0.2.10")
+        self.assertEqual(fake.requests, [(1, "192.0.2.10", self.served.port)])
+
+    def test_a_loopback_hub_is_dialled_directly_past_any_proxy(self):
+        for value in ("socks5://x", "socks5h://127.0.0.1:1"):
+            for host in ("127.0.0.1", "localhost", "LOCALHOST"):
+                with self.subTest(value=value, host=host):
+                    os.environ["ALL_PROXY"] = value
+                    self.assertEqual(self.read_one(host), 1)
+        self.assertIsNone(remote.socks_proxy("::1"))
 
     def test_the_owner_only_token_never_crosses_a_proxy(self):
         fake = self.proxy()
@@ -183,15 +204,15 @@ class ThroughAProxy(unittest.TestCase):
         real = socket.getaddrinfo
 
         def resolve(host, *args, **kwargs):
-            if host != "hub.example.test":
+            if host != HUB:
                 return real(host, *args, **kwargs)
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, args[0]))
-                    for address in ("192.0.2.1", "192.0.2.1", "127.0.0.1")]
+                    for address in ("192.0.2.1", "192.0.2.1", "192.0.2.3")]
 
         with mock.patch.object(remote.socket, "getaddrinfo", side_effect=resolve):
-            self.reach_tokenless("hub.example.test")
+            self.reach_tokenless()
         port = self.served.port
-        self.assertEqual(fake.requests, [(1, "192.0.2.1", port), (1, "127.0.0.1", port)])
+        self.assertEqual(fake.requests, [(1, "192.0.2.1", port), (1, "192.0.2.3", port)])
 
     def test_socks5_raises_the_last_refusal_when_no_address_answers(self):
         fake = self.proxy(unreachable=("192.0.2.1", "192.0.2.2"))
@@ -199,13 +220,13 @@ class ThroughAProxy(unittest.TestCase):
         real = socket.getaddrinfo
 
         def resolve(host, *args, **kwargs):
-            if host != "hub.example.test":
+            if host != HUB:
                 return real(host, *args, **kwargs)
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, 1)) for a in ("192.0.2.1", "192.0.2.2")]
 
         with mock.patch.object(remote.socket, "getaddrinfo", side_effect=resolve):
             with self.assertRaises(remote.HubUnreachable) as raised:
-                self.dial("hub.example.test", token="")
+                self.dial(token="")
         self.assertIn("host unreachable", raised.exception.reason)
         self.assertEqual(len(fake.requests), 2)
 
@@ -235,16 +256,16 @@ class ThroughAProxy(unittest.TestCase):
     def test_no_proxy_naming_the_hub_dials_it_directly(self):
         fake = self.proxy()
         os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
-        os.environ["NO_PROXY"] = "example.test,127.0.0.1"
+        os.environ["NO_PROXY"] = "other.test,example.test"
         self.assertEqual(self.read_one(), 1)
         self.assertEqual(fake.requests, [])
 
     def test_no_proxy_matches_by_name_not_by_substring(self):
         fake = self.proxy()
         os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
-        os.environ["NO_PROXY"] = "host"
-        self.reach_tokenless("localhost")
-        self.assertEqual(fake.requests, [(3, "localhost", self.served.port)])
+        os.environ["NO_PROXY"] = "ample.test"
+        self.reach_tokenless()
+        self.assertEqual(fake.requests, [(3, HUB, self.served.port)])
 
     def test_no_proxy_entries_match_whole_labels(self):
         cases = [("hub.example.test", "*", True), ("hub.example.test", ".example.test", True),
