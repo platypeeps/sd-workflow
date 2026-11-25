@@ -3083,20 +3083,25 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
     noted = [row for row in taken if not retry or row["item"] in {merged.get("item") for merged in landed}]
     ran = note_post_merge(noted, ran, main)
     if ran.startswith(POST_MERGE_PASSED):
-        ran = settle_post_merge(queue, [row["item"] for row in taken], ran)
+        ran = settle_post_merge(queue, [row["item"] for row in taken], ran, main)
     return {**answer, "post_merge": ran}
 
 
-def settle_post_merge(queue: Queue, items: list[Any], ran: str) -> str:
-    """`ran`, after a passing target resolved the open `Post-merge:` followups of its repository (sd:10407).
+def settle_post_merge(queue: Queue, items: list[Any], ran: str, main: pathlib.Path) -> str:
+    """`ran`, after a passing target in `main` resolved the open `Post-merge:` followups it covers (sd:10407).
 
-    A later pass covers every earlier commit, so each earlier failure is answered. A failed write leaves
-    them open and is said in the answer; the merge stands either way.
+    One is covered when `main`'s HEAD, read after the pass, holds its item's delivered commit: a pass
+    at an older pin answers no newer failure, and a git that cannot answer covers nothing. A failed
+    write leaves them open and is said in the answer; the merge stands either way.
     """
+    def covered(commit: str) -> bool:
+        done = publish_git(main, "merge-base", "--is-ancestor", commit, "HEAD")
+        return done is not None and done.returncode == 0
+
     def resolve_earlier(connection: Any) -> list[int]:
         sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
         from sd_db import workflow  # noqa: PLC0415
-        return workflow.resolve_post_merge(connection, items)
+        return workflow.resolve_post_merge(connection, items, covered)
 
     try:
         resolved = on_hub(queue, resolve_earlier)

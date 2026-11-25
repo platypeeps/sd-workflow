@@ -179,12 +179,15 @@ class WorkCompletion(ProgressCase):
         waiting = add_note(self.db, self.item, "followup", "Waits on an outside reply")
         blocked = add_note(self.db, self.item, "followup", "Build blocked: gate red. Look at the log")
         pasted = add_note(self.db, self.item, "followup", "Build blocked: the vendor must answer", session="operator")
+        # B2: only a covering post-merge pass answers the lane's `Post-merge: ` (`resolve_post_merge`).
+        refresh = add_note(self.db, self.item, "followup", "Post-merge: make post-merge failed (exit 2)",
+                           session="sd-lane")
         self.remote()
         commit = self.commit(f"Delivers: sd:{self.item}")
         self.git("push", "origin", "main")
         result = deliver_work(self.db, self.item, commit, who="sd-ship")
-        self.assertEqual([row["id"] for row in reads.open_followups(self.db)], [waiting, pasted])
-        self.assertEqual(json.loads(result["item"]["fields"])["kept_followups"], [waiting, pasted])
+        self.assertEqual([row["id"] for row in reads.open_followups(self.db)], [waiting, pasted, refresh])
+        self.assertEqual(json.loads(result["item"]["fields"])["kept_followups"], [waiting, pasted, refresh])
         self.assertIsNotNone(self.db.execute("SELECT resolved_at FROM note WHERE id = ?", (blocked,)).fetchone()[0])
 
     def notes(self, kind="status_change"):

@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from datetime import date
 from typing import Any
 
@@ -883,7 +883,8 @@ def _refuse_unlanded_branch(state: dict, item: int) -> None:
 #: an entry's end (`sd_lane.note_ended`) and a post-merge target's answer (`sd_lane.note_post_merge`);
 #: a build's block (`build._block`) records no session, which no person's note does: the CLI and the
 #: dashboard always record one. The text alone names no author: an operator can type or paste it.
-#: A done item owes none of the machine's, so its close resolves them without being asked.
+#: A done item owes none of the machine's: none blocks its close, which resolves each but a
+#: `Post-merge: ` one unasked (`done_resolves`).
 LANE_SESSION = "sd-lane"  # `sd_lane.LANE_SESSION` is the same name
 POST_MERGE_FOLLOWUP = "Post-merge: "
 LANE_FOLLOWUPS = ("Lane failed in ", "Lane skipped in ", POST_MERGE_FOLLOWUP)
@@ -898,25 +899,52 @@ def machine_followup(note: Mapping[str, Any]) -> bool:
         or (session is None and body.startswith(BUILD_FOLLOWUP)))
 
 
-def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int]) -> list[int]:
-    """Resolve every open `Post-merge: ` followup the lane wrote on the items of the repositories `items` belong to.
+def done_resolves(note: Mapping[str, Any]) -> bool:
+    """Whether a move to done resolves `note` unasked: the machine's, but `Post-merge: ` (sd:10407).
 
-    A passing post-merge target covers every commit before it: main is linear, so a later pass
-    answers each earlier failure in the same repository (sd:10406, sd:10407). The ids resolved."""
+    A close comes before the target that checks it, so only a covering pass
+    answers that one (`resolve_post_merge`); it blocks no close and stays owed."""
+    return machine_followup(note) and not str(note["body"]).startswith(POST_MERGE_FOLLOWUP)
+
+
+def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int],
+                       covered: Callable[[str], bool]) -> list[int]:
+    """Resolve each open `Post-merge: ` followup the lane wrote in the repositories of `items`
+    whose item's delivered commit a passing target covered; the ids resolved (sd:10406, sd:10407).
+
+    `covered(commit)` says whether the checkout the pass ran in holds `commit`: a pass at an
+    older pin answers no failure of a newer commit. An item with no recorded delivery keeps its
+    followup. `covered` runs outside the write, and a note another writer resolved meanwhile
+    is not counted."""
     numbers = sorted({int(item) for item in items})
     if not numbers:
         return []
     marks = ", ".join("?" for _ in numbers)
+    found = connection.execute(
+        "SELECT note.id, note.item FROM note JOIN item ON item.id = note.item "
+        "WHERE note.kind = 'followup' AND note.resolved_at IS NULL "
+        "AND note.session = ? AND substr(note.body, 1, ?) = ? AND item.repo IN "
+        f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id",
+        [LANE_SESSION, len(POST_MERGE_FOLLOWUP), POST_MERGE_FOLLOWUP, *numbers]).fetchall()
+    held: dict[int, bool] = {}
+    for _, item in found:
+        if item not in held:
+            commit = _delivered_commit(connection, item)
+            held[item] = commit is not None and bool(covered(commit))
     with transaction(connection):
-        found = [row["id"] for row in connection.execute(
-            "SELECT note.id FROM note JOIN item ON item.id = note.item "
-            "WHERE note.kind = 'followup' AND note.resolved_at IS NULL "
-            "AND note.session = ? AND substr(note.body, 1, ?) = ? AND item.repo IN "
-            f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id",
-            [LANE_SESSION, len(POST_MERGE_FOLLOWUP), POST_MERGE_FOLLOWUP, *numbers])]
-        for note in found:
-            resolve_note(connection, note)
-    return found
+        return [note for note, item in found if held[item] and resolve_note(connection, note)]
+
+
+def _delivered_commit(connection: sqlite3.Connection, item: int) -> str | None:
+    """The commit `item`'s latest delivery names: a `Code delivery` comment or a delivering transition."""
+    for kind, body in connection.execute(
+            "SELECT kind, body FROM note WHERE item = ? AND kind IN ('comment', 'status_change') "
+            "ORDER BY id DESC", (item,)):
+        text = str(body or "")
+        found = CODE_DELIVERY.match(text) if kind == "comment" else DELIVERED_AT.search(text)
+        if found:
+            return found.group(found.lastindex or 0)
+    return None
 
 
 def change_status(
@@ -927,8 +955,8 @@ def change_status(
     """Move a task, followup, hand idea or active work item without bypassing delivery authority.
 
     `session` is the status note's session, `who` when not given (pack sd:6046).
-    A move to done always resolves the machine's followups (`machine_followup`,
-    sd:10407). `followups` names the others a delivery settles; the rest stay
+    A move to done always resolves the machine's followups but a post-merge
+    one (`done_resolves`, sd:10407). `followups` names the others a delivery settles; the rest stay
     open and owed (sd:9869). A hand close (`followups` None) refuses while any
     other followup is open, naming each as `resolve followup N`, unless
     `resolve_followups` is True, as `reporting.acknowledge` does.
@@ -1024,7 +1052,8 @@ def change_status(
                     raise TransitionRefused(
                         f"item {item} has open followups; resolve each first: " + "; ".join(f"resolve followup {note}" for note in blocking))
             owed = [note["id"] for note in open_followups
-                    if machine_followup(note) or followups is None or note["id"] in followups]
+                    if done_resolves(note) or (followups is None and resolve_followups)
+                    or note["id"] in (followups or ())]
             for note in owed:
                 resolve_note(connection, note)
             if owed:

@@ -595,12 +595,23 @@ class DoneResolvesOpenNotes(WorkflowCase):
         item = self.capture()["item"]["id"]
         bodies = ("Build blocked: the gate failed. Look at the log",
                   "Lane failed in prepare at aaaaaaaaaaaa: gate red",
-                  "Lane skipped in merge at aaaaaaaaaaaa: stale head",
-                  "Post-merge: make post-merge failed (exit 2)")
+                  "Lane skipped in merge at aaaaaaaaaaaa: stale head")
         machine = [add_note(self.db, item, "followup", body,
                             session=None if body.startswith("Build") else LANE_SESSION) for body in bodies]
         change_status(self.db, item, "done", who="operator")
         self.assertEqual(self.notes(item), {note: ("followup", False) for note in machine})
+
+    def test_a_close_leaves_a_post_merge_followup_open_and_kept(self):
+        """sd:10407 B2: done resolved `Post-merge: ` before any target passed; only a covering
+        pass answers it (`resolve_post_merge`). It blocks no close, and Today keeps it."""
+        for followups in (None, ()):
+            with self.subTest(followups=followups):
+                item = self.capture()["item"]["id"]
+                note = add_note(self.db, item, "followup", "Post-merge: make post-merge failed (exit 2)",
+                                session=LANE_SESSION)
+                change_status(self.db, item, "done", who="operator", reason="delivered", followups=followups)
+                self.assertEqual(self.notes(item), {note: ("followup", True)})
+                self.assertEqual(json.loads(item_state(self.db, item)["item"]["fields"])["kept_followups"], [note])
 
     def test_a_persons_followup_that_opens_like_the_machines_is_still_owed(self):
         """sd:10407 class pass: the author was read from the text alone, so an operator's
@@ -636,25 +647,49 @@ class DoneResolvesOpenNotes(WorkflowCase):
 
     def test_a_passing_post_merge_resolves_its_repositorys_earlier_ones(self):
         """sd:10406: a refresh refused while a lane held its lock filed a followup on every merge,
-        each answered by the next refresh that passed; main is linear, so a pass covers them."""
+        each answered by the next refresh that passed. B1: a pass answers one only when the main
+        checkout holds its item's delivered commit; an older pin, or no recorded commit, does not."""
         from sd_db.workflow import resolve_post_merge
         upsert_repo(self.db, "/repos/example")
         upsert_repo(self.db, "/repos/other")
+        covered, newer = "a" * 40, "b" * 40
         earlier = create_item(self.db, kind="task", title="Earlier", repo="/repos/example", status="done")
+        later = create_item(self.db, kind="task", title="Later", repo="/repos/example", status="done")
+        unknown = create_item(self.db, kind="task", title="No commit", repo="/repos/example", status="done")
         landed = create_item(self.db, kind="task", title="Landed", repo="/repos/example", status="done")
         elsewhere = create_item(self.db, kind="task", title="Other", repo="/repos/other", status="done")
+        add_note(self.db, earlier, "comment", "Code delivery https://example.test/pull/1 at " + "c" * 40)
+        add_note(self.db, earlier, "comment", f"Code delivery https://example.test/pull/2 at {covered}")
+        self.db.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (later,))
+        transition(self.db, later, "done", who="sd-ship", reason=f"delivered at {newer} on main")
+        add_note(self.db, elsewhere, "comment", f"Code delivery https://example.test/pull/3 at {covered}")
         failed = add_note(self.db, earlier, "followup", "Post-merge: make post-merge failed (exit 2)",
                           session=LANE_SESSION)
         person = add_note(self.db, earlier, "followup", "Check the refresh by hand")
         pasted = add_note(self.db, earlier, "followup", "Post-merge: check it by hand", session="operator")
+        pinned = add_note(self.db, later, "followup", "Post-merge: make post-merge failed (exit 2)",
+                          session=LANE_SESSION)
+        bare = add_note(self.db, unknown, "followup", "Post-merge: make post-merge failed (exit 2)",
+                        session=LANE_SESSION)
         foreign = add_note(self.db, elsewhere, "followup", "Post-merge: make post-merge failed (exit 2)",
                            session=LANE_SESSION)
-        self.assertEqual(resolve_post_merge(self.db, [landed]), [failed])
-        self.assertEqual(self.notes(earlier), {failed: ("followup", False), person: ("followup", True),
-                                               pasted: ("followup", True)})
-        self.assertEqual(self.notes(elsewhere), {foreign: ("followup", True)})
-        self.assertEqual(resolve_post_merge(self.db, [landed]), [])
-        self.assertEqual(resolve_post_merge(self.db, []), [])
+        owed = lambda item: {note: row for note, row in self.notes(item).items() if row[0] == "followup"}  # noqa: E731
+        asked: list[str] = []
+
+        def holds(commit: str) -> bool:
+            asked.append(commit)
+            return commit == covered
+
+        self.assertEqual(resolve_post_merge(self.db, [landed], holds), [failed])
+        self.assertEqual(sorted(asked), sorted([covered, newer]))
+        self.assertEqual(owed(earlier), {failed: ("followup", False), person: ("followup", True),
+                                         pasted: ("followup", True)})
+        self.assertEqual(owed(later), {pinned: ("followup", True)})
+        self.assertEqual(owed(unknown), {bare: ("followup", True)})
+        self.assertEqual(owed(elsewhere), {foreign: ("followup", True)})
+        self.assertEqual(resolve_post_merge(self.db, [landed], holds), [])
+        self.assertEqual(resolve_post_merge(self.db, [], holds), [])
+        self.assertEqual(resolve_post_merge(self.db, [landed], lambda commit: True), [pinned])
 
     def test_resolve_followups_is_exactly_a_bool(self):
         item = self.capture()["item"]["id"]

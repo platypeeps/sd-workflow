@@ -2589,20 +2589,28 @@ class Landing(Lane):
 
     def test_a_passing_post_merge_resolves_the_repositorys_earlier_post_merge_followups(self) -> None:
         """sd:10406, sd:10407: a refresh refused while a lane held its lock filed a followup on every merge,
-        217 of them, each answered by the next refresh that passed. A pass resolves them; a person's stays."""
+        217 of them, each answered by the next refresh that passed. A pass resolves one only when the main
+        checkout holds its item's delivered commit (B1): an older pin, another repository's, a person's stay."""
         import sd_db
-        earlier, landed = self.register_items(2)
+        covered, pinned, landed = self.register_items(3)
+        held = git(self.repo, "rev-parse", "HEAD")
+        newer = self.advance_origin_main()  # on origin, not in the pinned checkout the pass runs in
         connection = sd_db.connect(home=self.tmp)
         try:
-            failed = sd_db.add_note(connection, earlier, "followup", "Post-merge: make post-merge failed (exit 2)",
-                                    session=sd_lane.LANE_SESSION)
-            person = sd_db.add_note(connection, earlier, "followup", "Post-merge: I check the refresh by hand",
+            sd_db.upsert_repo(connection, str(self.tmp / "other"), remote="https://github.com/example/other.git",
+                              managed=1)
+            other = sd_db.create_item(connection, kind="task", title="other", status="done", repo=str(self.tmp / "other"))
+            for item, commit in ((covered, held), (pinned, newer), (other, held)):
+                sd_db.add_note(connection, item, "comment", f"Code delivery https://example.test/pull/{item} at {commit}")
+            failed, late, foreign = (
+                sd_db.add_note(connection, item, "followup", "Post-merge: make post-merge failed (exit 2)",
+                               session=sd_lane.LANE_SESSION) for item in (covered, pinned, other))
+            person = sd_db.add_note(connection, covered, "followup", "Post-merge: I check the refresh by hand",
                                     session="operator")
             connection.commit()
         finally:
             connection.close()
         tree, head = self.topic()
-        self.advance_origin_main()
         git(self.repo, "switch", "-q", "--detach")  # a deploying checkout is pinned (sd:3647)
         self.post_merge("touch ran")
         self.merge_lands(tree, landed, head)
@@ -2612,10 +2620,11 @@ class Landing(Lane):
         connection = sd_db.connect(home=self.tmp)
         try:
             still = [row[0] for row in connection.execute(
-                "SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (earlier,))]
+                "SELECT id FROM note WHERE kind = 'followup' AND resolved_at IS NULL ORDER BY id")]
         finally:
             connection.close()
-        self.assertEqual(still, [person])
+        self.assertNotIn(newer, git(self.repo, "rev-list", "HEAD").split())  # the pin holds the older commit only
+        self.assertEqual(still, [late, foreign, person])
 
     def test_the_library_knows_the_lanes_session_by_the_lanes_own_name(self) -> None:
         from sd_db import workflow
