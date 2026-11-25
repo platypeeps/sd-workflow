@@ -55,6 +55,8 @@ import sqlite3
 import struct
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from . import errors as _errors
@@ -612,6 +614,111 @@ class Cursor:
         self._position = 0
 
 
+#: SOCKS5 reply codes (RFC 1928 section 6), for the refusal's text.
+_SOCKS_REPLIES = {
+    1: "general SOCKS server failure", 2: "connection not allowed by ruleset",
+    3: "network unreachable", 4: "host unreachable", 5: "connection refused",
+    6: "TTL expired", 7: "command not supported", 8: "address type not supported",
+}
+
+
+class ProxyRefused(OSError):
+    """The SOCKS5 proxy `ALL_PROXY` names refused or broke the connect."""
+
+
+def socks_proxy(host: str) -> tuple[str, int, bool] | None:
+    """`(proxy host, port, send the name)` when `ALL_PROXY` routes `host` through SOCKS5 (sd:10533).
+
+    A sandbox that reaches the network only through its proxy (the Codex
+    network proxy) sets `ALL_PROXY`. Only `socks5://` (resolved here) and
+    `socks5h://` (the proxy resolves) are read; another scheme, no value or
+    a `NO_PROXY` entry naming the hub leaves the direct dial. A SOCKS value
+    that does not parse is refused: a direct dial would hide it.
+    """
+    proxies = urllib.request.getproxies_environment()
+    value = (proxies.get("all") or "").strip()
+    scheme = value.partition("://")[0].lower()
+    if scheme not in ("socks5", "socks5h") or _bypassed(host, proxies.get("no", "")):
+        return None
+    parsed = urllib.parse.urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if not parsed.hostname or port is None or parsed.username is not None:
+        raise ProxyRefused(f"ALL_PROXY {value!r} is not {scheme}://<host>:<port> with no user")
+    return parsed.hostname, port, scheme == "socks5h"
+
+
+def _bypassed(host: str, no_proxy: str) -> bool:
+    """`NO_PROXY` names `host`: `*`, the name itself, or a domain it ends in after a dot."""
+    host = host.lower().rstrip(".")
+    for entry in no_proxy.split(","):
+        entry = entry.strip().lower().lstrip(".").rstrip(".")
+        if entry == "*" or (entry and (host == entry or host.endswith("." + entry))):
+            return True
+    return False
+
+
+def _socks_address(host: str, port: int, by_name: bool) -> bytes:
+    """The CONNECT request's address: an IP as itself, a name sent or resolved here."""
+    for family, kind in ((socket.AF_INET, 1), (socket.AF_INET6, 4)):
+        try:
+            return bytes([kind]) + socket.inet_pton(family, host) + struct.pack(">H", port)
+        except OSError:
+            pass
+    if not by_name:
+        address = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][4]
+        return _socks_address(str(address[0]), port, False)
+    try:
+        name = host.encode("idna")
+    except UnicodeError as error:
+        raise ProxyRefused(f"the hub name {host!r} cannot be sent: {error}") from None
+    if not name or len(name) > 255 or any(c < 0x21 or c > 0x7e for c in name):
+        raise ProxyRefused(f"the hub name {host!r} cannot be sent")
+    return b"\x03" + bytes([len(name)]) + name + struct.pack(">H", port)
+
+
+def dial(host: str, port: int, timeout: float | None) -> socket.socket:
+    """A socket to `host:port`, through the SOCKS5 proxy `ALL_PROXY` names, if any.
+
+    `timeout` bounds the proxy's connect and its handshake as it bounds a
+    direct connect. Every failure is an `OSError` whose text names the proxy.
+    """
+    proxy = socks_proxy(host)
+    if proxy is None:
+        return socket.create_connection((host, port), timeout=timeout)
+    proxy_host, proxy_port, by_name = proxy
+    where = f"through the SOCKS5 proxy {proxy_host}:{proxy_port}"
+    try:
+        request = b"\x05\x01\x00" + _socks_address(host, port, by_name)
+        sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    except OSError as error:
+        raise ProxyRefused(f"{where}: {error.strerror or error}") from error
+    try:
+        sock.sendall(b"\x05\x01\x00")
+        if _read_exactly(sock, 2) != b"\x05\x00":
+            raise ProxyRefused(f"{where}: it accepts no unauthenticated session")
+        sock.sendall(request)
+        version, reply, _, kind = _read_exactly(sock, 4)
+        if version != 5 or reply != 0:
+            raise ProxyRefused(f"{where}: {_SOCKS_REPLIES.get(reply, f'reply {reply}')}")
+        if kind not in (1, 3, 4):
+            raise ProxyRefused(f"{where}: reply address type {kind}")
+        size = {1: 4, 4: 16}.get(kind) or _read_exactly(sock, 1)[0]
+        _read_exactly(sock, size + 2)
+    except ProxyRefused:
+        sock.close()
+        raise
+    except (OSError, EOFError) as error:
+        sock.close()
+        raise ProxyRefused(f"{where}: {getattr(error, 'strerror', None) or error}") from error
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 class Connection:
     """A hub-side `sqlite3.Connection`, reached over one socket.
 
@@ -655,7 +762,7 @@ class Connection:
         """Dial the hub and send `open`, for a new connection or a reopened session."""
         token = self._token
         try:
-            self._socket = socket.create_connection((self.host, self.port), timeout=self._timeout)
+            self._socket = dial(self.host, self.port, self._timeout)
         except OSError as error:
             raise HubUnreachable(self.host, self.port, error.strerror or str(error)) from error
         self._socket.settimeout(self._answer_timeout)
