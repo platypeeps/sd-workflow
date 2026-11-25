@@ -142,7 +142,7 @@ def _mission(folder: Path | None, today: date) -> dict:
         latest = rows[-1][stamp] if rows else ""
         out["files"].append({"name": name, "rows": len(rows), "latest": latest, "error": ""})
         if key == "alarms":
-            since = (_day(latest) - timedelta(days=ALARM_DAYS)).isoformat() if rows else ""
+            since = (today - timedelta(days=ALARM_DAYS)).isoformat()  # the HOA's last 30 days (sd:10599)
             out[key] = [row for row in rows if row[stamp] >= since]
         else:
             out[key] = rows
@@ -493,7 +493,8 @@ def document(connection, *, now: str, jobs=None) -> dict:
     `jobs` is the operations backend the refresh jobs are read from, `operations.LaunchdBackend` by default."""
     recorded, place, problems = checkout(connection)
     state = "error" if problems else "read" if recorded else "missing"
-    today = datetime.fromisoformat(now.replace("Z", "+00:00")).date()
+    # The HOA's calendar date, this machine's zone, as Tasks counts due days: not UTC's (sd:10599).
+    today = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone().date()
     paths = _paths(place)
     mission, items = _mission(paths["mission"], today), _items(connection, recorded, now, today)
     if problems:
