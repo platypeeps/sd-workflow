@@ -6229,6 +6229,23 @@ class Importing(SharedQueue):
         self.assertEqual([(row["item"], row["status"], row.get("code")) for row in self.entries()],
                          [(1, "pending", None), (1, "cancelled", "duplicate_on_import")])
 
+    def test_an_enqueue_of_a_head_the_file_ended_refuses_imported_or_not(self) -> None:
+        """sd:10420 review: the file failed sd:1 at this head; an enqueue of it would run that delivery again,
+        so it refuses whether its import writes the entry or a runner lock holds the import back."""
+        head = git(self.feature, "rev-parse", "HEAD")
+        enqueue = ("enqueue", "--item", "1", "--title", "fix: t", "--body-file", str(self.body), "--deliver",
+                   "--expected-head", head)
+        self.write_file(self.old(1, self.feature, status="failed"))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane(*enqueue)
+        self.assertEqual((code, self.statuses()), (3, []), answer)
+        self.assertIn("already ran in this lane", answer["error"])
+        code, answer = self.lane(*enqueue)
+        self.assertEqual((code, self.statuses()), (3, [(1, "failed")]), answer)
+        self.assertEqual(self.lane(*enqueue[:-2])[0], 0)  # the worktree's head, once imported: an operator retry
+
     def test_lane_list_names_the_files_waiting_entries(self) -> None:
         """sd:10420 review: the view shows what the next runner pass imports, never an empty lane alone."""
         self.write_file(self.old(1, self.feature), self.old(2, self.feature, status="merged"))

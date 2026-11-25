@@ -312,6 +312,10 @@ FAKE = textwrap.dedent('''
         if any(row["item"] == items[0] and row["status"] in ("pending", "running") for row in entries):
             print(json.dumps({"ok": False, "error": f"sd:{items[0]} is already queued in this lane"}))
             sys.exit(3)
+        if any(row["item"] == items[0] and row.get("id", "").startswith("import-") and row["status"] != "cancelled"
+               and row["expected_head"] == argv[argv.index("--expected-head") + 1] for row in entries):
+            print(json.dumps({"ok": False, "error": f"sd:{items[0]} at this head already ran in this lane"}))
+            sys.exit(3)
         entry = {"id": f"e{len(entries) + 1}", "item": items[0], "status": "pending", "enqueue_seq": len(entries) + 1,
                  "expected_head": argv[argv.index("--expected-head") + 1]}
         lane.write_text(json.dumps(entries + [entry]))
@@ -3428,7 +3432,7 @@ class Supervise(Case):
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
         self.assertEqual(len(json.loads((self.plans / "lane.json").read_text())), 1)
 
-    def legacy_resume(self, head_of=lambda head: head):
+    def legacy_resume(self, head_of=lambda head: head, status="pending"):
         """A run resumed at enqueuing whose item an earlier version's queue file holds pending, not imported:
         `lane list` shows only a cancelled entry, and the enqueue imports the file and then refuses the item."""
         self.press()
@@ -3442,7 +3446,7 @@ class Supervise(Case):
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "cancelled",
                                                            "enqueue_seq": 1, "expected_head": head}]))
         (self.plans / "legacy.json").write_text(json.dumps([{"id": "import-1", "item": self.items[0],
-                                                             "status": "pending", "expected_head": head_of(head)}]))
+                                                             "status": status, "expected_head": head_of(head)}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         return self.supervisor().run()
 
@@ -3454,6 +3458,12 @@ class Supervise(Case):
                          ["list", "enqueue", "list"])
         self.assertEqual([row["id"] for row in json.loads((self.plans / "lane.json").read_text())], ["e1", "import-1"])
         self.assertFalse((self.plans / "legacy.json").exists())
+
+    def test_enqueue_resume_takes_a_legacy_entry_the_lane_failed_at_this_head(self):
+        """pack sd:10420 review: the file failed this head; the run records it for the watch, never requeues it."""
+        self.assertEqual(self.legacy_resume(status="failed")["step"], "enqueued")
+        self.assertEqual([(row["id"], row["status"]) for row in json.loads((self.plans / "lane.json").read_text())],
+                         [("e1", "cancelled"), ("import-1", "failed")])
 
     def test_enqueue_resume_blocks_on_a_legacy_entry_at_another_head(self):
         """The imported entry holds another head, so the refusal stands and the run is blocked on it."""

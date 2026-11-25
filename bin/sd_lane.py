@@ -1895,6 +1895,14 @@ def legacy_pending(path: pathlib.Path, present: set[str]) -> list[int] | str | N
     lock and no write (sd:10420): an entry whose import id is in `present`, the shared queue's ids, is written
     already, as the import itself skips it. Or why the file cannot be read, which the import also stops on;
     None with no file. A reader shows or refuses on this; only the import says what a file entry becomes."""
+    unwritten = legacy_unwritten(path, present)
+    if not isinstance(unwritten, list):
+        return unwritten
+    return [entry["item"] for entry in unwritten if entry.get("status") == "pending"]
+
+
+def legacy_unwritten(path: pathlib.Path, present: set[str]) -> list[dict[str, Any]] | str | None:
+    """The file's entries with an integer item that its import has still to write (`legacy_pending`)."""
     try:
         old = json.loads(path.read_text(encoding="utf-8")).get("entries")
     except FileNotFoundError:
@@ -1904,9 +1912,23 @@ def legacy_pending(path: pathlib.Path, present: set[str]) -> list[int] | str | N
     if not isinstance(old, list):
         return f"{path} holds no entry list"
     host = this_host()
-    return [entry["item"] for entry in old if isinstance(entry, dict) and entry.get("status") == "pending"
+    return [entry for entry in old if isinstance(entry, dict)
             and isinstance(entry.get("item"), int) and not isinstance(entry.get("item"), bool)
             and import_id(host, path, entry) not in present]
+
+
+def legacy_ran(queue: Queue, path: pathlib.Path, item: int, head: str | None) -> str | None:
+    """The status an earlier version's queue file ended `item` at `head` with, its import not written yet; None
+    when it holds no such entry. An enqueue of that head would run a delivery the lane already ran (sd:10420)."""
+    if not head:
+        return None
+    unwritten = legacy_unwritten(path, {str(row.get("id")) for row in read_queue(queue)})
+    if not isinstance(unwritten, list):  # no file, or one the import stops on: it writes nothing
+        return None
+    ended = [str(entry.get("status")) for entry in unwritten
+             if entry["item"] == item and entry.get("expected_head") == head
+             and entry.get("status") not in ("pending", "cancelled")]
+    return ended[-1] if ended else None
 
 
 def legacy_waiting(path: pathlib.Path, present: set[str]) -> str | None:
@@ -5136,8 +5158,7 @@ def lane_main(args: Any) -> int:
         if args.lane_command == "prune":
             return lane_prune(root, environ, dry_run=args.dry_run, as_json=args.json)
         if args.lane_command not in ("run", "list"):  # a view stays read-only; a writer reaches file entries (sd:10420)
-            import_for_writer(root, environ, args.lane_command,
-                              args.items[0] if args.lane_command == "enqueue" else args.item)
+            import_for_writer(root, environ, args)
         if args.lane_command == "enqueue":
             result: Any = enqueue_entry(root, args.items[0], args.title, args.body_file, environ,
                                         expected_head=args.expected_head, manual=args.manual, claim=args.claim,
@@ -5171,13 +5192,20 @@ def lane_main(args: Any) -> int:
     return succeed(shown(result))
 
 
-def import_for_writer(root: pathlib.Path, environ: dict[str, str], verb: str, item: int) -> None:
-    """Import the file queue before a writing verb, or refuse when it stays and holds `item` (sd:10420).
+def import_for_writer(root: pathlib.Path, environ: dict[str, str], args: Any) -> None:
+    """Import the file queue before a writing verb, or refuse when it stays and holds its item (sd:10420).
 
     `enqueue` misses nothing: it adds the live entry, and the import then cancels the file's as a duplicate.
+    An enqueue of an `--expected-head` the file ended refuses, imported or not: the lane ran that delivery.
     """
+    verb = args.lane_command
+    item, head = (args.items[0], args.expected_head) if verb == "enqueue" else (args.item, None)
     queue = queue_for(root, environ)
+    ran = legacy_ran(queue, queue_path(root, environ), item, head) if verb == "enqueue" else None
     imported = import_file_queue(root, queue)
+    if ran:
+        raise LaneError(f"sd:{item} at {head} already ran in this lane: an earlier version's queue file ended it "
+                        f"{ran}; `sd-ship lane retry {item}` runs it again")
     not_done = imported.get("stopped") or imported.get("skipped")  # its entries are not in the queue yet
     if not_done and verb != "enqueue" and file_holds(queue, queue_path(root, environ), item):
         raise LaneError(f"{queue_path(root, environ)}, an earlier version's queue, is not imported: {not_done}; "
