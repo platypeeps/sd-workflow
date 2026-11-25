@@ -381,6 +381,37 @@ class DropStranded(Repo):
         self.assertEqual(self.branch_and_status(items[1]), (None, "ready"))
 
 
+    def test_a_member_a_live_teammate_holds_keeps_its_state(self):
+        """Lane review of build/sd-1654 (build.py:1104): a member left out of a Retry that a teammate then took
+        (an `in_session` assignment), its branch field still the old one. The drop set it ready and cleared its
+        branch under the live teammate. Another owner's item is that owner's: the drop leaves it as it is."""
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        again = self.claim()
+        build.write(self.db, again["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, again["id"], "blocked", "blockers")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.db.execute("UPDATE item SET status = 'in_progress', branch = ? WHERE id = ?", (run["branch"], items[1]))
+        self.db.execute("INSERT INTO assignment (item, role, status) VALUES (?, 'author', 'in_session')", (items[1],))
+        self.db.commit()
+        DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual(self.branch_and_status(items[1]), (run["branch"], "in_progress"))
+
+    def test_a_member_a_newer_build_owns_keeps_its_state(self):
+        """Class pass of the case above: a newer build of the left-out member is queued. That build owns the
+        item, so the drop neither moves its status nor clears its branch."""
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        again = self.claim()
+        build.write(self.db, again["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, again["id"], "blocked", "blockers")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        build.queue(self.db, [items[1]], who="operator")
+        self.db.execute("UPDATE item SET status = 'in_progress', branch = ? WHERE id = ?", (run["branch"], items[1]))
+        self.db.commit()
+        DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual(self.branch_and_status(items[1]), (run["branch"], "in_progress"))
+
 class DropRound5(Repo):
     """Review round 5 of pack sd:9709, class pass: a git exit code read as an answer. Only `rev-parse -q --verify`
     exit 1 says a ref is unset; any other failure refuses unwritten."""

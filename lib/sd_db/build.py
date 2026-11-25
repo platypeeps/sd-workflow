@@ -1100,9 +1100,13 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
                                 how=how, verb="Drop")
         # Each item the drop leaves off the kept branch ends ready, its old branch cleared, so the next build takes
         # it on its own: dropped members sat in_progress on the old branch for days (pack sd:10167). One whose
-        # branch names another build is that build's; a done one keeps its record.
-        for row in connection.execute(f"SELECT id, status FROM item WHERE id IN ({', '.join('?' for _ in plan['aside'])}) "
+        # branch names another build is that build's; a done one keeps its record. So is one a newer build or a
+        # live teammate owns (`_ours`), whatever its branch field says (review of build/sd-1654).
+        marks = ", ".join("?" for _ in plan["aside"])
+        for row in connection.execute(f"SELECT id, status FROM item WHERE id IN ({marks}) "
                                       "AND branch = ? AND status != 'done'", (*plan["aside"], plan["branch"])).fetchall():
+            if row["id"] != plan["item"] and not _ours(connection, row["id"], plan["lead"]):
+                continue
             if row["status"] in ("in_progress", "blocked"):
                 transition(connection, row["id"], "ready", who=who, reason=how)
             set_item_fields(connection, row["id"], branch=None)
@@ -1118,6 +1122,14 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         # and takes a row that counts a run as its own bundle, its lead (`_bundle`). No run row backs the count.
         connection.execute("UPDATE assignment SET run_count = 1 WHERE id = ?", (alone[0]["id"],))
         return queued + [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in alone]
+
+
+def _ours(connection, item: int, lead: int) -> bool:
+    """Whether build `lead`'s bundle still owns `item`: no newer build of it stands (`_current`) and no run or
+    live teammate holds it (`_held`)."""
+    row = connection.execute("SELECT id, item FROM assignment WHERE item = ? AND (id = ? OR parent = ?) "
+                             "AND scope = ? ORDER BY id DESC LIMIT 1", (item, lead, lead, SCOPE)).fetchone()
+    return row is not None and _current(connection, dict(row)) and _held(connection, item) is None
 
 
 def drop_committed(connection, plan: dict) -> bool:
