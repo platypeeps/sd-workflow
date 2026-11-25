@@ -971,6 +971,18 @@ class TaskCLI(unittest.TestCase):
         self.assertIsNone(cleared["item"]["fields"])
         self.assertNotIn("waits on:", self.call("task", "show", item).stdout)
 
+    def test_edit_work_kind_marks_an_item_mechanical_and_back(self):
+        """sd:10758. `--work-kind mechanical` sets `fields.work_kind`, half a bundle slot; `normal` drops it."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Rename", "--json").stdout)["item"]["id"]
+        self.call("task", "edit", item, "--work-kind", "small", code=2)
+        state = json.loads(self.call("task", "edit", item, "--work-kind", "mechanical", "--json").stdout)
+        self.assertEqual(json.loads(state["item"]["fields"]), {"work_kind": "mechanical"})
+        self.assertEqual(state["notes"][-1]["body"], f"Updated work_kind by {getpass.getuser()}")
+        again = json.loads(self.call("task", "edit", item, "--work-kind", "mechanical", "--json").stdout)
+        self.assertEqual(again["revision"], state["revision"], "an equal value writes nothing")
+        cleared = json.loads(self.call("task", "edit", item, "--work-kind", "normal", "--json").stdout)
+        self.assertIsNone(cleared["item"]["fields"])
+
     def test_edit_area_takes_personal_and_the_realm_ids_the_setting_names(self):
         """pack sd:8062. `--area` takes home, hoa, personal and each
         dashboard.realms id, checked when the edit runs."""

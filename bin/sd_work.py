@@ -237,8 +237,9 @@ def _edit_changes(args: argparse.Namespace) -> dict[str, Any]:
     checkout is a path that has to be resolved -- and `run`'s job is to pick
     the operation, not to do this.
     """
+    # sd:10758: `work_kind` is `fields.work_kind`, which `edit_item` folds and `build._slots` reads.
     changes: dict[str, Any] = {
-        field: getattr(args, field) for field in ("title", "body", "priority", "due")
+        field: getattr(args, field) for field in ("title", "body", "priority", "due", "work_kind")
         if getattr(args, field) is not None
     }
     if args.clear_priority:
@@ -1824,6 +1825,9 @@ def register(groups: Any, store: Any) -> None:
                             "No build takes the item until each is done")
     waits.add_argument("--clear-blocked-by", action="store_true",
                        help="drop every item this one waits on")
+    # sd:10758: `fields.work_kind`, which `build._slots` reads.
+    edit.add_argument("--work-kind", choices=("mechanical", "normal"),
+                      help="mechanical: a small, low-risk item that takes half a bundle slot; normal: a whole one")
     # `--belongs-to` and not `--repo`: see `_belongs_to`. `--no-repo` is the
     # word `add` already uses for the same idea, so the pair reads the same on
     # both verbs.

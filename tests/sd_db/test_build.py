@@ -370,6 +370,24 @@ class Claim(Case):
         self.assertEqual(len(self.claim()["members"]), 5, "one whole slot and four half ones")
         self.assertEqual([build.bundled(self.db, items) for items in ([], [self.item()] * 4)], [0, 3])
 
+    def test_an_item_edited_mechanical_bundles_at_half_a_slot(self):
+        """sd:10758: `edit_item` writes `fields.work_kind`; mechanical is half a slot, normal clears it."""
+        items = [self.item(fields={"area": "home"}) for _ in range(6)]
+        self.assertEqual(build.bundled(self.db, items), 3)
+        for item in items:
+            workflow.edit_item(self.db, item, {"work_kind": "mechanical"}, who="operator")
+        self.assertEqual(build.bundled(self.db, items), 6, "six half slots fill three")
+        self.assertEqual(json.loads(item_state(self.db, items[0])["item"]["fields"]),
+                         {"area": "home", "work_kind": "mechanical"}, "other keys stay")
+        workflow.edit_item(self.db, items[0], {"work_kind": "normal"}, who="operator")
+        self.assertEqual(json.loads(item_state(self.db, items[0])["item"]["fields"]), {"area": "home"})
+        for bad in ("design", "Mechanical", "", None, 1):
+            with self.subTest(bad=bad), self.assertRaises(WorkflowError):
+                workflow.edit_item(self.db, items[1], {"work_kind": bad}, who="operator")
+        designed = self.item(fields={"work_kind": "design"})
+        with self.assertRaisesRegex(WorkflowError, "design"):
+            workflow.edit_item(self.db, designed, {"work_kind": "mechanical"}, who="operator")
+
     def test_one_running_bundle_fills_its_repository_not_another(self):
         """sd:8158: one bundle per repository at a time, so later items wait for it and the next bundle takes them."""
         build.queue(self.db, [self.item()], who="operator")
