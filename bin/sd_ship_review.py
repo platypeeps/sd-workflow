@@ -1816,12 +1816,13 @@ def unittest_failed_shards(text: str) -> dict[str, str]:
     """The shards in `run-tests.sh` output `text` that finished with unittest's own failure exit and printed a FAIL
     or ERROR header, each with the block validation read (its last start line before its last end line); empty
     when any shard did not write its complete end line (killed or hung), ended with any other non-zero exit (137
-    for a kill), or failed with no header: then more than a test failed."""
+    for a kill), or failed with no header: then more than a test failed. Empty too when a start line repeats: a
+    test's multiline message that quotes one would move the block past the real header (lane review of sd:9862)."""
     started = SHARD_START.findall(text)
     ended = {match.group(1): match for match in SHARD_END.finditer(text)}
     planned = SHARDS_PLANNED.findall(text)
     # Every planned shard finished: one that never launched left no log to count (review of sd:9768).
-    if any(name not in ended for name in started) or planned != [str(len(ended))]:
+    if any(name not in ended for name in started) or planned != [str(len(ended))] or len(set(started)) < len(started):
         return {}
     failing: dict[str, str] = {}
     for name, match in ended.items():

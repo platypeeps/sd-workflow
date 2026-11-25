@@ -805,6 +805,28 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
                        encoding="utf-8")
         self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST, other])
 
+    def test_a_multiline_assertion_that_prints_runner_lines_is_no_flake(self):
+        """Lane review of sd:9862: a failing test's message spans lines, as one that quotes a runner's output
+        does. A start line in it moved the validated block past the real header, so the rerun named the quoted
+        test, which passed, and dropped the one that failed. A shard whose start line repeats is no flake, and a
+        quoted header alone fails the count."""
+        log = pathlib.Path(self.row["output_path"])
+        quoted = "FAIL: test_b (tests.test_example.Case.test_b)\n"
+        cases = (("a quoted start line and header", "shard tests.test_example: start\n" + quoted),
+                 ("a quoted header", quoted),
+                 ("a start line quoted by another shard", None))
+        for name, message in cases:
+            with self.subTest(name):
+                if message is None:
+                    text = OUTPUT.replace("shard tests.test_other: start\nOK\n",
+                                          "shard tests.test_other: start\nshard tests.test_example: start\nOK\n")
+                else:
+                    text = OUTPUT.replace("AssertionError: git failed\n", f"AssertionError: git failed\n{message}")
+                log.write_text(text, encoding="utf-8")
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        log.write_text(OUTPUT, encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+
     def test_only_a_failure_of_tests_alone_is_rerun(self):
         lint = {**self.row, "failed_steps": [SHARD, "make target lint"]}
         crashed = {**self.row, "failed_steps": ["shard tests.test_crash: 1s exit=1", "make target test"]}
