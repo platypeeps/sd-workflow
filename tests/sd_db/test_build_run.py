@@ -4375,6 +4375,43 @@ class CargoClean(Case):
         self.supervisor(probe=GoneProbe(alive=None, group=None)).finish("blocked", "group unread")
         self.assertEqual(self.cargo_calls(), [], "an unread group keeps target/ too")
 
+    def survive(self, supervisor, said="process group 4250 (checks) still had a process after SIGKILL"):
+        def walked():
+            raise build_run.Survivor(said)
+        supervisor.walked = walked
+        return supervisor.ended()
+
+    def test_a_survivor_in_any_group_keeps_the_target_with_a_note(self):
+        """Class pass 2, build/sd-1798: a repository check that outlives SIGKILL runs in a group of its own
+        (`sd gate run`), not the recorded builder group; the end it causes cleans nothing."""
+        self.rust()
+        self.assertEqual(self.survive(self.supervisor())["outcome"], "blocked")
+        self.assertEqual(self.cargo_calls(), [])
+        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
+        self.assertTrue(any("4250" in body and "cargo clean" in body for body in self.notes()), self.notes())
+
+    def test_a_survivors_end_replayed_by_the_next_image_keeps_the_target(self):
+        """Class pass 2: the end waits through a hub fault and an exec in place; the next image must not clean."""
+        self.rust()
+        first = self.supervisor()
+        with mock.patch.object(build, "end", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.survive(first)
+        with mock.patch.dict(os.environ, {build_run.RESUME_ENV: json.dumps(first.state())}):
+            second = self.supervisor()
+        self.assertEqual(second.finish(*second.ending[:2])["outcome"], "blocked")
+        self.assertEqual(self.cargo_calls(), [])
+
+    def test_a_recorded_descendant_group_still_alive_is_kept(self):
+        """Class pass 2: a group the last child's descendants ran in, still alive or unread, may build."""
+        self.rust()
+        for answer in (True, None):
+            supervisor = self.supervisor(probe=GoneProbe(alive=False, group=answer))
+            supervisor.groups = {4251: "Sat Oct 24 09:00:00 2026"}
+            supervisor.finish("blocked", "fixture block")
+            self.assertEqual(self.cargo_calls(), [], answer)
+        self.assertTrue(any("4251" in body for body in self.notes()), self.notes())
+
     def test_a_missing_cargo_notes_and_still_ends(self):
         self.rust()
         self.tools.cargo = [str(self.root / "no-such-cargo")]

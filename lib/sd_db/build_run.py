@@ -1261,6 +1261,7 @@ class Supervisor:
         self.last: dict | None = None
         self.held: dict | None = None
         self.ending: tuple | None = None
+        self.survived: str | None = None
         self.marks: set[str] = set()
         self.unknown: dict[str, str] = {}
         self.hub_down = False
@@ -1276,6 +1277,7 @@ class Supervisor:
         self.last = self.held = state.get("child")
         self.reviewed = state.get("reviewed")
         self.ending = tuple(state["ending"]) if state.get("ending") else None
+        self.survived = state.get("survived") or None
         self.marks = set(state.get("marks") or ())
         self.unknown = dict(state.get("unknown") or {})
         groups = state.get("groups")
@@ -1287,7 +1289,8 @@ class Supervisor:
         if last is not None and last["exit"] is None:
             last["left"] = max(self.deadline - time.monotonic(), 0.0)
         return {"run": self.ident, "pid": os.getpid(), "child": last, "groups": self.groups, "reviewed": self.reviewed,
-                "ending": self.ending, "marks": sorted(self.marks), "unknown": self.unknown, "root": str(self.log_root)}
+                "ending": self.ending, "survived": self.survived, "marks": sorted(self.marks), "unknown": self.unknown,
+                "root": str(self.log_root)}
 
     def fault_seen(self, fault: Exception) -> None:
         if not self.hub_down:
@@ -1436,6 +1439,7 @@ class Supervisor:
         except TimedOut:
             return self.finish("timed_out", f"a child ran past {self.timeout:g} s; its group was ended")
         except Survivor as survivor:
+            self.survived = str(survivor)  # kept with the end: `clean_target` deletes nothing under a live process
             return self.finish("blocked", str(survivor))
         except Unread as unread:
             # An unknown result: no write, so the reap finds the run lost and retries it once.
@@ -1524,7 +1528,8 @@ class Supervisor:
         (by that tag's rule all below it is rebuilt at will), ignored by git with no tracked file below, and with
         no top-level file but the ones cargo writes there (`CARGO_FILES`). The worktree: its own checkout root, on
         the run's branch (`guarded`), no split holding or unread on it (`split_first` counts ignored files as a
-        left item's work), and no live session but this run's builder in it. An unread git keeps it.
+        left item's work), and no live session but this run's builder in it. An unread git keeps it. The run's
+        own processes: no `Survivor` ended it, and no group of its last child reads alive or unread.
         """
         if not manifest.is_file() or target.is_symlink() or not target.is_dir():
             return ""
@@ -1550,10 +1555,13 @@ class Supervisor:
             return ""
         if build.split(self.db, self.row["assignment"]) not in ("", "clear"):
             return ""
+        if self.survived:  # whichever group it was: the child's, or one a check ran in (`sd gate run`)
+            return self.survived
         row = self.fresh()
-        pgid = row["builder_pgid"]
-        if pgid and self.probe.group(pgid) is not False:  # a Survivor, or a group no read answers: it may build
-            return f"the builder's process group {pgid} may still run"
+        # The child's recorded group and each its descendants ran in: alive, or one no read answers, may build.
+        for pgid in (row["builder_pgid"], *sorted(self.groups or ())):
+            if pgid and self.probe.group(pgid) is not False:
+                return f"process group {pgid} of the run's last child may still run"
         own = row["session_id"]
         if sessions.holders(self.db, str(self.work), machine=this_host(), exclude=(own,) if own else ()):
             return ""
