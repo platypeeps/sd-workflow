@@ -1594,10 +1594,23 @@ R.cli = c.cli(m); C.run(c, m); await flush();""", self.job_doc())
         doc = self.download_doc(state="failed", reason="sh tools/mission/mission.sh export exited 1: boom",
                                 error="tools/mission/mission.sh is not in the hoa checkout /hoa, so the Mission download has no procedure there")
         out = self.run_page(self.DOWNLOAD, doc, pre=TIMERS)
-        self.assertRegex(out["R"]["src"], re.compile(r'data-id="source:mission".*?class="detail hide-sm">last download failed: sh tools/mission/mission.sh export exited 1: boom<', re.S))
+        self.assertRegex(out["R"]["src"], re.compile(r'data-id="source:mission".*?class="detail hide-sm">Mission download failed · no good download on record · Download from Mission tries again<', re.S))
         self.assertNotRegex(out["R"]["src"], re.compile(r'data-id="source:mission"(?:(?!data-id=).)*?1 d old · ', re.S))
         self.assertEqual(out["R"]["when"], doc["downloads"]["mission"]["error"])
         self.assertEqual(out["posts"], [])
+
+    def test_a_failed_download_names_the_last_good_one_and_the_retry_and_keeps_the_reason_in_details(self):
+        """sd:10616: the row says what failed, when the last good download was and what tries again; the parser's
+        reason is in Details, under Technical details."""
+        doc = self.download_doc(state="failed", reason="sh tools/mission/mission.sh export exited 1: <b>boom</b>",
+                                last_done="2026-09-05T08:00:00+00:00")
+        out = self.run_page(self.DOWNLOAD + "\nwindow.PAGE_LIST.select('source:mission'); R.det = ELS.details.html;", doc, pre=TIMERS)
+        row = re.search(r'data-id="source:mission".*?</tr>', out["R"]["src"], re.S)[0]
+        self.assertIn("Mission download failed · last good download 2026-09-05 08:00 UTC · Download from Mission tries again", row)
+        self.assertNotIn("boom", row)
+        self.assertIn("<dt>Last good download</dt><dd>2026-09-05 08:00 UTC</dd>", out["R"]["det"])
+        self.assertIn("<dt>Technical details</dt><dd>sh tools/mission/mission.sh export exited 1: &lt;b&gt;boom&lt;/b&gt;</dd>",
+                      out["R"]["det"])
 
     def test_a_source_that_is_not_listed_has_no_download_button(self):
         doc = self.download_doc()
