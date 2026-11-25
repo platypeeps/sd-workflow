@@ -36,6 +36,8 @@ class Drive:
                                           ("Layout.url", "LNK1", "text/plain")], "WA2": []}
         self.text = {"LNK1": "[InternetShortcut]\nURL=https://drive.google.com/file/d/TARGET/view\n"}
         self.calls, self.fail, self.say, self.listed, self.made = [], {}, {}, {}, 0
+        #: Rows a listing page holds, as Drive pages a long folder (sd:10605); None is one page.
+        self.page = None
 
     def __call__(self, tool, arguments, what):
         self.calls.append((tool, arguments))
@@ -47,11 +49,15 @@ class Drive:
             if arguments["folder_id"] in self.listed:
                 return self.listed[arguments["folder_id"]]
             rows = self.items.get(arguments["folder_id"], [])
+            start = int(arguments.get("page_token", "P0")[1:])
+            size = self.page or len(rows) or 1
+            rows, more = rows[start:start + size], start + size < len(rows)
             if not rows:
                 return f"No items found in folder '{arguments['folder_id']}'."
             return f"Found {len(rows)} items in folder '{arguments['folder_id']}' for x@example.invalid:\n" + "\n".join(
                 f'- Name: "{name}" (ID: {ident}, Type: {mime}, Created: 2026-10-30T00:00:00Z, Last Edited By: A '
-                f'<a@example.invalid>) Link: https://drive.google.com/open?id={ident}' for name, ident, mime in rows)
+                f'<a@example.invalid>) Link: https://drive.google.com/open?id={ident}' for name, ident, mime in rows) + (
+                f"\nnextPageToken: P{start + size}" if more else "")
         self.made += 1
         ident = f"NEW{self.made}"
         if tool == "create_drive_folder":
@@ -154,6 +160,35 @@ class TheListing(Case):
         self.assertIn("refused", body["error"])
         self.assertEqual(hoa_attach.listing(self.connection, {"asset": ["NOPE"]})[0], 400)
 
+
+    def test_a_folder_past_the_first_page_is_found_not_made_twice(self):
+        # sd:10605: Drive pages a long folder; the asset's folder on page two is
+        # the one it has, so the listing reads every page and makes nothing.
+        self.drive.page = 1
+        got = hoa_attach.listing(self.connection, {"asset": ["TANK-01"]})
+        self.assertIsInstance(got, dict, got)
+        self.assertEqual([row["id"] for row in got["files"]], ["PIC1", "DOC1", "LNK1"])
+        self.assertIn(("list_drive_items", {"user_google_email": "x@example.invalid", "folder_id": "ROOT",
+                                            "page_size": 200, "page_token": "P1"}), self.drive.calls)
+        self.assertEqual(self.drive.writes(), [])
+
+    def test_a_listing_whose_pages_do_not_end_is_unreadable(self):
+        # A token Drive already gave, or two token lines, is no whole listing.
+        page = ("Found 1 items in folder 'CIS' for x@example.invalid:\n- Name: \"a.pdf\" (ID: D1, Type: application/pdf"
+                ") Link: https://drive.google.com/open?id=D1\n")
+        for said in (page + "nextPageToken: P0", page + "nextPageToken: P1\nnextPageToken: P2",
+                     page + "nextPageToken: P1\ntrailing"):
+            with self.subTest(said=said):
+                self.drive.say["list_drive_items"] = said
+                self.drive.calls.clear()
+                with mock.patch.object(hoa_attach, "PAGES", 3):
+                    with self.assertRaisesRegex(LookupError, "unreadable"):
+                        hoa_attach._children("x@example.invalid", "CIS")
+                self.assertLessEqual(len(self.drive.calls), 3)
+        del self.drive.say["list_drive_items"]
+        self.drive.page = 1
+        with mock.patch.object(hoa_attach, "PAGES", 2), self.assertRaisesRegex(LookupError, "over 2 pages"):
+            hoa_attach._children("x@example.invalid", "CIS")
 
     def test_a_listing_drive_did_not_answer_is_no_empty_folder(self):
         # An error text, a page of a longer listing, or a header that does not
