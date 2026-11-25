@@ -89,9 +89,6 @@ TITLE_MAX = 63
 READ_SECONDS = 120
 # Ignored folders that `git worktree remove` may delete: tools rebuild them (pack sd:6979).
 DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache"})
-#: The Cache Directory Tagging signature cargo writes into a Rust `target/`, which kept every merged worktree,
-#: 20-60 GB each (pack sd:10506). With a tracked `Cargo.toml` beside it, it proves that folder cargo's.
-CACHE_TAG, CACHE_SIGNATURE = "CACHEDIR.TAG", b"Signature: 8a477f597d28d172789f06886806bc55"
 #: The pack checkout this module runs from: its `dashboard/dashboard.sh` is the health check.
 PACK = Path(__file__).resolve().parents[2]
 #: The `heartbeat` state row the tick writes first; a satellite's tick writes `<key>@<host>` (pack sd:7933).
@@ -582,75 +579,12 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
 
 def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder and those cargo wrote
-    in a proved `target/` (`_cargo_targets`, `_cargo_wrote`); "" when it may go."""
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
-    targets = _cargo_targets(git, work, [line[3:] for line in lines.splitlines() if line.startswith("!! ")],
-                             env=env)
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
-        line.startswith("!! ") and (DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])
-                                    or _cargo_wrote(work, line[3:], targets))))
-
-
-#: The files cargo writes at the top of a `target/`; anything else there is not proved cargo's.
-CARGO_FILES = frozenset({CACHE_TAG, ".rustc_info.json", ".rustdoc_fingerprint.json",
-                         ".future-incompat-report.json"})
-
-
-def _cargo_wrote(work: str, path: str, targets: tuple[str, ...]) -> bool:
-    """Whether the ignored `path` is cargo's under one of the proved `targets`: one of `CARGO_FILES` at the
-    target's top, or a file under a folder cargo locks, a profile (`debug/.cargo-lock`) or a target triple's
-    folder of profiles. ponytail: a file a person puts inside a locked profile still goes, as `cargo clean`
-    would take it; reading cargo's fingerprints would prove each file if that ever matters."""
-    target = next((target for target in targets if path.startswith(target)), None)
-    if target is None:
-        return False
-    first, _, rest = path[len(target):].partition("/")
-    if not rest:
-        return first in CARGO_FILES
-    folder = Path(work, target, first)
-    if folder.is_symlink() or not folder.is_dir():
-        return False
-    if _locked(folder):
-        return True
-    inner, _, below = rest.partition("/")
-    return bool(below) and not Path(folder, inner).is_symlink() and _locked(Path(folder, inner))
-
-
-def _locked(folder: Path) -> bool:
-    """Whether cargo locked `folder` as a profile's output: a plain `.cargo-lock` in it."""
-    lock = folder / ".cargo-lock"
-    return not lock.is_symlink() and lock.is_file()
-
-
-def _cargo_targets(git: Collection[str], work: str, ignored: list[str], *,
-                   env: dict | None = None) -> tuple[str, ...]:
-    """The folders of `work`, each ending in "/", proved cargo's output: a folder named `target` that holds
-    an ignored, plain `CACHEDIR.TAG` starting with `CACHE_SIGNATURE`, beside a `Cargo.toml` git tracks.
-    A tag alone proves nothing: any tool, or a person, may write one into a folder of local files (lead
-    ruling on build/sd-1867). A path git quotes matches no file."""
-    found = {}
-    for path in ignored:
-        folder, _, name = path.rpartition("/")
-        parent, _, last = folder.rpartition("/")
-        tag = Path(work, path)
-        if last != "target" or name != CACHE_TAG or tag.is_symlink() or not tag.is_file():
-            continue
-        try:
-            with tag.open("rb") as handle:
-                signed = handle.read(len(CACHE_SIGNATURE)) == CACHE_SIGNATURE
-        except OSError:
-            signed = False
-        manifest = f"{parent}/Cargo.toml" if parent else "Cargo.toml"
-        if signed and not Path(work, manifest).is_symlink() and Path(work, manifest).is_file():
-            found[manifest] = folder + "/"
-    if not found:
-        return ()
-    tracked = set(_read([*git, "--literal-pathspecs", "-C", work, "ls-files", "-z", "--", *found],
-                        env=env).split("\0"))
-    return tuple(folder for manifest, folder in found.items() if manifest in tracked)
+        line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
 
 
 def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
@@ -946,8 +880,8 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
     may land the same items; the lane squash-merges, so the branch reads
     unpushed forever (pack sd:6909). Kept: an unreleased run on the path, an
     item of any run on it not done, a dirty or unread worktree, one holding an
-    ignored or untracked file outside a `DISPOSABLE` folder or a cargo target, a
-    locked one, a live session other than a builder's. The paths removed.
+    ignored or untracked file outside a `DISPOSABLE` cache, a locked one, a
+    live session other than a builder's. The paths removed.
 
     An item marked done is no proof its commits landed: a squash merge leaves
     no ancestry to check, and an item can be closed by hand. So the branch

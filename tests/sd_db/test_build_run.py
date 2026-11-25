@@ -431,8 +431,8 @@ CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache
 
 
 def cargo(work: Path, *folders: str) -> None:
-    """Commit a `Cargo.toml` in each of `folders` of `work` ("" for its top): cargo's own manifest beside a
-    `target/` is what proves that folder cargo's output."""
+    """Commit a `Cargo.toml` in each of `folders` of `work` ("" for its top), as a real crate has beside
+    its `target/`."""
     for folder in folders or ("",):
         (work / folder).mkdir(parents=True, exist_ok=True)
         (work / folder / "Cargo.toml").write_text("[package]\nname = \"example\"\n")
@@ -3468,10 +3468,9 @@ class Supervise(Case):
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("kept worktree", note["body"])
 
-    def test_cleaning_removes_a_merged_worktree_whose_only_extras_are_build_output(self):
-        """Pack sd:10506: a Rust build leaves an ignored `target/`, so every merged worktree read as not
-        clean and kept 20-60 GB. A signed `CACHEDIR.TAG` in a `target/` beside a tracked `Cargo.toml` proves
-        it cargo's output, and that folder goes with the tree."""
+    def test_cleaning_keeps_a_merged_worktree_that_holds_a_cargo_target(self):
+        """Pack sd:10506, class pass of build/sd-1867: no place in a cargo target proves a file there can be
+        rebuilt, so cleaning keeps the tree, and its note names the first file."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
@@ -3486,7 +3485,9 @@ class Supervise(Case):
         (work / "target" / "debug" / ".cargo-lock").write_bytes(b"")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
-        self.assertFalse(work.exists())
+        self.assertEqual((work / "target" / "debug" / "app").read_bytes(), b"x")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
 
     def test_cleaning_keeps_an_ignored_local_file(self):
         """Review of build/sd-1867, pack sd:6979: `git worktree remove` deletes ignored files, and an ignored
@@ -3509,7 +3510,7 @@ class Supervise(Case):
 
     def test_cleaning_keeps_ignored_config_beside_a_real_cache(self):
         """Lead ruling on build/sd-1867 (notes #82533, #82540, #82541): a cache tag alone never makes ignored
-        files disposable. A hand-edited config in a tagged folder keeps the tree beside a real cargo target."""
+        files disposable. A hand-edited config in a tagged folder keeps the tree, as a cargo target does."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
@@ -3528,7 +3529,7 @@ class Supervise(Case):
         self.assertEqual((work / "target" / ".env").read_text(), "TOKEN=change-me\n")
         self.assertEqual((work / "config" / "local.toml").read_text(), "token = \"change-me\"\n")
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
-        self.assertIn("!! config/CACHEDIR.TAG", note["body"])
+        self.assertIn("kept worktree", note["body"])
 
     def test_cleaning_keeps_an_untracked_file(self):
         """An untracked file is work no merge carried: cleaning still keeps its tree."""
@@ -4980,25 +4981,41 @@ class Sweep(Case):
         self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
         self.assertNotEqual(self.branches(), "")
 
-    def test_build_output_goes_with_the_swept_worktree(self):
-        """Pack sd:10506: an ignored Rust `target/` kept every tree; a signed tag in a `target/` beside a
-        tracked `Cargo.toml` proves it cargo's, at any depth, and it goes with the tree."""
+    def test_no_place_in_a_cargo_target_makes_a_file_disposable(self):
+        """Review of build/sd-1867, the class pass. The class: where an ignored file sits (a folder's name,
+        a cache tag, a manifest beside it, cargo's lock) stood in for proof that the file itself can be
+        rebuilt. Cargo records no list of its files, so each place cargo writes can hold the only copy of
+        a local one. Every ignored file of a complete cargo target keeps the tree, row by row."""
         work = self.blocked()
         self.done()
-        cargo(work, "", "crates/café")
+        cargo(work, "", "crates/one")
         exclude(work, "target/\n")
-        for target in (work / "target", work / "crates" / "café" / "target"):
-            (target / "debug").mkdir(parents=True)
-            (target / "CACHEDIR.TAG").write_text(CACHE_TAG)
-            (target / ".rustc_info.json").write_text("{}\n")
-            (target / "debug" / "app").write_bytes(b"x")
-            (target / "debug" / ".cargo-lock").write_bytes(b"")
-        self.assertEqual(build_run.sweep(self.db), [str(work)])
-        self.assertFalse(work.exists())
+        rows = {
+            "CACHEDIR.TAG": CACHE_TAG,                              # the tag and the manifest
+            ".rustc_info.json": "{}\n",                             # a cargo file name at the top
+            ".env": "TOKEN=change-me\n",                            # a local file at the top
+            "debug/.cargo-lock": "",                                # the lock itself
+            "debug/captured-input.bin": "x",                        # a captured input in a locked profile
+            "debug/deps/captured-input.bin": "x",                   # below a locked profile
+            "debug/build/example-0a1b/out/captured-input.bin": "x",  # a build script's output folder
+            "debug/incremental/captured-input.bin": "x",
+            "example-triple/release/.cargo-lock": "",               # a target triple's profile
+            "example-triple/release/captured-input.bin": "x",
+        }
+        for target in ("target", "crates/one/target"):
+            for path, text in rows.items():
+                (work / target / path).parent.mkdir(parents=True, exist_ok=True)
+                (work / target / path).write_text(text)
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(),
+                         sorted(f"!! {target}/{path}" for target in ("crates/one/target", "target")
+                                for path in rows))
+        self.assertEqual(build_run.sweep(self.db), [])
+        for path in rows:
+            self.assertTrue((work / "target" / path).is_file(), path)
 
     def test_a_folder_only_named_like_build_output_keeps_the_tree(self):
         """Review of build/sd-1867, the class: a folder's name alone made its ignored files disposable, so local
-        files under any `target/`, `node_modules/` or `.venv/` went with the tree. The tool's own tag decides."""
+        files under any `target/`, `node_modules/` or `.venv/` went with the tree. No name decides."""
         work = self.blocked()
         self.done()
         exclude(work, "target/\nnode_modules/\n.venv/\n*.local\n")
@@ -5014,8 +5031,8 @@ class Sweep(Case):
         self.assertEqual((work / "docs" / "target" / "notes.local").read_text(), "mine\n")
 
     def test_the_sweep_keeps_ignored_config_beside_a_real_cache(self):
-        """Lead ruling on build/sd-1867: a tagged folder that is no cargo target is not build output, so its
-        hand-edited config keeps the tree; a real cache beside it changes nothing."""
+        """Lead ruling on build/sd-1867: a cache tag makes no folder build output, so a hand-edited config in
+        one keeps the tree; a real cache (`__pycache__`) beside it changes nothing."""
         work = self.blocked()
         self.done()
         cargo(work)
@@ -5027,86 +5044,11 @@ class Sweep(Case):
         (work / "__pycache__").mkdir()
         (work / "__pycache__" / "x.pyc").write_bytes(b"x")
         (work / "config" / "local.toml").write_text("mine\n")
-        self.assertEqual(build_run.kept_files(("git",), str(work)), "!! config/CACHEDIR.TAG\n!! config/local.toml\n"
-                                                                    "!! out/CACHEDIR.TAG")
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
+            "!! config/CACHEDIR.TAG", "!! config/local.toml", "!! out/CACHEDIR.TAG",
+            "!! target/.rustc_info.json", "!! target/CACHEDIR.TAG"])
         self.assertEqual(build_run.sweep(self.db), [])
         self.assertEqual((work / "config" / "local.toml").read_text(), "mine\n")
-
-    def test_only_a_proved_cargo_target_is_build_output(self):
-        """The class pass, each way a `target/` is not proved cargo's: no manifest beside it, an ignored or
-        untracked manifest, and a folder of another name beside a manifest."""
-        work = self.blocked()
-        cargo(work, "proved", "other")
-        exclude(work, "target/\nbuild/\nignored/Cargo.toml\n")
-        for folder in ("proved/target", "bare/target", "ignored/target", "untracked/target", "other/build"):
-            (work / folder).mkdir(parents=True)
-            (work / folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
-            (work / folder / ("o.bin" if folder == "other/build" else ".rustc_info.json")).write_bytes(b"x")
-        for folder in ("ignored", "untracked"):
-            (work / folder / "Cargo.toml").write_text("[package]\n")
-        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
-            "?? untracked/Cargo.toml", "!! bare/target/.rustc_info.json", "!! bare/target/CACHEDIR.TAG",
-            "!! ignored/Cargo.toml", "!! ignored/target/.rustc_info.json", "!! ignored/target/CACHEDIR.TAG",
-            "!! other/build/CACHEDIR.TAG", "!! other/build/o.bin",
-            "!! untracked/target/.rustc_info.json", "!! untracked/target/CACHEDIR.TAG"])
-
-    def test_a_local_file_inside_a_cargo_target_keeps_the_tree(self):
-        """Review of build/sd-1867: a proved target dropped every ignored file under it, so a local file
-        placed there went with the tree. Only cargo's own files at its top count, and a folder cargo
-        locks (`.cargo-lock`): a profile such as `debug/`, or a target triple's folder of profiles."""
-        work = self.blocked()
-        self.done()
-        cargo(work)
-        exclude(work, "target/\n")
-        target = work / "target"
-        for folder in ("debug", "example-triple/release", "notes", "plain"):
-            (target / folder).mkdir(parents=True)
-        for path in ("CACHEDIR.TAG",):
-            (target / path).write_text(CACHE_TAG)
-        for path in (".rustc_info.json", "debug/.cargo-lock", "debug/app", "example-triple/release/.cargo-lock",
-                     "example-triple/release/app", ".env", "notes/local.toml", "plain/app"):
-            (target / path).write_bytes(b"x")
-        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
-            "!! target/.env", "!! target/notes/local.toml", "!! target/plain/app"])
-        self.assertEqual(build_run.sweep(self.db), [])
-        self.assertEqual((target / ".env").read_bytes(), b"x")
-
-    def test_only_a_plain_signed_ignored_tag_in_a_folder_marks_a_cache(self):
-        """The class pass, each way a tag is no tag: wrong or empty content, a symlink, a folder of that name,
-        a tracked tag, a tag at the top, and a sibling whose name only starts like the tagged folder's."""
-        work = self.blocked()
-        cargo(work, "", "unsigned", "empty", "linked", "folder", "tracked")
-        exclude(work, "target*/\nout/\nCACHEDIR.TAG\n*.bin\n")
-        cases = {"unsigned": "Signature: 0000\n", "empty": ""}
-        for name, text in cases.items():
-            (work / name / "target").mkdir(parents=True)
-            (work / name / "target" / "CACHEDIR.TAG").write_text(text)
-            (work / name / "target" / ".rustc_info.json").write_bytes(b"x")
-        (work / "real").mkdir()
-        (work / "real" / "CACHEDIR.TAG").write_text(CACHE_TAG)
-        (work / "linked" / "target").mkdir(parents=True)
-        (work / "linked" / "target" / "CACHEDIR.TAG").symlink_to(work / "real" / "CACHEDIR.TAG")
-        (work / "linked" / "target" / ".rustc_info.json").write_bytes(b"x")
-        (work / "folder" / "target" / "CACHEDIR.TAG").mkdir(parents=True)
-        (work / "folder" / "target" / ".rustc_info.json").write_bytes(b"x")
-        (work / "target").mkdir()
-        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
-        (work / "target" / ".rustc_info.json").write_bytes(b"x")
-        (work / "target-notes").mkdir()
-        (work / "target-notes" / "o.bin").write_bytes(b"x")
-        (work / "CACHEDIR.TAG").write_text(CACHE_TAG)
-        (work / "top.bin").write_bytes(b"x")
-        (work / "tracked" / "target").mkdir(parents=True)
-        (work / "tracked" / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
-        support.git(work, "add", "-f", "tracked/target/CACHEDIR.TAG")
-        support.git(work, "commit", "-m", "track a tag")
-        (work / "tracked" / "target" / ".rustc_info.json").write_bytes(b"x")
-        kept = build_run.kept_files(("git",), str(work)).splitlines()
-        self.assertEqual(kept, [
-            "!! CACHEDIR.TAG", "!! empty/target/.rustc_info.json", "!! empty/target/CACHEDIR.TAG",
-            "!! folder/target/.rustc_info.json", "!! linked/target/.rustc_info.json", "!! linked/target/CACHEDIR.TAG",
-            "!! real/CACHEDIR.TAG", "!! target-notes/o.bin", "!! top.bin", "!! tracked/target/.rustc_info.json",
-            "!! unsigned/target/.rustc_info.json", "!! unsigned/target/CACHEDIR.TAG"])
 
     def test_a_tree_with_only_caches_is_swept(self):
         """pack sd:6979: a disposable cache is no reason to keep a tree; another ignored file still is."""
