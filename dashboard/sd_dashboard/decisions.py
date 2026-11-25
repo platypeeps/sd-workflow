@@ -55,9 +55,6 @@ from .tasks_screen import is_scheduled
 
 __all__ = ["answer", "document", "parse", "recommended", "request", "reverse", "reverse_request", "rulings"]
 
-#: A review batch's ref, as `sd_db.review` files it (`REF_SOURCE`, `review:<queue>:<batch>`); named here so Decisions reads
-#: without that module, and a test holds the two equal.
-BATCH_SOURCE, BATCH_PREFIX = "task-ref", "review:"
 #: The longest free-text answer the page posts: a ruling is a line or a short paragraph, not a document.
 ANSWER_MAX = 4000
 #: The days of rulings the page groups by session (pack sd:6015).
@@ -79,7 +76,7 @@ def document(connection, *, now: str | None = None) -> dict:
         if row["kind"] != "question":
             continue
         item = open_items[row["item"]]
-        if item["source"] == BATCH_SOURCE and (item["external_id"] or "").startswith(BATCH_PREFIX):
+        if reads.is_review_batch(item["source"], item["external_id"]):  # sd:10755: `review:<queue>:<batch>` alone
             batched += 1
             continue
         found.append({"note": row["id"], "item": row["item"], "title": item["title"], "repo": item["repo"],

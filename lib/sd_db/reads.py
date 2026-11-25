@@ -20,6 +20,7 @@ assertion was written against.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 from dataclasses import asdict, dataclass
@@ -304,8 +305,19 @@ def open_followups(connection: sqlite3.Connection, *, limit: int = 200) -> list[
 
 
 #: An item that is a review batch, filed under `review.REF_SOURCE` and the ref `review:<queue>:<batch>`. Copied,
-#: as `review` imports `workflow`, which imports this; a test holds the two equal. `IS` keeps a NULL a no (sd:5130).
-REVIEW_BATCH = "(item.source IS 'task-ref' AND substr(item.external_id, 1, 7) IS 'review:')"
+#: as `review` imports `workflow`, which imports this; a test holds the two equal. `IS` and `coalesce` keep a NULL
+#: a no (sd:5130). A review-finding item's `review:<slug>` ref, one name with no second colon, is no batch
+#: (sd:10755); `is_review_batch` is the same test in Python, and a test holds the two equal.
+REVIEW_BATCH_SOURCE = "task-ref"
+REVIEW_BATCH = (f"(item.source IS '{REVIEW_BATCH_SOURCE}' AND coalesce(item.external_id, '') GLOB 'review:?*:?*'"
+                " AND coalesce(item.external_id, '') NOT GLOB 'review:*:*:*')")
+_REVIEW_BATCH_REF = re.compile(r"review:[^:]+:[^:]+")
+
+
+def is_review_batch(source: Any, external_id: Any) -> bool:
+    """Whether an item's ref names a review batch, `review:<queue>:<batch>`, as `REVIEW_BATCH` does in SQL."""
+    return (source == REVIEW_BATCH_SOURCE and isinstance(external_id, str)
+            and _REVIEW_BATCH_REF.fullmatch(external_id) is not None)
 
 
 def repo_in(column: str, keep: set[str | None] | None) -> tuple[str, list[Any]]:

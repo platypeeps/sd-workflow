@@ -1238,8 +1238,8 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
     if args.kind != "decision":
         raise WorkRefusal("--answers records a decision: add --kind decision")
     sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
+    import sd_db.reads as reads  # noqa: PLC0415 - after the helper
     import sd_db.review as review  # noqa: PLC0415 - after the helper
-    from sd_db.review import REF_SOURCE  # noqa: PLC0415 - after the helper
 
     with workflow.transaction(connection):
         asked = connection.execute("SELECT item, kind, resolved_at, body FROM note WHERE id = ?",
@@ -1256,7 +1256,7 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
         # A question with no `Option:` line has no label to rule, so it is answered plainly (sd:8975).
         offers = any((tag := review.TAGGED.match(line)) and tag[1] == "Option"
                      for line in (asked["body"] or "").splitlines())
-        if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:") and (
+        if reads.is_review_batch(item["source"], item["external_id"]) and (
                 offers or getattr(args, "option", None) is not None):
             if _asks_in_batch(review, connection, args.item, args.answers):
                 return _rule_batch(review, workflow, connection, args, body, who, revision)

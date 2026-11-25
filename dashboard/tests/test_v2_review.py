@@ -358,9 +358,21 @@ class TodaysDecisions(ScreenCase):
         self.assertEqual(doc["review"], 7)
         self.assertEqual(ids["open"] in [d["item"] for d in doc["decisions"]], False)
 
-    def test_the_batch_ref_today_names_is_the_one_review_files_under(self):
-        self.assertEqual(decisions.BATCH_SOURCE, review.REF_SOURCE)
-        self.assertTrue("review:labels:C1".startswith(decisions.BATCH_PREFIX))
+    def test_a_review_slug_work_item_is_a_decision_not_a_scoring_tile(self):
+        # sd:10755: a review-finding item's `review:<slug>` ref is no batch; a `review:<queue>:<batch>` that does not
+        # read keeps its "not a review batch" tile (sd:5298).
+        ids = seed(self)
+        slug = self.item("UX terms")
+        self.connection.execute("UPDATE item SET source = 'task-ref', external_id = 'review:mws-ux-terms' WHERE id = ?",
+                                (slug,))
+        self.connection.commit()
+        asked = self.note(slug, "Rename it?\nOption: Yes\nOption: No", kind="question")
+        tiles = [b["item"] for b in review_screen.document(self.connection)["batches"]]
+        self.assertNotIn(slug, tiles)
+        self.assertIn(ids["broken"], tiles)
+        doc = decisions.document(self.connection)
+        self.assertIn(asked, [d["note"] for d in doc["decisions"]])
+        self.assertEqual(doc["review"], 7)
 
 
 class ThePage(unittest.TestCase):

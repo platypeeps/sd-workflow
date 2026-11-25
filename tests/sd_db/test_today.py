@@ -375,7 +375,26 @@ class TheSections(TodayCase):
 
     def test_the_batch_marker_is_the_one_the_review_store_files(self):
         self.assertIn(f"item.source IS '{review.REF_SOURCE}'", reads.REVIEW_BATCH)
-        self.assertIn("substr(item.external_id, 1, 7) IS 'review:'", reads.REVIEW_BATCH)
+        self.assertEqual(reads.REVIEW_BATCH_SOURCE, review.REF_SOURCE)
+
+    def test_a_review_slug_work_item_is_no_batch_and_its_question_is_a_decision(self):
+        """sd:10755: a review-finding item carries `review:<slug>`; only `review:<queue>:<batch>` is a batch."""
+        batch = self.batch("B1", questions=1)
+        slug = self.item("UX terms", source="task-ref", external_id="review:mws-20261124-6acb55b9-ux-terms")
+        asked = add_note(self.connection, slug, "question", "Rename it?\nOption: Yes (Recommended)\nOption: No")
+        self.assertEqual([row["note"] for row in today.decisions(self.connection)], [asked])
+        self.assertEqual(today.review_questions(self.connection), 1)
+        self.assertNotIn(batch, [row["id"] for row in today.decisions(self.connection)])
+        cases = {"review:labels:B1": True, "review:mws-ux-terms": False, "review:a:": False, "review::b": False,
+                 "review:a:b:c": False, "Review:a:b": False, "review:": False, "": False, None: False}
+        for ref, want in cases.items():
+            with self.subTest(ref=ref):
+                self.assertIs(reads.is_review_batch(review.REF_SOURCE, ref), want)
+                sql = self.connection.execute(
+                    f"SELECT {reads.REVIEW_BATCH} FROM (SELECT ? AS source, ? AS external_id) AS item",
+                    (review.REF_SOURCE, ref)).fetchone()[0]
+                self.assertEqual(sql, int(want), "the SQL and Python predicates agree")
+        self.assertFalse(reads.is_review_batch("jira", "review:labels:B1"))
 
     def grill(self, ref="grill:2026-09-07", repo=APP, questions=2):
         """A weekly grill as the KISS audit files it: `sd task add --ref grill:<date>`, then question notes."""
