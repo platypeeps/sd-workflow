@@ -36,6 +36,7 @@ import uuid
 from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from . import hub, paths, reads
 from .database import served_by, transaction
@@ -54,6 +55,7 @@ from .ship import this_host
 from .workflow import item_area, item_blocked_by
 from .writes import (
     UNBUILT,
+    UNCHECKED,
     add_note,
     cancel_unwanted_blocked,
     create_assignment,
@@ -573,7 +575,11 @@ def waiting_on(connection, row, *, riding: Collection[int] = ()) -> str:
         f"SELECT id, status FROM item WHERE id IN ({marks})", named)}
     gone = [other for other in named if other not in found]
     if gone:
-        return f"waits on sd:{gone[0]}, which no longer exists; clear it with sd task edit --blocked-by"
+        # `--blocked-by` replaces the set, so the fix names exactly the items that still exist: a bare
+        # `--clear-blocked-by` would drop live ones too and let the item build before them (pack sd:10691).
+        kept = [other for other in named if other in found]
+        fix = " ".join(f"--blocked-by {other}" for other in kept) if kept else "--clear-blocked-by"
+        return f"waits on sd:{gone[0]}, which no longer exists; drop it with sd task edit {row['id']} {fix}"
     held = [other for other in named if found[other] != "done" and other not in riding]
     return f"waits on {', '.join(f'sd:{other}' for other in held)}" if held else ""
 
@@ -1417,9 +1423,10 @@ def pickup_state(connection, *, now: str | None = None) -> dict:
     return {"on": value == "on", "value": value, "since": row["timestamp"] if row else None}
 
 
-def set_pickup(connection, on: bool, *, now: str | None = None) -> dict:
-    """On writes "on"; Off writes none. The state after."""
-    set_setting(connection, AUTO_PICKUP, "on" if on else None)
+def set_pickup(connection, on: bool, *, now: str | None = None, before: Any = UNCHECKED) -> dict:
+    """On writes "on"; Off writes none. The state after. `before`, when given, is the value the caller read:
+    one that moved since is `SettingStale`, and nothing is written (pack sd:10001)."""
+    set_setting(connection, AUTO_PICKUP, "on" if on else None, before=before)
     return pickup_state(connection, now=now)
 
 
@@ -2102,10 +2109,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
 
 
 def queued_fresh(connection, repo: str) -> list[dict]:
-    """`repo`'s queued fresh builds (no parent, never run), as `{id, title, priority}` in queue order: the rows a
-    claim bundles with a new press, for the Build dialog's plan (pack sd:9484)."""
+    """`repo`'s queued fresh builds (no parent, never run), as `{id, title, priority, fields}` in queue order: the
+    rows a claim bundles with a new press, for the Build dialog's plan (pack sd:9484)."""
     return [dict(row) for row in connection.execute(
-        "SELECT item.id, item.title, item.priority FROM assignment JOIN item ON item.id = assignment.item "
+        "SELECT item.id, item.title, item.priority, item.fields FROM assignment JOIN item ON item.id = assignment.item "
         "WHERE assignment.status = 'queued' AND assignment.scope = ? AND assignment.parent IS NULL "
         "AND assignment.run_count = 0 AND item.repo = ? ORDER BY assignment.queued_at, assignment.id",
         (SCOPE, repo))]
@@ -2246,11 +2253,12 @@ def _work_repo(connection, row) -> str | None:
 
 
 def _refuse(connection, row, reason: str) -> None:
-    """End one queued build `blocked` with why the claim did not take it; its item stays as it is."""
+    """End one queued build `blocked` with why the claim did not take it; its item stays as it is. A row no longer
+    queued, such as one this claim refused already, writes no second note (pack sd:9862)."""
     reason += "; not built"
-    connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? "
-                       "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"]))
-    add_note(connection, row["item"], "comment", f"Build assignment {row['id']} blocked: {reason}")
+    if connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? "
+                          "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"])).rowcount:
+        add_note(connection, row["item"], "comment", f"Build assignment {row['id']} blocked: {reason}")
 
 
 #: The result `_refuse` writes on a build the hub blocked on another host's quiet dispatcher.

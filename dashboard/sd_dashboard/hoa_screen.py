@@ -69,6 +69,9 @@ FILES = {
     "alarms": ("alarm-events.csv", "datetime", ("kind", "event", "notified", "minutes")),
 }
 
+#: The daily feeds whose newest row dates the export; the alarm log has no cadence, so it carries no age state.
+FEEDS = (FILES["analog"][0], FILES["pump"][0])
+
 #: The trend series' problem levels (sd:4969): the hoa checkout states its levels in prose only (the tank's fire floor),
 #: so the `dashboard.hoa_thresholds` setting row holds them (sd:5109). The file it replaced is read only while the
 #: database has never held the row (`setting_rows.text`).
@@ -125,7 +128,7 @@ def _csv(path: Path, stamp: str, columns: tuple[str, ...]) -> list[dict]:
 
 
 def _mission(folder: Path | None, today: date) -> dict:
-    out = {"dir": str(folder or ""), "error": "", "files": [], "latest": "", "age_days": None, "stale": False,
+    out = {"dir": str(folder or ""), "error": "", "files": [], "latest": "", "age_days": None, "stale": False, "state": "unknown",
            "analog": [], "pump": [], "alarms": [], "alarms_today": {"count": None, "reason": "", "acked": 0}}
     if folder is None:
         out["error"] = "no export folder: no repo named hoa is registered"
@@ -149,11 +152,17 @@ def _mission(folder: Path | None, today: date) -> dict:
     broken = [f["error"] for f in out["files"] if f["error"]]
     if broken:
         out["error"] = "; ".join(broken)
-    days = [f["latest"][:10] for f in out["files"] if f["latest"]]
-    if days:
-        out["latest"] = max(days)
+    for f in out["files"]:
+        f["age_days"] = (today - _day(f["latest"])).days if f["latest"] else None
+        f["state"] = None if f["name"] not in FEEDS else _freshness(f["age_days"])
+    # sd:10589: each feed answers for itself; a fresh sibling cannot cover a stale or missing one.
+    feeds = [f for f in out["files"] if f["name"] in FEEDS]
+    states = {f["state"] for f in feeds}
+    out["state"] = "unknown" if "unknown" in states or len(feeds) < len(FEEDS) else "stale" if "stale" in states else "current"
+    out["stale"] = out["state"] == "stale"
+    if out["state"] != "unknown":
+        out["latest"] = min(f["latest"][:10] for f in feeds)
         out["age_days"] = (today - _day(out["latest"])).days
-        out["stale"] = out["age_days"] > STALE_DAYS
     alarms = next((f for f in out["files"] if f["name"] == FILES["alarms"][0]), None)
     if alarms and not alarms["error"]:
         if alarms["latest"][:10] == today.isoformat():
@@ -164,6 +173,10 @@ def _mission(folder: Path | None, today: date) -> dict:
     elif alarms:
         out["alarms_today"]["reason"] = alarms["error"]
     return out
+
+
+def _freshness(age: int | None) -> str:
+    return "unknown" if age is None else "stale" if age > STALE_DAYS else "current"
 
 
 def thresholds(connection, path: Path | None = None) -> dict:
@@ -506,6 +519,8 @@ def document(connection, *, now: str, jobs=None) -> dict:
     ages = sources(place) if not problems else {"error": problems[0], "rows": [], "command": "", "repo": ""}
     if ages["rows"]:
         _refresh_jobs(connection, ages["rows"], jobs or operations.LaunchdBackend())
+    swept = sweep.status(place) if not problems else {**sweep.status(None), "error": problems[0]}
+    downloads = {source: _download(source, place) for source in hoa_download.SOURCES} if place else {}
     return {
         "read": now,
         "config": {"state": state, "source": "the repo table", "problems": problems},
@@ -516,19 +531,47 @@ def document(connection, *, now: str, jobs=None) -> dict:
         "items": items,
         "thresholds": thresholds(connection),
         "sources": ages,
-        "sweep": sweep.status(place) if not problems else {**sweep.status(None), "error": problems[0]},
-        "downloads": {source: _download(source, place) for source in hoa_download.SOURCES} if place else {},
+        "sweep": swept,
+        "downloads": downloads,
         "attention": _attention(mission, items),
+        "status": _status(ages, swept, downloads),
     }
+
+
+#: The fields of a download's status that move while it runs; its log tail is left out, as it moves on every line.
+DOWNLOAD_STATE = ("running", "state", "phase", "reason", "finished")
+
+
+def _status(ages: dict, swept: dict, downloads: dict) -> dict:
+    """sd:10610: what a running refresh job, sweep or download has to say, and nothing more. `running` is whether any
+    runs; `parts` is the state the page compares with its last full read's, which it reads again only on a change."""
+    jobs = {row.get("source"): [row["job"].get("state"), row["job"].get("last_exit")]
+            for row in ages.get("rows", []) if isinstance(row.get("job"), dict)}
+    parts = {"jobs": jobs, "sweep": [swept.get("running"), swept.get("error"), swept.get("last")],
+             "downloads": {source: [out.get(key) for key in DOWNLOAD_STATE] for source, out in downloads.items()}}
+    running = (any(state == "running" for state, _ in jobs.values()) or bool(swept.get("running"))
+               or any(out.get("running") for out in downloads.values()))
+    return {"running": running, "parts": parts}
+
+
+def status(connection, *, now: str, jobs=None) -> dict:
+    """`GET /api/hoa/status` (sd:10610): `document`'s `status`, read without the map, the export or its trends."""
+    _, place, problems = checkout(connection)
+    ages = sources(place) if not problems else {"rows": []}
+    if ages["rows"]:
+        _refresh_jobs(connection, ages["rows"], jobs or operations.LaunchdBackend())
+    swept = sweep.status(place) if not problems else {**sweep.status(None), "error": problems[0]}
+    downloads = {source: hoa_download.status(source, place) for source in hoa_download.SOURCES} if place else {}
+    return {"read": now, **_status(ages, swept, downloads)}
 
 
 def _attention(mission: dict, items: dict) -> dict:
     """The rail badge (sd:3446): the annunciator cells that can light, as hoa.js draws them: alarms today, overdue or
-    soon items, and a stale export. Water, tank, pumps and aquifer are never lit."""
+    soon items, and a stale daily feed. Water, tank, pumps and aquifer are never lit."""
     from .v2.pages import attention
 
     states = [r["state"] for r in items["rows"]] if not items["error"] else []
     cells = ["warning" if mission["alarms_today"]["count"] else "",
              "warning" if "warning" in states else "caution" if "caution" in states else "",
-             "caution" if mission["latest"] and mission["stale"] else ""]
+             "caution" if mission["state"] == "stale" else ""]
     return attention(cells, {"caution": "HOA annunciator cells", "warning": "HOA annunciator cells", "ok": "HOA water system"})
