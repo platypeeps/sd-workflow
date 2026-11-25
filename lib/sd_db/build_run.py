@@ -582,8 +582,8 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
 
 def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder or a proved cargo
-    `target/` (`_cargo_targets`); "" when it may go."""
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder and those cargo wrote
+    in a proved `target/` (`_cargo_targets`, `_cargo_wrote`); "" when it may go."""
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
     targets = _cargo_targets(git, work, [line[3:] for line in lines.splitlines() if line.startswith("!! ")],
@@ -591,7 +591,38 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and (DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])
-                                    or line[3:].startswith(targets))))
+                                    or _cargo_wrote(work, line[3:], targets))))
+
+
+#: The files cargo writes at the top of a `target/`; anything else there is not proved cargo's.
+CARGO_FILES = frozenset({CACHE_TAG, ".rustc_info.json", ".rustdoc_fingerprint.json",
+                         ".future-incompat-report.json"})
+
+
+def _cargo_wrote(work: str, path: str, targets: tuple[str, ...]) -> bool:
+    """Whether the ignored `path` is cargo's under one of the proved `targets`: one of `CARGO_FILES` at the
+    target's top, or a file under a folder cargo locks, a profile (`debug/.cargo-lock`) or a target triple's
+    folder of profiles. ponytail: a file a person puts inside a locked profile still goes, as `cargo clean`
+    would take it; reading cargo's fingerprints would prove each file if that ever matters."""
+    target = next((target for target in targets if path.startswith(target)), None)
+    if target is None:
+        return False
+    first, _, rest = path[len(target):].partition("/")
+    if not rest:
+        return first in CARGO_FILES
+    folder = Path(work, target, first)
+    if folder.is_symlink() or not folder.is_dir():
+        return False
+    if _locked(folder):
+        return True
+    inner, _, below = rest.partition("/")
+    return bool(below) and not Path(folder, inner).is_symlink() and _locked(Path(folder, inner))
+
+
+def _locked(folder: Path) -> bool:
+    """Whether cargo locked `folder` as a profile's output: a plain `.cargo-lock` in it."""
+    lock = folder / ".cargo-lock"
+    return not lock.is_symlink() and lock.is_file()
 
 
 def _cargo_targets(git: Collection[str], work: str, ignored: list[str], *,

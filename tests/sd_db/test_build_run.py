@@ -3483,6 +3483,7 @@ class Supervise(Case):
         (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
         (work / "target" / ".rustc_info.json").write_text("{}\n")
         (work / "target" / "debug" / "app").write_bytes(b"x")
+        (work / "target" / "debug" / ".cargo-lock").write_bytes(b"")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
         self.assertFalse(work.exists())
@@ -3519,10 +3520,12 @@ class Supervise(Case):
         for folder in (work / "target", work / "config"):
             folder.mkdir()
             (folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
-        (work / "target" / "app").write_bytes(b"x")
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
         (work / "config" / "local.toml").write_text("token = \"change-me\"\n")
+        (work / "target" / ".env").write_text("TOKEN=change-me\n")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "target" / ".env").read_text(), "TOKEN=change-me\n")
         self.assertEqual((work / "config" / "local.toml").read_text(), "token = \"change-me\"\n")
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("!! config/CACHEDIR.TAG", note["body"])
@@ -4989,6 +4992,7 @@ class Sweep(Case):
             (target / "CACHEDIR.TAG").write_text(CACHE_TAG)
             (target / ".rustc_info.json").write_text("{}\n")
             (target / "debug" / "app").write_bytes(b"x")
+            (target / "debug" / ".cargo-lock").write_bytes(b"")
         self.assertEqual(build_run.sweep(self.db), [str(work)])
         self.assertFalse(work.exists())
 
@@ -5019,7 +5023,7 @@ class Sweep(Case):
         for folder in ("target", "config", "out"):
             (work / folder).mkdir()
             (work / folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
-        (work / "target" / "app").write_bytes(b"x")
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
         (work / "__pycache__").mkdir()
         (work / "__pycache__" / "x.pyc").write_bytes(b"x")
         (work / "config" / "local.toml").write_text("mine\n")
@@ -5037,14 +5041,35 @@ class Sweep(Case):
         for folder in ("proved/target", "bare/target", "ignored/target", "untracked/target", "other/build"):
             (work / folder).mkdir(parents=True)
             (work / folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
-            (work / folder / "o.bin").write_bytes(b"x")
+            (work / folder / ("o.bin" if folder == "other/build" else ".rustc_info.json")).write_bytes(b"x")
         for folder in ("ignored", "untracked"):
             (work / folder / "Cargo.toml").write_text("[package]\n")
         self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
-            "?? untracked/Cargo.toml", "!! bare/target/CACHEDIR.TAG", "!! bare/target/o.bin",
-            "!! ignored/Cargo.toml", "!! ignored/target/CACHEDIR.TAG", "!! ignored/target/o.bin",
+            "?? untracked/Cargo.toml", "!! bare/target/.rustc_info.json", "!! bare/target/CACHEDIR.TAG",
+            "!! ignored/Cargo.toml", "!! ignored/target/.rustc_info.json", "!! ignored/target/CACHEDIR.TAG",
             "!! other/build/CACHEDIR.TAG", "!! other/build/o.bin",
-            "!! untracked/target/CACHEDIR.TAG", "!! untracked/target/o.bin"])
+            "!! untracked/target/.rustc_info.json", "!! untracked/target/CACHEDIR.TAG"])
+
+    def test_a_local_file_inside_a_cargo_target_keeps_the_tree(self):
+        """Review of build/sd-1867: a proved target dropped every ignored file under it, so a local file
+        placed there went with the tree. Only cargo's own files at its top count, and a folder cargo
+        locks (`.cargo-lock`): a profile such as `debug/`, or a target triple's folder of profiles."""
+        work = self.blocked()
+        self.done()
+        cargo(work)
+        exclude(work, "target/\n")
+        target = work / "target"
+        for folder in ("debug", "example-triple/release", "notes", "plain"):
+            (target / folder).mkdir(parents=True)
+        for path in ("CACHEDIR.TAG",):
+            (target / path).write_text(CACHE_TAG)
+        for path in (".rustc_info.json", "debug/.cargo-lock", "debug/app", "example-triple/release/.cargo-lock",
+                     "example-triple/release/app", ".env", "notes/local.toml", "plain/app"):
+            (target / path).write_bytes(b"x")
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
+            "!! target/.env", "!! target/notes/local.toml", "!! target/plain/app"])
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((target / ".env").read_bytes(), b"x")
 
     def test_only_a_plain_signed_ignored_tag_in_a_folder_marks_a_cache(self):
         """The class pass, each way a tag is no tag: wrong or empty content, a symlink, a folder of that name,
@@ -5056,17 +5081,17 @@ class Sweep(Case):
         for name, text in cases.items():
             (work / name / "target").mkdir(parents=True)
             (work / name / "target" / "CACHEDIR.TAG").write_text(text)
-            (work / name / "target" / "o.bin").write_bytes(b"x")
+            (work / name / "target" / ".rustc_info.json").write_bytes(b"x")
         (work / "real").mkdir()
         (work / "real" / "CACHEDIR.TAG").write_text(CACHE_TAG)
         (work / "linked" / "target").mkdir(parents=True)
         (work / "linked" / "target" / "CACHEDIR.TAG").symlink_to(work / "real" / "CACHEDIR.TAG")
-        (work / "linked" / "target" / "o.bin").write_bytes(b"x")
+        (work / "linked" / "target" / ".rustc_info.json").write_bytes(b"x")
         (work / "folder" / "target" / "CACHEDIR.TAG").mkdir(parents=True)
-        (work / "folder" / "target" / "o.bin").write_bytes(b"x")
+        (work / "folder" / "target" / ".rustc_info.json").write_bytes(b"x")
         (work / "target").mkdir()
         (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
-        (work / "target" / "o.bin").write_bytes(b"x")
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
         (work / "target-notes").mkdir()
         (work / "target-notes" / "o.bin").write_bytes(b"x")
         (work / "CACHEDIR.TAG").write_text(CACHE_TAG)
@@ -5075,13 +5100,13 @@ class Sweep(Case):
         (work / "tracked" / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
         support.git(work, "add", "-f", "tracked/target/CACHEDIR.TAG")
         support.git(work, "commit", "-m", "track a tag")
-        (work / "tracked" / "target" / "o.bin").write_bytes(b"x")
+        (work / "tracked" / "target" / ".rustc_info.json").write_bytes(b"x")
         kept = build_run.kept_files(("git",), str(work)).splitlines()
         self.assertEqual(kept, [
-            "!! CACHEDIR.TAG", "!! empty/target/CACHEDIR.TAG", "!! empty/target/o.bin",
-            "!! folder/target/o.bin", "!! linked/target/CACHEDIR.TAG", "!! linked/target/o.bin",
-            "!! real/CACHEDIR.TAG", "!! target-notes/o.bin", "!! top.bin", "!! tracked/target/o.bin",
-            "!! unsigned/target/CACHEDIR.TAG", "!! unsigned/target/o.bin"])
+            "!! CACHEDIR.TAG", "!! empty/target/.rustc_info.json", "!! empty/target/CACHEDIR.TAG",
+            "!! folder/target/.rustc_info.json", "!! linked/target/.rustc_info.json", "!! linked/target/CACHEDIR.TAG",
+            "!! real/CACHEDIR.TAG", "!! target-notes/o.bin", "!! top.bin", "!! tracked/target/.rustc_info.json",
+            "!! unsigned/target/.rustc_info.json", "!! unsigned/target/CACHEDIR.TAG"])
 
     def test_a_tree_with_only_caches_is_swept(self):
         """pack sd:6979: a disposable cache is no reason to keep a tree; another ignored file still is."""
