@@ -206,6 +206,38 @@ class SharedTransitions(WritingCase):
         self.assertEqual(state["item"]["ready_digest"], self.digest)
         self.assertIn("status: ready", self.index.read_text())
 
+    def index_hashes(self):
+        gates = json.loads(piece_state(self.db, self.item)["item"]["fields"])["writing_gates"]
+        return {name: gates[name].get("index_sha256") for name in ("fact-check", "adversarial")}
+
+    def test_gate_binds_index_bytes_a_layout_edit_moves_the_hash(self):
+        """sd:10719. The digest ignores whitespace; the gate also binds index.md bytes for a render check."""
+        self.gates()
+        held = hashlib.sha256(self.index.read_bytes()).hexdigest()
+        self.assertEqual(self.index_hashes(), {"fact-check": held, "adversarial": held})
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\n\nclaim."))
+        self.assertEqual(piece_state(self.db, self.item)["writing"]["gates"]["digest"], self.digest)
+        self.assertNotEqual(hashlib.sha256(self.index.read_bytes()).hexdigest(), held)
+        self.gates()
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+
+    def test_the_packs_own_frontmatter_rewrites_carry_the_index_hash(self):
+        """sd:10719. A file-owned ready or metadata rewrite moves index.md bytes; the gate hash follows."""
+        self.gates()
+        change_stage(self.db, self.item, "ready", who="operator")
+        current = hashlib.sha256(self.index.read_bytes()).hexdigest()
+        self.assertEqual(set(self.index_hashes().values()), {current})
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+
+    def test_a_rewrite_leaves_a_hash_for_other_bytes_alone(self):
+        """sd:10719. A gate hash for bytes edited by hand after the gate stays stale through a rewrite."""
+        self.gates()
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\nclaim."))
+        stale = self.index_hashes()
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        self.assertEqual(self.index_hashes(), stale)
+
     def test_ready_refuses_failed_or_unresolved_reviews(self):
         self.gates()
         record_gate(self.db, self.item, "adversarial", verdict="pass",

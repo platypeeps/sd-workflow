@@ -226,6 +226,20 @@ def _hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _carry_index_hash(fields: dict, before: bytes, after: bytes) -> None:
+    """The pack's own frontmatter rewrite moves index.md bytes: a gate bound to the old bytes moves with them (sd:10719).
+
+    A gate bound to other bytes, a hand edit after it, stays stale, so a render still refuses it.
+    """
+    gates = fields.get("writing_gates")
+    if not isinstance(gates, dict):
+        return
+    old, new = _hash(before), _hash(after)
+    for gate in gates.values():
+        if isinstance(gate, dict) and gate.get("index_sha256") == old:
+            gate["index_sha256"] = new
+
+
 def _draft(text: str) -> str | None:
     """The prose after `## Draft`, the part every gate reviews; None without that heading."""
     return text.split("## Draft", 1)[1] if "## Draft" in text else None
@@ -797,7 +811,9 @@ def record_gate(connection: sqlite3.Connection, item: int, artifact: str, *, ver
             raise WorkflowError("stored writing gate metadata is malformed")
         record = {"verdict": verdict, "findings": held, "reason": reason, "who": who,
                   "draft_digest": snapshot["digest"], "generation": row["gate_generation"],
-                  "evidence_sha256": snapshot["hashes"][artifact], "research_sha256": snapshot["hashes"]["research"]}
+                  "evidence_sha256": snapshot["hashes"][artifact], "research_sha256": snapshot["hashes"]["research"],
+                  # The draft digest ignores whitespace; a render binds the exact bytes it lays out (sd:10719).
+                  "index_sha256": snapshot["hashes"]["index"]}
         existing = gates.get(artifact)
         if isinstance(existing, dict) and {key: value for key, value in existing.items() if key != "at"} == record:
             return piece_state(connection, item)
@@ -1091,6 +1107,7 @@ def change_stage(connection: sqlite3.Connection, item: int, target: str, *, acto
                 source, original = snapshot["path"], snapshot["files"]["index"]
                 text = _rewrite(snapshot["text"], {key: metadata.get(key) for key in ("status", "updated", "published")})
                 _replace(source, text.encode("utf-8"))
+                _carry_index_hash(fields, original, text.encode("utf-8"))
                 changed["body"] = {"source": text}
             set_item_fields(connection, item, **changed)
             _transition(connection, item, STAGE_STATUS[target], who=who, reason=reason or f"writing {current} -> {target}")
@@ -1191,6 +1208,7 @@ def update_piece_metadata(connection: sqlite3.Connection, item: int, changes: di
                 source, original = snapshot["path"], snapshot["files"]["index"]
                 text = _rewrite(snapshot["text"], {key: metadata[key] for key in changes})
                 _replace(source, text.encode("utf-8"))
+                _carry_index_hash(fields, original, text.encode("utf-8"))
                 values["body"] = {"source": text}
             set_item_fields(connection, item, **values)
             add_note(connection, item, "comment", f"Updated writing metadata: {', '.join(sorted(changes))}", session=who)
