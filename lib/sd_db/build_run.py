@@ -1573,12 +1573,14 @@ class Supervisor:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
         unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
+        # `sd-review` runs no gate on a blocking report: a pass made from one here runs the checks (sd:10286).
+        ungated = unmanaged or answer["status"] == "blocking"
         # Read before `file_new_findings` rebuilds the answer: only a whole report may settle to a pass.
         whole = bool(answer.get("complete")) and (not prior or bool(answer.get("covers")))
         # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
         if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
             new, blockers = self.deferred(answer, prior, head)
-            if unmanaged and not blockers:  # before any rebuttal: a failed check means a fix round follows
+            if ungated and not blockers:  # before any rebuttal: a failed check means a fix round follows
                 checked = self.own_checks(head)
             answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
             if isinstance(checked, dict):
@@ -1587,7 +1589,7 @@ class Supervisor:
         if whole and answer["status"] == "blocking" and (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
             answer = self.settled(answer, head)
         if answer["status"] in ("clean", "advisory", "skipped"):
-            failed = checked if checked is not None else self.own_checks(head) if unmanaged else []
+            failed = checked if checked is not None else self.own_checks(head) if ungated else []
             if isinstance(failed, dict):
                 return failed
             if failed:

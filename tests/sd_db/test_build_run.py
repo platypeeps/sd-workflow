@@ -1163,7 +1163,8 @@ class Supervise(Case):
         self.assertIn("1. work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
 
-    def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2", rule="rule_apart"):
+    def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2", rule="rule_apart",
+                     **options):
         """A run whose class pass left `last`'s blockers, its ruling round writing `rulings` (text, or rows).
         `rule`: the round's fix commits apart from the blockers' file, or (`rule`) to that file."""
         R = build_run.REVIEW_ROUNDS
@@ -1173,7 +1174,7 @@ class Supervise(Case):
             (self.plans / "rulings.txt").write_text(rulings if isinstance(rulings, str) else json.dumps(rulings))
         self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), rule],
                   sd_review=[*["blocking"] * R, last, *after])
-        return self.supervisor().run()
+        return self.supervisor(**options).run()
 
     def decisions(self, item=None):
         return [body for (body,) in self.db.execute(
@@ -1231,6 +1232,20 @@ class Supervise(Case):
                                           after=after)
                 self.assertEqual(ended["outcome"], "blocked", ended)
                 self.assertIn("work.txt:1 a blocker", self.latest()["detail"])
+
+    def test_a_settled_review_runs_the_gate_its_blocking_report_skipped(self):
+        """Review of sd:10286: `sd-review` runs no gate on a blocking report, so a managed run whose ruled
+        repeat settles to a pass runs the repository's checks before it enqueues; a failed one delivers
+        nothing."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")])
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",), checks=lambda work: [[sys.executable, "-c", "exit(3)"]])
+        self.assertEqual(len(self.calls("gate")), 1, "the settled pass ran no gate")
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
 
     def test_a_ruled_repeat_in_an_incomplete_review_is_no_pass(self):
         """Review of sd:10286: clearing a ruled blocker turns no short or uncovered review into a pass. A
@@ -1785,6 +1800,20 @@ class Supervise(Case):
         filed = self.db.execute("SELECT id, title, repo FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
         self.assertEqual(len(filed), 1, "no follow-up item was filed")
         self.assertIn("far.txt:1", filed[0]["title"])
+
+    def test_a_deferral_that_clears_a_managed_review_runs_its_gate(self):
+        """Class pass on sd:10286: a deferral turns a blocking report, on which `sd-review` ran no gate, into
+        a pass; a managed run runs the repository's checks before it enqueues, and a failure goes back."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")])
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
+        fail = [sys.executable, "-c", "exit(3)"]
+        self.supervisor(checks=lambda work: [fail]).run()
+        self.assertGreaterEqual(len(self.calls("gate")), 1, "the deferral's pass ran no gate")
+        self.assertEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
 
     def test_a_filed_follow_up_is_a_rebuttal_the_lane_review_honours(self):
         """Review of sd:9769: the lane reviews the branch again; the same finding must not block it there."""
