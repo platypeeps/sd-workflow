@@ -700,7 +700,8 @@ class ReviewCompanions(WritingCase):
     def run_review(self, report=REPORT):
         brief = adversarial_brief(self.db, self.item)
         return brief, record_adversarial(self.db, self.item, report, digest=brief["digest"],
-                                         record=brief["record"], generation=brief["generation"])
+                                         record=brief["record"], generation=brief["generation"],
+                                         index_sha256=brief["index_sha256"])
 
     def reconcile(self, artifact="adversarial"):
         return reconcile_companion(self.db, self.item, artifact, note="Each finding was checked against the revision.")
@@ -730,7 +731,8 @@ class ReviewCompanions(WritingCase):
         brief, result = self.run_review()
         text = (self.folder / "adversarial.md").read_text()
         lines = text.split("\n\n")
-        self.assertRegex(lines[0], rf"^<!-- reconciled-with-draft: {brief['digest']} on \d{{4}}-\d\d-\d\d gen=0 -->$")
+        self.assertRegex(lines[0], rf"^<!-- reconciled-with-draft: {brief['digest']} on \d{{4}}-\d\d-\d\d gen=0 "
+                                   rf"index={brief['index_sha256']} -->$")
         self.assertEqual(lines[1], brief["record"])
         self.assertIn("Findings are HYPOTHESES", lines[2])
         self.assertTrue(text.endswith(REPORT))
@@ -755,10 +757,11 @@ class ReviewCompanions(WritingCase):
         self.assertEqual(result["index_sha256"], hashlib.sha256(self.index.read_bytes()).hexdigest())
         self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} -->$")
 
-    def test_a_run_refuses_a_malformed_index_hash(self):
+    def test_a_run_refuses_a_missing_or_malformed_index_hash(self):
         self.write_draft(SENTENCES)
         brief = adversarial_brief(self.db, self.item)
-        for extra in ({"index_sha256": "abc"}, {"index_sha256": 5}, {"index_sha256": brief["index_sha256"].upper()}):
+        for extra in ({"index_sha256": None}, {"index_sha256": "abc"}, {"index_sha256": 5},
+                      {"index_sha256": brief["index_sha256"].upper()}):
             with self.assertRaisesRegex(WorkflowError, "brief"):
                 record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
                                    generation=brief["generation"], **extra)
@@ -835,12 +838,66 @@ class ReviewCompanions(WritingCase):
             record_gate(self.db, self.item, "adversarial", verdict="pass", findings=[], who="operator",
                         reason="Reviewed full report", reviewed_digest=brief["digest"])
 
+    def restamp(self, change):
+        report = self.folder / "adversarial.md"
+        first, rest = report.read_text().split("\n", 1)
+        report.write_text(change(first) + "\n" + rest)
+
+    def test_a_reconcile_refuses_an_attestation_it_cannot_read(self):
+        """sd:10719. A malformed or repeated `index=` is refused, never dropped: a drop clears the gate."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        seen = brief["index_sha256"]
+        bare = f"<!-- reconciled-with-draft: {brief['digest']} on 2026-09-08 gen=0 -->"
+        for name, change in (("malformed", lambda line: line.replace(seen, seen[:-1])),
+                             ("upper", lambda line: line.replace(seen, seen.upper())),
+                             ("repeated", lambda line: line.replace(" -->", f" index={'0' * 64} -->")),
+                             ("two lines", lambda line: f"{line}\n{line}")):
+            with self.subTest(name):
+                self.attested_run()
+                self.restamp(change)
+                before = (self.folder / "adversarial.md").read_bytes()
+                with self.assertRaisesRegex(WorkflowError, "index stamp"):
+                    self.reconcile()
+                self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)
+        # An attestation on a second stamp line is kept, not lost behind a first line that has none.
+        self.attested_run()
+        self.restamp(lambda line: f"{bare}\n{line}")
+        self.reconcile()
+        self.assertRegex(self.stamp_line(), rf" index={seen} -->$")
+
+    def test_a_gate_refuses_a_run_report_that_names_no_index_bytes(self):
+        """sd:10719. A report the pack's run wrote always attests; one that lost its `index=` certifies nothing."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.restamp(lambda line: line.replace(f" index={brief['index_sha256']}", ""))
+        before = piece_state(self.db, self.item)
+        with self.assertRaisesRegex(WorkflowError, "names no index.md bytes"):
+            self.adversarial_gate(brief["digest"])
+        self.assertEqual(piece_state(self.db, self.item), before)
+
+    def test_a_gate_refuses_a_stamp_with_two_index_hashes(self):
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.restamp(lambda line: line.replace(" -->", f" index={'0' * 64} -->"))
+        with self.assertRaisesRegex(WorkflowError, "index stamp"):
+            self.adversarial_gate(brief["digest"])
+
+    def test_a_reconcile_after_the_gate_leaves_the_gate_stale(self):
+        """sd:10719. The gate binds the report's bytes, so no reconcile changes what a recorded gate attests."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.adversarial_gate(brief["digest"])
+        self.reconcile()
+        self.assertIn("adversarial evidence or research changed after its gate record",
+                      readiness(self.db, self.item)["problems"])
+
     def test_a_draft_changed_during_the_run_leaves_a_stale_report(self):
         self.write_draft(SENTENCES)
         brief = adversarial_brief(self.db, self.item)
         self.write_draft(SENTENCES[:-1])
         result = record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                                    generation=brief["generation"])
+                                    generation=brief["generation"], index_sha256=brief["index_sha256"])
         self.assertFalse(result["current"])
         self.assertEqual(self.companions()["adversarial"], "stale")
 
@@ -850,7 +907,7 @@ class ReviewCompanions(WritingCase):
         brief = adversarial_brief(self.db, self.item)
         with self.assertRaisesRegex(WorkflowError, "no report"):
             record_adversarial(self.db, self.item, "  \n", digest=brief["digest"], record=brief["record"],
-                               generation=brief["generation"])
+                               generation=brief["generation"], index_sha256=brief["index_sha256"])
         self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)
 
     def test_companion_states_are_missing_unstamped_current_or_stale(self):
@@ -1095,7 +1152,7 @@ class WorktreeCheckout(WritingCase):
         with checkout(str(self.repo), self.worktree):
             brief = adversarial_brief(self.db, self.item)
             record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                               generation=brief["generation"])
+                               generation=brief["generation"], index_sha256=brief["index_sha256"])
         self.assertEqual(brief["root"], str(self.worktree.resolve()))
         self.assertIn(brief["record"], (self.worktree / "content" / self.piece / "adversarial.md").read_text())
         self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)
