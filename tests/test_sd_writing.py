@@ -1,6 +1,7 @@
 """`sd writing import` names the operator to the library that records it."""
 
 import argparse
+import hashlib
 import importlib
 import io
 import json
@@ -266,8 +267,9 @@ class WritingContentCheckout(unittest.TestCase):
         self.assertEqual(0, self.run_verb("list")[0])
 
 
+DRAFT = b"---\ntitle: A\n---\n\n## Draft\n\nProse.\n"
 BRIEF = {"piece": "2026/a", "draft": "content/2026/a/index.md", "research": "content/2026/a/research.md",
-         "research_exists": True, "digest": "0123456789ab", "generation": 2, "index_sha256": "e" * 64, "index_mtime_ns": 5,
+         "research_exists": True, "digest": "0123456789ab", "generation": 2, "index_sha256": hashlib.sha256(DRAFT).hexdigest(),
          "record": "<!-- adversarial-reviewed: words=150 sentences=0123abcd -->", "words": 150}
 
 
@@ -283,7 +285,8 @@ class WritingReview(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
         self.repo = self.tmp / "repo"
-        (self.repo / "content").mkdir(parents=True)
+        (self.repo / "content/2026/a").mkdir(parents=True)
+        (self.repo / BRIEF["draft"]).write_bytes(DRAFT)
         self.stubs = self.tmp / "stubs"
         self.stubs.mkdir()
         self.parser = argparse.ArgumentParser()
@@ -291,6 +294,7 @@ class WritingReview(unittest.TestCase):
         self.connection = Mock()
         self.connect = Mock(return_value=self.connection)
         self.gate = self.stub("adversarial-gate", 'printf "%s\\n" "$@" > "$STUBS/gate.argv"\n'
+                                                  'cat "${5#DRAFT_PATH=}" > "$STUBS/draft.seen"\n'
                                                   'for n in $(seq 120); do printf "word "; done\necho\n')
         self.stub("codex", 'printf "%s\\n" "$@" > "$STUBS/codex.argv"\ncat > "$STUBS/codex.stdin"\n'
                            'while [ $# -gt 0 ]; do\n  if [ "$1" = -o ]; then printf "# Review\\n" > "$2"; fi\n'
@@ -335,25 +339,29 @@ class WritingReview(unittest.TestCase):
     def test_adversarial_renders_the_lens_and_runs_codex_read_only_on_the_checkout(self):
         code, result = self.call("adversarial", "--piece", "2026/a")
         self.assertEqual((code, result["path"]), (0, "content/2026/a/adversarial.md"))
+        handed = (self.stubs / "gate.argv").read_text().splitlines()[4].removeprefix("DRAFT_PATH=")
         self.assertEqual((self.stubs / "gate.argv").read_text().splitlines(),
-                         ["render", "--lens", "writing-draft", "--set", "DRAFT_PATH=content/2026/a/index.md",
+                         ["render", "--lens", "writing-draft", "--set", f"DRAFT_PATH={handed}",
                           "--set", "RESEARCH_PATH=content/2026/a/research.md"])
+        self.assertNotEqual(Path(handed), self.repo / BRIEF["draft"])
+        self.assertEqual((self.stubs / "draft.seen").read_bytes(), DRAFT)
         argv = (self.stubs / "codex.argv").read_text().splitlines()
         self.assertEqual(argv[:6] + argv[7:], ["exec", "-s", "read-only", "-C", str(self.repo), "-o", "-"])
         self.assertTrue(argv[6].endswith("report.md"))
         self.assertTrue((self.stubs / "codex.stdin").read_text().startswith("word word"))
         self.recorded.assert_called_once_with(self.connection, 7, "# Review\n", digest="0123456789ab",
-                                              record=BRIEF["record"], generation=2, index_sha256="e" * 64,
-                                              index_mtime_ns=5)
+                                              record=BRIEF["record"], generation=2,
+                                              index_sha256=BRIEF["index_sha256"])
         self.connect.assert_called_once_with(sd_db, write=False)
         self.connection.close.assert_called_once()
 
-    def test_adversarial_says_when_its_report_attests_no_layout(self):
-        """sd:10719. The mocked run returns no index_sha256: index.md was written while the reviewer read it."""
-        arguments = self.parser.parse_args(["writing", "adversarial", "--piece", "2026/a", "--json"])
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(arguments.handler(arguments), 0)
-        self.assertIn("attests no layout", errors.getvalue())
+    def test_adversarial_refuses_index_bytes_other_than_the_briefs_before_codex(self):
+        """sd:10719. The frozen copy must be the bytes the brief hashed, or the report would attest other bytes."""
+        (self.repo / BRIEF["draft"]).write_bytes(DRAFT + b"\n")
+        with self.assertRaisesRegex(cli.WorkRefusal, "changed while the brief was read"):
+            self.call("adversarial", "--piece", "2026/a")
+        self.assertFalse((self.stubs / "codex.argv").exists())
+        self.recorded.assert_not_called()
 
     def test_adversarial_passes_a_model(self):
         self.call("adversarial", "--piece", "2026/a", "--model", "m1")

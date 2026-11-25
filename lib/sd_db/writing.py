@@ -252,8 +252,6 @@ def _prose_digest(prose: str) -> str:
 
 def _snapshot(row) -> dict:
     path = _path(row["repo"], row["piece"], row["path"])
-    # Before the read: a write that lands between the two then shows as a changed time, never as these bytes' own.
-    mtime_ns = path.stat().st_mtime_ns
     data = path.read_bytes()
     text = data.decode("utf-8")
     prose = _draft(text) or ""
@@ -265,7 +263,7 @@ def _snapshot(row) -> dict:
             if not candidate.resolve().is_relative_to(_disk(row["repo"])):
                 raise WorkflowError(f"{filename} escapes the registered repository")
             files[name] = candidate.read_bytes()
-    return {"path": path, "text": text, "digest": digest, "files": files, "mtime_ns": mtime_ns,
+    return {"path": path, "text": text, "digest": digest, "files": files,
             "hashes": {key: _hash(value) for key, value in files.items()}}
 
 
@@ -966,7 +964,7 @@ def adversarial_brief(connection: sqlite3.Connection, item: int) -> dict:
             "research": draft.with_name(REPORTS["research"]).relative_to(disk).as_posix(),
             "research_exists": "research" in snapshot["files"], "digest": snapshot["digest"],
             "generation": row["gate_generation"], "record": reviewed_record(prose), "words": words,
-            "index_sha256": snapshot["hashes"]["index"], "index_mtime_ns": snapshot["mtime_ns"]}
+            "index_sha256": snapshot["hashes"]["index"]}
 
 
 def _write_report(path: Path, text: str) -> None:
@@ -977,11 +975,10 @@ def _write_report(path: Path, text: str) -> None:
 
 
 def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *, digest: str, record: str,
-                       generation: int, index_sha256: str | None = None,
-                       index_mtime_ns: int | None = None) -> dict:
+                       generation: int, index_sha256: str | None = None) -> dict:
     """Write `adversarial.md` for one run: draft stamp, run record, provenance, then the report.
 
-    `digest`, `record`, `generation`, `index_sha256` and `index_mtime_ns` come from the `adversarial_brief`
+    `digest`, `record`, `generation` and `index_sha256` come from the `adversarial_brief`
     the run reviewed. The result says whether the draft is still that one,
     counts the confidence tags, and quotes the reviewer's verdict line.
     The report is a set of hypotheses; this records which prose it answers
@@ -992,29 +989,23 @@ def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *
     if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{12}", digest) is None
             or not isinstance(record, str) or _REVIEWED.fullmatch(record) is None
             or type(generation) is not int
-            or (index_sha256 is None) != (index_mtime_ns is None)
-            or (index_sha256 is not None and (not isinstance(index_sha256, str) or type(index_mtime_ns) is not int
+            or (index_sha256 is not None and (not isinstance(index_sha256, str)
                                               or re.fullmatch(r"[0-9a-f]{64}", index_sha256) is None))):
         raise WorkflowError("adversarial run needs the digest, run record and generation from its brief")
     row = _piece(connection, item)["item"]
     snapshot = _snapshot(row)
     day = now()[:10]
     target = snapshot["path"].with_name(REPORTS["adversarial"])
-    # The reviewer read index.md from disk while it ran. Its bytes are attested only when the file is the brief's
-    # at the end too, by content and by change time: an edit made and undone meanwhile still moved the time, and
-    # the reviewer may have read it (sd:10719).
-    # ponytail: a writer that restores the old change time is not seen; hand the reviewer a copy if that matters.
-    untouched = (index_sha256 == snapshot["hashes"]["index"]
-                 and index_mtime_ns == snapshot["mtime_ns"] == snapshot["path"].stat().st_mtime_ns)
-    attested = index_sha256 if index_sha256 and untouched else None
-    layout = f" index={attested}" if attested else ""
+    # `index_sha256` names the frozen copy the reviewer read, not the live file: what lands on disk meanwhile, a
+    # restored backup too, changes nothing here, and `record_gate` refuses bytes other than these (sd:10719).
+    layout = f" index={index_sha256}" if index_sha256 else ""
     _write_report(target, f"<!-- reconciled-with-draft: {digest} on {day} gen={generation}{layout} -->\n\n{record}\n\n"
                           f"<!-- codex adversarial review of {row['piece']}, {day}. Findings are HYPOTHESES: "
                           "verify each against the source before acting. Nothing here edited the draft. -->\n\n"
                           + (report if report.endswith("\n") else report + "\n"))
     verdict = re.findall(r"(?im)^.*survive[s]? hostile reading.*$", report)
     return {"piece": row["piece"], "path": target.relative_to(_disk(row["repo"])).as_posix(), "digest": digest,
-            "current": snapshot["digest"] == digest, "index_sha256": attested,
+            "current": snapshot["digest"] == digest, "index_sha256": index_sha256,
             "confidence": {tag: len(re.findall(rf"\b{tag}\b", report)) for tag in ("CERTAIN", "LIKELY", "SPECULATIVE")},
             "verdict": verdict[-1].strip() if verdict else None}
 

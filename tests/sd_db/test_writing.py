@@ -1,12 +1,16 @@
 """One writing lifecycle, snapshot-bound reviews, and reversible cutover."""
 
+import argparse
 import hashlib
+import importlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -733,45 +737,74 @@ class ReviewCompanions(WritingCase):
         brief = adversarial_brief(self.db, self.item)
         between()
         return brief, record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                                         generation=brief["generation"], index_sha256=brief["index_sha256"],
-                                         index_mtime_ns=brief["index_mtime_ns"])
+                                         generation=brief["generation"], index_sha256=brief["index_sha256"])
 
-    def test_a_layout_edit_during_the_run_leaves_no_index_attestation(self):
-        """sd:10719. The reviewer reads the file while it runs: bytes that moved meanwhile are not attested."""
-        self.write_draft(SENTENCES)
-
-        def relaid():
-            self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
-        brief, result = self.attested_run(relaid)
-        self.assertTrue(result["current"])
-        self.assertIsNone(result["index_sha256"])
-        self.assertNotIn("index=", self.stamp_line())
-
-    def test_an_edit_reverted_during_the_run_leaves_no_index_attestation(self):
-        """sd:10719. The same bytes at both ends prove nothing when the file was written in between."""
-        self.write_draft(SENTENCES)
-
-        def touched():
-            stat = self.index.stat()
-            os.utime(self.index, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
-        brief, result = self.attested_run(touched)
-        self.assertIsNone(result["index_sha256"])
-        self.assertNotIn("index=", self.stamp_line())
-
-    def test_an_untouched_run_attests_its_index_bytes(self):
+    def test_a_run_attests_its_brief_index_bytes(self):
         self.write_draft(SENTENCES)
         brief, result = self.attested_run()
         self.assertEqual(result["index_sha256"], hashlib.sha256(self.index.read_bytes()).hexdigest())
         self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} -->$")
 
-    def test_a_run_refuses_half_an_attestation(self):
+    def test_a_run_refuses_a_malformed_index_hash(self):
         self.write_draft(SENTENCES)
         brief = adversarial_brief(self.db, self.item)
-        for extra in ({"index_sha256": brief["index_sha256"]}, {"index_mtime_ns": brief["index_mtime_ns"]},
-                      {"index_sha256": brief["index_sha256"], "index_mtime_ns": True}):
+        for extra in ({"index_sha256": "abc"}, {"index_sha256": 5}, {"index_sha256": brief["index_sha256"].upper()}):
             with self.assertRaisesRegex(WorkflowError, "brief"):
                 record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
                                    generation=brief["generation"], **extra)
+
+    def cli_run(self, during):
+        """Run `sd writing adversarial` with codex stubbed; `during(read)` edits disk, and `read()` is the reviewer
+        reading the draft path it was handed."""
+        with patch.object(sys, "path", [str(Path(__file__).resolve().parents[2] / "bin"), *sys.path]):
+            cli = importlib.import_module("sd_writing")
+        handed: dict = {}
+        read: dict[str, bytes] = {}
+
+        def render(brief):
+            handed.update(brief)
+            return "prompt"
+
+        def codex(root, prompt, **_):
+            during(lambda: read.setdefault("bytes", (Path(root) / handed["draft"]).read_bytes()))
+            return REPORT
+        args = argparse.Namespace(model=None, timeout=60, effort=None)
+        with patch.object(cli, "_render", render), patch.object(cli, "_codex", codex), \
+                redirect_stderr(io.StringIO()):
+            result = cli.adversarial(writing, self.db, self.item, args)
+        return result, read["bytes"]
+
+    def adversarial_gate(self, digest):
+        return record_gate(self.db, self.item, "adversarial", verdict="pass", findings=[], who="operator",
+                           reason="Reviewed full report", reviewed_digest=digest)
+
+    def test_a_run_attests_the_index_bytes_its_reviewer_read(self):
+        """sd:10719. A backup restored mid-review must not certify bytes the reviewer never read."""
+        self.write_draft(SENTENCES)
+        original, stat = self.index.read_bytes(), self.index.stat()
+
+        def relay_then_restore(read):
+            self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
+            read()
+            self.index.write_bytes(original)
+            os.utime(self.index, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        result, seen = self.cli_run(relay_then_restore)
+        self.assertEqual(result["index_sha256"], hashlib.sha256(seen).hexdigest())
+        self.adversarial_gate(result["digest"])
+        gate = json.loads(piece_state(self.db, self.item)["item"]["fields"])["writing_gates"]["adversarial"]
+        self.assertEqual(gate["index_sha256"], hashlib.sha256(seen).hexdigest())
+
+    def test_certify_refuses_index_bytes_other_than_the_reviewer_read(self):
+        """sd:10719. A layout edit mid-review leaves disk bytes the reviewer did not read: certify refuses."""
+        self.write_draft(SENTENCES)
+        def read_then_relay(read):
+            read()
+            self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
+        result, seen = self.cli_run(read_then_relay)
+        self.assertTrue(result["current"])
+        self.assertNotEqual(hashlib.sha256(seen).hexdigest(), hashlib.sha256(self.index.read_bytes()).hexdigest())
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
+            self.adversarial_gate(result["digest"])
 
     def test_a_reconcile_keeps_an_attestation_for_the_bytes_still_on_disk(self):
         """sd:10719. Reconciling an unchanged file rewrites the stamp; the layout attestation survives."""
