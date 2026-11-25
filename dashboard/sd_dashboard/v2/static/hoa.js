@@ -520,8 +520,16 @@ let polling = 0;
   // Read again (sd:5638): the shell's head button reads /api/hoa and the shown Briefs or Reports
   // view again. Download from Mission, on Data sources, starts a download.
   window.PAGE_AGAIN = { title: 'Read the HOA readings and the shown view again', run: () => Promise.all([load(), window.places.again()]) };
-  // One timer at a time; each read that still sees a running job sets the next.
-  function poll() { if (!polling) polling = setTimeout(() => { polling = 0; reader.reread(); }, SRC_POLL); }
+  // One timer at a time; each read that still sees a running job sets the next. sd:10610: the timer reads the small
+  // /api/hoa/status, and reads the whole document (its trends near a megabyte) only when that status moved from the
+  // last full read's, the run ended, or the status did not read.
+  function poll() { if (!polling) polling = setTimeout(check, SRC_POLL); }
+  async function check() {
+    const now = await window.shell.getJSON('/api/hoa/status').catch(() => null);
+    polling = 0;
+    if (now?.running && DOC?.status && JSON.stringify(now.parts) === JSON.stringify(DOC.status.parts)) return poll();
+    reader.reread();
+  }
   const spec = {
     source: '/api/hoa', what: 'the HOA readings',
     adopt: doc => {

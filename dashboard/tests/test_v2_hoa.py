@@ -194,6 +194,23 @@ class TheDocument(Fixture):
         self.assertIn("no repo named hoa", doc["items"]["error"])
         self.assertEqual((doc["mission"]["analog"], doc["assets"]["features"], doc["items"]["rows"]), ([], [], []))
 
+    def test_the_status_is_the_documents_status_without_the_trends(self):
+        """sd:10610: /api/hoa/status names what runs and nothing of the map or the export."""
+        doc = self.doc()
+        got = hoa_screen.status(self.connection, now=NOW, jobs=self.jobs)
+        self.assertEqual(set(got), {"read", "running", "parts"})
+        self.assertEqual({k: got[k] for k in ("running", "parts")}, doc["status"])
+        self.assertLess(len(json.dumps(got)), 2000)
+        state = self.root / "downloads" / "mission"
+        state.mkdir(parents=True)
+        (state / "lock").write_text("2026-09-06T08:00:00+00:00")
+        with mock.patch.object(hoa_download, "_held", lambda folder: "2026-09-06T08:00:00+00:00"):
+            moved = hoa_screen.status(self.connection, now=NOW, jobs=self.jobs)
+        self.assertTrue(moved["running"])
+        self.assertNotEqual(moved["parts"], got["parts"])
+        self.assertEqual(self.bare("/work/other")["status"], {"running": False, "parts": {
+            "jobs": {}, "sweep": [False, "no checkout: no repo named hoa is registered", None], "downloads": {}}})
+
     def test_the_trends_are_every_row_of_the_export_and_its_age(self):
         """sd:6689: the 6m, 1y and All chips need every daily row, not the last 30."""
         m = self.doc()["mission"]
@@ -375,6 +392,10 @@ class ThePage(BrowserSession):
         status, _, body = self.request("/api/hoa", headers=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["config"]["state"], "missing")
+        # sd:10610: the poll's status route is behind the same session.
+        self.assertEqual(self.request("/api/hoa/status")[0], 403)
+        status, _, body = self.request("/api/hoa/status", headers=cookie)
+        self.assertEqual((status, json.loads(body)["running"]), (200, False))
 
     def test_the_rail_opens_hoa_at_its_page(self):
         self.assertEqual(v2.SECTIONS["HOA"], "/hoa")
@@ -1444,6 +1465,30 @@ await flush(); R.timers = TIMERS;"""
         # A running download reads HOA again, so the row follows the session to the download and its end.
         self.assertEqual(out["R"]["timers"], [15000])
 
+    def test_a_running_download_polls_the_status_and_reads_the_document_only_on_a_change(self):
+        """sd:10610: each poll reads /api/hoa/status; the whole document, its trends near a megabyte, only when the
+        status moved, the run ended, or the status did not read."""
+        doc = self.download_doc(running=True, state="running", phase="waiting", started="2026-09-06T08:00:00+00:00")
+        doc["status"] = hoa_screen._status(doc["sources"], doc["sweep"], doc["downloads"])
+        self.assertTrue(doc["status"]["running"])
+        out = self.run_page("""const reads = () => OUT.gets.filter(p => !p.startsWith('/api/tasks/'));
+let S2 = { running: true, parts: DOC.status.parts };
+ANSWER = path => path === '/api/hoa' ? [200, DOC] : path === '/api/hoa/status' ? [200, S2] : [404, { error: 'no' }];
+const tick = async () => { await RUN.shift()(); await flush(); return reads(); };
+R.same = await tick();
+S2 = { running: true, parts: { ...DOC.status.parts, downloads: { mission: [true, 'running', 'downloading', '', ''] } } };
+R.moved = await tick();
+S2 = { running: false, parts: DOC.status.parts };
+R.ended = await tick();
+ANSWER = path => path === '/api/hoa' ? [200, DOC] : [503, { error: 'down' }];
+R.unread = await tick();
+R.left = RUN.length;""", doc, pre="var TIMERS = [], RUN = []; setTimeout = (f, ms) => { TIMERS.push(ms); RUN.push(f); return TIMERS.length; };")
+        status, full = "/api/hoa/status", "/api/hoa"
+        self.assertEqual(out["R"]["same"], [full, status])
+        self.assertEqual(out["R"]["moved"], [full, status, status, full])
+        self.assertEqual(out["R"]["ended"], [full, status, status, full, status, full])
+        self.assertEqual(out["R"]["unread"], [full, status, status, full, status, full, status, full])
+
     # sd:5678: Run now on a source row with a Download is that Download: its job exits 3 on a login page, the Download
     # waits for the login. The same off reason, CLI line and post, so the download's lock refuses both alike.
     RUN_NOW = """const c = cmd('jobs.retry'), d = cmd('download.mission'), v = OBJ.get('source:mission'), o = OBJ.get('download:mission');
@@ -1614,8 +1659,8 @@ R.when = ['mission', 'acme'].map(k => c.when(OBJ.get(`source:${k}`)));""", self.
 
 
 class TheRegistration(Registers, unittest.TestCase):
-    page, section, route, api = "hoa", "HOA", "/hoa", ("/api/hoa", "/api/hoa/alarm", "/api/hoa/alarms", "/api/hoa/sweep",
-                                              "/api/hoa/sweep/status", "/api/hoa/download", "/api/hoa/attachments",
+    page, section, route, api = "hoa", "HOA", "/hoa", ("/api/hoa", "/api/hoa/status", "/api/hoa/alarm", "/api/hoa/alarms",
+                                              "/api/hoa/sweep", "/api/hoa/sweep/status", "/api/hoa/download", "/api/hoa/attachments",
                                               "/api/hoa/attachments/picture", "/api/hoa/attach", "/api/hoa/vote", "/api/hoa/briefs",
                                               "/api/hoa/reports", "/api/hoa/votes")
 
