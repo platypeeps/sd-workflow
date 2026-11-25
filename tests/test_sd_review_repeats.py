@@ -485,6 +485,19 @@ class PriorVerdictTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(len(sd_review.carried(prior, [self.answer()], rebutted)), count)
 
+    def test_a_rebuttal_per_place_answers_a_blocker_rebutted_place_by_place(self) -> None:
+        """build/sd-1675 review (bin/sd-review:1849): the operator rebutted each instance in its own record, yet
+        no one record covered both, so the blocker stayed open. The newest record at each place decides."""
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes", instances=["src.py:10", "b.py:40"]),
+                      disposition="blocking", id="B1")]
+        own = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10)
+        other = adjudicated(("b.py", "Empty input crashes", "rebutted"), line=40)
+        newer = adjudicated(("b.py", "Empty input crashes", "accepted"), line=40)
+        for label, bodies, count in (("each place", (other, own), 0), ("one place", (own,), 1),
+                                     ("newer accepted", (newer, other, own), 1)):
+            with self.subTest(label):
+                self.assertEqual(len(sd_review.carried(prior, [self.answer()], listed(*bodies))), count)
+
     def test_a_failed_readers_open_verdict_outlives_a_fallbacks_fixed(self) -> None:
         """build/sd-1675 review: a reviewer that failed after a valid `open` verdict, and a fallback that
         said `fixed`, cleared the blocker, since only the readers that completed were read."""
@@ -863,6 +876,8 @@ class RepeatReviewTests(RepeatFixture):
         prompts, _result, _stderr = self.prompts(scope="branch", base=base, verify_report=str(report))
         self.assertIn('"id": "B1"', prompts[0])
         self.assertIn("verdicts", prompts[0])
+        # build/sd-1675 review (bin/sd-review:2318): an instance fixed and another rebutted is a fixed blocker
+        self.assertIn("every listed instance is fixed or rebutted", prompts[0])
 
     def test_a_prior_report_with_a_nul_in_a_path_is_refused_before_any_provider(self) -> None:
         """build/sd-1423 class pass (bin/sd-review:1865): the prompt's source read resolves each prior blocker's
