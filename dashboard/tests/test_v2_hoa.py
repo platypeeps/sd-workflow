@@ -704,6 +704,28 @@ shellRun(cmd('item.email'), OBJ.get('{self.late}')); await flush();""", doc)
                      "2026-09-20 · in 14 days", f'href="/tasks?row={self.task}">Open on Tasks</a>', "from /api/hoa."):
             self.assertIn(part, r["det"])
 
+    def test_a_tasks_details_show_its_latest_decision_above_the_fields(self):
+        """sd:10600: the filing evidence came after every editable field; the latest decision now sits under
+        the title, its markup inert, and an item with no decision shows none."""
+        notes = [{"id": 3, "kind": "decision", "body": "Hire the first painter", "at": "2026-09-01T10:00:00Z"},
+                 {"id": 9, "kind": "decision", "body": "Use the <b>second</b> painter's quote", "at": "2026-09-03T10:00:00Z"},
+                 {"id": 12, "kind": "comment", "body": "Asked for a date", "at": "2026-09-04T10:00:00Z"}]
+        detail = {"item": {"id": self.task, "body": None}, "notes": notes, "history": [], "assignments": [],
+                  "documents": [], "revision": "e" * 64}
+        pre = (f"ANSWER = (path, body) => path === '/api/hoa' ? [STATUS, DOC] : path === '/api/tasks/{self.task}' "
+               f"? [200, {json.dumps(detail)}] : [404, {{ error: 'no answer' }}];")
+        click = f"ELS['ob-body'].listeners.click[0]({{ target: {{ closest: s => s === 'tr[data-id]' ? {{ dataset: {{ id: '{self.task}' }} }} : null }} }}); "
+        det = self.run_page(click + "await flush(); await flush(); R.det = ELS.details.html;", pre=pre)["R"]["det"]
+        head = det[:det.index('<dl class="fields">')]
+        self.assertIn("Use the &lt;b&gt;second&lt;/b&gt; painter&#39;s quote", head)
+        self.assertLess(head.index("<h2>Paint the pump house</h2>"), head.index("Use the &lt;b&gt;second"))
+        self.assertNotIn("Hire the first painter", head)
+        self.assertNotIn("Asked for a date", head)
+        detail["notes"] = notes[2:]
+        pre = pre.replace(json.dumps({**detail, "notes": notes}), json.dumps(detail))
+        det = self.run_page(click + "await flush(); await flush(); R.det = ELS.details.html;", pre=pre)["R"]["det"]
+        self.assertNotIn("decision", det[:det.index('<dl class="fields">')].lower())
+
     def test_one_followup_one_task_and_one_blocked_task_show_and_kind_narrows(self):
         kind = "ELS['ob-kinds'].listeners.click[0]({ target: { closest: s => s === 'button[data-kind]' ? { dataset: { kind: 'K' } } : null } }); "
         rows = "re = () => [...ELS['ob-body'].html.matchAll(/data-id=\"(\\d+)\"/g)].map(m => +m[1]); "

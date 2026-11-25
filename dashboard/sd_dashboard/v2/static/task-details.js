@@ -582,7 +582,7 @@
       detKey = t.key;
       put(el, html`<div class="kind"><span class="label">${t.kind}</span><span class="tag real">observed</span></div>
         <h2>${t.title}</h2>
-        ${host.note?.(t) || ''}
+        ${host.note?.(t, detOf(t)) || ''}
         <dl class="fields">
           <dt>Id${hint('Id', 'The item\'s number in the workflow database; every sd command names the item by it.')}</dt><dd>#${t.id}</dd>
           <dt><label for="det-title">Title</label>${hint('Title', 'The name lists, the board and briefs show for this item.')}</dt><dd><input id="det-title" class="fld" value="${t.title}" required${dis}></dd>

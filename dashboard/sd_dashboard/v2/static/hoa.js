@@ -588,7 +588,10 @@ let polling = 0;
     TD = window.taskDetails.attach({ details: $('details'), rows: TASKS, selected: () => own() ? selected : null, read: () => DOC?.read, view: () => 'place',
       render: () => { drawTasks(); if (own() && TASKS().some(o => o.key === selected)) TD.renderDetails(); }, reread: () => reader.reread(), load: () => reader.load(),
       select: (key, open) => select(key, open), draftFirst: t => t.kind === 'followup',
-      note: t => html`<p class="why"><span class="g-${t.state}" aria-hidden="true">${GLYPH[t.state]}</span> ${t.due ? `${t.due.slice(0, 10)} · ${dueText(t)}` : 'no due date'}</p>`,
+      // sd:10600: the latest decision sits under the title, before the fields, as the filing evidence; read with the Details.
+      note: (t, d) => { const dec = (d?.notes || []).filter(n => n.kind === 'decision').reduce((a, n) => !a || n.id > a.id ? n : a, null);
+        return html`<p class="why"><span class="g-${t.state}" aria-hidden="true">${GLYPH[t.state]}</span> ${t.due ? `${t.due.slice(0, 10)} · ${dueText(t)}` : 'no due date'}</p>${dec ? html`
+        <p><b>Latest decision</b> · <time class="rel" datetime="${dec.at}"></time> ${dec.body}</p>` : ''}`; },
       foot: () => DOC ? html`Rows read <time class="rel" datetime="${DOC.read}"></time> from /api/hoa.` : '',
       more: t => html`<p class="why"><a href="${S.itemHref(t.id)}">Open on Tasks</a>: the board, the matrix and every task.</p>` });
     reader = S.read(spec);
