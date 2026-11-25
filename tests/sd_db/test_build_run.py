@@ -1387,8 +1387,17 @@ class Supervise(Case):
                        "src/dispatch.py": "def forward(text):\n    return text\n",
                        "src/route.py": "def route(text):\n    return middle(text)\n",
                        "src/middle.py": "def middle(text):\n    return parse_count(text)\n",
-                       "src/far.py": "def far():\n    return 1\n"})
+                       "src/far.py": "def far():\n    return 1\n",
+                       "src/run.py": "def run(payload):\n    return parse(payload)['k']\n",
+                       "src/load.py": "def parse(payload):\n    return decode(payload)\n",
+                       "src/decode.py": "def decode(payload):\n    return {'k': payload}\n"})
         row = {"path": "src/parse.py", "line": 4, "summary": "an empty count raises"}
+        # Review of sd:10286: the round makes an unchanged helper's callee return None; `run` indexes it.
+        helper = {"path": "src/run.py", "line": 2, "summary": "`run()` indexes what `parse()` returns"}
+        support.git(work, "reset", "-q", "--hard", base)
+        head = commit({"src/decode.py": "def decode(payload):\n    return None if payload == 'null' else {}\n"})
+        reach = supervisor.reaches(helper, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
+        self.assertTrue(reach, "a changed callee below an unchanged helper reaches the blocker")
         cases = {"src/dispatch.py": ("def forward(text):\n    return parse_count(text or '')\n", "a caller of"),
                  "src/route.py": ("def route(text):\n    return middle(text or '')\n", "a caller of"),
                  "src/limits.py": ("LIMIT = ''\n", "a name"),

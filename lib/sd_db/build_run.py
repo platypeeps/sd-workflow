@@ -2117,9 +2117,8 @@ class Supervisor:
         """How a ruling round's own changes (`round_words`) reach a blocker that names none of them, at each
         of its places (class pass on sd:10286): a changed function calls the function around the place,
         directly or through unchanged callers (`called_from`), or that function uses a name the round
-        defines. A ruling judged the code without that change, so `rule` does not apply it. A delta, or a
-        place, git cannot read reaches, fail closed.
-        ponytail: the names a function uses, one level; a changed callee two calls down is not followed."""
+        defines, directly or through unchanged callees (`calls_into`). A ruling judged the code without that
+        change, so `rule` does not apply it. A delta, or a place, git cannot read reaches, fail closed."""
         if words is None:
             return ["code that did not read"]
         sources: dict[str, list[str] | None] = {}
@@ -2128,8 +2127,7 @@ class Supervisor:
             at = f"{path}:{line}" if line else path
             if self.called_from(path, line, head, sources, words[0]):
                 found.append(f"a caller of {at}")
-            elif (scope := self.scope(path, line, head, sources)) is None or (
-                    set(re.findall(r"[A-Za-z_]\w*", "\n".join(scope[1]))) & words[1]):
+            elif self.calls_into(path, line, head, sources, words[1]):
                 found.append(f"a name {at} uses")
         return found
 
