@@ -1300,8 +1300,19 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+                elif state["item"]["status"] == "blocked" and _build_blocked(connection, item):
+                    # A member its run blocked, whose bundle cannot retry (its lead done: the code shipped
+                    # without it), builds fresh; the press still holds an open question (pack sd:10294).
+                    transition(connection, item, "ready", who=who, reason="Build after its bundle ended")
         fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])
+
+
+def _build_blocked(connection, item: int) -> bool:
+    """Whether `item`'s newest build assignment ended blocked: its block is the build's, which a Build lifts."""
+    row = connection.execute("SELECT status FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC LIMIT 1",
+                             (item, SCOPE)).fetchone()
+    return row is not None and row["status"] == "blocked"
 
 
 def _retry_row(connection, item: int):

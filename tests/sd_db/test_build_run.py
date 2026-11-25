@@ -5637,6 +5637,30 @@ class Drafts(Case):
         queued = build.retry(self.db, self.bundle["assignment"], who="operator")["queued"]
         self.assertEqual([row["item"] for row in queued], [code, design])
 
+    def test_a_blocked_design_builds_again_after_its_code_bundle_ships(self):
+        """Pack sd:10294: a design the builder skipped with an open question ended blocked, and its code
+        bundle shipped. Retry refused, as the lead is done, and Build pressed it fresh, which refused a
+        blocked item. Once ruled, Build queues its ride again."""
+        design = self.designed("draft-plain")
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        build.queue(self.db, [code], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
+        asked = add_note(self.db, design, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [code]))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (code,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on design question note #{asked}"):
+            build.queue_again(self.db, [design], who="operator")
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, design, "decision", f"Ruling on note #{asked}: A")
+        resolve_note(self.db, asked)
+        [ride] = build.queue_again(self.db, [design], who="operator")
+        self.assertEqual((ride["item"], ride["status"], ride["scope"]), (design, "queued", build.SCOPE))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "ready")
+
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""
         design, _ = self.design()
