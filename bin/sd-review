@@ -1871,13 +1871,20 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     revived = [*filter(_lends, prior)]
     def _lent(row: Mapping[str, Any]) -> str:  # revived evidence at any place of its own ruling, no other (sd-review:1865, :1877)
         return "\n".join(dict.fromkeys(text for old in revived if (mine := _ruling(row)) is not None and _ruling(old) is mine for text in [old.get("evidence")] if isinstance(text, str) and text.strip()))
-    def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
+    def _uncited(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
         return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row) and not _lent(row)
+    cited = instance_rows(*(others := [row for row in findings if _floor(row) and not _uncited(row) and not _synthetic(row)]))
+    def _unruled(row: Mapping[str, Any]) -> str | None:  # an unruled prior blocker of its summary no other blocker holds: no rebuttal clears it (sd-review:1875)
+        held = [text for old in prior if old.get("disposition") == "blocking" and not _rebutted(old) and summary_key(old.get("summary")) == summary_key(row.get("summary"))
+                if _rebutted(row) and all(prior_evidence([old], other, cited) is None for other in others) for text in [prior_evidence([old], row, cited)] if text is not None]
+        return "\n".join(dict.fromkeys(filter(None, held))) if held else None
+    def _repeat(row: Mapping[str, Any]) -> bool:
+        return _uncited(row) and _unruled(row) is None
     def _downgrade(record: dict[str, Any]) -> str | None:  # why a blocker posts as advisory; a held prior blocker's repeat never does
         cited = isinstance(record.get("evidence"), str) and record["evidence"].strip()
         if cited and not _synthetic(record):
             return None
-        stored = _lent(record) or prior_evidence(prior, record, at_floor)  # before the synthetic downgrade: no repeat clears a hold (sd:10288 review)
+        stored = _lent(record) or _unruled(record) or prior_evidence(prior, record, at_floor)  # before the synthetic downgrade: no repeat clears a hold (sd:10288 review)
         record.update({"evidence": stored} if stored and not cited else {})
         return None if stored is not None else SYNTHETIC_NOTE if _synthetic(record) else NO_REPRO_NOTE if repro and str(
             record.get("path") or "").strip() not in LANE_PATHS else None

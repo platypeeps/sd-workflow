@@ -1155,11 +1155,16 @@ class LineBudgetTests(unittest.TestCase):
         # 5222 -> 5225 merges pack sd:10235 from main: `bin/sd-review` +3,
         # so plain output prints a blocking finding's evidence under its
         # summary. Measured: `sd-review` is 3255 here.
+        #
+        # 5225 -> 5232 is the sd:10191 review at bin/sd-review:1875: +7 for
+        # `_unruled`, so a rebuttal at an adjacent line does not clear an
+        # unruled prior blocker no other finding holds. Measured: `sd-review`
+        # is 3262 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5225,
+            5232,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
