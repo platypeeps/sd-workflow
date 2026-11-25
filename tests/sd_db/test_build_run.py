@@ -3215,6 +3215,42 @@ class Supervise(Case):
         resumed, head = self.resumed_with_broken_report("bytes")
         self.assertIsNone(resumed.prior_review(head), "an older run's report stood in for an unreadable one")
 
+    def resumed_with_no_report(self):
+        """`resumed_with_broken_report` with no own report, after a control: the earlier run's report verifies."""
+        resumed, head = self.resumed_with_broken_report("none")
+        resumed.out("review").unlink()
+        self.assertIsNotNone(resumed.prior_review(head), "control: the earlier run's report did not verify")
+        resumed.out("prior").unlink()
+        return resumed, head
+
+    def test_an_earlier_runs_prior_alone_reviews_in_full(self):
+        """Lane review of build/sd-1726 (pack sd:10235): the archive had moved the newest earlier run's
+        `review.out` but not yet its `prior.out`, so the resume verified that older kept report, which omits
+        the moved round's blockers. A run's prior with no last report beside it is no prior: review in full."""
+        resumed, head = self.resumed_with_no_report()
+        earlier = self.db.execute("SELECT id FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+                                  (resumed.row["assignment"], resumed.row["run"])).fetchone()[0]
+        last, kept = (resumed.logs / f"{earlier}.{name}.out" for name in ("review", "prior"))
+        kept.write_text(last.read_text(encoding="utf-8"), encoding="utf-8")
+        last.unlink()
+        self.assertIsNone(resumed.prior_review(head), "the archived round's older kept report was verified")
+
+    def test_a_walk_stops_at_an_earlier_run_the_archive_may_have_emptied(self):
+        """Lane review of build/sd-1726 (pack sd:10235): a run that ended other than rate_limited may have
+        lost its reports to the archive before the resume; the walk went on to an older run's report.
+        Only a rate_limited run, whose files the archive keeps while it is the last, lets the walk pass it."""
+        resumed, head = self.resumed_with_no_report()
+        assignment, number = resumed.row["assignment"], resumed.row["run"]
+        self.db.execute("UPDATE runner_run SET run = ? WHERE id = ?", (number + 1, resumed.ident))
+        columns = [row[1] for row in self.db.execute("PRAGMA table_info(runner_run)") if row[1] not in ("id", "run")]
+        listed = ", ".join(columns)
+        self.db.execute(f"INSERT INTO runner_run (id, run, {listed}) SELECT 'emptied', ?, {listed} FROM runner_run "
+                        f"WHERE assignment = ? AND run = ?", (number, assignment, number - 1))
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', start_step = 'fixing' WHERE id = 'emptied'")
+        self.db.commit()
+        resumed.row = build.run(self.db, resumed.ident)
+        self.assertIsNone(resumed.prior_review(head), "the walk passed a run the archive may have emptied")
+
     def test_an_own_report_with_no_read_permission_reviews_in_full(self):
         """Lane review of build/sd-1726 (pack sd:10235): the same walk for a report the run cannot open."""
         resumed, head = self.resumed_with_broken_report("mode")

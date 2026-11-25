@@ -1782,16 +1782,24 @@ class Supervisor:
         names hold no review, and the next round would review the branch afresh (pack sd:10236). Only the runs
         it resumed: the walk stops at a fresh claim (`claimed`), whose earlier attempt's review covers another
         start (review of build/sd-1726). The files are read here, under the local root: the archive leaves them
-        until every run of the assignment is released (`_released`)."""
-        rows = [(self.ident, self.row["start_step"]), *((row[0], row[1]) for row in self.db.execute(
-            "SELECT id, start_step FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+        until every run of the assignment is released (`_released`), and while a rate_limited run is the last.
+        So an earlier run that ended otherwise may have lost a report to the archive before this run claimed:
+        its prior with no last report beside it, or no report at all, ends the walk with none (lane review of
+        build/sd-1726): an older report omits the moved round's blockers."""
+        rows = [(self.ident, self.row["start_step"], None), *((row[0], row[1], row[2]) for row in self.db.execute(
+            "SELECT id, start_step, outcome FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
             (self.row["assignment"], self.row["run"])))]
-        for ident, start in rows:
+        for ident, start, outcome in rows:
             pair = (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out")
+            earlier = ident != self.ident
             if any(_has_text(path) for path in pair):
+                if earlier and not os.path.lexists(pair[0]):
+                    break  # its last report moved: the prior left beside it is an older round's
                 return pair
             if start in ("claimed", None):  # a row with no start step reads as fresh: fail closed
                 break
+            if earlier and outcome != build.RATE_LIMITED:
+                break  # its reports may be in the archive: a run before it reviewed an older round
         return self.out("review"), self.out("prior")
 
     def verifiable(self, path: Any, head: str) -> bool:
