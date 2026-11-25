@@ -6486,6 +6486,7 @@ class HubFaults(Case):
                 faults.append(1)
                 raise remote.UnknownOutcome("r" * 26, "lost")
 
+        self.db.execute("UPDATE repo SET managed = 0")  # an unmanaged repository's entrypoints; a managed one has a gate
         supervisor = self.supervisor(checks=lambda _: [])
         supervisor.db.outcome = mock.Mock(return_value="recorded")
         with mock.patch.object(build_run, "add_note", note):
