@@ -1125,11 +1125,21 @@ class LineBudgetTests(unittest.TestCase):
         # one spelling, the newest overlapping record decides, and a repeat
         # at any place of a blocker answers it. Measured: `sd-review` is
         # 3150 here.
+        #
+        # 5120 -> 5123 is sd:10205: `bin/sd-review` +3 so `reader_cost`
+        # reads codex's closing `tokens used` total; 0 of 214 codex
+        # outcomes carried usage. Measured: `sd-review` is 3153 here.
+        #
+        # 5123 -> 5126 is pack sd:10235: `bin/sd-review` +3, so plain
+        # output prints a blocking finding's evidence under its summary.
+        # The lead read a blocker with no repro and reran with `--json`;
+        # the escape reuses `for_note`, so the three lines are a comment,
+        # the loop and its write. Measured: `sd-review` is 3156 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5120,
+            5126,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

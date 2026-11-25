@@ -515,7 +515,8 @@ def lane_rows(lanes: list[dict]) -> list[dict]:
                         "repo": lane["repo"], "repo_path": lane["path"], "repo_key": lane.get("key"),
                         "lane_revision": lane["revision"],
                         "expected_head": row.get("expected_head") or "", "runner_merge": lane.get("runner_merge"),
-                        "unchanged": row.get("unchanged"), "failure": row.get("failure") or {}})
+                        "unchanged": row.get("unchanged"), "failure": row.get("failure") or {},
+                        "held": row.get("held")})
     return out
 
 

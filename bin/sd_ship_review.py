@@ -1819,28 +1819,45 @@ def row_tests(row: dict) -> list[str]:
     # `make test` before it says so.
     if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
         return []
-    found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(text) or []]
     if not steps or not failing or not all(test_step(step, failing) for step in steps):
         return []
-    return found
+    # Only a failing shard's headers name its failures: a passing one may print one as output (sd:9866). The
+    # blocks are the ones validation counted, so an early end line a test printed hides no failure.
+    blocks = "\n".join(failing.values())
+    return [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(blocks) or []]
 
 
-def unittest_failed_shards(text: str) -> set[str]:
+def unittest_failed_shards(text: str) -> dict[str, str]:
     """The shards in `run-tests.sh` output `text` that finished with unittest's own failure exit and printed a FAIL
-    or ERROR header; empty when any shard did not write its complete end line (killed or hung), ended with any
-    other non-zero exit (137 for a kill), or failed with no header: then more than a test failed."""
-    started = SHARD_START.findall(text)
-    ended = {match.group(1): match for match in SHARD_END.finditer(text)}
+    or ERROR header, each with its block, from its start line to its end line; empty when any shard did not write
+    its complete end line (killed or hung), ended with any other non-zero exit (137 for a kill), or failed with no
+    header: then more than a test failed.
+
+    Empty too unless the markers read as `run-tests.sh` writes them: one
+    planned line, then each planned shard's start line and end line once,
+    each pair whole before the next starts. A test's output can quote any
+    of them (a multiline assertion, a captured runner log), in its own
+    block or another's, and a quoted one could move a block or its exit:
+    then no block is trusted, and no flake (class pass of the lane review
+    of sd:9862).
+    """
     planned = SHARDS_PLANNED.findall(text)
+    marks = sorted([*SHARD_START.finditer(text), *SHARD_END.finditer(text)], key=lambda match: match.start())
+    starts, ends = marks[0::2], marks[1::2]
+    names = [match.group(1) for match in starts]
     # Every planned shard finished: one that never launched left no log to count (review of sd:9768).
-    if any(name not in ended for name in started) or planned != [str(len(ended))]:
-        return set()
-    failing = {name for name, match in ended.items() if match.group(2) != "0"}
-    for name in failing:
-        match = ended[name]
-        opened = text.rfind(f"shard {name}: start\n", 0, match.start())
-        if match.group(2) != UNITTEST_FAILED or opened < 0 or not read_failures(text[opened:match.start()]):
-            return set()
+    if (planned != [str(len(starts))] or len(starts) != len(ends) or len(set(names)) < len(names)
+            or any(start.re is not SHARD_START or end.re is not SHARD_END or end.group(1) != start.group(1)
+                   for start, end in zip(starts, ends, strict=True))):
+        return {}
+    failing: dict[str, str] = {}
+    for start, end in zip(starts, ends, strict=True):
+        if end.group(2) == "0":
+            continue
+        block = text[start.start():end.start()]
+        if end.group(2) != UNITTEST_FAILED or not read_failures(block):
+            return {}
+        failing[start.group(1)] = block
     return failing
 
 
@@ -1861,7 +1878,7 @@ def read_failures(block: str) -> bool:
     return sum(int(count) for count in re.findall(r"(?:^|, )(?:failures|errors)=(\d+)", summaries[0])) == len(named)
 
 
-def test_step(step: str, failing: set[str]) -> bool:
+def test_step(step: str, failing: dict[str, str]) -> bool:
     """`make target test`, or one complete `shard X: Ns exit=1` line of a shard in `failing`: a listed step that
     only starts like one (`exit=1` of `exit=137`) or names an unfinished shard is not a test failure."""
     if step == "make target test":
@@ -1950,7 +1967,8 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
     import sd_gate_run  # noqa: PLC0415
 
     with tempfile.TemporaryDirectory(**sd_gate_cache.worktree_place(root, head)) as parent:
-        tree = pathlib.Path(parent) / "tree"
+        # Resolved, as make's `abspath` names the interpreter: `/var` links to `/private/var` (sd:10530).
+        tree = pathlib.Path(parent).resolve() / "tree"
         try:
             sd_gate_run.gate_git(root, "worktree", "add", "--detach", str(tree), head)
         except sd_gate_run.GateError as error:
@@ -1958,8 +1976,9 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
         try:
             if sd_gate_run.gate_git(tree, "rev-parse", "HEAD") != head:
                 return None, "", f"the rerun's worktree is not at {head[:12]}"
-            # The runner's git entries replace the gate's; fsmonitor stays off on top of them.
-            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(tree), **runner_guards(tree)})
+            # The runner's git entries replace the gate's; fsmonitor stays off on top of them. The gate's own
+            # environment: no PATH entry in the checkout `root`, as `check_in_worktree` cuts it (sd:9866).
+            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(root), **runner_guards(tree)})
             python = gate_python(tree, environment)
             if python is None:
                 return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"

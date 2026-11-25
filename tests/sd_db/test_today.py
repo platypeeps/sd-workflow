@@ -330,7 +330,8 @@ class TheSections(TodayCase):
         asked = self.item("Asked")
         decision = add_note(self.connection, asked, "question", "Move all 45?\nOption: Approve all (Recommended)\nOption: Videos only")
         add_note(self.connection, asked, "followup", "Chase the vendor")
-        workflow.change_status(self.connection, asked, "done", who="operator", reason="landed")
+        workflow.change_status(self.connection, asked, "done", who="operator", reason="landed",
+                               resolve_followups=True)
         self.assertEqual([(row["id"], row["note"], row["status"]) for row in today.decisions(self.connection)],
                          [(asked, decision, "done")])
         self.assertEqual(today.followups(self.connection), [])

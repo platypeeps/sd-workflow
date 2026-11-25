@@ -86,6 +86,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -107,8 +108,13 @@ BUILDING_HOURS = 6
 BLOCKED_DAYS = 3
 #: What the page sends as `action`: `move`'s relative places, the two hold verbs, cancel, a blocked row's retry and
 #: approve (`retry --manual`), a cancelled row's Re-queue (`requeue`, which runs `lane retry`), and a running row's
-#: Release (`reclaim`, which runs `lane cancel --expected-claim`).
-ACTIONS = ("up", "down", "top", "hold", "release", "cancel", "retry", "approve", "requeue", "reclaim")
+#: Release (`reclaim`, which runs `lane cancel --expected-claim`), and a review-blocked row's Reject and enqueue
+#: (`reject`: `sd-ship adjudicate` rebuts each blocker with the operator's reason, then `lane retry`, sd:9966).
+ACTIONS = ("up", "down", "top", "hold", "release", "cancel", "retry", "approve", "requeue", "reclaim", "reject")
+#: The prepare blocker a lane review block answers with (`sd_ship_dispositions.blocking_refusal`).
+REVIEW_BLOCKING = "review_blocking"
+#: The most a rejection's reason may hold: `sd_ship_dispositions.text`'s bound.
+REASON_BYTES = 4096
 #: The ends short of a merge that the page shows as blocked and `lane retry` takes.
 BLOCKED = ("failed", "skipped", "prepared")
 #: Who acts on a blocked entry, by its status and failed step.
@@ -324,10 +330,9 @@ def _failure(entry: dict, lane: Path) -> dict:
     return _logged(entry, lane) or ({"code": code} if isinstance(code, str) and code else {})
 
 
-def _logged(entry: dict, lane: Path) -> dict:
-    """pack sd:8584: a failed prepare's answer from its log in the lane's `logs/`: the blocker's `code`, whether the
-    lane marks it `retryable`, and its `next_action`. `{}` for a failure at another step or a log not read here: a log
-    on another host, outside `logs/`, cut short or with no answer."""
+def _answer(entry: dict, lane: Path) -> dict:
+    """pack sd:8584: a failed prepare's JSON answer from its log in the lane's `logs/`; `{}` for a failure at another
+    step or a log not read here: a log on another host, outside `logs/`, cut short or with no answer."""
     log = Path(str(entry.get("prepare_log") or ""))
     if entry.get("step") != "prepare" or log.parent != lane / "logs":
         return {}
@@ -338,7 +343,87 @@ def _logged(entry: dict, lane: Path) -> dict:
         answer = json.loads(text.partition("\n")[2].partition("\n--- stderr ---\n")[0])
     except (OSError, ValueError):
         return {}
-    workflow = answer.get("workflow") if isinstance(answer, dict) else None
+    return answer if isinstance(answer, dict) else {}
+
+
+HEAD = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def review_of(answer: dict) -> tuple[str, list[str]] | None:
+    """sd:9966: the review a review-blocked prepare's answer names: the head it saw and the digest of each
+    blocking finding (`sd_ship_dispositions.blocking_refusal`). None for an answer that names either not, as one
+    from before them, or names a count of findings other than of digests."""
+    head, digests, rows = answer.get("reviewed_head"), answer.get("finding_digests"), answer.get("findings")
+    if not (isinstance(head, str) and HEAD.fullmatch(head) and isinstance(digests, list) and digests
+            and all(isinstance(row, str) and row for row in digests) and isinstance(rows, list)
+            and len(rows) == len(digests) and all(isinstance(row, dict) for row in rows)):
+        return None
+    return head, digests
+
+
+def _line(raw: object) -> str | None:
+    """One blocking finding as Reject's dialog prints it: the finding adjudicate's template carries, every field,
+    as exact JSON. A folded or partial print let two findings read alike, another failing input or affected path
+    among them, so Reject rebutted one the operator never saw (sd:9966 review round 3). None for a finding that is
+    no object: no review the page can name. HTML folds a run of spaces and hides a no-break or zero-width space, so
+    every space beside another prints escaped, still valid JSON (sd:9966 lead review). Every other character past
+    ASCII prints escaped too: a homoglyph or combining mark printed raw read like another finding, and a hand-made
+    escape of a character past U+FFFF read back as another one (sd:10246)."""
+    if not (isinstance(raw, dict) and raw):
+        return None
+    return re.sub(r" (?= )|(?<= ) ", r"\\u0020", json.dumps(raw, sort_keys=True))
+
+
+def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[str], str] | None:
+    """sd:9966 class pass: what Reject's dialog prints and what Reject rebuts are one read. From adjudicate's
+    `template`, each blocking finding's line and the key a page binds Reject and enqueue to, over the head, the
+    digests the prepare log names and those lines: the row prints them, and `rebut` makes them again from the
+    template it fills, so a reason applies only to the findings the page printed. None for a template not read,
+    one whose findings are not the log's (the review ran again), or one with a finding the page cannot print."""
+    proposal = template.get("proposal") if template.get("exit") == 0 else None
+    live = proposal.get("findings") if isinstance(proposal, dict) else None
+    if not isinstance(live, list) or [row.get("finding_digest") if isinstance(row, dict) else None for row in live] != review[1]:
+        return None
+    lines = [_line(row.get("raw_finding")) for row in live]
+    if not all(lines):
+        return None
+    return lines, hashlib.sha256(json.dumps([*review, lines]).encode()).hexdigest()[:16]
+
+
+def _review_fields(entry: dict, lane: Path) -> dict:
+    """A failed row's review key, and each finding it covers whole, for Reject's dialog; none for a review this
+    host cannot rebut: none named, a worktree on another host, or a template `shown_review` cannot print
+    (sd:9966). `held`: whether that review already holds recorded dispositions, which a `lane retry` reuses:
+    False only when adjudicate's template says none, so Retry asks first only then; None when not read here."""
+    tree = _here(entry)
+    if not (tree and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
+        return {"review": None, "review_findings": [], "held": None, "reviewed_head": None}
+    review = review_of(_answer(entry, lane))
+    # One read-only template call, only on a review-blocked row: rebut's step 1, which writes nothing.
+    template = _run([command("sd-ship"), "-C", str(tree), "adjudicate", "--item", str(entry.get("item")),
+                     "--expected-head", review[0] if review else str(entry.get("expected_head") or ""), "--json"],
+                    LIST_SECONDS)
+    recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
+    held = None if recorded is False else recorded is not None
+    shown = shown_review(review, template) if review else None
+    if shown:  # `reviewed_head`: the head Reject's CLI line adjudicates at (sd:10246)
+        return {"review": shown[1], "review_findings": shown[0], "held": held, "reviewed_head": review[0]}
+    proposal = template.get("proposal") if template.get("exit") == 0 else None
+    live = proposal.get("findings") if isinstance(proposal, dict) else None
+    if review and isinstance(live, list) and [row.get("finding_digest") if isinstance(row, dict) else None
+                                              for row in live] != review[1]:
+        # The review at that head ran again since the log: its findings are not the logged ones, so no Reject,
+        # and Retry, which runs prepare against the live review, stays on (sd:9966 lane review).
+        held = None
+    return {"review": None, "review_findings": [], "held": held, "reviewed_head": None}
+
+
+def _logged(entry: dict, lane: Path) -> dict:
+    """pack sd:8584: a failed prepare's answer from its log in the lane's `logs/`: the blocker's `code`, whether the
+    lane marks it `retryable`, and its `next_action`. `{}` for a failure at another step or a log not read here: a log
+    on another host, outside `logs/`, cut short or with no answer."""
+    answer = _answer(entry, lane)
+    workflow = answer.get("workflow")
     blocker = workflow.get("blocker") if isinstance(workflow, dict) else None
     if not isinstance(blocker, dict):
         return {}
@@ -359,6 +444,15 @@ def _git(tree: Path, *args: str) -> str | None:
 CATCH_UP_LINKS = 14
 
 
+def _here(entry: dict) -> Path | None:
+    """The entry's worktree when it is on this host: enqueued here and still a folder. None for another host's,
+    which the lane host ran in a lane worktree of its own and removed (sd:3283), or one gone."""
+    from sd_db.ship import this_host
+
+    tree = Path(str(entry.get("worktree") or ""))
+    return tree if entry.get("worktree") and entry.get("enqueued_on") == this_host() and tree.is_dir() else None
+
+
 def _unchanged(entry: dict) -> bool | None:
     """pack sd:8584: whether the entry's worktree still holds the head it ended at, or a chain of merges on it, the
     shape of prepare's catch-up. None when not read here: another host's worktree, one gone or on another branch,
@@ -367,10 +461,8 @@ def _unchanged(entry: dict) -> bool | None:
     One local git read under `GIT_SECONDS`: rows() runs on every page read. It never asks `sd_lane.at_head`, which
     reads origin and writes merge objects into the worktree (round 1). So a merge that is not a clean catch-up reads
     as unchanged here; `lane retry` makes the full check and refuses it `HEAD_MOVED`."""
-    from sd_db.ship import this_host
-
-    head, branch, tree = entry.get("expected_head"), entry.get("branch"), Path(str(entry.get("worktree") or ""))
-    if not (head and branch and entry.get("worktree") and entry.get("enqueued_on") == this_host() and tree.is_dir()):
+    head, branch, tree = entry.get("expected_head"), entry.get("branch"), _here(entry)
+    if not (head and branch and tree):
         return None
     if _git(tree, "branch", "--show-current") != branch:
         return None
@@ -471,7 +563,8 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
                 # The log of the step that failed: a merge failure's prepare log is of a prepare that passed (sd:8601).
                 log = entry.get("merge_log" if entry.get("step") == "merge" else "prepare_log")
                 failed = {"branch": entry.get("branch"), "unchanged": _unchanged(entry), "failure": _failure(entry, lane),
-                          "log": str(log or "") or None} if status == "failed" else {}
+                          "log": str(log or "") or None, **_review_fields(entry, lane)
+                          } if status == "failed" else {}
                 blocked.append({**base, "state": "blocked", "status": status, "step": entry.get("step"),
                                 "reason": reason, "who": who, "finished": entry.get("finished_at"),
                                 "head": head[:12], "expected_head": head, **failed})
@@ -668,17 +761,23 @@ def document(connection, *, now: str = "") -> dict:
 def move(payload: dict):
     """Check the page's request, then return the write: a best-effort revision check, then one lane verb."""
     values = dict(payload)
-    again, reclaim = values.get("action") in ("retry", "approve", "requeue"), values.get("action") == "reclaim"
-    if (set(values) != {"repo", "item", "action", "revision", *(("head",) if again else ()), *(("claim",) if reclaim else ())}
+    again, reclaim = values.get("action") in ("retry", "approve", "requeue", "reject"), values.get("action") == "reclaim"
+    reject = values.get("action") == "reject"
+    if (set(values) != {"repo", "item", "action", "revision", *(("head",) if again else ()), *(("claim",) if reclaim else ()),
+                        *(("reason", "review") if reject else ())}
             or not isinstance(values["repo"], str)
             or type(values["item"]) is not int or not 1 <= values["item"] <= 9223372036854775807
             or values["action"] not in ACTIONS or not isinstance(values["revision"], str)
             or (again and not (isinstance(values["head"], str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", values["head"])))
             or (reclaim and not (isinstance(values["claim"], str) and len(values["claim"]) <= 200
-                                 and all(values["claim"].partition(":")[::2])))):
+                                 and all(values["claim"].partition(":")[::2])))
+            or (reject and not (isinstance(values["reason"], str) and values["reason"].strip()
+                                and len(values["reason"].strip().encode()) <= REASON_BYTES
+                                and isinstance(values["review"], str) and re.fullmatch(r"[0-9a-f]{16}", values["review"])))):
         raise ValueError("Name the repository, the item, one of up, down, top, hold, release, cancel, retry, approve, "
-                         "requeue or reclaim, the lane's revision, for retry, approve or requeue the full head the row "
-                         "showed, and for reclaim the claim it showed.")
+                         "requeue, reclaim or reject, the lane's revision, for retry, approve, requeue or reject the "
+                         "full head the row showed, for reclaim the claim it showed, and for reject the review the row "
+                         f"showed and a reason of at most {REASON_BYTES} bytes.")
 
     def write(connection):
         from sd_db import repos, workflow
@@ -701,6 +800,17 @@ def move(payload: dict):
             # The operator's ruling (sd:3398): Re-queue takes back a cancel; it enqueues nothing new.
             raise ValueError(f"sd:{item}'s newest entry in this lane is {found.get('status') if found else 'missing'}; "
                              "Re-queue takes only a cancelled one.")
+        if action == "reject":
+            unknown = rebut(found, Path(str(listed.get("queue") or "")).parent.parent, values["head"],
+                            values["reason"].strip(), values["review"])
+            if unknown:
+                return 502, {"error": unknown, "outcome": "unknown"}
+            return rebutted(lambda: run(path, item, action, entries))
+        return run(path, item, action, entries)
+
+    def run(path, item, action, entries):
+        from sd_db import workflow
+
         verb = (["move", item, action] if action in ("up", "down", "top")
                 else ["retry", item, "--expected-head", values["head"]] if again
                 else ["cancel", item, "--expected-claim", values["claim"]] if reclaim else [action, item])
@@ -728,6 +838,84 @@ def move(payload: dict):
             raise ValueError(answer.get("error") or "sd-ship lane refused the change.")
         return {"ok": True, "action": action, "item": values["item"], "pending": answer.get("pending"), "edits": EDITS}
     return write
+
+
+#: sd:9966 review round 3: what a failed `lane retry` after a recorded rebuttal adds to its answer.
+KEPT = ("The rebuttal is recorded: a later `sd-ship lane retry` reuses it and clears the review; Reject and enqueue "
+        "refuses a review that holds it.")
+
+
+def rebutted(retry):
+    """`retry()`, Reject and enqueue's second step, after `rebut` recorded its rebuttals: a refusal, a stale head
+    or an unknown outcome keeps them, so its answer says so (`rebutted`) rather than reading as nothing done."""
+    from sd_db import workflow
+
+    try:
+        answer = retry()
+    except workflow.StaleItem as error:
+        return 409, {"error": f"{error} {KEPT}", "reload": True, "rebutted": True}
+    except ValueError as error:
+        return 400, {"error": f"{error} {KEPT}", "rebutted": True}
+    if isinstance(answer, tuple):
+        status, said = answer
+        return status, {**said, "error": f"{said.get('error')} {KEPT}", "rebutted": True}
+    return answer
+
+
+def rebut(entry: dict | None, lane: Path, head: str, reason: str, shown: str) -> str | None:
+    """sd:9966: Reject and enqueue's first step. Record a rebuttal, `reason`, of each blocking finding the lane's
+    review raised on `entry` at `head`, through `sd-ship adjudicate` in its worktree; `lane retry` then reuses that
+    review and clears it. Raises ValueError when nothing was written; returns why when a write may have landed.
+    Pressed twice, the second refuses: the first one's rebuttals are recorded dispositions, never replaced here.
+
+    `shown` is the review key the page's row showed (`shown_review`): a newer prepare log, or a review run again at
+    the same head since, names other findings, and the reason given for the shown ones rebuts none of them. The
+    key is made again here from the template this call fills, so the findings rebutted are the ones printed."""
+    from sd_db import workflow
+
+    if not (entry and entry.get("status") == "failed" and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
+        raise ValueError("Reject and enqueue takes a lane entry whose prepare a review blocked, its log read here.")
+    if _here(entry) is None:  # sd:9966 review round 3
+        raise ValueError(f"sd:{entry.get('item')}'s worktree is on another host ({entry.get('enqueued_on')}) or gone, "
+                         "so adjudicate cannot run in it here; rebut it with sd-ship adjudicate in that worktree.")
+    if entry.get("expected_head") != head:
+        raise ValueError(f"sd:{entry.get('item')} failed at another head than the page showed. Read it again.")
+    # Adjudicate binds the head the review saw, which prepare's catch-up may have moved past the queued `head`;
+    # `lane retry` still checks the queued one (sd:9966 review).
+    review = review_of(_answer(entry, lane))
+    if review is None:
+        raise ValueError(f"sd:{entry.get('item')}'s prepare log names no review to bind; rebut it with sd-ship adjudicate.")
+    seen, digests = review
+    base = [command("sd-ship"), "-C", str(entry["worktree"]), "adjudicate", "--item", str(entry["item"]),
+            "--expected-head", seen, "--json"]
+    template = _run(base, WRITE_SECONDS)  # read only: the one read the check below and the rebuttal both use
+    proposal = template.get("proposal")
+    if not (template.get("exit") == 0 and isinstance(proposal, dict) and isinstance(proposal.get("findings"), list)
+            and all(isinstance(row, dict) for row in proposal["findings"])):
+        raise ValueError(f"sd-ship adjudicate gave no findings to rebut: {template.get('error') or 'no template'}")
+    if [row.get("finding_digest") for row in proposal["findings"]] != digests:
+        raise workflow.StaleItem(f"sd:{entry.get('item')}'s review at {seen[:12]} ran again since the lane's run; its "
+                                 "findings are not the ones the page showed. Read it again, then retry.")
+    printed = shown_review(review, template)
+    if printed is None or printed[1] != shown:  # the lines this template prints are not the ones the dialog did
+        raise workflow.StaleItem(f"sd:{entry.get('item')}'s review changed since the page read it. Read it again, then retry.")
+    if "recorded_revision" not in template:
+        raise ValueError("sd-ship adjudicate does not say whether this review holds dispositions; update sd-ship.")
+    if template["recorded_revision"] is not None:  # the CLI's reasons or parked risks: a filled template replaces them
+        raise workflow.StaleItem(f"sd:{entry.get('item')}'s review holds dispositions recorded since the lane's run; "
+                                 f"Reject would replace them. Queue it with `sd-ship lane retry {entry.get('item')} "
+                                 f"--expected-head {head}`.")
+    for row in proposal["findings"]:
+        row.update(response_disposition="rebutted", reason=reason)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", prefix="sd-rebut-") as filled:
+        json.dump(proposal, filled)
+        filled.flush()
+        answer = _run([*base, "--dispositions-file", filled.name], WRITE_SECONDS)
+    if answer.get("exit") == 0 and answer.get("phase") == "disposition_recorded":
+        return None
+    if answer.get("exit") == 3:
+        raise ValueError(f"sd-ship adjudicate refused the rebuttal: {answer.get('error') or 'no reason given'}")
+    return f"not known whether the rebuttal was recorded: {answer.get('error') or 'sd-ship adjudicate gave no answer'}"
 
 
 def check_prs(payload: dict):

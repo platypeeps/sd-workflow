@@ -197,7 +197,7 @@ def _close_report(connection: sqlite3.Connection, item: int, why: str, who: str)
 
 def _question_check(connection: sqlite3.Connection, note: int) -> tuple[str | None, str]:
     row = connection.execute("SELECT * FROM note WHERE id = ? AND resolved_at IS NULL", (note,)).fetchone()
-    ruling = _standing_ruling(connection, row) if row else None
+    ruling = standing_ruling(connection, row) if row else None
     return (f"answered by decision #{ruling}", "") if ruling else (None, "no standing ruling")
 
 
@@ -242,7 +242,7 @@ def sweep(connection: sqlite3.Connection, *, who: str, apply: bool = True) -> di
 
     for note in connection.execute("SELECT * FROM note WHERE kind = 'question' AND resolved_at IS NULL"
                                    " ORDER BY id").fetchall():
-        if _standing_ruling(connection, note) is None:
+        if standing_ruling(connection, note) is None:
             continue  # an unanswered question is the Decisions list's, not this sweep's to doubt
         settle({"item": note["item"], "kind": "question", "note": note["id"], "title": _first(note["body"])},
                lambda note=note: _question_check(connection, note["id"]),
@@ -253,10 +253,11 @@ def sweep(connection: sqlite3.Connection, *, who: str, apply: bool = True) -> di
 #: A ruling, as Decisions writes it (`decisions.RULING`, `review.RULING`), and the two notes that take one back:
 #: Decisions' reversal and a review batch's withdrawal. Each reopens the question it ruled.
 RULING = re.compile(r"\ARuling on note #([0-9]+): ")
-UNDONE = re.compile(r"\A(?:Reversed ruling #([0-9]+)\b|Withdrawn: ruling #([0-9]+) on note #)")
+#: A withdrawal names its ruling's own note, alone or before `review.WITHDRAWN`'s `; sd:N stays filed`.
+UNDONE = re.compile(r"\A(?:Reversed ruling #([0-9]+)\b|Withdrawn: ruling #([0-9]+) on note #([0-9]+)(?:;|\Z))")
 
 
-def _standing_ruling(connection: sqlite3.Connection, question) -> int | None:
+def standing_ruling(connection: sqlite3.Connection, question) -> int | None:
     """The newest ruling on `question` that no later reversal or withdrawal took back, or None."""
     standing = None
     for decision in connection.execute("SELECT id, body FROM note WHERE item = ? AND kind = 'decision' AND id > ?"
@@ -264,7 +265,8 @@ def _standing_ruling(connection: sqlite3.Connection, question) -> int | None:
         body = decision["body"] or ""
         if (ruled := RULING.match(body)) and int(ruled[1]) == question["id"]:
             standing = decision["id"]
-        elif (undone := UNDONE.match(body)) and standing is not None and int(undone[1] or undone[2]) == standing:
+        elif ((undone := UNDONE.match(body)) and standing is not None and int(undone[1] or undone[2]) == standing
+              and (undone[3] is None or int(undone[3]) == question["id"])):
             standing = None
     return standing
 
