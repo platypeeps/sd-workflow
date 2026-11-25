@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
-import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -270,75 +268,28 @@ class TheRequest(ScreenCase):
         self.assertTrue(callable(health_cleanup.request({"row": "wt:merged", "revision": "0" * 64})))
 
 
-class Disposable(unittest.TestCase):
-    """Class pass, review of build/sd-1782: build output is what its generator stamped, not what a suffix or a
-    folder suggests. Each case is one ignored entry in a Unity project folder named `Game`."""
-
-    STAMP = ("<Project>\n  <!-- Generated file, do not modify, your changes will be overwritten "
-             "(use AssetPostprocessor.OnGeneratedCSProject) -->\n</Project>\n")
-
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name).resolve()
-        self.game = self.root / "Game"
-        (self.game / "ProjectSettings").mkdir(parents=True)
-        (self.game / "ProjectSettings" / "ProjectVersion.txt").write_text("m_EditorVersion: 6000.0\n")
-        (self.game / "Assembly-CSharp.csproj").write_text(self.STAMP)
-
-    def goes(self, name: str) -> bool:
-        return health_collectors._disposable(name, self.root)
-
-    def test_a_stamped_project_goes_and_a_hand_kept_one_beside_it_stays(self):
-        (self.game / "Tool.csproj").write_text("<Project/>\n")
-        self.assertTrue(self.goes("Game/Assembly-CSharp.csproj"))
-        self.assertFalse(self.goes("Game/Tool.csproj"), "no Unity stamp: hand-kept")
-
-    def test_a_stamp_outside_a_unity_project_or_behind_a_link_or_a_folder_stays(self):
-        (self.root / "Loose.csproj").write_text(self.STAMP)
-        (self.game / "Link.csproj").symlink_to("Assembly-CSharp.csproj")
-        (self.game / "Dir.csproj").mkdir()
-        (self.game / "Late.csproj").write_text("<Project/>\n" + " " * 5000 + self.STAMP)
-        for name in ("Loose.csproj", "Game/Link.csproj", "Game/Dir.csproj/", "Game/Late.csproj", "Game/Gone.csproj"):
-            with self.subTest(name=name):
-                self.assertFalse(self.goes(name))
-        self.assertFalse(health_collectors._disposable("Game/Assembly-CSharp.csproj"), "no root, no proof")
-
-    def test_a_solution_goes_only_under_the_folder_s_name_with_stamped_projects_alone(self):
-        (self.game / "Tool.csproj").write_text("<Project/>\n")
-        line = '  <Project Path="{0}" />\r\n'
-
-        def solution(*projects):
-            return "\ufeff<Solution>\r\n" + "".join(line.format(p) for p in projects) + "</Solution>\r\n"
-
-        (self.game / "Game.slnx").write_text(solution("Assembly-CSharp.csproj"), newline="")
-        self.assertTrue(self.goes("Game/Game.slnx"))
-        (self.game / "Mine.slnx").write_text(solution("Assembly-CSharp.csproj"), newline="")
-        self.assertFalse(self.goes("Game/Mine.slnx"), "Unity writes only <folder>.slnx")
-        for project in ("Tool.csproj", "../Loose.csproj", "Native.vcxproj", "Gone.csproj"):
-            (self.game / "Game.slnx").write_text(solution("Assembly-CSharp.csproj", project), newline="")
-            self.assertFalse(self.goes("Game/Game.slnx"), project)
-        (self.game / "Game.slnx").write_text("")
-        self.assertFalse(self.goes("Game/Game.slnx"), "names no project")
-
-    def test_a_hand_edited_solution_or_stamped_project_stays(self):
-        """Review of build/sd-1782 round 3: a solution that lists only stamped projects, or a project that keeps
-        Unity's stamp, may still carry the operator's edits; only Unity's exact shape goes."""
-        edited = ('<Solution>\n  <Configurations><BuildType Name="Custom" /></Configurations>\n'
-                  '  <Project Path="Assembly-CSharp.csproj" />\n</Solution>\n')
-        (self.game / "Game.slnx").write_text(edited)
-        self.assertFalse(self.goes("Game/Game.slnx"), "a custom build configuration")
-        (self.game / "Game.sln").write_text(
-            'Project("{FAE04EC0}") = "A", "Assembly-CSharp.csproj", "{1}"\nGlobal\n\tCustom|Any CPU\nEndGlobal\n')
-        self.assertFalse(self.goes("Game/Game.sln"), "a *.sln's shape is not checked, so it stays")
-        stamped = self.STAMP.replace("</Project>", '  <Target Name="Mine"><Exec Command="make" /></Target>\n'
-                                                   "</Project>")
-        (self.game / "Edited.csproj").write_text(stamped)
-        self.assertFalse(self.goes("Game/Edited.csproj"), "a target Unity never writes")
-        (self.game / "Cond.csproj").write_text(self.STAMP.replace(
-            "</Project>", '  <PropertyGroup Condition="x"><Mine>1</Mine></PropertyGroup>\n</Project>'))
-        self.assertFalse(self.goes("Game/Cond.csproj"), "an attribute or property Unity never writes")
-        (self.game / "Broken.csproj").write_text(self.STAMP + "<")
-        self.assertFalse(self.goes("Game/Broken.csproj"), "not well-formed")
-        (self.game / "Wide.csproj").write_text('<?xml version="1.0" encoding="shift_jis"?>' + self.STAMP)
-        self.assertFalse(self.goes("Game/Wide.csproj"), "an encoding the parser refuses keeps the tree")
+class Disposable(Merged):
+    def test_a_unity_project_or_solution_keeps_the_tree_whatever_it_holds(self):
+        """Class pass of build/sd-1782: a stamp, a shape or a tag list read from an ignored Unity file cannot prove
+        nobody edited it, so cleanup would delete the edit. No such file counts as build output."""
+        seed = self.root / "seed"
+        (seed / "ProjectSettings").mkdir()
+        (seed / "ProjectSettings" / "ProjectVersion.txt").write_text("m_EditorVersion: 6000.0\n")
+        (seed / ".gitignore").write_text("*.csproj\n*.slnx\n")
+        git("-C", str(seed), "add", "-A")
+        git("-C", str(seed), "commit", "-q", "-m", "unity")
+        git("-C", str(seed), "push", "-q", str(self.origin), "main")
+        git("-C", str(self.alpha), "fetch", "-q", "origin")
+        stamp = ("<Project>\n  <!-- Generated file, do not modify, your changes will be overwritten "
+                 "(use AssetPostprocessor.OnGeneratedCSProject) -->\n{0}</Project>\n")
+        cases = {"stamped": ("Assembly-CSharp.csproj", stamp.format("")),
+                 "edited": ("Assembly-CSharp.csproj", stamp.format(
+                     "  <PropertyGroup><DefineConstants>LOCAL_FIX</DefineConstants></PropertyGroup>\n")),
+                 "solution": ("wt-solution.slnx", '<Solution>\n  <Project Path="A.csproj" />\n</Solution>\n')}
+        for name, (file, text) in cases.items():
+            (self.tree(name) / file).write_text(text)
+        (self.root / "wt-solution" / "A.csproj").write_text(stamp.format(""))
+        why = "it holds ignored files that are not build output: "
+        self.assertEqual(self.kept(), {"wt-stamped": why + "Assembly-CSharp.csproj",
+                                       "wt-edited": why + "Assembly-CSharp.csproj", "wt-solution": why + "A.csproj"})
+        self.assertEqual(self.row()["removable"], [])

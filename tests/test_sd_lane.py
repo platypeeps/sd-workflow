@@ -2379,12 +2379,12 @@ class Landing(Lane):
         self.assertEqual(self.watched(1)[1][:24], "pack sd:1 Removed: workt")  # build output alone goes
         self.assertFalse(tree.exists())
 
-    def test_generated_unity_project_files_do_not_keep_a_merged_worktree(self) -> None:
-        """sd:10325: Unity regenerates its ignored *.csproj and solution on every open; the lane kept a merged
-        clean worktree for `Assembly-CSharp-Editor.csproj`. Class pass, review of build/sd-1782: a file is Unity's
-        by Unity's own stamp in it, not by its suffix or its folder; a hand-kept project beside it keeps the tree."""
-        stamp = ("<Project>\n  <!-- Generated file, do not modify, your changes will be overwritten "
-                 "(use AssetPostprocessor.OnGeneratedCSProject) -->\n</Project>\n")
+    def test_a_unity_project_file_keeps_a_merged_worktree_and_is_named(self) -> None:
+        """sd:10325, class pass of build/sd-1782: no reading of an ignored Unity *.csproj or solution proves nobody
+        edited it (Unity writes no checksum), so none counts as build output: each keeps the tree and is named."""
+        edited = ("<Project>\n  <!-- Generated file, do not modify, your changes will be overwritten "
+                  "(use AssetPostprocessor.OnGeneratedCSProject) -->\n  <PropertyGroup>\n"
+                  "    <DefineConstants>LOCAL_FIX</DefineConstants>\n  </PropertyGroup>\n</Project>\n")
         tree, _ = self.topic()
         (tree / "Game/ProjectSettings").mkdir(parents=True)
         (tree / "Game/ProjectSettings/ProjectVersion.txt").write_text("m_EditorVersion: 6000.0\n", encoding="utf-8")
@@ -2395,15 +2395,15 @@ class Landing(Lane):
         self.merge_lands(tree, 1, head)
         self.drain()
         (self.repo / ".git/info/exclude").write_text("*.csproj\n*.slnx\n", encoding="utf-8")
-        (tree / "Game/Assembly-CSharp-Editor.csproj").write_text(stamp, encoding="utf-8")
+        (tree / "Game/Assembly-CSharp-Editor.csproj").write_text(edited, encoding="utf-8")
+        self.assertEqual(self.watched(1)[1:], [f"pack sd:1 kept {tree}: it holds ignored files that are not "
+                                               "build output: Game/Assembly-CSharp-Editor.csproj"])
+        (tree / "Game/Assembly-CSharp-Editor.csproj").unlink()
         (tree / "Game/Game.slnx").write_text(
             '<Solution>\n  <Project Path="Assembly-CSharp-Editor.csproj" />\n</Solution>\n', encoding="utf-8")
-        (tree / "Game/Tool.csproj").write_text("<Project/>\n", encoding="utf-8")
         self.assertEqual(self.watched(1)[1:], [f"pack sd:1 kept {tree}: it holds ignored files that are not "
-                                               "build output: Game/Tool.csproj"])
-        (tree / "Game/Tool.csproj").unlink()
-        self.assertEqual(self.watched(1)[1][:24], "pack sd:1 Removed: workt")
-        self.assertFalse(tree.exists())
+                                               "build output: Game/Game.slnx"])
+        self.assertEqual((tree / "Game/Game.slnx").read_text(encoding="utf-8")[:10], "<Solution>")
 
     def test_ignored_data_keeps_the_worktree_whatever_status_shows_by_default(self) -> None:
         """Review of sd:6727: `status.showUntrackedFiles=no` hides ignored files from a bare status too."""

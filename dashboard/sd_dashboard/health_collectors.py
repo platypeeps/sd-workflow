@@ -70,7 +70,6 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
-from xml.etree import ElementTree
 
 from sd_db import paths, reads, repos
 from sd_db.config import system_checkout
@@ -95,31 +94,6 @@ _DU_OVERRAN: dict[str, float] = {}
 BUILD_DIRS = ("target", "node_modules", ".venv")
 #: Ignored folders and files a merged worktree may hold and still be removed: build output and tool caches.
 DISPOSABLE = (*BUILD_DIRS, "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store")
-#: The line Unity writes at the top of each project file it generates: the file's own proof of who wrote it. A
-#: suffix or a folder is no proof: a hand-kept project sits beside Unity's (sd:10325, review of build/sd-1782).
-UNITY_STAMP = (b"Generated file, do not modify, your changes will be overwritten "
-               b"(use AssetPostprocessor.OnGeneratedCSProject)")
-#: The whole of the solution Unity 6 writes, named after its project folder: one line per project it generated.
-#: Anything more, such as a build configuration, is the operator's (review of build/sd-1782, round 3). A *.sln's
-#: shape is not checked here, so it keeps the tree.
-UNITY_SOLUTION = re.compile(rb'(?:\xef\xbb\xbf)?<Solution>\r?\n((?:  <Project Path="[^"\r\n]*" />\r?\n)+)'
-                            rb'</Solution>(?:\r?\n)?')
-SOLUTION_PROJECT = re.compile(rb'Path="([^"]*)"')
-#: The elements and attributes Unity 6's project generator writes. A stamped project with any other, such as a
-#: Target or a Condition, holds an edit and keeps the tree (review of build/sd-1782, round 3).
-# ponytail: shape, not values: an edited value inside a known element passes. Unity offers no checksum.
-UNITY_PROJECT_TAGS = frozenset((
-    "Project", "PropertyGroup", "ItemGroup", "Import", "Reference", "HintPath", "Private", "Compile", "None",
-    "Analyzer", "ProjectReference", "ProjectCapability", "UseCommonOutputDirectory", "UnityVersion",
-    "UnityProjectType", "UnityProjectGeneratorVersion", "UnityProjectGeneratorStyle", "UnityProjectGenerator",
-    "UnityBuildTarget", "TargetFramework", "RootNamespace", "OutputType", "OutputPath", "NoWarn", "NoStdLib",
-    "NoStandardLibraries", "NoConfig", "MSBuildWarningsAsMessages", "LangVersion", "IntermediateOutputPath",
-    "GenerateAssemblyInfo", "EnableDefaultItems", "DisableImplicitFrameworkReferences", "DefineConstants",
-    "BaseIntermediateOutputPath", "BaseDirectory", "AssemblyName", "AppendTargetFrameworkToOutputPath",
-    "AllowUnsafeBlocks"))
-UNITY_PROJECT_ATTRIBUTES = frozenset(("Include", "Remove", "Project", "Sdk"))
-#: A generated project or solution larger than this is not read and keeps the tree; Unity's run to about 100 KB.
-UNITY_FILE_MAX = 4 << 20
 #: A full object name, SHA-1 or SHA-256.
 OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
@@ -284,68 +258,10 @@ def _cwds(walk: Walk) -> list[str] | None:
     return [line[1:] for line in done.stdout.splitlines() if line.startswith("n")]
 
 
-def _read_regular(path: str) -> bytes | None:
-    """The bytes of the regular file at `path`, or None for a link, a folder, an unread or an oversized file."""
-    try:
-        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > UNITY_FILE_MAX:
-            return None
-        with open(path, "rb") as handle:
-            return handle.read(UNITY_FILE_MAX + 1)
-    except OSError:
-        return None
-
-
-def _unity_project(path: str) -> bool:
-    """Whether `path` is a regular file that opens with Unity's stamp and holds only what Unity's generator writes;
-    unread, linked, unstamped, malformed or carrying another element or attribute is not."""
-    data = _read_regular(path)
-    if data is None or UNITY_STAMP not in data[:512] or b"<!" in data.replace(b"<!--", b""):
-        return False  # a DOCTYPE or an entity is never Unity's, and is not parsed
-    try:
-        root = ElementTree.fromstring(data)
-    except (ElementTree.ParseError, ValueError):  # ValueError: an encoding expat refuses, such as shift_jis
-        return False
-    return all(node.tag in UNITY_PROJECT_TAGS and UNITY_PROJECT_ATTRIBUTES.issuperset(node.attrib)
-               for node in root.iter())
-
-
-def _unity_generated(root: str | os.PathLike, parts: list[str]) -> bool:
-    """Whether the ignored file at `parts` under `root` is one Unity wrote and writes again on its next open.
-
-    In a Unity project's folder (it holds ProjectSettings/ProjectVersion.txt): a *.csproj that `_unity_project`
-    accepts, or the *.slnx named after that folder in exactly Unity's shape, listing one or more projects, each
-    such a *.csproj beside it. A solution carries no stamp, so its name, shape and list stand for it; anything
-    else may be hand-kept."""
-    folder = os.path.join(root, *parts[:-1])
-    path, name = os.path.join(folder, parts[-1]), parts[-1]
-    if not os.path.isfile(os.path.join(folder, "ProjectSettings", "ProjectVersion.txt")):
-        return False
-    if name.endswith(".csproj"):
-        return _unity_project(path)
-    if name != os.path.basename(os.path.realpath(folder)) + ".slnx":
-        return False
-    data = _read_regular(path)
-    shape = UNITY_SOLUTION.fullmatch(data) if data is not None else None
-    if shape is None:
-        return False
-    try:
-        projects = [project.decode("utf-8") for project in SOLUTION_PROJECT.findall(shape.group(1))]
-    except UnicodeDecodeError:
-        return False
-    return bool(projects) and all(
-        project.endswith(".csproj") and os.path.basename(project) == project and "\\" not in project
-        and _unity_project(os.path.join(folder, project)) for project in projects)
-
-
-def _disposable(name: str, root: str | os.PathLike | None = None) -> bool:
-    """Whether the ignored entry `name`, relative to the worktree `root`, is build output or a tool cache.
-
-    A project or solution file counts only when Unity generated it (`_unity_generated`); with no `root` to read
-    it from, it does not."""
-    parts = name.rstrip("/").split("/")
-    if any(part in DISPOSABLE or part.endswith(".egg-info") for part in parts):
-        return True
-    return root is not None and not name.endswith("/") and _unity_generated(root, parts)
+def _disposable(name: str) -> bool:
+    # A Unity *.csproj or solution is not here on purpose (sd:10325): no stamp, shape or tag list read from one
+    # proves nobody edited it, and Unity writes no checksum; three review rounds each found an edit that passed.
+    return any(part in DISPOSABLE or part.endswith(".egg-info") for part in name.rstrip("/").split("/"))
 
 
 def busy(path: str, cwds: list[str] | None) -> str:
@@ -370,7 +286,7 @@ def merged_tree_kept(walk: Walk, tree: dict, cwds: list[str] | None) -> str:
         # The first entry that is not ignored answers, before a rename's second path could be read as an entry.
         if not entry.startswith("!! "):
             return "it has uncommitted or untracked files"
-        if not _disposable(entry[3:], tree["path"]):
+        if not _disposable(entry[3:]):
             return f"it holds ignored files that are not build output: {entry[3:]}"
     return ""
 

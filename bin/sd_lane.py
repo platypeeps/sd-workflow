@@ -2839,7 +2839,7 @@ def local_data(tree: pathlib.Path) -> str:
     for entry in filter(None, status.split("\0")):
         if not entry.startswith("!! "):  # the first entry that is not ignored answers, before a rename's second path
             return "it has uncommitted changes"
-        if not disposable(entry[3:], tree):
+        if not disposable(entry[3:]):
             return f"it holds ignored files that are not build output: {entry[3:]}"
     return ""
 
