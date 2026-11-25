@@ -1733,11 +1733,17 @@ def review_costs(connection: sqlite3.Connection, items: Iterable[int] | None = N
     each pass of the item's ship receipts, those a restart set aside too. Cost: the build runs' `run` and `bound`
     cost rows, as `build.run_spent` sums them, and each lane pass's reviewer cost; a bundle's run counts for each of
     its items. The builder's own review records no cost (sd:10400)."""
+    from .runner import ALONE
+
     wanted = None if items is None else set(items)
-    leads: dict[int, set[int]] = {}
-    for row in connection.execute("SELECT id, item, parent FROM assignment WHERE scope = 'build'"):
+    # Per lead, its members with the last run each is in: a member cancelled on its own (`ALONE`) is in the
+    # released runs up to its `run_count` and no later one, as `build.run` reads a run's bundle (lane review).
+    leads: dict[int, list[tuple[int, int | None]]] = {}
+    for row in connection.execute("SELECT id, item, parent, result, run_count FROM assignment WHERE scope = 'build'"):
         if wanted is None or row["item"] in wanted:
-            leads.setdefault(row["parent"] or row["id"], set()).add(row["item"])
+            alone = row["parent"] is not None and (row["result"] or "").startswith(ALONE)
+            leads.setdefault(row["parent"] or row["id"], []).append(
+                (row["item"], (row["run_count"] or 0) if alone else None))
     spent = {row["pass"]: row for row in connection.execute(
         "SELECT pass, SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out, SUM(usd) AS usd FROM cost "
         "WHERE source IN ('run', 'bound') AND pass IS NOT NULL GROUP BY pass")}
@@ -1749,7 +1755,7 @@ def review_costs(connection: sqlite3.Connection, items: Iterable[int] | None = N
 
     prev: sqlite3.Row | None = None
     for run in connection.execute(
-            "SELECT id, assignment, review_round, session_id, step FROM runner_run "
+            "SELECT id, assignment, run, review_round, session_id, step, released_at FROM runner_run "
             "WHERE assignment IN (SELECT id FROM assignment WHERE scope = 'build') ORDER BY assignment, run"):
         last = prev if prev is not None and prev["assignment"] == run["assignment"] \
             and run["session_id"] is not None and run["session_id"] == prev["session_id"] else None
@@ -1757,7 +1763,9 @@ def review_costs(connection: sqlite3.Connection, items: Iterable[int] | None = N
         clean = run["step"] in PAST_REVIEW and not (last is not None and last["step"] in PAST_REVIEW)
         prev = run
         cost = spent.get(run["id"])
-        for item in leads.get(run["assignment"], ()):
+        for item, last_run in leads.get(run["assignment"], ()):
+            if last_run is not None and (run["released_at"] is None or run["run"] > last_run):
+                continue
             row = entry(item)
             row["runs"] += 1
             row["blocking"] += blocking

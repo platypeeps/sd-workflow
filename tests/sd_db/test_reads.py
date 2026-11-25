@@ -805,6 +805,22 @@ class ReviewCosts(unittest.TestCase):
         found = reads.review_costs(self.db, [item])[item]
         self.assertEqual((found["blocking"], found["clean"], found["runs"], found["usd"]), (3, 1, 3, 1.5))
 
+    def test_a_member_cancelled_out_of_its_bundle_pays_only_for_the_runs_it_was_in(self):
+        """Lane review: a member a Retry or drop cancelled on its own (`ALONE`) after run 1 is in no later run."""
+        from sd_db.runner import ALONE
+        lead_item = create_item(self.db, kind="task", title="Lead", repo="/example/repo", status="done")
+        member = create_item(self.db, kind="task", title="Member", repo="/example/repo", status="done")
+        lead = self.assignment(lead_item)
+        gone = self.assignment(member, parent=lead)
+        self.build_run(lead, rounds=1, step="fixing", session="s1", usd=1.0)
+        self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = 'run1'", (NOW,))
+        self.db.execute("UPDATE assignment SET status = 'cancelled', run_count = 1, result = ? WHERE id = ?",
+                        (f"{ALONE}operator: left out", gone))
+        self.build_run(lead, rounds=2, step="enqueued", session="s2", usd=3.0)
+        found = reads.review_costs(self.db)
+        self.assertEqual((found[member]["runs"], found[member]["blocking"], found[member]["usd"]), (1, 1, 1.0))
+        self.assertEqual((found[lead_item]["runs"], found[lead_item]["usd"]), (2, 4.0))
+
     def test_a_bundle_run_counts_for_each_member_and_lane_passes_count_per_item(self):
         lead_item = create_item(self.db, kind="task", title="Lead", repo="/example/repo", status="done")
         member = create_item(self.db, kind="task", title="Member", repo="/example/repo", status="done")
