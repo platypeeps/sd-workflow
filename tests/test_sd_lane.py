@@ -4007,6 +4007,41 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
+    def test_a_revert_that_moves_the_fix_into_a_new_file_keeps_the_close(self) -> None:
+        """sd:10214 lane review: a cited commit fixes a draft of a base file; a revert-titled commit puts the
+        fixed text in a new file and the old one back as the base has it. Git pairs no rename, yet the work
+        ships in the new file: a file added since the cited commit that git pairs as a copy of the fixed
+        text, closer to it than to the text before, holds the work. Dropping the copy too closes nothing."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-fix-moved-to-a-new-file")
+        lines = "".join(f"reader line {n}\n" for n in range(20))
+        (tree / "reader.txt").write_text(lines, encoding="utf-8")
+        git(tree, "add", "reader.txt")
+        git(tree, "commit", "-q", "-m", "docs: the reader")
+        git(tree, "push", "-q", "origin", "HEAD:main")
+        git(tree, "fetch", "-q", "origin")
+        draft = lines.replace("line 3\n", "line 3 draft\n")
+        (tree / "reader.txt").write_text(draft, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "feat: a draft reader")
+        fixed = draft.replace("line 3 draft\n", "line 3 fixed\n") + "the fix\n"
+        (tree / "reader.txt").write_text(fixed, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: the reader\n\nCloses: sd:{a}")
+        cited = git(tree, "rev-parse", "HEAD")
+        (tree / "caller.txt").write_text(fixed, encoding="utf-8")
+        (tree / "reader.txt").write_text(lines, encoding="utf-8")
+        git(tree, "add", "caller.txt", "reader.txt")
+        git(tree, "commit", "-q", "-m", "revert: move the reader into the caller")
+        head = git(tree, "rev-parse", "HEAD")
+        status = git(tree, "diff", "-M", "--name-status", cited, head)
+        self.assertNotIn("R", "".join(line[:1] for line in status.splitlines()),
+                         "the fixture must be a move git does not pair as a rename")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+        git(tree, "rm", "-q", "caller.txt")
+        git(tree, "commit", "-q", "-m", "revert: drop the caller")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
     def test_a_move_back_of_a_rewritten_file_keeps_the_close(self) -> None:
         """sd:10214 class pass 5: the cited commit moves a file and rewrites it, so git sees a delete and an
         add, no rename. A revert that only moves it back keeps the rewrite: the work is read where it went."""
