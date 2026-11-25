@@ -814,7 +814,9 @@ class ReviewCompanions(WritingCase):
             read()
             self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
         result, seen = self.cli_run(read_then_relay)
-        self.assertTrue(result["current"])
+        # The prose is the one reviewed, the layout is not: neither the run nor the companion reads as current.
+        self.assertFalse(result["current"])
+        self.assertEqual(self.companions()["adversarial"], "stale")
         self.assertNotEqual(hashlib.sha256(seen).hexdigest(), hashlib.sha256(self.index.read_bytes()).hexdigest())
         with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
             self.adversarial_gate(result["digest"])
@@ -939,7 +941,9 @@ class ReviewCompanions(WritingCase):
         self.assertIn("<!-- adversarial-reviewed: words=", text)
         self.assertIn("## Resolution ledger", text)
         self.assertTrue(text.endswith("Each finding was checked against the revision.\n"))
-        self.assertEqual(self.companions()["adversarial"], "current")
+        # The run attested other index.md bytes, and a reconcile keeps that attestation, so the report reads as
+        # stale, as the gate on it refuses: only a fresh run answers the edited file (sd:10719).
+        self.assertEqual(self.companions()["adversarial"], "stale")
         # 36 more words against the reconcile, 20%, but 48 against the run: 26% of 183.
         revised[1:5] = [s.replace("sourced", "revised") for s in revised[1:5]]
         self.write_draft(revised)

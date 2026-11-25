@@ -892,6 +892,13 @@ def _companion(snapshot: dict, artifact: str) -> dict:
     if not stamped:
         return {"state": "unstamped", "detail": "predates reconcile tracking; treat as stale"}
     if stamped.group(1) == snapshot["digest"]:
+        # The digest ignores whitespace; a report that attests index.md bytes answers only those bytes (sd:10719).
+        try:
+            attested = _attested(data.decode("utf-8"))
+        except WorkflowError as error:
+            return {"state": "stale", "detail": str(error)}
+        if attested and attested != snapshot["hashes"]["index"]:
+            return {"state": "stale", "detail": "index.md layout changed after the review; run the review again"}
         return {"state": "current", "detail": f"draft {snapshot['digest']}"}
     return {"state": "stale", "detail": f"reconciled with {stamped.group(1)}, draft is now {snapshot['digest']}"}
 
@@ -1023,7 +1030,8 @@ def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *
                           + (report if report.endswith("\n") else report + "\n"))
     verdict = re.findall(r"(?im)^.*survive[s]? hostile reading.*$", report)
     return {"piece": row["piece"], "path": target.relative_to(_disk(row["repo"])).as_posix(), "digest": digest,
-            "current": snapshot["digest"] == digest, "index_sha256": index_sha256,
+            "current": snapshot["digest"] == digest and snapshot["hashes"]["index"] == index_sha256,
+            "index_sha256": index_sha256,
             "confidence": {tag: len(re.findall(rf"\b{tag}\b", report)) for tag in ("CERTAIN", "LIKELY", "SPECULATIVE")},
             "verdict": verdict[-1].strip() if verdict else None}
 
