@@ -169,6 +169,28 @@ class TaskCLI(unittest.TestCase):
         self.assertEqual(closed["item"]["status"], "done")
         self.assertTrue(next(row for row in closed["notes"] if row["id"] == pasted)["resolved_at"])
 
+    def test_the_suggested_retry_keeps_the_evidence_and_the_revision_guard(self):
+        """sd:10407 review: the refusal suggested a bare `done --resolve-followups`, which dropped
+        `--reason`, `--delivered-by`, `--delivered-in` and `--if-revision` the caller gave."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "A task", "--json").stdout)["item"]
+        self.call("task", "note", item["id"], "Ask example.test", "--kind", "followup")
+        revision = json.loads(self.call("task", "show", item["id"], "--json").stdout)["revision"]
+        reason = "shipped by hand; it's <b>done</b>"
+        refused = self.call("task", "status", item["id"], "done", "--reason", reason,
+                            "--if-revision", revision, code=1).stderr
+        suggested = shlex.split(re.search(r"`(sd task status [^`]+)`", refused).group(1))
+        self.assertEqual(suggested, ["sd", "task", "status", str(item["id"]), "done", "--reason", reason,
+                                     "--if-revision", revision, "--resolve-followups"])
+        # `--delivered-by` is verified before the close, so its retry is read from the helper.
+        given = argparse.Namespace(item=7, reason=None, delivered_by="a" * 40,
+                                   delivered_in="/repos/example dir", if_revision=None)
+        self.assertEqual(shlex.split(sd_work._retry_with_resolve(given)),
+                         ["sd", "task", "status", "7", "done", "--delivered-by", "a" * 40,
+                          "--delivered-in", "/repos/example dir", "--resolve-followups"])
+        closed = json.loads(self.call("task", *suggested[2:], "--json").stdout)
+        self.assertEqual(closed["item"]["status"], "done")
+        self.assertIn(reason, closed["notes"][-1]["body"])
+
     def test_an_edit_with_no_field_names_the_edit_command(self):
         """sd:5065: the refusal names the command that fixes it."""
         item = json.loads(self.call("task", "add", "--priority", "3", "A task", "--json").stdout)["item"]["id"]

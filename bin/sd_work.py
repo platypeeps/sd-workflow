@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import stat
 import sys
 from typing import Any
@@ -821,11 +822,23 @@ def _change_status(workflow: Any, connection: Any, args: argparse.Namespace,
     except workflow.TransitionRefused as refused:
         if not str(refused).startswith(f"item {args.item} has open followups; "):
             raise
-        raise WorkRefusal(f"{refused}; or close with `sd task status {args.item} done "
-                          f"--resolve-followups`, which resolves them too") from None
+        raise WorkRefusal(f"{refused}; or close with `{_retry_with_resolve(args)}`, "
+                          f"which resolves them too") from None
     spawned = result.get("next_occurrence")
     following = None if spawned is None else workflow.item_state(connection, spawned)["item"]
     return result, following
+
+
+def _retry_with_resolve(args: argparse.Namespace) -> str:
+    """The caller's own `sd task status N done`, every option it gave kept, plus `--resolve-followups`.
+
+    A bare retry dropped the delivery evidence and the revision guard (sd:10407)."""
+    words = ["sd", "task", "status", str(args.item), "done"]
+    for flag, value in (("--reason", args.reason), ("--delivered-by", args.delivered_by),
+                        ("--delivered-in", args.delivered_in), ("--if-revision", args.if_revision)):
+        if value is not None:
+            words += [flag, value]
+    return shlex.join([*words, "--resolve-followups"])
 
 
 def _refuse_task_delivery(workflow: Any, connection: Any, args: argparse.Namespace) -> None:
