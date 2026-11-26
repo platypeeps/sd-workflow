@@ -23,6 +23,7 @@ For itemless records, replace `--item ID` below with `--no-item --review-id ID`.
    The test must run at the reviewed head: a test already committed there (`["python3", "-m", "pytest", "tests/test_x.py::test_y"]`) or an inline script (`["python3", "-c", "..."]`).
    A new commit moves the head, so adjudicate at the head the next review sees.
    Recording and each prepare run that test at the clean head, with no shell, for up to 300 s.
+   Merge, publication and `verify-review` only read the record; they run no test.
    A test that fails, cannot start, overruns or dirties the checkout refuses: the blocker stays open.
    `test` is `[]` when there is none, such as a cosmetic or a parked finding.
    File the rebutted finding as an item for the next PR; it is advisory now.

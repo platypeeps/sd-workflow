@@ -153,7 +153,8 @@ def text(value: Any, label: str) -> None:
         raise Refusal(f"disposition {label} needs nonempty bounded text")
 
 
-def validate(operation: Any, head: str, proposal: Any) -> str:
+def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool) -> str:
+    """`run_tests`: recording and prepare run each row's `test`; a read (merge, publication, `verify-review`) does not (sd:10893)."""
     bindings, expected = context(operation, head)
     if (not isinstance(proposal, dict) or set(proposal) != {"schema_version", "bindings", "findings"}
             or type(proposal["schema_version"]) is not int or proposal["schema_version"] != 1
@@ -172,7 +173,7 @@ def validate(operation: Any, head: str, proposal: Any) -> str:
         text(row["reason"], "reason")
     tests = [test_argv(row.get("test")) for row in rows]
     for index, argv in enumerate(tests, 1):
-        if argv:
+        if argv and run_tests:
             reproduces(operation.root, head, index, argv)
     return digest(proposal)
 
@@ -210,12 +211,12 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
                       f"fix it, or name a test that passes; {tail}")
 
 
-def accepted(operation: Any, head: str) -> dict:
+def accepted(operation: Any, head: str, *, run_tests: bool = False) -> dict:
     revision, value = operation.store.read(operation.connection, key(operation))
     if not revision or value.get("decision") != "accepted":
         raise blocking_refusal(operation, head, operation.review_inputs(head),
                                "local review contains blocking findings without recorded dispositions")
-    proposal_digest = validate(operation, head, value.get("proposal"))
+    proposal_digest = validate(operation, head, value.get("proposal"), run_tests=run_tests)
     if value.get("proposal_digest") != proposal_digest:
         raise Refusal("recorded disposition receipt digest does not match")
     return {"kind": "adjudicated", "key": key(operation), "revision": revision, "digest": proposal_digest}
@@ -237,7 +238,7 @@ def adjudicate(operation: Any) -> dict:
         proposal = json.loads(read_file(args.dispositions_file, MAX_PROPOSAL_BYTES), object_pairs_hook=unique_object)
     except (ValueError, RecursionError):
         raise Refusal("disposition proposal is not bounded valid JSON") from None
-    proposal_digest = validate(operation, args.expected_head, proposal)
+    proposal_digest = validate(operation, args.expected_head, proposal, run_tests=True)
     from sd_db.database import transaction
     with transaction(operation.connection):
         source_revision, source_state = operation.store.read(operation.connection, operation.key)

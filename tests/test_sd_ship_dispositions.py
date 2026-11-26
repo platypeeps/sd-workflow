@@ -259,6 +259,20 @@ class DispositionTests(unittest.TestCase):
         with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
             self.prepare()
 
+    def test_only_recording_and_prepare_run_the_test_never_a_read(self):
+        """sd:10893 review: merge, publication and `verify-review` read the record and run nothing; a test
+        is code, so a read-only command executing it in the live checkout is not read-only."""
+        self.blocked()
+        runs = self.directory / "runs"
+        script = f"open({str(runs)!r}, 'a').write('x')"
+        self.accepted(self.with_test([sys.executable, "-c", script]))
+        self.assertEqual(runs.read_text(), "x")
+        self.prepare()
+        self.assertEqual(runs.read_text(), "xx")
+        self.operation().check_review(self.head)
+        self.operation().check_review(self.head, refresh_adjudication=True)
+        self.assertEqual(runs.read_text(), "xx")
+
     def test_a_test_that_dirties_the_checkout_or_is_malformed_refuses(self):
         """sd:10893. The record binds the clean exact head; `test` is an argv list, not a shell string."""
         self.blocked()
