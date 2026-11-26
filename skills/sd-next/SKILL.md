@@ -1,6 +1,6 @@
 ---
 name: sd-next
-description: 'Use when the operator asks for status, "what next", recommendations, followups or "what do you need from me" across all their work: done recently, landing soon, open items, numbered next steps, then the waiting questions one at a time; and when the operator says "grill", to walk the weekly grill questions.'
+description: 'Use when the operator asks for status, "what next", recommendations, followups or "what do you need from me" across all their work: done recently, landing soon, open items, numbered next steps, then the waiting questions one at a time; when the operator says "grill", to walk the weekly grill questions; and for the runs "triage", "park review", "health check", "open threads" or "collect followups".'
 ---
 
 # sd-next
@@ -60,9 +60,17 @@ When the operator says "grill":
 4. Stop when the operator says stop, or when no question waits. A question left open stays on the item for the next grill.
 5. Once every question on an item has a ruling, close it: `sd task status N done --reason 'grill answered'`.
 
+## Operator runs
+
+Each run below lives in its own file; read it in full when its trigger comes, and follow it in place of the steps above.
+
+- `references/triage.md`: "triage" (every stalled item, then builds) and "park review" (its parked items alone).
+- `references/health.md`: "health check" (this machine's health and open findings).
+- `references/open-threads.md`: "open threads" or "collect followups" (this session's unfiled threads, filed and ruled).
+
 ## Never
 
 - Never say "none" for a section `sd today` printed as `unknown`; say it is unknown.
 - Never list more than five rows in a section; the rest stay in `sd today` and the dashboard.
 - Never invent an item number, a PR number, a commit or a note id; copy them from the output.
-- Never write anything but the question and decision notes of the walks above, and a grill item's close.
+- Never write anything but the question and decision notes of the walks above, and a grill item's close; an operator run records what its reference says.
