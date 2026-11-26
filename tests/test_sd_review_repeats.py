@@ -1389,6 +1389,30 @@ class RebuttalIdentityTests(unittest.TestCase):
         disposed = sd_review.dispose([row()], "high", listed(ruled_body()), prior=same)
         self.assertEqual([r["disposition"] for r in disposed], ["advisory"])
 
+    def test_a_ruling_holds_no_uncited_repeat_beside_another_saved_blocker(self) -> None:
+        """Class pass 7 (bin/sd-review:1820, :1842): the saved repro was found by the prior blocker's words,
+        so one in other words at the ruled place let the uncited repeat through. A ruling holds an uncited
+        repeat only when every blocker the prior review saved at or beside its place is the claim it judged:
+        the ruled repro, or the ruled words with none. Any other saved there blocks, fail closed."""
+        fresh = "python3 t.py --empty: IndexError"
+        def held(*saved: dict[str, Any]) -> list[str]:
+            prior = [dict(old, disposition="blocking") for old in saved]
+            return [r["disposition"] for r in sd_review.dispose([row()], "high", listed(ruled_body()), prior=prior)]
+        for name, old in (("other words, another repro", row(summary="crash on empty input", evidence=fresh)),
+                          ("other words, no repro", row(summary="crash on empty input")),
+                          ("other words, a line beside", row(summary="crash on empty input", evidence=fresh,
+                                                             line=1 + sd_review.SHIFT_LINES)),
+                          ("other words, no line", row(summary="crash on empty input", evidence=fresh, line=None)),
+                          ("the ruled words, another repro", row(evidence=fresh))):
+            with self.subTest(name):
+                self.assertEqual(held(old), ["blocking"])
+        for name, old in (("the ruled repro in other words", row(summary="crash on empty input", evidence=REPRO)),
+                          ("the ruled words, no repro", row()), ("another file", row(path="other.py", evidence=fresh)),
+                          ("a line far off", row(summary="crash", evidence=fresh, line=2 + sd_review.SHIFT_LINES))):
+            with self.subTest(name):
+                self.assertEqual(held(old), ["advisory"])
+        self.assertEqual(held(), ["advisory"])
+
     def test_every_ruling_rebuttal_holds_past_the_prompts_cap(self) -> None:
         """Class pass 4 (build_run.py:2199): a build clears each exact repeat its ruling round ruled, however
         many; the prompt's cap listed ten rebuttals, so the lane blocked the eleventh. A ruling's hold reads

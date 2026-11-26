@@ -1816,8 +1816,21 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         record = recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances"))
         # Or a build's ruling: it holds an uncited repeat, and one citing the evidence it judged, never a fresh
         # reproduction; a build clears exactly those, or it enqueues what blocks here (class pass 4, sd:10286).
-        ruled = getattr(record, "ruled", None)  # an uncited one carries the repro the prior review saved there (sd:10286)
-        return (cited if cited is not None else prior_evidence(saved, row) or None) in (None, ruled) if ruled is not None else cited is None and getattr(record, "listed", False)
+        ruled = getattr(record, "ruled", None)
+        if ruled is None:
+            return cited is None and getattr(record, "listed", False)
+        # An uncited one holds only when each blocker the prior review saved at or beside its place is the claim
+        # the ruling judged: its repro, or its words with none. A closed test, whatever the saved one's words or
+        # line; any other saved there blocks (class pass 7, sd:10286).
+        def _judged(old: Mapping[str, Any]) -> bool:
+            kept = old.get("evidence") if isinstance(old.get("evidence"), str) and old["evidence"].strip() else None
+            return kept == ruled if kept is not None else summary_key(old.get("summary")) == summary_key(row.get("summary"))
+        def _beside(old: Mapping[str, Any], at: Mapping[str, Any]) -> bool:
+            mine, theirs = old.get("line"), at.get("line")
+            return _place(old.get("path")) == _place(at.get("path")) and (
+                type(mine) is not int or type(theirs) is not int or abs(mine - theirs) <= SHIFT_LINES)
+        return cited == ruled if cited is not None else all(
+            _judged(old) for old in saved if old.get("disposition") == "blocking" and any(_beside(old, at) for at in instance_rows(row)))
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
         evidence = row.get("evidence")
         return _floor(row) and _rebutted(row, evidence if isinstance(evidence, str) and evidence.strip() else None)
@@ -1849,6 +1862,10 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     return disposed
 
 
+def _place(path: Any) -> str:
+    return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
+
+
 def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any], findings: Sequence[Any] = ()) -> str | None:
     """The evidence a prior report's blockers stored for `record`'s finding, one per line; "" when they stored
     none, as a report from before sd:9867 may, or when a prior blocker of any pass within `SHIFT_LINES` matches no
@@ -1858,9 +1875,6 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     A match is the same file, as `repo_spelling` spells it, the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8). Failing that,
     the same file and `summary_key` within `ECHO_LINES`, when no finding repeats that blocker at its own line."""
-    def _place(path: Any) -> str:
-        return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
-
     def _file(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
         mine, theirs = _place(new.get("path")), _place(old.get("path"))
         return bool(mine) and mine == theirs  # one spelling (`repo_spelling`), never a suffix: /elsewhere/src.py

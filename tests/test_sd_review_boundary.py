@@ -1148,11 +1148,16 @@ class LineBudgetTests(unittest.TestCase):
         # ruling holds back only the repeat it judged: a citation of
         # other evidence, a lapsed ruling or a cut text's literal
         # stored form blocks. Measured: `sd-review` is 3210 here.
+        #
+        # 5180 -> 5194 is the sd:10286 class pass: `bin/sd-review` +14
+        # so a ruling holds an uncited repeat only when each blocker
+        # the prior review saved beside it is the claim it judged, a
+        # closed test in `dispose`. Measured: `sd-review` is 3224 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5180,
+            5194,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
