@@ -4185,6 +4185,34 @@ class CitedCloses(SharedQueue):
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a} if cites else set())
 
+    def test_a_revert_that_brings_the_old_name_back_reads_both_names(self) -> None:
+        """sd:10214 review: a refactor renamed the cited file, then a revert brought the old name back and left
+        the new one in place. The rename's mapping is stale there: both names are read, so the old content
+        back at the old name undoes the work, and the fix kept at the old name keeps the close."""
+        import sd_operations
+        a, *_ = self.open
+        original = "".join(f"line {n}\n" for n in range(20))
+        fixed = original.replace("line 7\n", "line 7 fixed\n")
+        for case, (old_text, new_text, closes) in {
+                "reverted": (original, "unrelated text\n", set()),
+                "kept": (fixed, original, {a})}.items():
+            with self.subTest(case=case):
+                tree, _ = self.committed(f"topic-stale-rename-{case}")
+                git(tree, "fetch", "-q", "origin")
+                git(tree, "reset", "-q", "--hard", "origin/main")
+                if not (tree / "x.txt").exists():  # the second case builds on the first's main
+                    self.on_main(tree, {"x.txt": original})
+                (tree / "x.txt").write_text(fixed, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", f"fix: line 7\n\nCloses: sd:{a}")
+                git(tree, "mv", "x.txt", "y.txt")
+                git(tree, "commit", "-q", "-m", "refactor: rename x to y")
+                (tree / "x.txt").write_text(old_text, encoding="utf-8")
+                (tree / "y.txt").write_text(new_text, encoding="utf-8")
+                git(tree, "add", "-A")
+                git(tree, "commit", "-q", "-m", "revert: line 7")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
+
     def test_a_submodule_link_holds_no_text_and_hides_no_revert(self) -> None:
         """sd:10214 class pass 10: a submodule link is a commit, not text. An unrelated link the head changed
         is no failed read that keeps a reverted item's close, and a cited link a revert set back is undone."""

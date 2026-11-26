@@ -1107,7 +1107,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         return found
 
     def reads_before(where: dict[str, str], rev: str, names: list[str], before: str,
-                     home: dict[str, str] | None = None) -> bool | None:
+                     home: dict[str, str] | None = None, cited: str = "") -> bool | None:
         """Whether the files `names`, at `where` in `rev`, read as `before` held them; None when git gave no answer.
 
         `home` names the path a file the cited commit renamed came from: such
@@ -1116,17 +1116,30 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         not pair still holds the work (class pass 6). A move git follows to a
         third name holds the work there, unless it reads there as `before`
         held it: git paired a restored file, not the work (sd:10214 review).
+        A mapping goes stale when the file's old name comes back while the
+        new one still stands: no read says which name holds the work. Given
+        `cited`, the commit that left the work, both names are read there:
+        either reading as `cited` left the file holds the work, else either
+        reading as `before` held it does not (sd:10214 review, stale rename).
         """
         home = home or {}
         held = [where.get(name, name) for name in names]
         paths = held + names + [home[name] for name in names if name in home]
-        want, now = blobs(before, paths), blobs(rev, paths)
-        if want is None or now is None:
+        want, now, fix = blobs(before, paths), blobs(rev, paths), blobs(cited, names) if cited else {}
+        if want is None or now is None or fix is None:
             return None
         held = [name if at != name and now.get(at) == want.get(at) else at for at, name in zip(held, names, strict=True)]
-        return all(now.get(at) == want.get(name) if name not in home else
-                   at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))
-                   for at, name in zip(held, names, strict=True))
+
+        def one(at: str, name: str) -> bool:
+            if name in home:
+                return at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))
+            if cited and at != name and name in now:  # both names stand: the mapping may be stale
+                # ponytail: the old content back at the old name beside an edited fix at the new one reads as
+                # undone (a lost close, fixed by hand); read the edit's lineage if that matters.
+                found = (now.get(at), now.get(name))
+                return (fix.get(name) is None or fix.get(name) not in found) and want.get(name) in found
+            return now.get(at) == want.get(name)
+        return all(one(at, name) for at, name in zip(held, names, strict=True))
 
     def undone(index: int, names: list[str], before: str) -> bool | None:
         """Whether reverts alone took the work in `names` out; None when the cited commit itself left them as
@@ -1174,9 +1187,11 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                                  for old in [places[held[0]].get(name, name)] if step.get(old, old) != name}
 
             def back(later: str = later, where: dict[str, str] = where) -> bool:
-                return git_answered(reads_before(where, later, names, sha))
+                # Both names, as the reads above: a stale mapping hides the work back at the old name.
+                return git_answered(reads_before(where, later, names, sha)) or \
+                    git_answered(reads_before({}, later, names, sha))
 
-            was[later] = git_answered(reads_before(where, later, names, before, moved))
+            was[later] = git_answered(reads_before(where, later, names, before, moved, sha))
             left[later] = work_left(was[later], revert,
                                     [(was[parent], left[parent]) for parent in held], back, forked_in)
             if unread:
