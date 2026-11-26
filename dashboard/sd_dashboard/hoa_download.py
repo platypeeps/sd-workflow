@@ -24,7 +24,8 @@ module's `run` detached, its output in `<state>/start.log`, and 202. `status` is
    `unavailable`: the Chrome tools did not load (pack sd:7723).
 3. The download: the checkout's command, phase `downloading`. Exit 0 is `done`, 3 `unavailable`, any other `failed`,
    each with the command's last output line. The command keeps its own lock and its own landing.
-4. `last.json` as `done`, `unavailable` or `failed`, with the exit code and the reason.
+4. `last.json` as `done`, `unavailable` or `failed`, with the exit code and the reason. Each record carries
+   `last_done`, the end of the last run that was done, so a failure still names the last good download.
 
 Exit codes: 0 done, 3 not possible now (signed out, no browser, another run), 1 failed.
 """
@@ -199,13 +200,32 @@ def request(values: dict):
     return lambda connection: start(connection, source)
 
 
+def _last_done(record) -> str:
+    """sd:10616: when the source's last good download finished, from its record: its `last_done`, or its own end when
+    a record from before that field says done. No record, or one that is not an object, names none."""
+    if not isinstance(record, dict):
+        return ""
+    done = record.get("last_done") or (record.get("finished") if record.get("state") == "done" else "")
+    return done if isinstance(done, str) else ""
+
+
+def _read_record(path: Path):
+    """The record at `path`, or None when it does not read."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def status(source: str, place: Path | None = None) -> dict:
     """The source's last download for the page: `running`, `state` (never, running, done, unavailable, failed),
-    `phase` while it runs (opening, waiting, downloading), `reason`, times, `log`, and `error`, why Download is off."""
+    `phase` while it runs (opening, waiting, downloading), `reason`, times, `log`, `last_done`, when the last good
+    download finished (sd:10616), and `error`, why Download is off."""
     state = state_dir(source)
     out = {"source": source, "label": SOURCES[source]["label"], "command": _command(source), "running": False,
            "state": "never", "phase": "", "reason": "", "started": "", "finished": "", "exit": None,
-           "log": str(state / "start.log"), "error": _gap(place, source) if place else ""}
+           "log": str(state / "start.log"), "error": _gap(place, source) if place else "",
+           "last_done": ""}
     try:
         record = json.loads((state / "last.json").read_text(encoding="utf-8"))
         if not isinstance(record, dict):
@@ -217,6 +237,7 @@ def status(source: str, place: Path | None = None) -> dict:
     held = _held(state)
     if record:
         out.update({key: record.get(key, out[key]) for key in ("state", "phase", "reason", "started", "finished", "exit")})
+        out["last_done"] = _last_done(record)
     if out["state"] == "running" and not held:
         # Every live runner holds the lock, so a free one ends the run even if its pid now names another process.
         out.update(state="failed", phase="", reason=f"the download stopped without recording an outcome; see {out['log']}")
@@ -445,7 +466,8 @@ def run(source: str, place: Path, out=sys.stdout, err=sys.stderr) -> int:
     try:
         started = (state / "lock").read_text(encoding="utf-8").strip() or _now()
         record = {"source": source, "state": "running", "phase": "opening", "started": started, "finished": "",
-                  "exit": None, "reason": "", "pid": os.getpid(), "log": str(state / "start.log")}
+                  "exit": None, "reason": "", "pid": os.getpid(), "log": str(state / "start.log"),
+                  "last_done": _last_done(_read_record(state / "last.json"))}
 
         def phase(name):
             record["phase"] = name
@@ -454,6 +476,8 @@ def run(source: str, place: Path, out=sys.stdout, err=sys.stderr) -> int:
         def finish(code, reason):
             record.update(state={EXIT_OK: "done", EXIT_NONE: "unavailable"}.get(code, "failed"), phase="", exit=code,
                           reason=reason, finished=_now())
+            if code == EXIT_OK:
+                record["last_done"] = record["finished"]
             write_record(state / "last.json", record)
             if code != EXIT_OK:
                 print(f"hoa_download: {source}: {reason}", file=err)

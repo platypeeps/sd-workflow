@@ -1347,7 +1347,10 @@ def merged_by_hand(root: pathlib.Path, entry: dict[str, Any], receipts: list[dic
     nothing, so it can only refuse; a git read that fails refuses
     `PUBLISH_UNKNOWN`, unless the item is `done`: a head another machine
     queued is often absent here, and a done item's merged receipt is then
-    the proof (pack sd:6805).
+    the proof (pack sd:6805). An entry imported from the file queue has
+    no receipt to show: that queue kept none, and a satellite's merge
+    writes none on the hub; its item being `done`, with no merged
+    receipt of the item at all, is the proof (sd:10381).
     """
     item, head = entry.get("item"), str(entry.get("expected_head") or "")
     for receipt in receipts:
@@ -1361,6 +1364,8 @@ def merged_by_hand(root: pathlib.Path, entry: dict[str, Any], receipts: list[dic
             if not done or error.code != PUBLISH_UNKNOWN:
                 raise
             return f"sd:{item} is done; its receipt merged at {commit}, and this clone cannot read {head} or {merged}"
+    if done and entry.get("imported_from") and not receipts:  # a receipt read here that excludes the head is other work
+        return f"sd:{item} is done; the old file queue kept no ship receipt for {head or 'its head'}"
     raise LaneError(f"sd:{item}'s prepared entry {entry.get('id')} at {head or 'no head'} has no merged ship receipt "
                     "that holds its head; merge it with `sd-ship merge --item`, or queue it again with "
                     "`sd-ship lane retry --manual`")
@@ -1548,6 +1553,8 @@ def ask_wait(checkout: pathlib.Path, path: str, environ: dict[str, str]) -> dict
 
 #: The suite a gate failure names: `sd-check`'s `failed shard <suite>:` summary (pack sd:6739).
 FAILED_SUITE = re.compile(r"\bfailed shard (\S+?):")
+#: The suffix `run-tests.sh` gives one part of a module it splits by test id: `tests.test_x.part2of3`.
+SHARD_PART = re.compile(r"\.part\d+of\d+$")
 #: The statuses a gate passed in: the head the gate ran at is proved good.
 GATE_PASSED = ("merged", "prepared")
 
@@ -1574,7 +1581,9 @@ def flake_items(connection: Any, repository: str, path: str, *, now: float, days
             continue
         reason = str(entry.get("reason") or "")
         if entry.get("status") == "failed":
-            failed.setdefault(head, []).extend((suite, entry) for suite in FAILED_SUITE.findall(reason))
+            # A split module's shard, `<suite>.partNofM`, is its suite's: sd-ship names the module (sd:9866).
+            failed.setdefault(head, []).extend((SHARD_PART.sub("", suite), entry)
+                                               for suite in dict.fromkeys(FAILED_SUITE.findall(reason)))
             continue
         if entry.get("status") not in GATE_PASSED or entry["finished_at"] < since:
             continue
