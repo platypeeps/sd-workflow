@@ -43,7 +43,7 @@ Budget: about 90 minutes. Follow `references/decide-ask-record.md` to decide, as
 
 - Stalled: no commit in 14 days and no in_progress item, or the Status names no next step.
 - For each stalled item, decide:
-  - unblock it and set it ready (`sd task status N ready --if-revision <revision>`, the `revision:` line of the `sd task show N` you decided from) if nothing it needs is missing and its build never failed;
+  - unblock it and set it ready (`sd task status N ready --if-revision <revision>`, the `revision:` line of the `sd task show N` you decided from) if nothing it needs is missing, its build never failed and its repository has no open question (step 0 holds it);
     a refusal means the item changed since: read it again;
   - fix it or split it if it failed review or a build, then retry it with `sd assignments build N`, never set ready, with a decision note for each blocker past round 3;
   - otherwise leave a note naming what it waits on: an item, a date, a measurement, or the operator.

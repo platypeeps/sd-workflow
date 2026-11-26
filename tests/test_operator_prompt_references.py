@@ -220,6 +220,12 @@ class ScopeOfEachWrite(unittest.TestCase):
                 # No per-item skip stands in for the hold: a skipped item's sibling pressed it anyway.
                 self.assertNotRegex(text, r"Skip an item with an open question note")
 
+    def test_the_fleet_review_sets_ready_only_where_no_question_holds(self):
+        """fleet-review.md:46: a ready item is auto-picked, so a held repository sets none ready."""
+        rule = reference("sd-research-repo", "fleet-review.md").split("## 3.", 1)[1].split("\n## ", 1)[0]
+        ready = next(line for line in rule.splitlines() if "unblock it and set it ready" in line)
+        self.assertIn("and its repository has no open question (step 0 holds it)", ready)
+
     def test_the_deep_run_presses_only_items_it_filed(self):
         """A new item has no bundle: its press queues it alone. An older item's build is triage's."""
         rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
