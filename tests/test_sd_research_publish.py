@@ -906,6 +906,33 @@ class ObsidianTests(Fixture):
         self.assertIn("source_repo: my-research", written)
         self.assertIn("source_path: 10-x/a.md", written)
 
+    def commit_docs(self) -> list[dict]:
+        docs = self.docs()
+        (self.repo / "10-x" / "a.md").write_text("# A\n\ncommitted\n\n", encoding="utf-8")
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-q", "-m", "first")
+        return docs
+
+    def test_a_recorded_revision_carries_that_commit_s_bytes(self) -> None:
+        """sd:10629: the copy named HEAD but held the working tree's edit."""
+        docs = self.commit_docs()
+        head = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "10-x" / "a.md").write_text("# A\n\nunsaved edit\n", encoding="utf-8")
+        PUBLISH.write_obsidian(self.repo, docs)
+        written = (self.briefs() / "a.md").read_text(encoding="utf-8")
+        self.assertIn("revision: %s\n" % head, written)
+        self.assertTrue(written.endswith("---\n# A\n\ncommitted\n\n"), written)
+
+    def test_an_uncommitted_document_records_no_commit(self) -> None:
+        """A file no commit holds is written as it is, and says so."""
+        self.commit_docs()
+        (self.repo / "10-x" / "new.md").write_text("# New\n", encoding="utf-8")
+        PUBLISH.write_obsidian(self.repo, [dict(src="10-x/new.md", out="new", title="N", obsidian={})])
+        written = (self.briefs() / "new.md").read_text(encoding="utf-8")
+        self.assertIn("revision: uncommitted\n", written)
+        self.assertTrue(written.endswith("# New\n"))
+
     def test_a_re_render_replaces_rather_than_appends(self) -> None:
         PUBLISH.write_obsidian(self.repo, self.docs())
         PUBLISH.write_obsidian(self.repo, self.docs())

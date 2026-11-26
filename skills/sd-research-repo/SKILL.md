@@ -143,9 +143,9 @@ records the differences that are on purpose. Both are in
    argument — the exact invocation and its limits are in
    `references/conventions.md`. If it is unavailable, record that in Status
    rather than letting self-review pass as review.
-8. Local publication already happened: `render` wrote each document's Markdown
-   into `$OBSIDIAN_VAULT/Briefs/<repo>/` and registered `docs/dashboard/` with
-   the Documents tab. Nothing further is needed for a document that publishes
+8. Local publication already happened: `render` wrote the Markdown of each
+   document carrying `obsidian=dict()` into `$OBSIDIAN_VAULT/Briefs/<repo>/`
+   and registered `docs/dashboard/` with the Documents tab. Nothing further is needed for a document that publishes
    locally, which is every document until the user designates one.
 
    For a document carrying a `notion=` or `drive=` key, `render` left a request
