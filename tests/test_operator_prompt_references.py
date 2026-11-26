@@ -25,7 +25,15 @@ from clean_env import clean_environment  # noqa: E402
 #: skill -> reference file -> the triggers the operator types.
 PROMPTS = {
     "sd-next": {
+        "triage.md": ("triage", "park review"),
         "health.md": ("health check",),
+        "open-threads.md": ("open threads", "collect followups"),
+    },
+    "sd-research-repo": {
+        "fleet-review.md": ("review my research repos",),
+    },
+    "sd-status": {
+        "deep.md": ("/sd-status deep",),
     },
 }
 
@@ -60,7 +68,7 @@ class OperatorPromptReferences(unittest.TestCase):
 
     def test_model_invoked_skill_descriptions_name_the_triggers(self):
         """A plain ask loads the skill only through its description."""
-        for skill in ("sd-next",):
+        for skill in [s for s in PROMPTS if model_invocable(s)]:
             for triggers in PROMPTS[skill].values():
                 for trigger in triggers:
                     with self.subTest(skill=skill, trigger=trigger):
@@ -108,6 +116,82 @@ class ReviewRoundFixes(unittest.TestCase):
                                    and f"skills/{skill}/references/{name}`" in skill_text(s)
                                    or (s == skill and model_invocable(s) and trigger in description(s))]
                         self.assertTrue(loaders, trigger)
+
+    def test_review_batch_questions_go_to_the_review_page(self):
+        """A review batch's questions are labelled on the dashboard, not answered with --answers."""
+        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md")):
+            with self.subTest(reference=name):
+                self.assertIn("dashboard's Review page", reference(skill, name))
+
+    def test_each_state_move_names_its_command(self):
+        """`unpark`, `set it ready` and `retry` are verbs of real commands; say which."""
+        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md"),
+                            ("sd-status", "deep.md")):
+            with self.subTest(reference=name):
+                self.assertIn("sd task status N ready", reference(skill, name))
+        triage = reference("sd-next", "triage.md")
+        self.assertIn("sd task edit N --unpark", triage)
+        self.assertIn("sd assignments cancel <assignment>", triage)
+
+    def test_triage_cancels_no_member_of_a_live_bundle(self):
+        """Cancelling one member of a running bundle parks the whole run (sd:10795)."""
+        triage = reference("sd-next", "triage.md")
+        self.assertIn("Cancel only an assignment whose run has ended or lost its beat", triage)
+        self.assertIn("A member of a live bundle waits for its run to end", triage)
+
+    def test_item_writes_bind_to_the_revision_read(self):
+        """A status move or a cancel decided from a read carries that read's revision."""
+        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md"),
+                            ("sd-status", "deep.md")):
+            with self.subTest(reference=name):
+                self.assertIn("--if-revision <revision>", reference(skill, name))
+        self.assertIn("sd assignments cancel <assignment> --if-revision <revision>",
+                      reference("sd-next", "triage.md"))
+
+    def test_deep_review_writes_only_as_its_reference_says(self):
+        """sd-status writes nothing, except the deep run's items and report (sd:10795)."""
+        self.assertIn("`/sd-status deep`", description("sd-status"))
+        self.assertIn("**Never write, anywhere**, outside a `/sd-status deep` run", skill_text("sd-status"))
+
+    def test_deep_review_reads_the_kiss_audit_for_new_mechanisms(self):
+        """The weekly audit already counts new mechanisms; the run reads it (sd:10800 suggestion 3)."""
+        self.assertIn("sd store items --grep 'KISS audit and grill' --json", reference("sd-status", "deep.md"))
+
+
+class ScopeOfEachWrite(unittest.TestCase):
+    """Class pass (sd:10821): a run's write reaches past what its scope or the operator chose.
+
+    The open blockers at the split (triage.md:40, open-threads.md:9, fleet-review.md:21, deep.md:65) are
+    instances; each test reads every reference, not only the one a finding named.
+    """
+
+    def test_an_answer_is_decided_as_the_run_decides_before_it_builds(self):
+        """triage.md:40: "set it ready and build it" after an answer starts a fresh build of a failed item."""
+        for path, text in all_references().items():
+            with self.subTest(path=path):
+                self.assertNotRegex(text, r"(?i)answer unblocks an item, set it ready")
+
+    def test_no_reference_keeps_its_own_ask_and_record_rules(self):
+        """open-threads.md:9: an own --answers step had no question note to answer; the shared block files one."""
+        for path, text in all_references().items():
+            if path == SHARED_RELATIVE:
+                continue
+            with self.subTest(path=path):
+                self.assertNotIn("--answers", text)
+                self.assertNotIn("AskUserQuestion", text)
+
+    def test_the_fleet_review_reads_and_acts_on_the_reviewed_repos_only(self):
+        """fleet-review.md:21: `sd today --here` is one checkout; its Decisions rows reach other repos."""
+        text = reference("sd-research-repo", "fleet-review.md")
+        self.assertNotIn("sd today --here", text)
+        self.assertIn("sd today --only <name>", text)
+        ask = text.split("## 6. Ask\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("items of the reviewed repos only", ask)
+
+    def test_a_routine_ruling_queues_no_build(self):
+        """deep.md:65: a routine ruling built items the operator did not choose."""
+        rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
+        self.assertIn("A routine ruling never builds", rule)
 
 def all_references() -> dict[str, str]:
     found = {f"skills/{skill}/references/{name}": reference(skill, name)
@@ -234,7 +318,9 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
             ("sd", "task", "edit"): r"edit N --",
             # A run's follow-up reads every repo's tagged items in one window (sd:10800).
             ("sd", "store", "items"): (r"--(belongs-to PLACEHOLDER|here)"
-                                       r"|^sd store items (--parked )?(--grep 'PLACEHOLDER:' )?--json$"),
+                                       r"|^sd store items (--parked )?(--grep 'PLACEHOLDER:' )?--json$"
+                                       # The weekly audit item lives in the system repo, not the reviewed one.
+                                       r"|^sd store items --grep 'KISS audit and grill' --json$"),
             # A task filed with no priority is refused (sd:10800 class pass).
             ("sd", "task", "add"): r"--priority PLACEHOLDER .*--ref \S+ --body ",
             ("sd-ship", "lane", "enqueue"): r"--item N .*--title .*--body-file .*--expected-head ",

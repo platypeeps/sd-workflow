@@ -1,6 +1,6 @@
 ---
 name: sd-research-repo
-description: Use when writing, rendering, reviewing, or publishing a document in a research repo that follows the shared research-repo standard — the numbered layout, provenance blocks, Status sections, and the outward mirrors.
+description: Use when writing, rendering, reviewing, or publishing a document in a research repo that follows the shared research-repo standard — the numbered layout, provenance blocks, Status sections, and the outward mirrors; and when the operator says "review my research repos", to review every research repo at once.
 ---
 
 # sd-research-repo
@@ -27,6 +27,10 @@ Mirror to Notion, Google Drive, or any other external service only after the
 user explicitly asks for it in this session. A designated destination or a
 queued mirror sync is not that request. The local render to the vault and the
 dashboard needs no request.
+
+When the operator says "review my research repos", follow `references/fleet-review.md`
+in place of the workflow below: one run over every research repo, ending in suggested items.
+It decides, asks, records and reports as `references/decide-ask-record.md` says.
 
 ## When to use
 
