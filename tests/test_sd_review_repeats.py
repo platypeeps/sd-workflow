@@ -638,8 +638,19 @@ class PriorVerdictTests(unittest.TestCase):
         failed = answer("one", verdicts=[verdict()], status=sd_review.UNAVAILABLE)
         self.assertEqual(verified(failed, answer("two"))["status"], "blocking")
         parsed = sd_review.parse_findings(json.dumps({"findings": [], "verdicts": [verdict()]}))
-        self.assertEqual(sd_review._answer("one", sd_review.Completed(1, "", ""), parsed).verdicts, ())
         self.assertEqual(sd_review._answer("one", sd_review.Completed(0, "", ""), parsed).verdicts, (verdict(),))
+
+    def test_an_open_verdict_from_a_failed_reader_still_holds(self) -> None:
+        """Review of build/sd-2205 (bin/sd-review:1847): a reader that failed after saying `open` with evidence
+        lost its verdict, and a fallback's `fixed` cleared the blocker. Only `fixed` needs a completed answer."""
+        failed = answer("one", verdicts=[verdict("open", "python3 t.py: still 2")], status=sd_review.UNAVAILABLE)
+        result = verified(failed, answer("two", verdicts=[verdict()]))
+        self.assertEqual((result["status"], [row["evidence"] for row in result["findings"]]),
+                         ("blocking", [f"{REPRO}\npython3 t.py: still 2"]))
+        parsed = sd_review.parse_findings(json.dumps({"findings": [], "verdicts": [verdict("open")]}))
+        self.assertEqual(sd_review._answer("one", sd_review.Completed(1, "", ""), parsed).verdicts, (verdict("open"),))
+        bad_findings = sd_review.parse_findings(json.dumps({"findings": [{"path": "src.py"}], "verdicts": [verdict("open")]}))
+        self.assertEqual(sd_review._answer("one", sd_review.Completed(0, "", ""), bad_findings).verdicts, (verdict("open"),))
 
     def test_no_completed_reader_carries_nothing(self) -> None:
         result = verified(answer("one", status=sd_review.UNAVAILABLE))

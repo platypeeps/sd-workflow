@@ -1377,7 +1377,8 @@ def parse_findings(text: str, diagnostic: dict[str, Any] | None = None, *, allow
         kept = sorted(findings, key=lambda row: rank.get(row["severity"], 3))[:MAX_FINDINGS - 1]
         omitted = len(rows) - len(kept)
         findings = (*kept, evidence_limit(f"{omitted} finding row(s) omitted at the output limit; review remains incomplete"))
-    verdicts = tuple(value["verdicts"]) if not issue and isinstance(value.get("verdicts"), list) else ()
+    found = value.get("verdicts")
+    verdicts = tuple(found) if isinstance(found, list) and not _verdicts_error(found) else ()  # an `open` holds even beside bad findings
     return ParsedFindings(findings, "; ".join(errors), verdicts)
 
 
@@ -1441,7 +1442,7 @@ def _answer(
         # A failing process can still report a real defect. A fallback must
         # never erase those findings or turn its partial answer into a pass.
         detail = f"{failed.detail}; {parsed.error}" if parsed is not None and parsed.error else failed.detail
-        return failed._replace(findings=findings, detail=detail)
+        return failed._replace(findings=findings, detail=detail, verdicts=parsed.verdicts if parsed is not None else ())
     status, detail = FINDINGS if findings else CLEAN, f"{len(findings)} finding(s)"
     return Outcome(backend, status, tuple(findings), detail, tuple(argv), tuple(scrubbed), verdicts=parsed.verdicts)
 
@@ -1841,19 +1842,21 @@ def prior_listing(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome], rebutted: Sequence[Rebuttal]) -> list[dict[str, Any]]:
     """Each prior blocker no listed rebuttal answers, unless every completed answer returned `fixed` for its id
-    with evidence (pack sd:10087): silence, a paraphrase, a nearby repeat or an `open` keeps it blocking, at its
-    stored place, with its stored evidence and each `open` answer's. With no completed answer nothing is carried:
-    the pass is incomplete and decides nothing."""
+    with evidence and no answer, failed or not, said `open` (pack sd:10087; a fallback's `fixed` must not clear
+    what a failed reader found open): silence, a paraphrase, a nearby repeat or an `open` keeps it blocking, at
+    its stored place, with its stored evidence and each `open` answer's. With no completed answer nothing is
+    carried: the pass is incomplete and decides nothing."""
     answered = [row for row in outcomes if row.status in (CLEAN, FINDINGS)]
     def _said(row: Outcome, name: str) -> list[dict[str, Any]]:
         return [given for given in row.verdicts if given["id"].strip() == name]
     kept = []
     for index, old in enumerate(prior if answered else ()):
         name = f"B{index + 1}"
-        if is_rebutted(rebutted, old) or all(_said(row, name) and all(
+        opened = [given["evidence"] for row in outcomes for given in _said(row, name) if given["verdict"] == "open"]
+        if is_rebutted(rebutted, old) or not opened and all(_said(row, name) and all(
                 given["verdict"] == "fixed" and given["evidence"].strip() for given in _said(row, name)) for row in answered):
             continue
-        notes = [old.get("evidence"), *(given["evidence"] for row in answered for given in _said(row, name) if given["verdict"] == "open")]
+        notes = [old.get("evidence"), *opened]
         evidence = "\n".join(dict.fromkeys(text.strip() for text in notes if isinstance(text, str) and text.strip()))
         kept.append(dict(old, disposition="blocking", prior_blocker=name, evidence=evidence[:EVIDENCE_CHARS]))
     return kept
