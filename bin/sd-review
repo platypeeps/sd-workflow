@@ -3105,7 +3105,7 @@ def recorded_base(root: pathlib.Path, result: dict[str, Any], head: str, verifie
     return str(result["covers_from"])
 
 
-def unrecorded_reason(result: dict[str, Any], head: str, current: str, branch: str | None,
+def unrecorded_reason(result: dict[str, Any], head: str, current: str, branch: str,
                       imported: Any, binding: dict | None) -> str | None:
     """The first condition that keeps a passing review from its lane receipt (sd:10380): one reason each,
     so a lane host's missing receipt names its cause. `binding` must be the review's own, read again now."""
@@ -3140,7 +3140,7 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
     try:
         head = result["subject"]["head"]
         owner, name, current = sd_lib.github_head(root) or ("", "", "")
-        branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root)
+        branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root) or ""
         imported, binding = sd_lib.import_sd_db(), sd_lib.lead_review_binding(root)
         library = imported.module
         if reason := unrecorded_reason(result, head, current, branch, imported, binding):
