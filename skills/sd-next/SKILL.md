@@ -63,6 +63,7 @@ When the operator says "grill":
 ## Operator runs
 
 Each run below lives in its own file; read it in full when its trigger comes, and follow it in place of the steps above.
+Every run decides, asks, records and reports as `references/decide-ask-record.md` says.
 
 - `references/health.md`: "health check" (this machine's health and open findings).
 - `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout: "check open PRs" (every open pull request and the lane action); sd-ship is operator-invoked only, so this skill routes the plain ask.
