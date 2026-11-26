@@ -1266,7 +1266,10 @@ def update_piece_metadata(connection: sqlite3.Connection, item: int, changes: di
                 source, original = snapshot["path"], snapshot["files"]["index"]
                 text = _rewrite(snapshot["text"], {key: metadata[key] for key in changes})
                 _replace(source, text.encode("utf-8"))
-                _carry_index_hash(fields, original, text.encode("utf-8"))
+                # A title or tip is shown on the page, so its rewrite is a change no reviewer read; only the
+                # URL bookkeeping, which no reader sees, carries the gate's index hash (sd:10719).
+                if not set(changes) & {"title", "tip"}:
+                    _carry_index_hash(fields, original, text.encode("utf-8"))
                 values["body"] = {"source": text}
             set_item_fields(connection, item, **values)
             add_note(connection, item, "comment", f"Updated writing metadata: {', '.join(sorted(changes))}", session=who)

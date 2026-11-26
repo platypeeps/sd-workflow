@@ -265,8 +265,18 @@ class SharedTransitions(WritingCase):
         self.gates()
         change_stage(self.db, self.item, "ready", who="operator")
         self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
-        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        update_piece_metadata(self.db, self.item, {"review_urls": {"gdocs": "https://example.test/d"}}, who="operator")
         self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+
+    def test_a_headline_or_tip_edit_leaves_the_gate_stale(self):
+        """sd:10719. A title or tip is shown on the page: a rewrite of it is a change no reviewer read."""
+        for change in ({"title": "A renamed piece"}, {"tip": "A new tip."}):
+            with self.subTest(change=next(iter(change))):
+                self.attest()
+                self.gates()
+                update_piece_metadata(self.db, self.item, change, who="operator")
+                self.assertIn("adversarial index.md changed after its gate record; review the current layout",
+                              readiness(self.db, self.item)["problems"])
 
     def test_cutover_keeps_a_passing_gate_current(self):
         """sd:10719. Cutover drops status and published from index.md; the gate hash follows the pack's rewrite."""
