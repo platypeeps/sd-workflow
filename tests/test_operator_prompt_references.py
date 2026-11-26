@@ -30,9 +30,6 @@ PROMPTS = {
     "sd-research-repo": {
         "fleet-review.md": ("review my research repos",),
     },
-    "sd-ship": {
-        "open-prs.md": ("check open PRs",),
-    },
     "sd-status": {
         "deep.md": ("/sd-status deep",),
     },
@@ -83,13 +80,6 @@ class OperatorPromptReferences(unittest.TestCase):
                 with self.subTest(skill=skill, reference=name):
                     self.assertNotRegex(text, r"~/|/(Users|Volumes)/")
 
-    def test_open_prs_routes_fixes_through_the_build_verb(self):
-        text = (ROOT / "skills" / "sd-ship" / "references" / "open-prs.md").read_text(encoding="utf-8")
-        for phrase in ("sd assignments build N --finding", "Past round 3",
-                       "--kind decision", "does not manage"):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, text)
-
 
 def model_invocable(skill: str) -> bool:
     head = skill_text(skill).split("\n---", 1)[0]
@@ -100,9 +90,19 @@ def reference(skill: str, name: str) -> str:
     return (ROOT / "skills" / skill / "references" / name).read_text(encoding="utf-8")
 
 
+class OpenPrSweepMovedOut(unittest.TestCase):
+    def test_no_skill_carries_or_routes_the_open_pr_sweep(self):
+        """The open-PR sweep moved to sd:10803 (ruling on sd:10795)."""
+        self.assertFalse((ROOT / "skills" / "sd-ship" / "references" / "open-prs.md").exists())
+        for skill in ("sd-next", "sd-ship"):
+            with self.subTest(skill=skill):
+                self.assertNotIn("open-prs", skill_text(skill))
+                self.assertNotIn("check open PRs", skill_text(skill))
+
+
 class ReviewRoundFixes(unittest.TestCase):
     def test_a_plain_trigger_reaches_a_skill_the_model_may_load(self):
-        """sd-ship is operator-invoked only, so "check open PRs" must route elsewhere."""
+        """A plain trigger must reach a skill the model may load."""
         for skill, files in PROMPTS.items():
             for name, triggers in files.items():
                 for trigger in triggers:
@@ -129,11 +129,6 @@ class ReviewRoundFixes(unittest.TestCase):
                 self.assertIn("dashboard's Review page", text)
                 self.assertNotRegex(text, r"Walk every open question, decision and score")
                 self.assertNotRegex(text, r"review questions or scores\.?\n")
-
-    def test_enqueue_binds_the_head_the_sweep_checked(self):
-        text = reference("sd-ship", "open-prs.md")
-        self.assertIn("sd-ship -C <worktree> lane enqueue", text)
-        self.assertIn("--expected-head <head>", text)
 
 
 def all_references() -> dict[str, str]:
@@ -226,14 +221,6 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
                     with self.subTest(path=path, command=command):
                         self.assertRegex(command, r'note N "<[^>]+>" --kind decision')
 
-    def test_enqueue_names_the_delivery_claim(self):
-        """The first enqueue of an item refuses without --deliver or --associate-only."""
-        text = reference("sd-ship", "open-prs.md")
-        enqueue = next(c for c in prescribed_commands(text) if "lane enqueue" in c)
-        self.assertIn("--deliver|--associate-only", enqueue)
-        self.assertIn("`--deliver` when", text)
-        self.assertIn("`--associate-only` when", text)
-
     def test_a_ref_names_the_finding_not_the_run(self):
         """`sd task add --ref` refuses a ref an item holds: a date or rank collides on a rerun."""
         for skill, name, source in (("sd-status", "deep.md", "deep-review"),
@@ -262,7 +249,6 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
         triage = reference("sd-next", "triage.md")
         self.assertIn("sd task edit N --unpark", triage)
         self.assertIn("sd assignments cancel <assignment>", triage)
-        self.assertIn("sd-ship -C <worktree> lane retry N", reference("sd-ship", "open-prs.md"))
 
     def test_triage_cancels_no_member_of_a_live_bundle(self):
         """Cancelling one member of a running bundle parks the whole run (sd:10795)."""
@@ -272,25 +258,6 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
 
     # Class pass (sd:10795): no reference predicts, from an earlier read, whether a write applies. The write
     # checks in its own transaction; the reference binds it to what was read and says what a refusal means.
-
-    def test_sweep_lets_the_finding_command_decide(self):
-        """`--finding` goes to a Retry or a Fix; only the command knows which a press would be."""
-        sweep = reference("sd-ship", "open-prs.md")
-        self.assertNotIn("only when the item's build ended", sweep)
-        self.assertIn("let the command decide", sweep)
-        self.assertIn("`--finding goes to a Retry or a Fix`", sweep)
-        self.assertIn("record the finding with `sd task note N \"<finding>\"`", sweep)
-
-    def test_sweep_binds_the_retry_in_its_own_write(self):
-        """`lane retry` takes the item's newest entry; a read before it of that entry goes stale."""
-        sweep = reference("sd-ship", "open-prs.md")
-        self.assertNotIn("Retry only when its `branch`", sweep)
-        self.assertIn("refuses `stale_head` and queues nothing", sweep)
-        self.assertIn("sd-ship -C <worktree> lane cancel N --expected-revision <revision>", sweep)
-
-    def test_sweep_enqueue_leaves_the_queued_check_to_the_command(self):
-        sweep = reference("sd-ship", "open-prs.md")
-        self.assertIn("enqueue refuses an item already queued", sweep)
 
     def test_no_reference_prefilters_a_build_press(self):
         """The press refuses an item it cannot build; a list read earlier says nothing by then."""
