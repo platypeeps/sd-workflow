@@ -1143,11 +1143,17 @@ class LineBudgetTests(unittest.TestCase):
         # conditions, so a lane host's miss named no cause; the table is
         # its own function to keep `record_lead_review` under the branch
         # ceiling. Measured: `sd-review` is 3176 here.
+        #
+        # 5146 -> 5149 is sd:10698: `bin/sd-review` +3 so plain output
+        # escapes what the stream cannot encode, and splits evidence at
+        # newlines alone, not at U+2028. A non-ASCII repro raised on an
+        # ASCII stdout before the status line. Measured: `sd-review` is
+        # 3179 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5146,
+            5149,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
