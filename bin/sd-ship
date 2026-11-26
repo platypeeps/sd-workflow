@@ -9,6 +9,7 @@ Merge independently rechecks GitHub ownership, protection and exact-head checks.
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib as hashlib
 import json
 import os
@@ -40,7 +41,15 @@ from sd_ship_history import review_history as review_history
 from sd_ship_history import timeout_evidence as timeout_evidence
 from sd_ship_history import validate_additional_requests as validate_additional_requests
 from sd_ship_item import ItemIdentity
-from sd_ship_remote import GitHub, Refusal, git, refuse_behind, run, slug
+from sd_ship_remote import (
+    COPILOT_REQUEST_REFUSED,
+    GitHub,
+    Refusal,
+    git,
+    refuse_behind,
+    run,
+    slug,
+)
 from sd_ship_review import (
     RAW_CAPTURE_ENV,
     ReviewRuntime,
@@ -1141,13 +1150,16 @@ class Ship(SharedReview):
         The receipt goes first, as `requesting`: a prepare killed after GitHub
         took the request still owes the review at a merge, and
         `settle_copilot_requests` reads what became of it on the next prepare.
-        A refused request restores the receipts as they were.
+        Only a request GitHub refused outright restores the receipts as they
+        were; an answer that may follow a request GitHub took keeps the
+        `requesting` receipt for the next prepare to settle.
         """
         result = self.record_copilot_request(entries, number, head, selection, "requesting", decision)
         try:
             self.api.request_copilot_review(number)
-        except Refusal:
-            self.save(copilot_reviews=entries)
+        except Refusal as error:
+            if error.workflow["blocker"]["code"] == COPILOT_REQUEST_REFUSED:
+                self.save(copilot_reviews=entries)
             raise
         result = {**result, "status": "requested"}
         self.save(copilot_reviews=[*entries, {name: value for name, value in result.items() if name != "decision"}])
@@ -1161,29 +1173,38 @@ class Ship(SharedReview):
         or a completed Copilot review no other receipt accounts for, means the
         POST landed: the receipt is confirmed and counts as the one bought. No
         sign of it means it was never sent: the receipt is dropped, nothing is
-        owed, and this prepare decides afresh. The count leans to "landed": a
+        owed, and this prepare decides afresh. A review accounts for a receipt
+        only at that receipt's head, so a request that vanished with no review
+        hides no other (sd:10207 review). The count leans to "landed": a
         review someone asked for by hand reads as this one, which costs a wait
         an explicit request ends, never a second paid review.
         """
         entries = self.copilot_entries()
-        if not any(entry["pull"] == number and entry["status"] == "requesting" for entry in entries):
+        waiting = [index for index, entry in enumerate(entries)
+                   if entry["pull"] == number and entry["status"] == "requesting"]
+        if not waiting:
             return
         reviews = self.api.pages(f"{self.api.prefix}/pulls/{number}/reviews")
-        completed = sum(1 for review in self.api.copilot_reviews(reviews)
-                        if bool(review.get("submitted_at"))
-                        and str(review.get("state") or "").upper() not in ("", "PENDING"))
-        confirmed = sum(1 for entry in entries if entry["pull"] == number and entry["status"] != "requesting")
+        statuses = {index: self.api.copilot_review_status(pull, reviews, entries[index]["head"]) for index in waiting}
+        left = self.unclaimed_copilot_reviews(reviews, [
+            entry["head"] for index, entry in enumerate(entries)
+            if entry["pull"] == number and statuses.get(index, entry["status"]) != "absent"])
         settled = []
-        for entry in entries:
-            if entry["pull"] == number and entry["status"] == "requesting":
-                status = self.api.copilot_review_status(pull, reviews, entry["head"])
-                if status == "absent":
-                    if completed <= confirmed:
-                        continue
-                    status = "requested"
-                entry, confirmed = {**entry, "status": status}, confirmed + 1
-            settled.append(entry)
+        for index, entry in enumerate(entries):
+            status = statuses.get(index)
+            if status == "absent":
+                if left <= 0:
+                    continue
+                status, left = "requested", left - 1
+            settled.append(entry if status is None else {**entry, "status": status})
         self.save(copilot_reviews=settled)
+
+    def unclaimed_copilot_reviews(self, reviews: list[dict], heads: list[str]) -> int:
+        """How many completed Copilot reviews no receipt at the review's own head claims."""
+        completed = collections.Counter(
+            str(review.get("commit_id") or "") for review in self.api.copilot_reviews(reviews)
+            if bool(review.get("submitted_at")) and str(review.get("state") or "").upper() not in ("", "PENDING"))
+        return sum((completed - collections.Counter(heads)).values())
 
     def prepare_copilot_review(self, number: int, pull: dict, head: str, mode: str) -> dict:
         self.settle_copilot_requests(number, pull)

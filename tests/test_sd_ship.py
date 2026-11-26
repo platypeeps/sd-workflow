@@ -122,6 +122,8 @@ class ShipDouble(GitHubDouble):
         self.copilot_pending = set()
         self.copilot_requested_login = "copilot-pull-request-reviewer[bot]"
         self.lose_copilot_request = False
+        #: GitHub takes the request, then the answer is lost: a 502 (sd:10207).
+        self.ambiguous_copilot_request = False
         self.create_draft = False
         #: What `GET /rules/branches/{b}` and `GET /rulesets/{id}` answer: no
         #: ruleset unless a test says so, the way the fixture's `main` had no
@@ -188,9 +190,11 @@ class ShipDouble(GitHubDouble):
         if method == "POST" and path.startswith(f"{prefix}/pulls/") and path.endswith("/requested_reviewers"):
             number = int(path.split("/")[-2])
             if self.lose_copilot_request:
-                raise RemoteRefusal(503, "review request transport failed")
+                raise RemoteRefusal(422, "review request transport failed")
             self.copilot_requests.append({"number": number, "body": body})
             self.copilot_pending.add(number)
+            if self.ambiguous_copilot_request:
+                raise RemoteRefusal(502, "review request answer lost")
             return 201, self._pull(self.remote.pull(number))
         if method == "POST" and path.startswith(f"{prefix}/statuses/"):
             # The local gate's write (sd:1843), newest first as GitHub lists.
@@ -2352,7 +2356,7 @@ roles:
         self.assertEqual(result["phase"], "ready_to_send")
         self.assertEqual(result["copilot_review"]["decision"], "request_failed")
         self.assertIn("automatic Copilot review request failed", "\n".join(result["warnings"]))
-        self.assertEqual(self.operation().state.get("copilot_reviews"), None)
+        self.assertEqual(self.operation().state.get("copilot_reviews") or [], [])
         self.assertEqual(self.double.copilot_requests, [])
 
     def test_invalid_new_prepare_creates_no_receipt_or_suppression(self):
@@ -2535,14 +2539,53 @@ roles:
                          ["requested", "pending"])
 
     def test_a_failed_explicit_request_leaves_no_receipt(self):
-        """sd:10207. A refused request owes nothing: the receipt is undone."""
-        def refuses(api, number):
-            raise ship.Refusal("reviewer endpoint refused")
-
-        with patch.object(ship.GitHub, "request_copilot_review", refuses):
-            with self.assertRaisesRegex(ship.Refusal, "reviewer endpoint refused"):
-                self.prepare("--copilot-review", "request")
+        """sd:10207. A request GitHub refuses (a 4xx) owes nothing: the receipt is undone."""
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
         self.assertEqual(self.operation().state.get("copilot_reviews") or [], [])
+
+    def test_an_ambiguous_answer_keeps_the_receipt_of_a_request_github_took(self):
+        """sd:10207 review: GitHub took the request and the answer was a 502.
+        The receipt stays, so the merge at that head still owes the review,
+        and the rerun confirms it without a second request."""
+        self.double.ambiguous_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "answer lost"):
+            self.prepare("--copilot-review", "request")
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]], ["requesting"])
+        with self.assertRaisesRegex(ship.Refusal, "has not completed"):
+            self.merge()
+        self.double.ambiguous_copilot_request = False
+        rerun = self.prepare("--copilot-review", "request")
+        self.assertEqual(rerun["copilot_review"]["decision"], "already_recorded")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+
+    def test_an_ambiguous_automatic_answer_keeps_the_receipt(self):
+        """sd:10207 review: the automatic path warns, and keeps what GitHub may hold."""
+        self.enable_automatic_copilot()
+        self.double.ambiguous_copilot_request = True
+        result = self.prepare()
+        self.assertEqual(result["copilot_review"]["decision"], "request_failed")
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]], ["requesting"])
+
+    def test_a_vanished_request_does_not_hide_a_landed_recovery(self):
+        """sd:10207 review: the first request vanished with no review, its
+        recovery landed and Copilot reviewed a later head. The vanished
+        receipt accounts for no review, so the recovery counts: the cap
+        holds at three requests, and no third request goes out."""
+        self.prepare("--copilot-review", "request")
+        self.double.copilot_pending.clear()
+        self.interrupt_copilot_request("--copilot-review", "request", lands=True)
+        self.advance()
+        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
+        self.double.copilot_pending.clear()
+        self.prepare("--copilot-review", "request")
+        self.assertEqual(len(self.operation().state["copilot_reviews"]), 3)
+        (self.root / "src.py").write_text("value = 8\n")
+        _git(self.root, "commit", "-qam", "again\n\nAuthored-with: human")
+        with self.assertRaisesRegex(ship.Refusal, "limit"):
+            self.prepare("--copilot-review", "request")
+        self.assertEqual(len(self.double.copilot_requests), 2)
 
     def test_selected_automatic_review_adopts_an_existing_remote_request(self):
         self.enable_automatic_copilot()

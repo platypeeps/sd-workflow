@@ -74,6 +74,10 @@ def run(root: Path, argv: list[str], *, input: str | None = None, timeout: int =
     return completed_process(root, argv, input=input, timeout=timeout).stdout.strip()
 
 
+#: The refusal code of a Copilot request GitHub answered with a 4xx: it took nothing (sd:10207).
+COPILOT_REQUEST_REFUSED = "copilot_request_refused"
+
+
 def git(root: Path, *args: str) -> str:
     return run(root, ["git", *args])
 
@@ -178,8 +182,8 @@ class GitHub:
         except ValueError:
             raise Refusal("GitHub returned unreadable JSON") from None
 
-    def api_status(self, path: str) -> tuple[int, Any]:
-        """`(HTTP status, body)` for a GET whose non-2xx answer is still an answer.
+    def api_status(self, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, Any]:
+        """`(HTTP status, body)` for a call whose non-2xx answer is still an answer.
 
         `api` folds every failure into one refusal, which is right everywhere
         but the protection endpoints: there a 404 means "no classic protection
@@ -192,20 +196,21 @@ class GitHub:
         the response line `gh api --include` prints, not from the wording of
         gh's stderr, so a reworded message cannot turn a refusal into a fact.
         """
-        argv = ["gh", "api", "--include", path, "--method", "GET"]
+        argv = ["gh", "api", "--include", path, "--method", method] + (["--input", "-"] if body is not None else [])
         try:
-            result = subprocess.run(argv, cwd=self.root, text=True, capture_output=True, timeout=60, check=False)
+            result = subprocess.run(argv, cwd=self.root, text=True, capture_output=True, timeout=60, check=False,
+                                    input=json.dumps(body) if body is not None else None)
         except (OSError, subprocess.SubprocessError) as error:
             raise Refusal(f"gh could not finish: {error}", code="command_unavailable", boundary="runtime",
                           state="retryable_failure", next_action="Restore command access, then retry this command.") from None
-        head, _, body = result.stdout.partition("\n\n")
+        head, _, answer = result.stdout.partition("\n\n")
         match = re.match(r"HTTP/[\d.]+ (\d{3})", head)
         if not match:
             raise Refusal((result.stderr or "gh api returned no HTTP status line").strip()[:2000],
                           code="command_failed", boundary="runtime", state="retryable_failure",
                           next_action="Inspect the command error, resolve its cause, then retry.")
         try:
-            return int(match[1]), json.loads(body)
+            return int(match[1]), json.loads(answer)
         except ValueError:
             raise Refusal("GitHub returned unreadable JSON") from None
 
@@ -327,9 +332,22 @@ class GitHub:
         return "absent"
 
     def request_copilot_review(self, number: int) -> None:
-        """Request one Copilot review through GitHub's reviewer endpoint."""
-        self.api(f"{self.prefix}/pulls/{number}/requested_reviewers", method="POST",
-                 body={"reviewers": [COPILOT_REVIEWER]})
+        """Request one Copilot review through GitHub's reviewer endpoint.
+
+        Only a 4xx is a definite "not taken" (`COPILOT_REQUEST_REFUSED`); a
+        5xx, a timeout or an unreadable answer may follow a request GitHub
+        took, so it refuses under another code (sd:10207).
+        """
+        status, value = self.api_status(f"{self.prefix}/pulls/{number}/requested_reviewers", method="POST",
+                                        body={"reviewers": [COPILOT_REVIEWER]})
+        if 200 <= status < 300:
+            return
+        message = value.get("message") if isinstance(value, dict) else None
+        refused = 400 <= status < 500
+        raise Refusal(f"{message or 'Copilot review request failed'} (HTTP {status})",
+                      code=COPILOT_REQUEST_REFUSED if refused else "command_failed", boundary="runtime",
+                      state="operator_decision" if refused else "retryable_failure",
+                      next_action="Inspect the GitHub answer, then prepare again.")
 
     def protection_observed(self, base: str) -> tuple[int, Any]:
         return self.api_status(f"{self.prefix}/branches/{quote(base, safe='')}/protection")
