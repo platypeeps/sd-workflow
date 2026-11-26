@@ -694,8 +694,17 @@ def round_words(git: Collection[str], work: str, base: str, head: str, *,
         return None
     lines = [line for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
     defined = {name for line in lines for name in defined_names(line[1:])}
-    defined |= {name for line in lines if line[0] in "+-" and not line[1:2].isspace()
-                for name in bound_names(line[1:])}
+    # A changed line binds what its whole statement binds: `TABLE = {` over lines, its entry changed. Each
+    # side of each hunk is read as text, its context included (`--function-context`), so the statement's
+    # first line is there; one indented at its start binds nothing at module level.
+    for hunk in re.split(r"^(?:@@|diff --git ).*$", diff, flags=re.M)[1:]:
+        rows = [line for line in hunk.splitlines() if line and line[0] in "+- " and not line.startswith(("+++", "---"))]
+        for side in "+-":
+            text = [line[1:] for line in rows if line[0] in (" ", side)]
+            marks = [index for index, line in enumerate(line for line in rows if line[0] in (" ", side))
+                     if line[0] == side]
+            defined |= {name for index in marks for first in statement(text, index)[:1]
+                        if not first[:1].isspace() for name in bound_names(first)}
     return {name for line in lines for name in re.findall(r"[A-Za-z_]\w*", line[1:])}, defined
 
 

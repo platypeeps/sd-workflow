@@ -1387,6 +1387,8 @@ class Supervise(Case):
 
         base = commit({"src/parse.py": "import limits\n\ndef parse_count(text):\n    return int(text) + limits.LIMIT\n",
                        "src/limits.py": "LIMIT = 3\n",
+                       "src/table.py": "TABLE = {\n    'count': 3,\n}\n",
+                       "src/size.py": "import table\n\ndef size(text):\n    return len(text) + table.TABLE['count']\n",
                        "src/dispatch.py": "def forward(text):\n    return text\n",
                        "src/route.py": "def route(text):\n    return middle(text)\n",
                        "src/middle.py": "def middle(text):\n    return parse_count(text)\n",
@@ -1396,6 +1398,7 @@ class Supervise(Case):
                        "src/decode.py": "def decode(payload):\n    return {'k': payload}\n"})
         row = {"path": "src/parse.py", "line": 4, "summary": "an empty count raises"}
         # Review of sd:10286: the round makes an unchanged helper's callee return None; `run` indexes it.
+        sized = {"path": "src/size.py", "line": 4, "summary": "a text count is no int"}
         helper = {"path": "src/run.py", "line": 2, "summary": "`run()` indexes what `parse()` returns"}
         support.git(work, "reset", "-q", "--hard", base)
         head = commit({"src/decode.py": "def decode(payload):\n    return None if payload == 'null' else {}\n"})
@@ -1404,12 +1407,16 @@ class Supervise(Case):
         cases = {"src/dispatch.py": ("def forward(text):\n    return parse_count(text or '')\n", "a caller of"),
                  "src/route.py": ("def route(text):\n    return middle(text or '')\n", "a caller of"),
                  "src/limits.py": ("LIMIT = ''\n", "a name"),
+                 # Review of sd:10286: a change inside a binding written over lines binds its name too.
+                 "src/table.py": ("TABLE = {\n    'count': '',\n}\n", "a name"),
+                 "src/table.py ": ("TABLE = {\n}\n", "a name"),
                  "src/far.py": ("def far():\n    return 2\n", None)}
         for name, (text, said) in cases.items():
             with self.subTest(name):
                 support.git(work, "reset", "-q", "--hard", base)
-                head = commit({name: text})
-                reach = supervisor.reaches(row, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
+                head = commit({name.strip(): text})
+                blocker = sized if name.startswith("src/table.py") else row
+                reach = supervisor.reaches(blocker, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
                 self.assertEqual(bool(reach), said is not None, reach)
                 if said:
                     self.assertIn(said, reach[0])
