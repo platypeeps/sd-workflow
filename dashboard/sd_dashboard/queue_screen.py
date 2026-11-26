@@ -390,14 +390,43 @@ def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[st
     return lines, hashlib.sha256(json.dumps([*review, lines]).encode()).hexdigest()[:16]
 
 
+#: sd:10814: each failed row's review fields, keyed by its lane, item, head and prepare log (path, mtime): they move
+#: only when a retry makes a new entry or a rebut through this page, which `forget` drops. Only a template that
+#: answered is kept, so a timed-out adjudicate is asked again on the next build.
+_REVIEWS: dict[tuple, dict] = {}
+#: The most `_REVIEWS` keeps before it starts again: a lane holds a few failed rows.
+REVIEWS_KEPT = 512
+
+
 def _review_fields(entry: dict, lane: Path) -> dict:
+    """`_read_review_fields`, kept per entry in `_REVIEWS` while its prepare log is unchanged (sd:10814)."""
+    log = str(entry.get("prepare_log") or "")
+    try:
+        mtime = os.stat(log).st_mtime_ns if log else None
+    except OSError:
+        mtime = None
+    key = (str(lane), entry.get("item"), str(entry.get("expected_head") or ""), str(entry.get("worktree") or ""),
+           log, mtime)
+    # A worktree gone since is no row to rebut: `_here` is read on every build, the kept answer only beside it.
+    kept = _REVIEWS.get(key) if mtime is not None and _here(entry) else None
+    if kept is not None:
+        return copy.deepcopy(kept)
+    fields, answered = _read_review_fields(entry, lane)
+    if mtime is not None and answered:
+        if len(_REVIEWS) >= REVIEWS_KEPT:
+            _REVIEWS.clear()
+        _REVIEWS[key] = copy.deepcopy(fields)
+    return fields
+
+
+def _read_review_fields(entry: dict, lane: Path) -> tuple[dict, bool]:
     """A failed row's review key, and each finding it covers whole, for Reject's dialog; none for a review this
     host cannot rebut: none named, a worktree on another host, or a template `shown_review` cannot print
     (sd:9966). `held`: whether that review already holds recorded dispositions, which a `lane retry` reuses:
     False only when adjudicate's template says none, so Retry asks first only then; None when not read here."""
     tree = _here(entry)
     if not (tree and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
-        return {"review": None, "review_findings": [], "held": None, "reviewed_head": None}
+        return {"review": None, "review_findings": [], "held": None, "reviewed_head": None}, False
     review = review_of(_answer(entry, lane))
     # One read-only template call, only on a review-blocked row: rebut's step 1, which writes nothing.
     template = _run([command("sd-ship"), "-C", str(tree), "adjudicate", "--item", str(entry.get("item")),
@@ -405,9 +434,10 @@ def _review_fields(entry: dict, lane: Path) -> dict:
                     LIST_SECONDS)
     recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
     held = None if recorded is False else recorded is not None
+    answered = template.get("exit") == 0
     shown = shown_review(review, template) if review else None
     if shown:  # `reviewed_head`: the head Reject's CLI line adjudicates at (sd:10246)
-        return {"review": shown[1], "review_findings": shown[0], "held": held, "reviewed_head": review[0]}
+        return {"review": shown[1], "review_findings": shown[0], "held": held, "reviewed_head": review[0]}, answered
     proposal = template.get("proposal") if template.get("exit") == 0 else None
     live = proposal.get("findings") if isinstance(proposal, dict) else None
     if review and isinstance(live, list) and [row.get("finding_digest") if isinstance(row, dict) else None
@@ -415,7 +445,7 @@ def _review_fields(entry: dict, lane: Path) -> dict:
         # The review at that head ran again since the log: its findings are not the logged ones, so no Reject,
         # and Retry, which runs prepare against the live review, stays on (sd:9966 lane review).
         held = None
-    return {"review": None, "review_findings": [], "held": held, "reviewed_head": None}
+    return {"review": None, "review_findings": [], "held": held, "reviewed_head": None}, answered
 
 
 def _logged(entry: dict, lane: Path) -> dict:
@@ -706,6 +736,7 @@ def forget() -> None:
     """Drop the shared document: the next read builds it again. Waits out a build in flight, so it drops that one too."""
     with _share_lock:
         _shared.clear()
+        _REVIEWS.clear()  # a write here may have recorded a rebuttal: the held review reads again (sd:10814)
 
 
 def document(connection, *, now: str = "") -> dict:

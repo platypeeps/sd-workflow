@@ -174,6 +174,8 @@ class Lane:
                  "expected_head": self.merged, "branch": "main", "worktree": str(self.checkout),
                  "enqueued_on": ship.this_host(), "prepare_log": str(log), **extra}
         self.list(self.entries() + [entry])
+        # Each case's stub may answer adjudicate otherwise for the same entry; the page keeps the last (sd:10814).
+        queue_screen.forget()
         return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"] if row.get("item") == 14)
 
     def shot_entries(self):
@@ -988,6 +990,19 @@ class TheMove(Lane, BrowserSession):
                 self.assertIs(row["held"], held)
                 self.assertIsNotNone(row["review"])
         self.assertIsNone(self.failed(enqueued_on="satellite-1")["held"])
+
+    def test_a_second_build_over_an_unchanged_failed_row_runs_no_adjudicate(self):
+        """sd:10814: a failed row's review moves only with its entry; a build asked adjudicate on every poll."""
+        first = self.failed()
+        self.log.write_text("")
+        again = next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                     if row.get("item") == 14)
+        self.assertEqual([c for c in self.calls() if "adjudicate" in c], [])
+        self.assertEqual(again["review"], first["review"])
+        log = Path(again["log"])
+        os.utime(log, ns=(log.stat().st_atime_ns, log.stat().st_mtime_ns + 1))  # a retry's new prepare log
+        queue_screen.document(self.connection, now=NOW)
+        self.assertEqual(len([c for c in self.calls() if "adjudicate" in c]), 1)
 
     def test_a_review_run_again_at_the_same_head_offers_retry_not_reject(self):
         """sd:9966 lane review: the review at that head ran again with other findings; the prepare log still
