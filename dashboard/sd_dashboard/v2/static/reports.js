@@ -201,7 +201,7 @@ function nothing() {
   const said = F.status === 'act' ? `No ${F.job} report needs action` : `No ${F.job} report matches these filters`;
   const runs = last === 'ok' ? ' Its last run succeeded.' : '';
   return html`${all ? `${said}: the filters hide its ${all} report${all === 1 ? '' : 's'}.` : `${F.job} has filed no report.`}${runs}
-    <button type="button" data-empty="all">Show all reports</button>${CAD[F.job] ? html` <button type="button" data-empty="cadence">Back to run history</button>` : ''}`;
+    <button class="linkbtn" type="button" data-empty="all">Show all reports</button>${CAD[F.job] ? html` <button class="linkbtn" type="button" data-empty="cadence">Back to run history</button>` : ''}`;
 }
 // read: the reader draws, and its settle picks the selection, so no reconcile runs here.
 function renderRows(read) {

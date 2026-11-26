@@ -1058,8 +1058,8 @@ R.p = ['job:weekly-scan', 'job:nightly-sync'].map(id => [C.get(id).failed, !!c.p
                             + "F.status = 'act'; " + row % "quiet-one" + " R.quiet = ELS.rows.html;")
         R = out["R"]
         self.assertIn("No weekly-scan report needs action: the filters hide its 2 reports. Its last run succeeded.", R["scan"])
-        self.assertIn('<button type="button" data-empty="all">Show all reports</button>', R["scan"])
-        self.assertIn('<button type="button" data-empty="cadence">Back to run history</button>', R["scan"])
+        self.assertIn('<button class="linkbtn" type="button" data-empty="all">Show all reports</button>', R["scan"])
+        self.assertIn('<button class="linkbtn" type="button" data-empty="cadence">Back to run history</button>', R["scan"])
         self.assertNotIn("Nothing matches", R["scan"])
         self.assertEqual(R["views"][-1], "cadence")
         self.assertEqual(R["F"], ["", "", True])
