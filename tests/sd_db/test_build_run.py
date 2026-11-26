@@ -4720,6 +4720,22 @@ class Tick(Case):
         body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
         self.assertTrue(body.endswith(f"```\n\nRefs: sd:{kept}\n"), body)
 
+    def test_the_refs_lines_a_delivery_adds_pass_the_lane_line_check(self):
+        """Review of build/sd-1808: one `Refs:` line for many items ran past the lane's 72 characters, and
+        enqueue refused the body. Each added line keeps to the limit, and together they name every item."""
+        ship = build_run._ship_body()
+        items = list(range(10001, 10013))
+        body = build_run.with_refs("## Summary\n\nx\n", items)
+        assert body is not None
+        self.assertEqual(ship.long_lines(body), [])
+        self.assertEqual(ship.referenced_ids(body), set(items))
+        self.assertEqual(build_run.with_refs(body, items), body, "a second pass adds nothing")
+
+    def test_a_body_left_in_an_open_fence_gets_no_dead_refs_line(self):
+        """Review of build/sd-1808: a line added after an unclosed fence names nothing, so the merge would close
+        the item. The helper answers None; the delivery blocks rather than enqueue."""
+        self.assertIsNone(build_run.with_refs("## Summary\n\n```\nx\n", [10001]))
+
     def test_a_member_cancelled_out_of_the_new_bundle_sends_it_to_main(self):
         """Review of build/sd-1808: the bundle read counted a member cancelled out of it (`ALONE`) as selected."""
         head, _ = self.rebuilt_after_lane_failure(2, left_out=True)

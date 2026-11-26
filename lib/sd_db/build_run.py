@@ -1266,6 +1266,23 @@ def _ship_body():
     return importlib.import_module("sd_ship_body")
 
 
+def with_refs(body: str, items: Collection[int]) -> str | None:
+    """`body` with `Refs:` lines for each of `items` no live one names yet, or None when an added line would
+    name nothing (an unclosed fence or comment). Only a live line counts (ruling on sd:10379), and each added
+    line keeps to the lane's line limit, or enqueue refuses the body (review of build/sd-1808)."""
+    ship = _ship_body()
+    missing = [item for item in dict.fromkeys(items) if item not in ship.referenced_ids(body)]
+    if not missing:
+        return body
+    lines = ["Refs:"]
+    for item in missing:
+        if len(f"{lines[-1]} sd:{item}") > ship.LINE_LIMIT:
+            lines.append("Refs:")
+        lines[-1] += f" sd:{item}"
+    body = body.rstrip("\n") + "\n\n" + "\n".join(lines) + "\n"
+    return body if set(missing) <= ship.referenced_ids(body) else None
+
+
 def thread_cap(env: dict, *, load: float | None, cores: int | None = None) -> int:
     """How many test threads one builder's child may start (sd:10393): no more than a gate holder's share of the
     cores, nor than the cores the five-minute `load` leaves idle, and at least one. On 2026-11-24 builders' own
@@ -2430,10 +2447,13 @@ class Supervisor:
                 f"body keeps each open"))
         if asked or outside:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
-            # Only a live line counts: one in a code fence or a comment names nothing (ruling on sd:10379).
-            refs = f"Refs: {' '.join(f'sd:{item}' for item in [*asked, *outside])}"
-            if not {*asked, *outside} <= _ship_body().referenced_ids(body):
-                body = body.rstrip("\n") + f"\n\n{refs}\n"
+            kept = with_refs(body, [*asked, *outside])
+            if kept is None:
+                return self.finish("blocked", f"the body at {self.body} ends inside a code fence or a comment, "
+                                              f"so no `Refs:` line added after it keeps an item open; close it, "
+                                              f"then Retry")
+            if kept != body:
+                body = kept
                 self.body.write_text(body, encoding="utf-8")
         if not delivered:
             return self.finish("blocked", "the branch delivers no item: no commit has a `Closes: sd:N` trailer "
