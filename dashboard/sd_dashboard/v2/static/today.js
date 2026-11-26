@@ -335,7 +335,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // its child rows under it and closes the row that was open, and a click on the open row closes it. The children, in order:
   // working (the live items of `active`, the build runs of /api/queue/builds, a builder's gate in the lane and the runner's
   // assignments no run holds), merging, next and blocked (the lane entries of /api/queue), suggested (what sd-next offers next,
-  // from `queues.suggested`, at most nine, pack sd:7222, sd:7314, sd:7869 and sd:8008), open (All items: its other open tasks, from
+  // from `queues.suggested`, all of them (sd:10760), pack sd:7222, sd:7314, sd:7869 and sd:8008), open (All items: its other open tasks, from
   // /api/tasks) and ended (ended build runs, and the cancelled
   // and landed lane entries). Each row's marker is its state glyph and its type in words; the parent's glyph is its worst
   // child's. Suggested is on by default (pack sd:7314), All items and Ended builds are off; on, a repo with only those rows
@@ -351,7 +351,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // the merge, which nothing takes back. A build run's Cancel asks first and posts the assignment cancel route; an ended
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
-  const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended', 'parked'], QSHOW = ['suggested', 'open', 'ended', 'parked'], NEXT = 9;
+  const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended', 'parked'], QSHOW = ['suggested', 'open', 'ended', 'parked'];
   const BOXES = ['merging', 'review', 'building', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247); today.html's Detail head names them in this order (sd:9315)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
@@ -527,12 +527,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     <td class="what"><a href="${shell.itemHref(r.id)}">#${r.id} ${r.title}</a></td>
     <td class="detail">${(WHY[r.why] || WHY.ready)(r).filter(Boolean).join(' · ')}${runNote(r.id)}</td><td class="num">${r.since ? age(r.since) : ''}</td><td class="act">${shell.commands.rowActions(String(r.id))}</td></tr>`];
   // What sd-next offers next (pack sd:7314): the read's `queues.suggested`, ranked by sd_db.today.suggested (ready, due,
-  // planned, then unscheduled), less the items live now, at most NEXT per repo, in that order. An item with no repo is
+  // planned, then unscheduled), less the items live now, in that order (sd:10760: no per-repo cap). An item with no repo is
   // no row (pack sd:7731): Suggested draws no Unassociated group; Tasks still lists it.
   function suggested(doc) {
-    const live = new Set(((doc.active || {}).rows || []).map(r => r.item)), counted = {}, found = new Map();
+    const live = new Set(((doc.active || {}).rows || []).map(r => r.item)), found = new Map();
     ((doc.queues || {}).suggested || []).filter(r => r.repo && !live.has(r.id)).forEach(r => {
-      const k = repoKey(r.repo); counted[k] = (counted[k] || 0) + 1; if (counted[k] <= NEXT) found.set(String(r.id), r); });
+      found.set(String(r.id), r); });
     return found;
   }
   // All items (#40961): an open task of a repo, as Tasks reads it, that is no suggested row while Suggested shows (pack
@@ -653,7 +653,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, building: bd, merging: m, next: n, blocked: b, review: v, suggested: s, parked: pk } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${bd} building, ${w} working, ${n} next, ${b} blocked, ${s} suggested, ${unread ? 'parked not read' : `${pk} parked`}">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('building', bd, ' on', 'building: build runs that hold a builder now, not queued or waiting')}${pip('working', w, ' on', 'working: live sessions, queued builds and lane gates; a building run counts in building only')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}${parkedPip()}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${bd} building, ${w} working, ${n} next, ${b} blocked, ${s} suggested, ${unread ? 'parked not read' : `${pk} parked`}">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('building', bd, ' on', 'building: build runs that hold a builder now, not queued or waiting')}${pip('working', w, ' on', 'working: live sessions, queued builds and lane gates; a building run counts in building only')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', 'suggested: items to do next: ready, due today or overdue, planned or unscheduled')}${parkedPip()}</td>`;
   }
   function queueView() {
     const unread = [];
