@@ -69,6 +69,7 @@ Read in parallel; write one repo at a time.
 ## 5. Build
 
 - Run `sd assignments build N` for each ready item, including step-4 fixes. Respect the load limit.
+  Skip an item with an open question note or a Decisions row: step 6 asks first, then builds it.
   Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing.
 - Note on each item touched what you did.
 
