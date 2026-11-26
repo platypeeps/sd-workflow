@@ -125,6 +125,37 @@ class OpenPrSweep(unittest.TestCase):
         self.assertLess(text.index("no other open PR of the item"), retry)
         self.assertNotIn("A full commit names this PR's work", text)
 
+    # Class pass (sd:10803): the CLI keys each write by item, and the sweep means one PR's branch.
+    # Every item-keyed command in the sweep is bound to this PR's branch before it runs, or names the PR.
+
+    def item_keyed(self) -> list[str]:
+        return [command for command in prescribed_commands(self.text())
+                if re.search(r"(build|retry|note) N\b|--item N\b", command)]
+
+    def test_every_item_keyed_command_is_enumerated(self):
+        """A new item-keyed command must join the class, not slip past it."""
+        kinds = sorted({" ".join(parse(command)[1]) for command in self.item_keyed()})
+        self.assertEqual(kinds, ["assignments build", "lane enqueue", "lane retry", "task note"])
+
+    def test_an_item_with_two_open_prs_is_reported_only(self):
+        text = self.text()
+        guard = text.index("resolve to one item: report each and act on none")
+        self.assertLess(guard, text.index("4. Act on the rest"))
+
+    def test_a_finding_goes_only_to_the_build_on_this_branch(self):
+        text = self.text()
+        send = text.index("sd assignments build N --finding")
+        self.assertLess(text.index("`build/sd-<assignment>` exactly"), send)
+        self.assertLess(text.index("sd assignments get <assignment> --json"), send)
+        self.assertLess(text.index("sd assignments list --json"), send)
+
+    def test_each_note_names_its_pr(self):
+        notes = [command for command in self.item_keyed() if " note N" in command]
+        self.assertEqual(len(notes), 2, notes)
+        for command in notes:
+            with self.subTest(command=command):
+                self.assertIn("<PR URL", command)
+
     def test_item_is_matched_exactly(self):
         text = self.text()
         self.assertIn("equals the PR's head branch exactly", text)
