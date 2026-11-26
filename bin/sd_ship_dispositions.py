@@ -153,7 +153,7 @@ def text(value: Any, label: str) -> None:
         raise Refusal(f"disposition {label} needs nonempty bounded text")
 
 
-def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool) -> str:
+def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool = False) -> str:
     """`run_tests`: recording and prepare run each row's `test`; a read (merge, publication, `verify-review`) does not (sd:10893)."""
     bindings, expected = context(operation, head)
     if (not isinstance(proposal, dict) or set(proposal) != {"schema_version", "bindings", "findings"}
