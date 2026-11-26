@@ -1905,7 +1905,7 @@ def _carry(old: Mapping[str, Any], answered: Sequence[Outcome], outcomes: Sequen
     if not still and all(_fixed(outcome) for outcome in answered):
         return None
     stored = old.get("evidence") if isinstance(old.get("evidence"), str) else ""
-    return dict({key: value for key, value in old.items() if key != "id"}, disposition="blocking",
+    return dict({key: value for key, value in old.items() if key not in ("id", "prior_review")}, disposition="blocking",  # mapped here: no stale source head
                 evidence="\n".join(dict.fromkeys(_opened(ident, outcomes))) or stored,
                 carried={"id": ident, "verdict": "open" if still else "none"},
                 **({"reopened": reopen_count(old) + 1} if _opened(ident, outcomes) else {}))

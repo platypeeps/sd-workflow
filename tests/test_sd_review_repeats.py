@@ -300,6 +300,24 @@ class PriorLineTests(RepeatFixture):
                                      self.blocker(line=5, prior_review={"head": "not-a-head"})),
                          [("src.py", 40), ("src.py", 40), ("src.py", 5)])
 
+    def test_a_carried_blocker_maps_from_the_head_its_places_are_at(self) -> None:
+        """build/sd-1675 review (bin/sd-review:1910, 1994, 2012): a resumed review carried a row mapped to
+        this head with its old `prior_review.head`, so the next fix verification shifted it again. A carried
+        row drops that source, so the next map starts at its report's head and moves nothing."""
+        source = "".join(f"line{number}\n" for number in range(1, 41))
+        (self.root / "src.py").write_text(source, encoding="utf-8")
+        first = self.commit("add", "src.py") and self.commit("first")
+        (self.root / "src.py").write_text("x\ny\nz\n" + source, encoding="utf-8")
+        resumed = self.commit("add", "src.py") and self.commit("resumed")
+        (self.root / "other.py").write_text("x = 1\n", encoding="utf-8")
+        verified = self.commit("add", "other.py") and self.commit("verified")
+        [row] = sd_review.prior_at(self.root, first, resumed, [self.blocker(
+            id="B1", instances=["src.py:10"], prior_review={"pass": 1, "head": first})])
+        [kept] = sd_review.carried([row], [sd_review.Outcome("one", sd_review.CLEAN, (), "", (), ())])
+        self.assertNotIn("prior_review", kept)
+        [again] = sd_review.prior_at(self.root, resumed, verified, [kept])
+        self.assertEqual((again["line"], again["instances"]), (13, ["src.py:13"]))
+
     def test_each_instance_maps_on_its_own_in_one_row(self) -> None:
         (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 21)), encoding="utf-8")
         (self.root / "b.py").write_text("".join(f"b{n}\n" for n in range(1, 61)), encoding="utf-8")
