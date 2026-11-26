@@ -1144,40 +1144,38 @@ class Ship(SharedReview):
         return {**existing, "decision": "already_recorded"}
 
     def send_copilot_request(self, entries: list[dict], number: int, head: str,
-                             selection: str, decision: str) -> dict:
+                             selection: str, decision: str, resend: int | None = None) -> dict:
         """Record, send, confirm (sd:10207).
 
         The receipt goes first, as `requesting`: a prepare killed after GitHub
-        took the request still owes the review at a merge, and
-        `settle_copilot_requests` reads what became of it on the next prepare.
-        Only a request GitHub refused outright restores the receipts as they
-        were; an answer that may follow a request GitHub took keeps the
-        `requesting` receipt for the next prepare to settle.
+        took the request still owes the review at a merge. `resend` is the
+        index of a `requesting` receipt to send again in place, at this head.
+        Only a first send GitHub refused outright (a 4xx) undoes its receipt.
+        Every other failure keeps it: an ambiguous answer may follow a request
+        GitHub took, and a refused resend says nothing of the earlier send.
         """
-        result = self.record_copilot_request(entries, number, head, selection, "requesting", decision)
+        kept = entries if resend is None else [*entries[:resend], *entries[resend + 1:]]
+        result = self.record_copilot_request(kept, number, head, selection, "requesting", decision)
         try:
             self.api.request_copilot_review(number)
         except Refusal as error:
-            if error.workflow["blocker"]["code"] == COPILOT_REQUEST_REFUSED:
+            if resend is None and error.workflow["blocker"]["code"] == COPILOT_REQUEST_REFUSED:
                 self.save(copilot_reviews=entries)
             raise
         result = {**result, "status": "requested"}
-        self.save(copilot_reviews=[*entries, {name: value for name, value in result.items() if name != "decision"}])
+        self.save(copilot_reviews=[*kept, {name: value for name, value in result.items() if name != "decision"}])
         return result
 
     def settle_copilot_requests(self, number: int, pull: dict) -> None:
-        """Settle each `requesting` receipt of this pull from GitHub, before anything reads one (sd:10207).
+        """Confirm each `requesting` receipt of this pull GitHub shows a sign of (sd:10207).
 
-        Run first on every prepare, whatever the head or the selection now, so
-        no later branch meets an unconfirmed receipt. A request GitHub holds,
-        or a completed Copilot review no other receipt accounts for, means the
-        POST landed: the receipt is confirmed and counts as the one bought. No
-        sign of it means it was never sent: the receipt is dropped, nothing is
-        owed, and this prepare decides afresh. A review accounts for a receipt
-        only at that receipt's head, so a request that vanished with no review
-        hides no other (sd:10207 review). The count leans to "landed": a
-        review someone asked for by hand reads as this one, which costs a wait
-        an explicit request ends, never a second paid review.
+        Run first on every prepare, whatever the head or the selection now. A
+        request GitHub holds, or a completed Copilot review no receipt at the
+        review's own head claims, means the POST landed: the receipt is
+        confirmed and counts as the one bought. No sign proves nothing, since
+        the read can lag and a request can leave before its review: the
+        receipt stays `requesting` and owed. A prepare that selects a review
+        sends it again in place; a merge that will not wait abandons it.
         """
         entries = self.copilot_entries()
         waiting = [index for index, entry in enumerate(entries)
@@ -1189,15 +1187,13 @@ class Ship(SharedReview):
         left = self.unclaimed_copilot_reviews(reviews, [
             entry["head"] for index, entry in enumerate(entries)
             if entry["pull"] == number and statuses.get(index, entry["status"]) != "absent"])
-        settled = []
-        for index, entry in enumerate(entries):
-            status = statuses.get(index)
-            if status == "absent":
-                if left <= 0:
-                    continue
+        for index in waiting:
+            status = statuses[index]
+            if status == "absent" and left > 0:
                 status, left = "requested", left - 1
-            settled.append(entry if status is None else {**entry, "status": status})
-        self.save(copilot_reviews=settled)
+            if status != "absent":
+                entries[index] = {**entries[index], "status": status}
+        self.save(copilot_reviews=entries)
 
     def unclaimed_copilot_reviews(self, reviews: list[dict], heads: list[str]) -> int:
         """How many completed Copilot reviews no receipt at the review's own head claims."""
@@ -1214,6 +1210,11 @@ class Ship(SharedReview):
 
         entries = self.copilot_entries()
         pull_entries = [entry for entry in entries if entry["pull"] == number]
+        # A receipt nothing confirmed is owed and unasked as far as anyone can tell: send it again, in place.
+        unconfirmed = next((index for index in reversed(range(len(entries)))
+                            if entries[index]["pull"] == number and entries[index]["status"] == "requesting"), None)
+        if unconfirmed is not None:
+            return self.dispatch_copilot_request(entries, number, head, selection, automatic, unconfirmed)
         if automatic and pull_entries:
             return {**pull_entries[-1], "decision": "not_repeated"}
         existing = next((entry for entry in reversed(pull_entries) if entry["head"] == head), None)
@@ -1231,8 +1232,12 @@ class Ship(SharedReview):
             result = self.record_copilot_request(entries, number, head, selection, status, "recorded")
             self.clear_copilot_suppression()
             return result
+        return self.dispatch_copilot_request(entries, number, head, selection, automatic)
+
+    def dispatch_copilot_request(self, entries: list[dict], number: int, head: str, selection: str,
+                                 automatic: bool, resend: int | None = None) -> dict:
         try:
-            result = self.send_copilot_request(entries, number, head, selection, "recorded")
+            result = self.send_copilot_request(entries, number, head, selection, "recorded", resend)
         except Refusal as error:
             if automatic:
                 return {"decision": "request_failed", "selection": "automatic",

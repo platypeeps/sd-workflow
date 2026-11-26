@@ -2516,14 +2516,54 @@ roles:
         [entry] = self.operation().state["copilot_reviews"]
         self.assertEqual((entry["status"], entry["head"]), ("requested", _git(self.root, "rev-parse", "HEAD")))
 
-    def test_an_unsent_request_owes_nothing_once_the_rerun_skips_copilot(self):
-        """sd:10207. Killed before the POST, rerun with `skip`: no review was
-        asked for, so the merge waits for none."""
-        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+    def test_a_receipt_github_shows_no_sign_of_is_kept_when_the_rerun_skips(self):
+        """sd:10207 class pass. GitHub took the request, the answer was lost,
+        and GitHub's read shows no request. Absence proves nothing: a rerun
+        with `skip` keeps the receipt, and only an abandonment ends the wait."""
+        self.interrupt_copilot_request("--copilot-review", "request", lands=True)
+        self.double.copilot_pending.clear()
         self.prepare("--copilot-review", "skip")
-        self.assertEqual(self.operation().state["copilot_reviews"], [])
-        self.assertEqual(self.double.copilot_requests, [])
-        self.assertEqual(self.merge()["phase"], "merged")
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]], ["requesting"])
+        with self.assertRaisesRegex(ship.Refusal, "has not completed"):
+            self.merge()
+        self.assertEqual(self.merge("--abandon-copilot-review", "request never sent")["phase"], "merged")
+
+    def refused_resend(self, *extra):
+        self.interrupt_copilot_request(*extra, lands=True)
+        self.double.copilot_pending.clear()
+        self.double.lose_copilot_request = True
+
+    def assert_receipt_still_owed(self):
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]], ["requesting"])
+        with self.assertRaisesRegex(ship.Refusal, "has not completed"):
+            self.merge()
+
+    def test_a_refused_resend_keeps_the_receipt_of_the_earlier_request(self):
+        """sd:10207 class pass. The first request may have landed; a 4xx to
+        the resend answers for the resend alone, so the receipt stays."""
+        self.refused_resend("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        self.assert_receipt_still_owed()
+
+    def test_a_refused_automatic_resend_keeps_the_receipt(self):
+        """sd:10207 class pass. The automatic path warns and keeps it too."""
+        self.enable_automatic_copilot()
+        self.refused_resend()
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "request_failed")
+        self.assert_receipt_still_owed()
+
+    def test_a_resend_reuses_the_receipt_and_spends_no_capacity(self):
+        """sd:10207 class pass. Each rerun that finds no sign of the request
+        sends it again on the one receipt: the cap counts it once."""
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        for _ in range(ship.COPILOT_REVIEW_LIMIT + 1):
+            self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.assertEqual(len(self.operation().state["copilot_reviews"]), 1)
+        rerun = self.prepare("--copilot-review", "request")
+        self.assertEqual(rerun["copilot_review"]["status"], "requested")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertEqual(len(self.operation().state["copilot_reviews"]), 1)
 
     def test_a_recovery_request_interrupted_after_it_landed_keeps_its_receipt(self):
         """sd:10207. The recovery of a disappeared request records before it
