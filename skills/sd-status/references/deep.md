@@ -10,7 +10,7 @@ Budget about 2 hours. Threat model: the threat-model line in the repo's `CLAUDE.
 - Connected repos: each one this repo calls, is called by, ships to or reads data from.
   Name the API, data format, executable, deployment step or user workflow that links them.
   Mark any you could not read.
-- Previous runs: items with ref `deep-review:<repo>:*`.
+- Previous runs: `sd store items --here --grep "deep-review:<repo>"`; each filed finding carries that line in its body, and `--ref` matches one exact reference only.
   Note which of their findings shipped and which are still open.
 
 ## 1. Fan out
@@ -45,7 +45,9 @@ e. Cross-repo agreement: for each link from step 0, check that both sides agree 
 ## 4. File
 
 - Dedupe each surviving finding against open items; note the existing item instead of filing a copy.
-- File the top 20 as items in their own repo: priority 2 for a reproduced defect, 3 for the rest, ref `deep-review:<repo>:<date>:<rank>` (a ref names one item, so each finding takes its own), body: file:line, trigger, consequence, smallest fix, done test.
+- File the top 20 as items in their own repo: priority 2 for a reproduced defect, 3 for the rest, ref `deep-review:<repo>:<slug>`, body: a first line `deep-review:<repo>:<date>`, then file:line, trigger, consequence, smallest fix, done test.
+  `<slug>` is a short kebab name of the finding, never its rank or the date: a ref names one item, and a run key collides on a rerun.
+  A refusal `already carries --ref` names the item that holds this finding: an open one gets a note with the new evidence, no copy; a done one means the finding is back, so file it as `<slug>-<date>`.
   Leave them planning, so they show in Suggested.
 - Past the top 20, also file every finding that is high priority or high value: a reproduced defect, a data-loss, security or wrong-result risk, or a fix that removes a recurring manual step.
   The cap of 20 never drops one of these.
@@ -61,7 +63,7 @@ Then: the scope table; what shipped since the last run; the workflow trace; plan
 
 - Decide a routine one yourself: the options do not differ in money, risk, a standing ruling, or scope.
   Record the ruling and its reason as a decision note on its item, and act on it.
-- Ask the operator only about the rest, one per question (`AskUserQuestion`): one or two lines on the finding and its evidence, then the options, recommended first: build now (set ready, queue a build), keep planned, defer to a date or item, or drop with a reason.
+- Ask the operator only about the rest, one per question (`AskUserQuestion`): one or two lines on the finding and its evidence, then the options, recommended first: build now (`sd task status N ready`, then `sd assignments build N`), keep planned, defer to a date or item, or drop with a reason.
   Record each answer at once as a decision note, and act on it.
 
 End with the report path, a table (rank, item, ruling, state), and under it the veto table of the rulings made without asking.

@@ -16,7 +16,7 @@ Read in parallel; write one repo at a time.
 
 - Activity: last commit on origin/main, open branches and worktrees, and unpushed commits.
 - Items: every planning, blocked, parked or ready item, its newest note, and any build or lane entry.
-  Use `sd store items --parked` and `sd assignments list`.
+  Use `sd store items --parked --belongs-to <repo>` and `sd assignments list`.
 - Questions: open question notes and research rows in the Decisions list of `sd today --here`.
   Count review questions and scores for the report only: a review batch's questions are labelled on the dashboard's Review page, not answered with `--answers`.
 - Kit checks, run from a worktree: `sd-research-kit review`, `checklinks` and `pins`. Quote each one's failing lines.
@@ -37,7 +37,7 @@ Read in parallel; write one repo at a time.
 
 - Stalled: no commit in 14 days and no in_progress item, or the Status names no next step.
 - For each stalled item, decide as in the sd-next triage run (`skills/sd-next/references/triage.md`):
-  - unblock it and set it ready if nothing it needs is missing;
+  - unblock it and set it ready (`sd task status N ready`) if nothing it needs is missing;
   - fix it or split it if it failed review, with a decision note for each blocker past round 3;
   - otherwise leave a note naming what it waits on: an item, a date, a measurement, or the operator.
 
@@ -47,15 +47,17 @@ Read in parallel; write one repo at a time.
   - Fix: a contradicted, outdated or unsourced claim, a failing kit check, a moved pin, or an inconsistency.
   - Forward: the top 1-2 open research questions, a missing next step, or a stale Status, each scoped to one PR's work.
 - Before filing, drop a candidate that an open item already covers. Note the existing item instead.
-- File each surviving one as its own item, 1 to 5 per repo, ranked; `<n>` is its rank, since a ref names one item:
+- File each surviving one as its own item, 1 to 5 per repo, ranked:
 
   ```bash
   sd task add --priority <2 fix of a wrong claim | 3 the rest> \
-    --belongs-to <repo> --ref research-review:<repo>:<date>:<n> \
-    --body "<why, with file:line or source; the done test: what a reader can check when it is finished>" \
+    --belongs-to <repo> --ref research-review:<repo>:<slug> \
+    --body "<first line research-review:<date>; then why, with file:line or source; the done test: what a reader can check when it is finished>" \
     "<repo>: <action verb> <what>"
   ```
 
+- `<slug>` is a short kebab name of the finding, never its rank or the date: a ref names one item, and a run key collides on a rerun.
+  A refusal `already carries --ref` names the item that holds this finding: an open one gets a note, no copy; a done one means the finding is back, so file it as `<slug>-<date>`.
 - Leave them planning, unclaimed, so they show in Today's Suggested list.
   Set ready and build only a fix with no open question.
 - A candidate needing spend, a new experiment or a scope call goes on the item as a question note, not a build.
@@ -64,7 +66,7 @@ Read in parallel; write one repo at a time.
 
 ## 5. Build
 
-- Run `sd assignments build` for each ready item with no queued or running build, including step-4 fixes. Respect the load limit.
+- Run `sd assignments build N` for each ready item with no queued or running build, including step-4 fixes. Respect the load limit.
 - Note on each item touched what you did.
 
 ## 6. Ask
