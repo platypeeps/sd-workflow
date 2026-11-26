@@ -119,6 +119,8 @@ SHARED_RELATIVE = "skills/_shared/references/decide-ask-record.md"
 SHARED = ROOT / SHARED_RELATIVE
 #: What makes a question routine; only the shared block may say it.
 ROUTINE = "money, risk, a standing ruling or scope"
+#: Runs about one machine: their refs name the host, so two machines never share one.
+MACHINE_RUNS = (("sd-next", "health.md"),)
 
 
 class SharedDecideAskRecord(unittest.TestCase):
@@ -138,7 +140,7 @@ class SharedDecideAskRecord(unittest.TestCase):
                 text = reference(skill, name)
                 with self.subTest(skill=skill, reference=name):
                     self.assertIn("references/decide-ask-record.md", text)
-                    self.assertRegex(text, r"`--ref [a-z-]+(:<repo>)?:<date>:<slug>`")
+                    self.assertRegex(text, r"`--ref [a-z-]+(:<repo>|:<host>)?:<date>:<slug>`")
                     self.assertRegex(text, r"(?m)^End with .*`RESULT: ")
                     self.assertRegex(text, r"(?i)budget: about \d+ minutes")
 
@@ -147,6 +149,25 @@ class SharedDecideAskRecord(unittest.TestCase):
         for skill in PROMPTS:
             with self.subTest(skill=skill):
                 self.assertIn("references/decide-ask-record.md`", skill_text(skill))
+
+    def test_the_last_run_lookup_reaches_done_and_parked_items_of_any_age(self):
+        """A plain list hides done items past a week and every parked item (review of sd:10800)."""
+        text = SHARED.read_text(encoding="utf-8")
+        lookup = text.split("## Open with the last run", 1)[1].split("\n## ", 1)[0]
+        self.assertNotIn("--since", lookup)
+        self.assertIn("`sd store items --grep '<tag>:' --json`", lookup)
+        self.assertIn("`sd store items --parked --grep '<tag>:' --json`", lookup)
+        # --grep reads the title, body and notes, never the ref: the body must carry it.
+        self.assertIn("--body 'ref: <tag>:<date>:<slug>", text)
+
+    def test_a_machine_run_puts_its_host_in_the_tag(self):
+        """Two machines' health checks file the same finding as two items (review of sd:10800)."""
+        self.assertIn("`<host>`", SHARED.read_text(encoding="utf-8"))
+        for skill, name in MACHINE_RUNS:
+            with self.subTest(reference=name):
+                text = reference(skill, name)
+                self.assertIn("this run's tag is `health:<host>`", text)
+                self.assertNotRegex(text, r"--ref health:<date>")
 
     def test_no_other_file_repeats_the_routine_definition(self):
         repeats = [str(path.relative_to(ROOT)) for path in sorted((ROOT / "skills").rglob("*.md"))
@@ -220,7 +241,8 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
             ("sd", "task", "status"): r"status N \w+",
             ("sd", "task", "edit"): r"edit N --",
             # A run's follow-up reads every repo's tagged items in one window (sd:10800).
-            ("sd", "store", "items"): r"--(belongs-to PLACEHOLDER|here)|^sd store items --since 40d --json$",
+            ("sd", "store", "items"): (r"--(belongs-to PLACEHOLDER|here)"
+                                       r"|^sd store items (--parked )?--grep 'PLACEHOLDER:' --json$"),
             ("sd-ship", "lane", "enqueue"): r"--item N .*--title .*--body-file .*--expected-head ",
             ("sd-ship", "lane", "retry"): r"retry N\b",
         }
