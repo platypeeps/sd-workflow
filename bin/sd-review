@@ -864,16 +864,13 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
 
     def unchanged(receipt: str, path: Any) -> bool:
         """No change to `path` since the receipt's head, the worktree included at worktree scope; hold on doubt:
-        a failed diff is a change. `path` None: no change of the branch's own at all, as a ruling needs: a
-        commit since its head not from the base, or an uncommitted change (review of sd:10286)."""
-        if path is None:
-            local = [["diff", "--quiet", "HEAD"], ["ls-files", "--others", "--exclude-standard"]] if subject.scope == "worktree" else []
-            return all(sd_lib.git_output(args, root) == "" for args in [
-                ["rev-list", "--no-merges", f"{receipt}..{span[0]}", f"^{span[1]}"], *local])
+        a failed diff is a change. `path` None: no change to any file, as a ruling needs: it judged that tree,
+        and a catch-up merge can add the caller as a branch commit can (class pass 5, sd:10286)."""
         reads = [["diff", "--quiet", receipt, span[0]]] if subject.scope != "worktree" else [
             ["diff", "--quiet", receipt], ["ls-files", "--others", "--exclude-standard"]]
-        return isinstance(path, str) and all(sd_lib.git_output(["--literal-pathspecs", *args, "--", path], root) == ""
-                                             for args in reads)
+        return (path is None or isinstance(path, str)) and all(
+            sd_lib.git_output(["--literal-pathspecs", *args, *([] if path is None else ["--", path])], root) == ""
+            for args in reads)
     return rebuttals(rows, span[2].__contains__, unchanged)
 
 
@@ -921,13 +918,14 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     for index, record in enumerate(records):
         valid = (record.listed and (shown < REBUTTED_LINES or record.ruled is not None)
                  and recorded_at(records, record.path, record.summary, record.line) is record
-                 and all(unchanged(record.head, path) for path in (record.path, *(re.sub(r":\d+$", "", entry) for entry in record.instances))))
+                 # A ruling judged the tree at its head: any change since, to a file it names or not (a new
+                 # caller, from a branch commit or a catch-up merge), lapses it whole (class pass 5, sd:10286).
+                 and all(unchanged(record.head, path) for path in (
+                     *(() if record.ruled is None else (None,)), record.path,
+                     *(re.sub(r":\d+$", "", entry) for entry in record.instances))))
         own = valid and shown < REBUTTED_LINES
         shown += own
-        # A ruling judged its head: any later change of the branch's own, to a file it names or not (a new
-        # caller), lapses it (review of sd:10286, bin/sd-review:919).
-        ruled = record.ruled if valid and unchanged(record.head, None) else None
-        records[index] = record._replace(listed=own, ruled=ruled)
+        records[index] = record._replace(listed=own, ruled=record.ruled if valid else None)
     return records
 
 
@@ -1239,13 +1237,20 @@ def agy_answer(result: Completed, expected: str | None) -> tuple[Completed, Pars
     return result, parse_findings(json.dumps(raw)) if isinstance(raw, dict) else None
 
 
+#: How a cut `evidence` ends: the digest of the whole text.
+CUT_EVIDENCE = re.compile(r"\.\.\. sha256:[0-9a-f]{64}\Z")
+
+
 def _evidence(value: Any) -> str:
     """A finding's `evidence`, stripped and bounded; anything but a string is none (pack sd:9270). A cut one
-    ends in a digest of the whole: two repros that share the kept prefix stay two, so a ruling on one holds
-    back no other (review of sd:10286)."""
+    ends in the digest of the whole: two repros that share the kept prefix stay two, so a ruling on one holds
+    back no other (review of sd:10286). A text that already ends as a cut one does is cut again: a literal
+    citation of a stored form is no copy of the text behind it (class pass 5)."""
     text = value.strip() if isinstance(value, str) else ""
-    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
-    return text if len(text) <= EVIDENCE_CHARS else text[:EVIDENCE_CHARS - 23] + f"... sha256:{digest}"
+    if len(text) <= EVIDENCE_CHARS and not CUT_EVIDENCE.search(text):
+        return text
+    mark = f"... sha256:{hashlib.sha256(text.encode('utf-8', 'replace')).hexdigest()}"
+    return text[:EVIDENCE_CHARS - len(mark)] + mark
 
 
 def _instances(value: Any) -> list[str]:

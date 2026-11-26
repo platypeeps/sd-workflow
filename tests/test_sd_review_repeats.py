@@ -1094,6 +1094,13 @@ class RepeatRuleTests(unittest.TestCase):
         self.assertNotEqual(*(answer.findings[0]["evidence"] for answer in cut if answer is not None))
         self.assertEqual({len(answer.findings[0]["evidence"]) for answer in cut if answer is not None},
                          {sd_review.EVIDENCE_CHARS})
+        # Class pass 5 (bin/sd-review:1248): a literal citation of a cut evidence's stored form is another
+        # text than the one it was cut from, so it reads as another repro.
+        assert cut[0] is not None
+        stored = cut[0].findings[0]["evidence"]
+        literal = sd_review.parse_findings(json.dumps({"findings": [row(evidence=stored)]}))
+        assert literal is not None
+        self.assertNotEqual(literal.findings[0]["evidence"], stored)
         nested = sd_review.parse_findings(json.dumps({"findings": [row(evidence={"command": {"argv": ["git"]}})]}))
         assert nested is not None
         self.assertEqual(sd_review.dispose(nested.findings, "high", self.REBUTTED)[0]["disposition"], "advisory")
@@ -1524,6 +1531,22 @@ class RebuttalScopeTests(RepeatFixture):
         for scope in ("worktree", "branch"):
             with self.subTest(scope=scope):
                 self.assertEqual(ruled(scope), [None], "a later commit kept the ruling")
+
+    def test_a_ruling_lapses_on_a_catch_up_merge(self) -> None:
+        """Class pass 5 on sd:10286 (bin/sd-review:872): the base's own commits can add the caller too. A
+        ruling holds only at the tree it judged, and a lapsed one is no listed rebuttal either."""
+        self.adjudication(("lane claim", "rebutted", "x"), ruled="the repro")
+        self.commit("checkout", "--quiet", "-")
+        (self.root / "caller.py").write_text("import tool\n", encoding="utf-8")
+        self.commit("add", "caller.py")
+        self.commit("a caller on the base")
+        self.commit("checkout", "--quiet", BRANCH)
+        self.commit("merge", "--quiet", "--no-edit", "-")
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                                   self.environment())
+                self.assertEqual([(entry.ruled, entry.listed) for entry in seen], [(None, False)])
 
     def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))
