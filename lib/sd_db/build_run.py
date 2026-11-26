@@ -2226,6 +2226,10 @@ class Supervisor:
                    if moved is not None and functions is not None else None)
         lapsed = ("" if ruling not in ("reject", "file") or not finding else
                   "; not applied: the review gate's own blocker, no code it judged" if not ruleable(row) else
+                  # One rule with the lane (class pass 4): `settled` clears only what the rebuttal below holds
+                  # back there, so no rebuttal (no GitHub origin, an unread branch, no words) is no ruling.
+                  "; not applied: no rebuttal the lane's review reads" if not (
+                      repository and changed is not None and str(row.get("summary") or "").strip()) else
                   "" if touched == [] else
                   "; not applied: the round changed " + ", ".join(touched) if touched else
                   "; not applied: the round's own changes did not read")
@@ -2250,14 +2254,16 @@ class Supervisor:
                 record_state(self.db, "checkpoint", key=f"{RULED}{self.ident}:{head}:{number}", body=row)
             # Each file the branch changes is an instance too, as for a follow-up: a later change to a caller
             # there lapses the rebuttal in the lane. A branch that does not read takes none (fail closed).
-            if ruling in ("reject", "file") and finding and repository and changed is not None:
+            # Its evidence too: the lane holds back a cited repeat of that evidence alone, never a fresh one.
+            if ruling in ("reject", "file") and finding:
                 raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
-                       "instances": [str(entry) for entry in row.get("instances") or []] + sorted(changed)}
+                       "evidence": row.get("evidence"),
+                       "instances": [str(entry) for entry in row.get("instances") or []] + sorted(changed or ())}
                 record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:ruling:{head}:{number}",
                              body={"decision": "accepted", "proposal": {
                                  "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},
-                                 # `ruled`: the lane's `sd-review` holds back its cited repeat too, as
-                                 # `settled` does here; else the run enqueues what the lane blocks.
+                                 # `ruled`: the lane's `sd-review` holds back its repeat with this evidence
+                                 # too, as `settled` does here; else the run enqueues what the lane blocks.
                                  "findings": [{"raw_finding": raw, "response_disposition": "rebutted", "ruled": True,
                                                "reason": f"filed as follow-up sd:{filed}: {reason}" if filed else reason}]}})
 

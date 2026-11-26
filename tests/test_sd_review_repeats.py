@@ -1235,6 +1235,14 @@ def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 
         for path, summary, answer, *rest in rows for at in [(*rest, line)[0]]]}})
 
 
+def ruled_body(summary: str = "defect", evidence: Any = REPRO, ruled: Any = True) -> str:
+    """An adjudication body as a build's ruling round writes it: the judged evidence kept, the row marked."""
+    body = json.loads(adjudicated(("src.py", summary, "rebutted")))
+    body["proposal"]["findings"][0]["ruled"] = ruled
+    body["proposal"]["findings"][0]["raw_finding"]["evidence"] = evidence
+    return json.dumps(body)
+
+
 def listed(*bodies: str) -> list[Any]:
     """The rebuttals in `bodies`, newest first, as the prompt lists them."""
     return sd_review.rebuttals([(body,) for body in bodies], {ON_BRANCH}.__contains__, lambda _head, _path: True)
@@ -1270,18 +1278,41 @@ class RebuttalIdentityTests(unittest.TestCase):
     def test_a_ruling_rebuttal_holds_back_a_cited_repeat(self) -> None:
         """Review of sd:10286 (build_run.py:2199): a build's ruling round rejected the blocker and its
         evidence, so the cited repeat it clears posts as advice here too. An `sd-ship adjudicate` rebuttal
-        still holds back only an uncited repeat."""
+        still holds back only an uncited repeat.
+
+        Class pass 4 (bin/sd-review:1791): only the evidence the ruling judged, as its rebuttal records it.
+        A fresh reproduction at the same place blocks, as does any when the rebuttal records none."""
         plain = adjudicated(("src.py", "defect", "rebutted"))
-        ruled = json.loads(plain)
-        ruled["proposal"]["findings"][0]["ruled"] = True
         cited = row(evidence=REPRO)
         self.assertEqual(gate([cited], plain), ["blocking"])
-        self.assertEqual(gate([cited], json.dumps(ruled)), ["advisory"])
-        self.assertEqual(gate([row(summary="another defect", evidence=REPRO)], json.dumps(ruled)), ["blocking"])
+        self.assertEqual(gate([cited], ruled_body()), ["advisory"])
+        self.assertEqual(gate([row(evidence=" " + REPRO.upper() + "\n")], ruled_body()), ["advisory"], "folded")
+        self.assertEqual(gate([row()], ruled_body()), ["advisory"], "an uncited repeat holds as ever")
+        self.assertEqual(gate([row(evidence="python3 t.py --empty: IndexError")], ruled_body()), ["blocking"],
+                         "a fresh reproduction was held back")
+        self.assertEqual(gate([row(summary="another defect", evidence=REPRO)], ruled_body()), ["blocking"])
+        for evidence in (None, "", 7, [REPRO]):
+            with self.subTest(recorded=evidence):
+                self.assertEqual(gate([cited], ruled_body(evidence=evidence)), ["blocking"])
         for value in ("true", 1, None):
             with self.subTest(ruled=value):
-                ruled["proposal"]["findings"][0]["ruled"] = value
-                self.assertEqual(gate([cited], json.dumps(ruled)), ["blocking"], "only a literal true")
+                self.assertEqual(gate([cited], ruled_body(ruled=value)), ["blocking"], "only a literal true")
+
+    def test_every_ruling_rebuttal_holds_past_the_prompts_cap(self) -> None:
+        """Class pass 4 (build_run.py:2199): a build clears each exact repeat its ruling round ruled, however
+        many; the prompt's cap listed ten rebuttals, so the lane blocked the eleventh. A ruling's hold reads
+        the recorded evidence, not what the reviewer was shown, so the cap does not bound it. The cap still
+        bounds the prompt, and an `sd-ship adjudicate` rebuttal past it."""
+        count = sd_review.REBUTTED_LINES + 3
+        bodies = [ruled_body(summary=f"claim {index}") for index in range(count)]
+        self.assertEqual(gate([row(summary=f"claim {index}", evidence=REPRO) for index in range(count)], *bodies),
+                         ["advisory"] * count)
+        self.assertEqual(gate([row(summary=f"claim {index}") for index in range(count)], *bodies),
+                         ["advisory"] * count, "an uncited repeat of a ruling past the cap")
+        self.assertEqual(sd_review.rebuttal_section(listed(*bodies)).count("\n- "), sd_review.REBUTTED_LINES)
+        changed = sd_review.rebuttals([(bodies[0],)], {ON_BRANCH}.__contains__, lambda _head, _path: False)
+        self.assertEqual(sd_review.dispose([row(summary="claim 0", evidence=REPRO)], "high", changed)[0]["disposition"],
+                         "blocking", "a ruling whose file changed since still held")
 
     def test_only_an_accepted_adjudication_rebuts(self) -> None:
         for decision in ("rejected", "", "proposed"):

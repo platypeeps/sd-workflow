@@ -1242,7 +1242,10 @@ class Supervise(Case):
     def test_the_lane_holds_back_the_ruled_repeat_the_build_cleared(self):
         """Review of sd:10286 (build_run.py:2199, :2256): `settled` clears a ruled repeat that cites evidence,
         and the run enqueues; the lane's `sd-review` blocked that same repeat, a rebuttal holding back only an
-        uncited one. The ruling's rebuttal now holds back the cited repeat there too."""
+        uncited one. The ruling's rebuttal now holds back the cited repeat there too.
+
+        Class pass 4: the build and the lane judge a ruled repeat by one rule. The rebuttal carries the
+        evidence the ruling judged, so a fresh reproduction at the same place still blocks in the lane."""
         ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
                                    {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
                                   after=("repeat2",))
@@ -1251,11 +1254,33 @@ class Supervise(Case):
         (body,) = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE "
                                   "'ship-adjudication:build-run:%'").fetchone()
         ruled = json.loads(body)["proposal"]["findings"][0]["raw_finding"]
-        repeat = {"path": ruled["path"], "line": ruled["line"], "summary": ruled["summary"], "severity": "high",
-                  "family": "correctness", "instances": [], "evidence": "the original evidence"}
+        self.assertEqual(ruled.get("evidence"), "the original evidence", "the rebuttal omits what it judged")
         seen = review.rebuttals([(body,)], lambda _head: True, lambda _head, _path: True)
-        (lane,) = review.dispose([review._finding(repeat)], "high", seen)
-        self.assertEqual(lane["disposition"], "advisory", "the lane blocks the repeat the build cleared")
+        for evidence, lane in (("the original evidence", "advisory"), ("a new failing input", "blocking")):
+            with self.subTest(evidence=evidence):
+                repeat = {"path": ruled["path"], "line": ruled["line"], "summary": ruled["summary"],
+                          "severity": "high", "family": "correctness", "instances": [], "evidence": evidence}
+                (found,) = review.dispose([review._finding(repeat)], "high", seen)
+                self.assertEqual(found["disposition"], lane)
+
+    def test_a_ruling_the_lane_cannot_read_clears_nothing(self):
+        """Class pass 4 on sd:10286: `settled` cleared a ruled repeat from its own checkpoint, written even
+        when no rebuttal was: a repository with no GitHub origin, where `sd-review` reads none, or a branch
+        delta that did not read. The lane then blocked what the build enqueued. Such a ruling is noted, not
+        applied, and its repeat parks the run."""
+        cases = {"no GitHub origin": lambda: self.db.execute("UPDATE repo SET remote = 'https://example.test/r.git'"),
+                 "an unread branch": lambda: self.enterContext(
+                     mock.patch.object(build_run.Supervisor, "branch_delta", return_value=None))}
+        for name, arrange in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                arrange()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=("repeat2",))
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual(self.rebuttals(), [])
+                self.assertIn("not applied: no rebuttal the lane's review reads", self.decisions()[1])
 
     def test_a_settled_review_runs_the_gate_its_blocking_report_skipped(self):
         """Review of sd:10286: `sd-review` runs no gate on a blocking report, so a managed run whose ruled
