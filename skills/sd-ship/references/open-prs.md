@@ -16,30 +16,19 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
    Step 4 acts only where no other open PR of the item is in that list.
 3. Skip, and only report, a PR in either case:
    - its builder or its lane entry is still running: touching it races that writer;
-     this read can go stale, so each step-4 command checks again in its own write, and its refusal is a skip too;
+     this read can go stale, so enqueue checks again in its own write, and its refusal is a skip too;
    - its repo is one the operator does not manage (no row in `sd-db repo list`): report it, and act on nothing there.
 4. Act on the rest:
    - A finding blocks only when it names a concrete failing input, command or interruption that a real caller reaches.
      File every other finding as an sd item for the repo's next PR.
-   - A blocking finding goes to the item's builder, which works on the item's build branch, so send it only when that branch is this PR's:
-     the PR's head branch is `build/sd-<assignment>` exactly, `sd assignments get <assignment> --json` shows `scope` `build` and `item` N,
-     and no row of `sd assignments list --json` for item N with `scope` `build` has a higher `id`.
-     Otherwise the item's build is on another branch: record the finding with `sd task note N "<PR URL>: <finding>"` and report the PR.
-     When it is this PR's, send it with `sd assignments build N --finding "<finding>"`, the dashboard's Fix, and let the command decide:
-     never predict from a build's status whether it takes one.
-     If it refuses, for any reason, it writes nothing: record the finding with the same note and report the PR with the refusal's text.
+   - The sweep sends no finding to a builder and retries no lane entry: both commands name the item, not the branch,
+     and pick the item's newest build or entry when they write, so one queued since the sweep's read takes the write.
+     Record a blocking finding with `sd task note N "<PR URL>: <finding>"`, and report the PR for the operator's Fix.
      Never push by hand to a branch the lane holds.
-     A build that takes the finding enqueues its own fixed head; do not retry or enqueue that PR.
    - Past round 3, counting builder and lane rounds, record fix, file or reject for each blocker with `sd task note N "<PR URL: fix, file or reject, and the reason>" --kind decision`.
    - Rebut a finding that doesn't hold, with a reason a reader can check.
-   - Retry a failed lane entry only when its cause lay outside the branch and is gone (an sd outage, a gate that never ran).
+   - Report a failed lane entry for the operator's Retry only when its cause lay outside the branch and is gone (an sd outage, a gate that never ran).
      A review blocker is fixed or rejected, never retried.
-     Two PRs of one item can sit at one commit, so the commit alone does not pick this PR.
-     Retry only when the item's newest entry in `sd-ship -C <checkout> lane list` is one whose `branch` equals this PR's head branch and whose `expected_head` is the head step 1 read,
-     otherwise report the PR and retry nothing.
-     Then run `sd-ship -C <checkout> lane retry N --expected-head <head>`, `<head>` that full head commit.
-     The retry checks `<head>` against the item's newest entry in its own write:
-     an entry queued since at another commit refuses `stale_head` and queues nothing. Report a refusal; never retry without the head.
    - Enqueue a PR that passes and has no lane entry, from a worktree checked out on its head branch.
      Find it with `git -C <checkout> worktree list --porcelain`: the entry whose `branch` is `refs/heads/<head branch>` exactly.
      No such worktree, or one whose `HEAD` is not the head step 1 read: report the PR and queue nothing.

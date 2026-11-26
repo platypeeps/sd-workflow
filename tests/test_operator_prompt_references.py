@@ -104,26 +104,12 @@ class OpenPrSweep(unittest.TestCase):
         check = text.index("refs/heads/<head branch>")
         self.assertLess(check, text.index("lane enqueue"))
 
-    def test_every_finding_refusal_falls_back_to_a_note(self):
-        """The fallback does not hang on one refusal's wording."""
-        text = self.text()
-        self.assertIn("If it refuses, for any reason, it writes nothing", text)
-        self.assertNotIn("refuses with `--finding goes to", text)
-
     def test_a_fork_pr_is_reported_before_any_match(self):
         """A fork's head branch can share a name with one in the base repo."""
         text = self.text()
         fork = text.index("head.repo.full_name")
         self.assertLess(fork, text.index("lane list"))
         self.assertIn("is a fork PR: report it and act on nothing", text)
-
-    def test_retry_binds_branch_and_head_not_the_commit_alone(self):
-        """Two PRs of one item can sit at one commit; the commit alone picks neither."""
-        text = self.text()
-        retry = text.index("lane retry N")
-        self.assertLess(text.index("`branch` equals this PR's head branch and whose `expected_head`"), retry)
-        self.assertLess(text.index("no other open PR of the item"), retry)
-        self.assertNotIn("A full commit names this PR's work", text)
 
     # Class pass (sd:10803): the CLI keys each write by item, and the sweep means one PR's branch.
     # Every item-keyed command in the sweep is bound to this PR's branch before it runs, or names the PR.
@@ -135,19 +121,20 @@ class OpenPrSweep(unittest.TestCase):
     def test_every_item_keyed_command_is_enumerated(self):
         """A new item-keyed command must join the class, not slip past it."""
         kinds = sorted({" ".join(parse(command)[1]) for command in self.item_keyed()})
-        self.assertEqual(kinds, ["assignments build", "lane enqueue", "lane retry", "task note"])
+        self.assertEqual(kinds, ["lane enqueue", "task note"])
+
+    def test_sweep_runs_no_write_it_cannot_bind_to_the_branch(self):
+        """`build N --finding` and `lane retry N` pick by item: a write
+        queued since the sweep's read sends either to another branch."""
+        kinds = {" ".join(parse(command)[1]) for command in prescribed_commands(self.text())}
+        self.assertFalse(kinds & {"assignments build", "lane retry"}, kinds)
+        self.assertIn("the operator's Fix", self.text())
+        self.assertIn("the operator's Retry", self.text())
 
     def test_an_item_with_two_open_prs_is_reported_only(self):
         text = self.text()
         guard = text.index("resolve to one item: report each and act on none")
         self.assertLess(guard, text.index("4. Act on the rest"))
-
-    def test_a_finding_goes_only_to_the_build_on_this_branch(self):
-        text = self.text()
-        send = text.index("sd assignments build N --finding")
-        self.assertLess(text.index("`build/sd-<assignment>` exactly"), send)
-        self.assertLess(text.index("sd assignments get <assignment> --json"), send)
-        self.assertLess(text.index("sd assignments list --json"), send)
 
     def test_each_note_names_its_pr(self):
         notes = [command for command in self.item_keyed() if " note N" in command]
