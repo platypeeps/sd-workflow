@@ -270,6 +270,18 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
         self.assertIn("Cancel only an assignment whose run has ended or lost its beat", triage)
         self.assertIn("A member of a live bundle waits for its run to end", triage)
 
+    def test_sweep_retries_only_the_entry_of_this_pr(self):
+        """`lane retry` takes the item's newest entry, which may be another PR of the item (sd:10795)."""
+        sweep = reference("sd-ship", "open-prs.md")
+        self.assertIn("the item's newest entry in `sd-ship -C <worktree> lane list`", sweep)
+        self.assertIn("its `branch` is this PR's head branch and its `expected_head` this PR's head", sweep)
+
+    def test_sweep_sends_findings_only_to_builds_that_take_them(self):
+        """`--finding` goes to a Retry or a Fix; any other build refuses it (sd:10795)."""
+        sweep = reference("sd-ship", "open-prs.md")
+        self.assertIn("only when the item's build ended blocked or cancelled, or its lane entry failed", sweep)
+        self.assertIn("record the finding with `sd task note N \"<finding>\"`", sweep)
+
 
 if __name__ == "__main__":
     unittest.main()

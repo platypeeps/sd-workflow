@@ -10,11 +10,15 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
 4. Act on the rest:
    - A finding blocks only when it names a concrete failing input, command or interruption that a real caller reaches.
      File every other finding as an sd item for the repo's next PR.
-   - Fix a blocking finding on a build branch through `sd assignments build N --finding "<finding>"`, the dashboard's Fix.
+   - Fix a blocking finding through `sd assignments build N --finding "<finding>"`, the dashboard's Fix,
+     only when the item's build ended blocked or cancelled, or its lane entry failed: any other build refuses it.
+     Otherwise record the finding with `sd task note N "<finding>"` and report the PR: no builder can take it yet.
      Never push by hand to a branch the lane holds.
    - Past round 3, counting builder and lane rounds, record fix, file or reject for each blocker with `sd task note N "<fix, file or reject: reason>" --kind decision`.
    - Rebut a finding that doesn't hold, with a reason a reader can check.
    - Retry a failed lane entry once its cause is fixed: `sd-ship -C <worktree> lane retry N --expected-head <head>`.
+     Retry takes the item's newest entry in `sd-ship -C <worktree> lane list`, which may belong to another PR of the item.
+     Retry only when its `branch` is this PR's head branch and its `expected_head` this PR's head; otherwise stop and report.
    - Enqueue a PR that passes and has no lane entry, from the worktree on its head branch, at the head step 2 read:
      `sd-ship -C <worktree> lane enqueue --item N --deliver|--associate-only --title "<title>" --body-file <body> --expected-head <head>`.
      The first enqueue of an item refuses without its claim: `--deliver` when this PR is the item's last, `--associate-only` when a later PR finishes it.
