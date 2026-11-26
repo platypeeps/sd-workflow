@@ -20,7 +20,7 @@ from .database import transaction
 from .reads import KEPT_FOLLOWUPS
 from .repos import same_remote
 from .shadow_sync import read_watermark
-from .workflow import WorkflowError, _checked_state, _text, item_state
+from .workflow import WorkflowError, _checked_state, _text, done_resolves, item_state
 from .writes import _transition, add_note, resolve_note, set_item_fields, stamp
 from .writes import now as current_time
 
@@ -436,9 +436,14 @@ def _complete_delivery(connection: sqlite3.Connection, item: int, revision: str,
                                 "at": current_time(), "who": who, **evidence}
         if waived:
             fields["completion"]["waived"] = waived
-        # sd:9869: a delivery answers none of the item's followups, so Today keeps each open one,
-        # read from `fields` as `workflow.change_status` writes it for a task.
-        kept = [note["id"] for note in state["notes"] if note["kind"] == "followup" and not note["resolved_at"]]
+        # sd:9869: a delivery answers none of a person's followups, so Today keeps each open one,
+        # read from `fields` as `workflow.change_status` writes it for a task. The machine's own
+        # (a build's block, a lane failure) the delivery settles; a post-merge one waits on a pass (sd:10407).
+        open_followups = [note for note in state["notes"] if note["kind"] == "followup" and not note["resolved_at"]]
+        for note in open_followups:
+            if done_resolves(note):
+                resolve_note(connection, note["id"])
+        kept = [note["id"] for note in open_followups if not done_resolves(note)]
         if kept:
             fields[KEPT_FOLLOWUPS] = kept
         set_item_fields(connection, item, fields=fields, shipped_at=evidence["shipped_at"])

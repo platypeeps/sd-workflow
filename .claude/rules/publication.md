@@ -7,7 +7,7 @@ paths:
 # Where a finished document goes
 
 - `skills/_shared/references/publication-contract.md` is the policy for this pack and everything installed from it; read it before you decide where a document goes.
-- Publish every finished document by default: Markdown in the Obsidian vault under `Briefs/<repo>/`, HTML on the dashboard Documents tab from `docs/dashboard/`.
+- Publish every finished document by default as HTML on the dashboard Documents tab from `docs/dashboard/`; Markdown goes to the vault under `Briefs/<repo>/` when its entry designates `obsidian=dict()`, or for the vault's own repo.
 - A skill that ends by naming a path in a build directory has not finished: a document nobody can find was not delivered.
 - Working state (ledgers, receipts, handoff packets, monitor state) is not a finished document and does not publish.
 - The vault copy is the document; each other copy is a duplicate in its destination's native format: HTML, Notion blocks or a native Google Doc.

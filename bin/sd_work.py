@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import stat
 import sys
 from typing import Any
@@ -806,17 +807,38 @@ def _change_status(workflow: Any, connection: Any, args: argparse.Namespace,
     (sd:5065), after `--delivered-by` is refused with its own reason; the
     library's refusal names the action, never a verb (sd:3503).
     """
+    if getattr(args, "resolve_followups", False) and args.status != "done":
+        raise WorkRefusal("--resolve-followups closes followups with done; give it only with done")
     reason = _status_reason(workflow, connection, args)
     if args.status == "done" and workflow.item_state(connection, args.item)["item"]["kind"] == "report":
         raise WorkRefusal(
             f"item {args.item} is a report, and a report closes by acknowledgement: "
             f"`sd reports acknowledge {args.item} --resolve-followups` also resolves its open followups")
-    result = workflow.change_status(
-        connection, args.item, args.status, who=who, session=_session(who),
-        expected_revision=getattr(args, "if_revision", None), reason=reason)
+    try:
+        result = workflow.change_status(
+            connection, args.item, args.status, who=who, session=_session(who),
+            expected_revision=getattr(args, "if_revision", None), reason=reason,
+            resolve_followups=bool(getattr(args, "resolve_followups", False)))
+    except workflow.TransitionRefused as refused:
+        if not str(refused).startswith(f"item {args.item} has open followups; "):
+            raise
+        raise WorkRefusal(f"{refused}; or close with `{_retry_with_resolve(args)}`, "
+                          f"which resolves them too") from None
     spawned = result.get("next_occurrence")
     following = None if spawned is None else workflow.item_state(connection, spawned)["item"]
     return result, following
+
+
+def _retry_with_resolve(args: argparse.Namespace) -> str:
+    """The caller's own `sd task status N done`, every option it gave kept, plus `--resolve-followups`.
+
+    A bare retry dropped the delivery evidence and the revision guard (sd:10407)."""
+    words = ["sd", "task", "status", str(args.item), "done"]
+    for flag, value in (("--reason", args.reason), ("--delivered-by", args.delivered_by),
+                        ("--delivered-in", args.delivered_in), ("--if-revision", args.if_revision)):
+        if value is not None:
+            words += [flag, value]
+    return shlex.join([*words, "--resolve-followups"])
 
 
 def _refuse_task_delivery(workflow: Any, connection: Any, args: argparse.Namespace) -> None:
@@ -914,7 +936,7 @@ def _deliver(progress: Any, workflow: Any, connection: Any, args: argparse.Names
             return _delivered_again(state, args.commit)
         sentence = _delivery_reason(row, args.commit, trailer="Item")
         return workflow.change_status(
-            connection, args.item, "done", who=who, expected_revision=args.if_revision,
+            connection, args.item, "done", who=who, expected_revision=args.if_revision, resolve_followups=True,
             reason=f"{sentence} (after the fact: {args.reason.strip()})")
     deliver = getattr(progress, "deliver_associated_work", None)
     if deliver is None:
@@ -1223,16 +1245,51 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
                      for line in (asked["body"] or "").splitlines())
         if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:") and (
                 offers or getattr(args, "option", None) is not None):
-            return _rule_batch(review, workflow, connection, args, body, who, revision)
-        if getattr(args, "option", None) is not None:
-            raise WorkRefusal(f"sd:{args.item} is not a review batch, so --option rules nothing: drop it")
+            if _is_batch(review, connection, args.item):
+                return _rule_batch(review, workflow, connection, args, body, who, revision)
+        ruling = body if getattr(args, "option", None) is None else _plain_ruling(review, asked["body"], args, body)
         ruled = workflow.add_item_note(connection, args.item, kind="decision", who=who,
-                                       body=f"Ruling on note #{args.answers}: {body}",
+                                       body=f"Ruling on note #{args.answers}: {ruling}",
                                        expected_revision=revision, session=_session(who))
         state = workflow.resolve_item_note(connection, args.answers, who=who,
                                            expected_revision=ruled["revision"])
         state["note"] = ruled["note"]
         return state
+
+
+def _is_batch(review: Any, connection: Any, item: int) -> bool:
+    """Whether `review.read` reads the item: a lane review files its findings with a `review:` ref
+    and no batch header (sd:10097), and such an item is answered as any other is."""
+    try:
+        review.read(connection, item)
+    except review.ReviewError:
+        return False
+    return True
+
+
+def _plain_ruling(review: Any, asked: str | None, args: argparse.Namespace, body: str) -> str:
+    """The ruling `--option` names on a question outside a review batch: its label, then TEXT when it differs."""
+    labels = [_label(tag[2]) for line in (asked or "").splitlines()
+              if (tag := review.TAGGED.match(line)) and tag[1] == "Option"]
+    option = _pick(labels, _label(args.option))
+    if option is None:
+        raise WorkRefusal(f"--option {args.option!r} is not an option of note {args.answers}"
+                          + (f"; its options are {', '.join(labels)}" if labels
+                             else "; it has no Option: lines, so drop --option"))
+    return option if body.strip().casefold() == option.casefold() else f"{option}: {body}"
+
+
+def _pick(options: list[str], wanted: str) -> str | None:
+    """The option `wanted` names: its exact spelling first, then one equal case aside. With `Use Foo` and
+    `Use foo`, a case-folded match alone picked the first (review of build/sd-1624)."""
+    if wanted in options:
+        return wanted
+    return next((held for held in options if held.casefold() == wanted.casefold()), None)
+
+
+def _label(option: str) -> str:
+    """An `Option:` line's label: its text less a trailing `(Recommended)` mark, case kept."""
+    return re.sub(r"\s*\(recommended\)\s*$", "", option.strip(), flags=re.IGNORECASE)
 
 
 def _rule_batch(review: Any, workflow: Any, connection: Any, args: argparse.Namespace, body: str, who: str,
@@ -1252,7 +1309,7 @@ def _rule_batch(review: Any, workflow: Any, connection: Any, args: argparse.Name
     named = f", one of {', '.join(options)}" if options else ""
     if args.option is None:
         raise WorkRefusal(f"sd:{args.item} is a review batch: name the ruling with --option LABEL{named}")
-    option = next((held for held in options if held.casefold() == args.option.casefold()), None)
+    option = _pick(options, args.option)
     if option is None:
         raise WorkRefusal(f"--option {args.option!r} is not an option of note {args.answers}"
                           + (f"; its options are {', '.join(options)}" if options else ""))
@@ -1802,6 +1859,9 @@ def register(groups: Any, store: Any) -> None:
     status.add_argument("--delivered-in", metavar="PATH",
                         help="registered checkout the --delivered-by commit landed in, "
                              "when it is not the item's own; the item keeps its checkout")
+    status.add_argument("--resolve-followups", action="store_true",
+                        help="with done: resolve every open followup too; without it, done refuses "
+                             "while a followup the machine did not write is open (sd:10407)")
     _output(status, "status", revision=True)
 
     cancel = verbs.add_parser(
@@ -1825,9 +1885,10 @@ def register(groups: Any, store: Any) -> None:
     note.add_argument("--answers", type=note_id, metavar="NOTE",
                       help="with --kind decision: the question note this rules on, resolved in the same write")
     note.add_argument("--option", metavar="LABEL",
-                      help="with --answers on a review batch question: the option it rules, such as Approve or "
-                           "Reject; Approve on an Approve-or-Reject question files a task, and TEXT other than "
-                           "the label is kept as the question's comment")
+                      help="with --answers: the question's option it rules, its `(Recommended)` mark optional. "
+                           "On a review batch, Approve on an Approve-or-Reject question files a task, and TEXT "
+                           "other than the label is kept as the question's comment; elsewhere TEXT follows the "
+                           "label in the ruling")
     _output(note, "note", revision=True)
     # A read alias (sd:1112): the same operation as `sd store item`, which
     # stays the canonical read for every kind, so both print the same thing.

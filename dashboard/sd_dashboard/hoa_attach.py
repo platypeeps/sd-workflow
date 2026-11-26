@@ -59,6 +59,10 @@ LINK = re.compile(r"https://(drive|docs)\.google\.com/[^\s\"'<>]+")
 ID = re.compile(r"[\w-]{10,200}")
 ITEM = re.compile(r'^- Name: "(?P<name>.*)" \(ID: (?P<id>[\w-]+), Type: (?P<mime>[^,)]+).*?\) Link: (?P<link>\S+)$',
                   re.MULTILINE)
+#: The most listing pages one folder is read in (200 rows each): past it the listing is no whole one.
+PAGES = 50
+
+
 class Unknown(Exception):
     """A write workspace-mcp gave no clear answer to: whether Drive holds the file is not known."""
 
@@ -165,16 +169,32 @@ def _asset(connection, ident: object) -> dict:
 
 
 def _children(account: str, folder: str) -> list[dict]:
-    """The folder's whole listing; `LookupError` for any answer that is not one, so none reads as empty."""
-    said = _call("list_drive_items", {"user_google_email": account, "folder_id": folder, "page_size": 200}, "the listing")
-    if said.strip() == f"No items found in folder '{folder}'.":
-        return []
-    header = re.match(rf"Found (\d+) items in folder '{re.escape(folder)}' for ", said)
-    rows = [match.groupdict() for match in ITEM.finditer(said)]
-    # A nextPageToken is one page of a longer listing: a folder past it could be missed and made twice.
-    if not header or int(header[1]) != len(rows) or "nextPageToken:" in said:
-        raise LookupError(f"workspace-mcp's listing of {folder} is unreadable: {said[:200]}")
-    return rows
+    """The folder's whole listing, every page; `LookupError` for any answer that is not one, so none reads as empty.
+
+    sd:10605: a `nextPageToken:` last line names the next page; a folder past page one would otherwise be missed
+    and made twice. A token seen before, or more than `PAGES` pages, is no whole listing either."""
+    rows, token, seen = [], None, set()
+    for _ in range(PAGES):
+        arguments = {"user_google_email": account, "folder_id": folder, "page_size": 200}
+        if token:
+            arguments["page_token"] = token
+        said = _call("list_drive_items", arguments, "the listing")
+        if not token and said.strip() == f"No items found in folder '{folder}'.":
+            return []
+        header = re.match(rf"Found (\d+) items in folder '{re.escape(folder)}' for ", said)
+        page = [match.groupdict() for match in ITEM.finditer(said)]
+        tokens = re.findall(r"^nextPageToken: (\S+)$", said, re.MULTILINE)
+        last = said.rstrip().rsplit("\n", 1)[-1]
+        paged = "nextPageToken:" in said
+        if (not header or int(header[1]) != len(page)
+                or (paged and (len(tokens) != 1 or last != f"nextPageToken: {tokens[0]}" or tokens[0] in seen))):
+            raise LookupError(f"workspace-mcp's listing of {folder} is unreadable: {said[:200]}")
+        rows += page
+        if not tokens:
+            return rows
+        token = tokens[0]
+        seen.add(token)
+    raise LookupError(f"workspace-mcp's listing of {folder} is unreadable: over {PAGES} pages")
 
 
 def _one(account: str, parent: str, name: str | tuple[str, str]) -> str | None:

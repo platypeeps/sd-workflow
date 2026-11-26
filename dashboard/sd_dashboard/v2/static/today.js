@@ -335,7 +335,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // its child rows under it and closes the row that was open, and a click on the open row closes it. The children, in order:
   // working (the live items of `active`, the build runs of /api/queue/builds, a builder's gate in the lane and the runner's
   // assignments no run holds), merging, next and blocked (the lane entries of /api/queue), suggested (what sd-next offers next,
-  // from `queues.suggested`, at most nine, pack sd:7222, sd:7314, sd:7869 and sd:8008), open (All items: its other open tasks, from
+  // from `queues.suggested`, all of them (sd:10760), pack sd:7222, sd:7314, sd:7869 and sd:8008), open (All items: its other open tasks, from
   // /api/tasks) and ended (ended build runs, and the cancelled
   // and landed lane entries). Each row's marker is its state glyph and its type in words; the parent's glyph is its worst
   // child's. Suggested is on by default (pack sd:7314), All items and Ended builds are off; on, a repo with only those rows
@@ -351,8 +351,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // the merge, which nothing takes back. A build run's Cancel asks first and posts the assignment cancel route; an ended
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
-  const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended', 'parked'], QSHOW = ['suggested', 'open', 'ended', 'parked'], NEXT = 9;
-  const BOXES = ['merging', 'review', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247); today.html's Detail head names them in this order (sd:9315)
+  const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended', 'parked'], QSHOW = ['suggested', 'open', 'ended', 'parked'];
+  const BOXES = ['merging', 'review', 'building', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247); today.html's Detail head names them in this order (sd:9315)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
@@ -441,7 +441,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // or an open question asks); stalled (the log has not grown for 15 min); lost (no supervisor beat for 3 min, which the
   // dispatcher's next reap settles).
   const RUNSTATE = { working: 'ok', merging: 'queued', waiting: 'warning', stalled: 'caution', lost: 'unknown' };
-  const names = r => r.items.length ? html`${r.items.map((m, i) => html`${i ? '; ' : ''}<a href="${shell.itemHref(m.item)}">#${m.item} ${m.title}</a>`)}` : 'no items recorded';
+  // Operator 2026-11-24 (pack sd:10306): each member's blocking review rounds, builder and lane, after its title.
+  const rounds = m => m.reviews ? html` <span class="via" title="${`${m.reviews} rounds ended on blockers: builder reviews, gates and lane reviews${m.bundle ? '; the bundle\'s builder rounds are noted on this lead item' : ''}`}">· ${m.reviews} ${m.reviews === 1 ? 'review' : 'reviews'}</span>` : '';
+  const names = r => r.items.length ? html`${r.items.map((m, i) => html`${i ? '; ' : ''}<a href="${shell.itemHref(m.item)}">#${m.item} ${m.title}</a>${rounds(m)}`)}` : 'no items recorded';
   const bb = (act, r, label, aria, off) => html`<button class="btn quiet sm" type="button" data-build="${act}" data-run="${r.run}" aria-label="${aria}"${off ? html` disabled title="${off}"` : QV.busy ? html` disabled` : ''}>${label}</button>`;
   // Open PR (pack sd:6020 ruling #31553): the pull request `sd-ship` opened for the row's branch; none shows nothing.
   const prLink = r => r.pull ? html`<a class="btn quiet sm" href="${r.pull}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of run ${r.run} on GitHub">Open PR</a>` : '';
@@ -453,11 +455,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const teamFacts = r => html`<b>${r.state}</b> · teammate · worktree <code>${r.worktree}</code> · branch ${r.branch || 'not recorded'} · due ${at(r.due)} · ${r.beat == null ? 'no beat yet' : `beat ${dur(r.beat)} ago`}`;
   function runRow(r) {
     const s = RUNSTATE[r.state] || 'unknown', id = `run:${r.run}`;
+    // pack sd:10306: a run that holds a builder now (`builder`: working or stalled, not at a lane step) counts in building.
     return ['working', s, html`<tr class="child" data-type="working" data-run="${r.run}" data-id="${id}" aria-selected="${String(row() === id)}">${marker(s, 'working')}
       <td class="what">${names(r)}</td>
       <td class="detail">${r.teammate ? teamFacts(r) : html`<b>${r.state}</b> · build ${r.run} · ${r.model || 'model not recorded'} · step <b>${r.step}</b> · ${r.quiet == null ? 'no output yet' : `output ${dur(r.quiet)} ago`} · ${usd(r.usd || 0)} so far`}${hostFacts(r)}${r.why ? ` · ${r.why}` : ''}${r.cancel_requested ? ` · cancel requested: ${r.cancel_requested}` : ''}</td>
       <td class="num">${dur(r.elapsed)}</td>
-      <td class="act"><div class="ctl" role="group" aria-label="Run ${r.run}">${bb('cancel', r, 'Cancel…', `Cancel build run ${r.run}`, r.cancel.allowed ? '' : r.cancel.reason || 'cancel is off')}${prLink(r)}${logBtn(r)}</div></td></tr>`];
+      <td class="act"><div class="ctl" role="group" aria-label="Run ${r.run}">${bb('cancel', r, 'Cancel…', `Cancel build run ${r.run}`, r.cancel.allowed ? '' : r.cancel.reason || 'cancel is off')}${prLink(r)}${logBtn(r)}</div></td></tr>`, undefined, !r.teammate && !!r.builder];
   }
   // A blocked or cancelled bundle keeps its worktree: Retry queues it again at once; Send to builder asks for a finding,
   // notes it on each item and queues it again, so the next builder resumes that worktree with it.
@@ -524,12 +527,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     <td class="what"><a href="${shell.itemHref(r.id)}">#${r.id} ${r.title}</a></td>
     <td class="detail">${(WHY[r.why] || WHY.ready)(r).filter(Boolean).join(' · ')}${runNote(r.id)}</td><td class="num">${r.since ? age(r.since) : ''}</td><td class="act">${shell.commands.rowActions(String(r.id))}</td></tr>`];
   // What sd-next offers next (pack sd:7314): the read's `queues.suggested`, ranked by sd_db.today.suggested (ready, due,
-  // planned, then unscheduled), less the items live now, at most NEXT per repo, in that order. An item with no repo is
+  // planned, then unscheduled), less the items live now, in that order (sd:10760: no per-repo cap). An item with no repo is
   // no row (pack sd:7731): Suggested draws no Unassociated group; Tasks still lists it.
   function suggested(doc) {
-    const live = new Set(((doc.active || {}).rows || []).map(r => r.item)), counted = {}, found = new Map();
+    const live = new Set(((doc.active || {}).rows || []).map(r => r.item)), found = new Map();
     ((doc.queues || {}).suggested || []).filter(r => r.repo && !live.has(r.id)).forEach(r => {
-      const k = repoKey(r.repo); counted[k] = (counted[k] || 0) + 1; if (counted[k] <= NEXT) found.set(String(r.id), r); });
+      found.set(String(r.id), r); });
     return found;
   }
   // All items (#40961): an open task of a repo, as Tasks reads it, that is no suggested row while Suggested shows (pack
@@ -564,10 +567,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     return l.rows.filter(r => r.item == null || (!seen.has(r.item) && !(laned.has(Number(r.item)) && ['cancelled', 'landed'].includes(r.state)) && !!seen.add(r.item))); };
   // Each repo's children, from the four reads, each with the rows the filters show; queueView draws a repo that shows one.
   function qGroups() {
-    const G = new Map(), add = (repo, [type, s, tr, pr]) => {
+    const G = new Map(), add = (repo, [type, s, tr, pr, build]) => {
       const k = repoKey(repo);
       if (!G.has(k)) G.set(k, { key: k, host: '', rows: [] });
-      G.get(k).rows.push({ type, s, tr, pr });
+      G.get(k).rows.push({ type, s, tr, pr, build });
     };
     const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.filter(p => p.item != null).map(p => Number(p.item)));
     // sd:9078: an item with a lane entry not yet ended is that entry's row alone: no live-session, run or blocked
@@ -627,7 +630,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const stalePr = c => c.type === 'blocked' && c.s === 'unknown';
   // sd:8565: the filter text keeps the rows whose words carry it, an item's #number among them.
   const qMatch = c => !query || low(c.tr.text.replace(/<[^>]*>/g, ' ')).includes(query);
-  const inBox = t => t === 'review' ? c => c.pr : c => c.type === t && !c.pr && !stalePr(c);
+  const inBox = t => t === 'review' ? c => c.pr : t === 'building' ? c => !!c.build && !c.pr
+    // Operator 2026-11-24: a building row counts in building alone, so one box mentions it.
+    : t === 'working' ? c => c.type === t && !c.build && !c.pr : c => c.type === t && !c.pr && !stalePr(c);
   const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t && !stalePr(c)).length]).filter(([, n]) => n);
   // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
   const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
@@ -646,9 +651,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.key) === g.key)))
       return html`<td class="detail${g.n.parked ? ' pipe' : ''}"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read${g.n.parked ? parkedPip() : ''}</td>`;
     // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
-    const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s, parked: pk } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
+    const { working: w, building: bd, merging: m, next: n, blocked: b, review: v, suggested: s, parked: pk } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${n} next, ${b} blocked, ${s} suggested, ${unread ? 'parked not read' : `${pk} parked`}">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}${parkedPip()}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${bd} building, ${w} working, ${n} next, ${b} blocked, ${s} suggested, ${unread ? 'parked not read' : `${pk} parked`}">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('building', bd, ' on', 'building: build runs that hold a builder now, not queued or waiting')}${pip('working', w, ' on', 'working: live sessions, queued builds and lane gates; a building run counts in building only')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', 'suggested: items to do next: ready, due today or overdue, planned or unscheduled')}${parkedPip()}</td>`;
   }
   function queueView() {
     const unread = [];
@@ -814,7 +819,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       ok: 'Reject and enqueue', keep: 'Leave it blocked', danger: false,
       // Every finding the review key covers, whole: the refusal's own text names only the first few (sd:9966).
       body: `${(r.review_findings || []).length} blocking finding${(r.review_findings || []).length === 1 ? '' : 's'} of the lane's review, each whole: ${(r.review_findings || []).map((f, n) => `(${n + 1}) ${f}`).join(' ')} Each is recorded as rebutted with this reason through sd-ship adjudicate; then the entry is queued again at head ${head.slice(0, 12)}: prepare reuses that review and the rebuttal clears it.`,
-      cli: `sd-ship -C ${shell.shq(l.path)} lane retry ${item} --expected-head ${head}`,
+      // sd:10246: both steps; `lane retry` alone skips the rebuttal and the same review blocks again.
+      cli: `sd-ship -C ${shell.shq(r.worktree || '')} adjudicate --item ${item} --expected-head ${r.reviewed_head || head} --json --dispositions-file <the template, each finding rebutted with the reason> && sd-ship -C ${shell.shq(l.path)} lane retry ${item} --expected-head ${head}`,
       fields: [{ name: 'reason', label: 'Reason a reader can check', required: true, multiline: true, value: '' }] });
     return yes ? String(values && values.reason || '').trim() : '';
   }

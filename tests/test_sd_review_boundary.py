@@ -1125,11 +1125,34 @@ class LineBudgetTests(unittest.TestCase):
         # one spelling, the newest overlapping record decides, and a repeat
         # at any place of a blocker answers it. Measured: `sd-review` is
         # 3150 here.
+        #
+        # 5120 -> 5123 is sd:10205: `bin/sd-review` +3 so `reader_cost`
+        # reads codex's closing `tokens used` total; 0 of 214 codex
+        # outcomes carried usage. Measured: `sd-review` is 3153 here.
+        #
+        # 5123 -> 5126 is pack sd:10235: `bin/sd-review` +3, so plain
+        # output prints a blocking finding's evidence under its summary.
+        # The lead read a blocker with no repro and reran with `--json`;
+        # the escape reuses `for_note`, so the three lines are a comment,
+        # the loop and its write. Measured: `sd-review` is 3156 here.
+        #
+        # 5126 -> 5146 is sd:10380: `bin/sd-review` +20 for
+        # `unrecorded_reason`, so a pass that records no lane receipt
+        # names the one condition that failed, and a reader shortfall
+        # says so instead of nothing. One refusal covered five
+        # conditions, so a lane host's miss named no cause; the table is
+        # its own function to keep `record_lead_review` under the branch
+        # ceiling. Measured: `sd-review` is 3176 here.
+        #
+        # 5146 -> 5180 is sd:10286: `bin/sd-review` +34 so a build's
+        # ruling holds back only the repeat it judged: a citation of
+        # other evidence, a lapsed ruling or a cut text's literal
+        # stored form blocks. Measured: `sd-review` is 3210 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5120,
+            5180,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
