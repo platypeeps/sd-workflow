@@ -1101,6 +1101,13 @@ class RepeatRuleTests(unittest.TestCase):
         literal = sd_review.parse_findings(json.dumps({"findings": [row(evidence=stored)]}))
         assert literal is not None
         self.assertNotEqual(literal.findings[0]["evidence"], stored)
+        # Class pass 6 (bin/sd-review:1247): a saved ruling may hold a form an earlier release cut, with
+        # a 12-digit digest; a literal citation of it is no copy of the text behind it either.
+        for old in ("python3 t.py --input aaaa... sha256:0123456789ab", "x... sha256:" + "f" * 16):
+            with self.subTest(old=old):
+                cited = sd_review.parse_findings(json.dumps({"findings": [row(evidence=old)]}))
+                assert cited is not None
+                self.assertNotEqual(cited.findings[0]["evidence"], old)
         nested = sd_review.parse_findings(json.dumps({"findings": [row(evidence={"command": {"argv": ["git"]}})]}))
         assert nested is not None
         self.assertEqual(sd_review.dispose(nested.findings, "high", self.REBUTTED)[0]["disposition"], "advisory")

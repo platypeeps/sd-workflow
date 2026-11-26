@@ -1237,8 +1237,9 @@ def agy_answer(result: Completed, expected: str | None) -> tuple[Completed, Pars
     return result, parse_findings(json.dumps(raw)) if isinstance(raw, dict) else None
 
 
-#: How a cut `evidence` ends: the digest of the whole text.
-CUT_EVIDENCE = re.compile(r"\.\.\. sha256:[0-9a-f]{64}\Z")
+#: How a cut `evidence` ends: the digest of the whole text, at any length a release wrote (12 before
+#: class pass 5): a saved ruling keeps the form it was cut in.
+CUT_EVIDENCE = re.compile(r"\.\.\. sha256:[0-9a-f]+\Z")
 
 
 def _evidence(value: Any) -> str:
