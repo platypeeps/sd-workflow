@@ -4412,6 +4412,29 @@ class CargoClean(Case):
             self.assertEqual(self.cargo_calls(), [], answer)
         self.assertTrue(any("4251" in body for body in self.notes()), self.notes())
 
+    def test_a_target_the_lane_may_hold_is_kept_with_a_note(self):
+        """Review of build/sd-1798: an enqueue that wrote its entry and then refused, or a cancel after it,
+        ends the run blocked while the lane still prepares in the worktree; an unread lane may hold it too."""
+        self.rust()
+        lane = self.plans / "lane.json"
+        for status in ("pending", "running"):
+            lane.write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": status, "enqueue_seq": 1}]))
+            self.supervisor().finish("blocked", "sd-ship lane enqueue refused: no JSON answer")
+            self.assertEqual(self.cargo_calls(), [], status)
+        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
+        self.assertTrue(any("lane entry e1" in body and "cargo clean" in body for body in self.notes()), self.notes())
+        lane.unlink()
+        self.plan(sd_ship=["unread"])
+        self.supervisor().finish("blocked", "a cancel was asked after the lane entry was written")
+        self.assertEqual(self.cargo_calls(), [], "an unread lane keeps target/")
+
+    def test_a_target_whose_lane_entry_merged_or_ended_is_cleaned(self):
+        self.rust()
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "merged",
+                                                           "enqueue_seq": 1}]))
+        self.supervisor().finish("done", "worktree kept: not clean")
+        self.assertEqual(len(self.cargo_calls()), 1)
+
     def test_a_missing_cargo_notes_and_still_ends(self):
         self.rust()
         self.tools.cargo = [str(self.root / "no-such-cargo")]

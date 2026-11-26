@@ -1529,7 +1529,8 @@ class Supervisor:
         no top-level file but the ones cargo writes there (`CARGO_FILES`). The worktree: its own checkout root, on
         the run's branch (`guarded`), no split holding or unread on it (`split_first` counts ignored files as a
         left item's work), and no live session but this run's builder in it. An unread git keeps it. The run's
-        own processes: no `Survivor` ended it, and no group of its last child reads alive or unread.
+        own processes: no `Survivor` ended it, and no group of its last child reads alive or unread. The lane:
+        no entry of the run's items that has not merged or ended, and an unread lane keeps it.
         """
         if not manifest.is_file() or target.is_symlink() or not target.is_dir():
             return ""
@@ -1562,6 +1563,13 @@ class Supervisor:
         for pgid in (row["builder_pgid"], *sorted(self.groups or ())):
             if pgid and self.probe.group(pgid) is not False:
                 return f"process group {pgid} of the run's last child may still run"
+        # An enqueue that wrote its entry, then refused or saw a cancel, ends blocked while the lane prepares here.
+        try:
+            entry = lane_entry(self.tools.ship, self.work, [self.lead, *self.others], env=self.env)
+        except Unread as unread:
+            return f"the lane gave no answer ({unread}), so it may hold the worktree"
+        if entry is not None and entry.get("status") not in ("merged", *LANE_ENDED):
+            return f"lane entry {entry.get('id')} is {entry.get('status')} and may build in it"
         own = row["session_id"]
         if sessions.holders(self.db, str(self.work), machine=this_host(), exclude=(own,) if own else ()):
             return ""
