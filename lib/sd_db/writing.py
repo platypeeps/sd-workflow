@@ -1468,6 +1468,18 @@ def cutover_pieces(connection: sqlite3.Connection, repo: str, *, expected_finger
             journal = {"repo": repo, "backup_path": str(backup), "phase": "prepared", "files": entries,
                        "fingerprint": expected_fingerprint, "who": who, "at": now()}
             _save_journal(journal_path, journal)
+            # Cutover drops only the status and published lines, which the pack owns: a gate bound to the old
+            # bytes moves with them, as on a ready transition, so a passing gate stays passing (sd:10719).
+            ids = {row["piece"]: row["id"] for row in preview["rows"]}
+            for entry in preview["files"]:
+                path = disk / entry["path"]
+                if entry["piece"] in ids:
+                    held = connection.execute("SELECT fields FROM item WHERE id = ?", (ids[entry["piece"]],)).fetchone()
+                    fields = _fields(held["fields"])
+                    before = json.dumps(fields, sort_keys=True)
+                    _carry_index_hash(fields, original[path], rewritten[path])
+                    if json.dumps(fields, sort_keys=True) != before:
+                        set_item_fields(connection, ids[entry["piece"]], fields=fields)
             upsert_repo(connection, repo, pieces_source="retiring")
             for entry in entries:
                 path = disk / entry["path"]

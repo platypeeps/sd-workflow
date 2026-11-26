@@ -268,6 +268,16 @@ class SharedTransitions(WritingCase):
         update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
         self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
 
+    def test_cutover_keeps_a_passing_gate_current(self):
+        """sd:10719. Cutover drops status and published from index.md; the gate hash follows the pack's rewrite."""
+        self.attest()
+        self.gates()
+        self.assertTrue(readiness(self.db, self.item)["ok"])
+        self.cutover()
+        self.assertNotIn("status:", self.index.read_text())
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+        self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
     def test_a_gate_after_the_packs_rewrite_asks_for_a_fresh_review(self):
         """sd:10719. A stamp names the bytes before a title rewrite: the gate refuses, never certifies, the new ones."""
         self.attest()
