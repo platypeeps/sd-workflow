@@ -55,7 +55,7 @@ e. Cross-repo agreement: for each link from step 0, check that both sides agree 
 
 ## 5. Report
 
-Write `docs/dashboard/deep-review-<date>.md` in the primary repo.
+Write `docs/dashboard/deep-review-<date>-<HHMM>.md` in the primary repo, the local start time, so a same-day rerun keeps the earlier report.
 Lead with the top 20 table: rank, repo, finding, label, fix, item.
 Then: the scope table; what shipped since the last run; the workflow trace; planned-work rulings (keep, simplify, defer, drop); what works well enough to keep; what could not be verified, and what evidence would settle it.
 
