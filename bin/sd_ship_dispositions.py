@@ -9,11 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 from sd_ship_bindings import adjudicator_binding
-from sd_ship_remote import Refusal, git
+from sd_ship_remote import Refusal, completed_process, git
 
 MAX_PROPOSAL_BYTES = 2_000_000
 #: The only values that clear a blocker; the template names them (sd:9881).
@@ -69,9 +70,35 @@ def gate_waivable(check: Any) -> bool:
     return (type(code) is int and code == 0) or (check.get("status") == GATE_NOT_RUN and code is None)
 
 
+def require_reviewed_checkout(root: pathlib.Path, head: str) -> None:
+    """sd:10391. Refuse unless `root` is clean at `head`, naming the way there.
+
+    A lane catch-up can review a head the lead checkout has not reached; when
+    that head is a local descendant of HEAD, the refusal names the
+    fast-forward. Any other head needs the review's checkout or a new review.
+    """
+    lead = "adjudication requires the clean exact reviewed head"
+    if git(root, "status", "--porcelain", "--untracked-files=all"):
+        raise Refusal(f"{lead}: the checkout has uncommitted or untracked files", state="operator_decision",
+                      next_action="Commit or remove the uncommitted files, then run adjudicate again.")
+    current = git(root, "rev-parse", "HEAD")
+    if current == head:
+        return
+    # `head` is typed by the caller: only a full hex id reaches git, so it is never read as an option.
+    known = re.fullmatch(r"[0-9a-f]{40}", head or "") and completed_process(
+        root, ["git", "merge-base", "--is-ancestor", current, head], answers=frozenset({0, 1, 128})).returncode == 0
+    if known:
+        raise Refusal(f"{lead}: the checkout is at {current[:12]}, behind the reviewed head; "
+                      f"run `git merge --ff-only {head}`", state="operator_decision",
+                      next_action=f"Run `git merge --ff-only {head}`, then run adjudicate again.")
+    raise Refusal(f"{lead}: the checkout at {current[:12]} does not lead to the reviewed head {head[:12]}",
+                  state="operator_decision",
+                  next_action="Run adjudicate in the checkout the review ran in, at the reviewed head, "
+                              "or prepare again here for a fresh review of this head.")
+
+
 def context(operation: Any, head: str) -> tuple[dict, list[dict]]:
-    if git(operation.root, "status", "--porcelain", "--untracked-files=all") or git(operation.root, "rev-parse", "HEAD") != head:
-        raise Refusal("adjudication requires the clean exact reviewed head")
+    require_reviewed_checkout(operation.root, head)
     report = operation.review_inputs(head)
     if report["status"] != "blocking":
         raise Refusal("adjudication requires a complete blocking report")
@@ -131,7 +158,8 @@ def blocking_refusal(operation: Any, head: str, report: dict, lead: str) -> Refu
     command = f"sd-ship adjudicate {selector} --expected-head {head} --json"
     return Refusal(f"{lead}: {named}{more}", code="review_blocking", boundary="review", state="operator_decision",
                    next_action=f"Run `{command}` to print each blocking finding in full; fix them and prepare "
-                               "again, or rebut or park each one through that adjudication.",
+                               "again, or rebut or park each one through that adjudication. Run it in a clean "
+                               f"checkout at {head[:12]}; one behind it runs `git merge --ff-only {head}` first.",
                    # The head the review saw, which a catch-up may have moved past the queued one, and the digest
                    # `context` binds of each blocking finding: Reject rebuts only the review a page showed (sd:9966).
                    details={"findings": findings, "check": report.get("check"), "reviewed_head": head,

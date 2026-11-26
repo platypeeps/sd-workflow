@@ -96,6 +96,43 @@ class DispositionTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(caught.exception.details["reviewed_head"], self.head)
 
+    def refused_template(self):
+        result = self.command()
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_a_checkout_behind_the_reviewed_head_is_told_to_fast_forward(self):
+        """sd:10391. The lane reviewed a catch-up head the lead checkout had not
+        reached, and the refusal named no way there: it names the fast-forward."""
+        self.blocked()
+        fixture._git(self.root, "commit", "--allow-empty", "-m", "catch-up\n\nAuthored-with: human")
+        self.head = fixture._git(self.root, "rev-parse", "HEAD")
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        self.assertIn(f"git merge --ff-only {self.head}", caught.exception.workflow["next_action"])
+        fixture._git(self.root, "reset", "--hard", "HEAD~1")
+        answer = self.refused_template()
+        self.assertIn(f"git merge --ff-only {self.head}", answer["error"])
+        self.assertIn(f"git merge --ff-only {self.head}", answer["workflow"]["next_action"])
+        fixture._git(self.root, "merge", "--ff-only", self.head)
+        self.filled()
+
+    def test_a_checkout_without_the_reviewed_head_is_told_where_to_adjudicate(self):
+        """sd:10391. A reviewed head this checkout does not hold has no fast-forward."""
+        self.blocked()
+        self.head = "0" * 40
+        answer = self.refused_template()
+        self.assertNotIn("--ff-only", answer["error"])
+        self.assertIn("checkout the review ran in", answer["workflow"]["next_action"])
+
+    def test_a_dirty_checkout_is_told_to_clean_up_first(self):
+        """sd:10391. The refusal says which half failed: here the checkout is dirty."""
+        self.blocked()
+        (self.root / "stray.txt").write_text("x\n")
+        answer = self.refused_template()
+        self.assertIn("uncommitted", answer["error"])
+        self.assertNotIn("--ff-only", answer["error"])
+
     def test_a_blocking_refusal_names_the_digest_of_each_finding_adjudicate_binds(self):
         """sd:9966 review round 2: Reject binds the review the page showed; adjudicate's rows carry the same digests."""
         self.blocked()
