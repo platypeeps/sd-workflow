@@ -400,15 +400,14 @@ REVIEWS_KEPT = 512
 
 
 def _review_generation(connection) -> int | None:
-    """The newest `ship:` or `ship-adjudication:` checkpoint's id: a review saved, run again or adjudicated, from
-    this page or the CLI, moves it. 0 for none; None when the store did not answer, so nothing is kept."""
+    """`sd_db.ship.review_generation`: the store's newest review checkpoint, which a review saved, run again or
+    adjudicated, from this page or the CLI, moves. None when the store did not answer, so nothing is kept."""
+    from sd_db import ship
+
     try:
-        row = connection.execute("SELECT max(id) FROM state WHERE kind = 'checkpoint' AND (key >= 'ship:' "
-                                 "AND key < 'ship;' OR key >= 'ship-adjudication:' "
-                                 "AND key < 'ship-adjudication;')").fetchone()
+        return ship.review_generation(connection)
     except sqlite3.Error:
         return None
-    return int(row[0] or 0) if row else None
 
 
 def _review_fields(entry: dict, lane: Path, generation: int | None = None) -> dict:
