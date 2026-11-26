@@ -1020,29 +1020,44 @@ def work_left(now: bool, revert: bool, held: list[tuple[bool, bool | None]], bac
 
 def holds_fix(old: list[str], fixed: list[str], text: list[str]) -> bool:
     """Whether `text` holds the content `fixed` changed in `old` (sd:10214, the ruling on class pass 14: the
-    fix's content decides, not a count of lines). Each place the fix changed must hold: the lines it took
-    out stay out there, the lines it wrote there stand, edited or not, and the lines around the place are
-    kept; a place it only added to needs the added lines. So an edit of the fixed line keeps the work, and
-    the old line back, or the fixed line deleted, does not."""
-    edits = [(tag, i1, i2) for tag, i1, i2, _, _ in
-             difflib.SequenceMatcher(None, old, text, autojunk=False).get_opcodes() if tag != "equal"]
-    gone = {at for _, i1, i2 in edits for at in range(i1, i2)}
-    rewritten = {at for tag, i1, i2 in edits if tag == "replace" for at in range(i1, i2)}
-    return all(fix_place_holds(tag, set(range(i1, i2)), [at for at in (i1 - 1, i2) if 0 <= at < len(old)],
-                               collections.Counter(fixed[j1:j2]) - collections.Counter(text), gone, rewritten)
-               for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, fixed, autojunk=False).get_opcodes()
-               if tag != "equal")
+    fix's content decides, not a count of lines). Each place the fix changed is read in `text` between the
+    old lines around it, which must stand there (class pass 16): a line elsewhere in the file says
+    nothing of the place. There the text must read as the fix (`fix_place_holds`)."""
+    kept = {at + n: to + n for at, to, size in
+            difflib.SequenceMatcher(None, old, text, autojunk=False).get_matching_blocks() for n in range(size)}
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, fixed, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        # ponytail: a place with no old line kept around it reads as undone (a lost close, fixed by hand).
+        if (i1 == 0 and i2 == len(old)) or (i1 > 0 and i1 - 1 not in kept) or (i2 < len(old) and i2 not in kept):
+            return False
+        region = text[kept[i1 - 1] + 1 if i1 > 0 else 0:kept[i2] if i2 < len(old) else len(text)]
+        if not fix_place_holds(old[i1:i2], fixed[j1:j2], region):
+            return False
+    return True
 
 
-def fix_place_holds(tag: str, place: set[int], around: list[int], missing: collections.Counter[str],
-                    gone: set[int], rewritten: set[int]) -> bool:
-    """One place `holds_fix` reads: `place` the old lines the fix changed, `around` the lines beside them,
-    `missing` the fix's lines the text lacks; `gone` and `rewritten` the old lines the text took out."""
-    if not place:  # the fix only added here
-        return not missing
-    # ponytail: a place with no line around it, or an added line edited, reads as undone (a lost close,
-    # fixed by hand). Read the edit's lineage if that matters.
-    return place <= (rewritten if tag == "replace" else gone) and bool(around) and not gone & set(around)
+def fix_place_holds(was: list[str], wrote: list[str], region: list[str]) -> bool:
+    """Whether `region`, the text at one place the fix changed `was` into `wrote`, holds the fix. A place the
+    fix only added to needs the added lines there. Else each edit the fix made to the old text, read by
+    character, must stand in the region at the same spot: the old text there is taken out and the fix's
+    text is in what replaced it. An edit of the fixed line keeps the work; the old line back, edited or
+    not, or deleted, does not (class pass 16)."""
+    if not was:
+        return not collections.Counter(wrote) - collections.Counter(region)
+    old, here = "\n".join(was), "\n".join(region)
+    edits = [(i1, i2, here[j1:j2]) for tag, i1, i2, j1, j2 in
+             difflib.SequenceMatcher(None, old, here, autojunk=False).get_opcodes() if tag != "equal"]
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, "\n".join(wrote), autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        # ponytail: difflib's alignment stands for the edit's spot; a fixed line rewritten past it reads as
+        # undone (a lost close, fixed by hand). Read the edit's lineage if that matters.
+        there = [(a, b, put) for a, b, put in edits if a <= i2 and b >= i1]
+        if not set(range(i1, i2)) <= {at for a, b, _ in there for at in range(a, b)} or \
+                "\n".join(wrote)[j1:j2] not in "".join(put for _, _, put in there):
+            return False
+    return True
 
 
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],

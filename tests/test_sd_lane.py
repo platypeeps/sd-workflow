@@ -4194,6 +4194,7 @@ class CitedCloses(SharedQueue):
         original = "".join(f"line {n}\n" for n in range(20))
         fixed = original.replace("line 7\n", "line 7 fixed\n")
         cleaned = fixed.replace("line 3\n", "line 3 tidy\n").replace("line 12\n", "line 12 tidy\n")
+        guarded = original.replace("line 7\n", "line 7\nguard\n")
         for case, (old_text, new_text, closes) in {
                 "reverted": (original, "unrelated text\n", set()),
                 "kept": (fixed, original, {a}),
@@ -4205,9 +4206,14 @@ class CitedCloses(SharedQueue):
                 # of the fixed line keeps the work; the old line back beside the fix's cleanups does not.
                 "inline": (original, fixed.replace("line 7 fixed\n", "line 7 fixed # note\n"), {a}),
                 "cleanups-kept": (original, cleaned.replace("line 7 fixed\n", "line 7\n"), set()),
-                "fix-deleted": (original, fixed.replace("line 7 fixed\n", ""), set())}.items():
+                "fix-deleted": (original, fixed.replace("line 7 fixed\n", ""), set()),
+                # The review of class pass 15: an edit of the old line is no fix, and a line the fix
+                # added counts only where the fix put it.
+                "old-edited": (original, original.replace("line 7\n", "line 7 # fallback\n"), set()),
+                "added-elsewhere": (original, original + "guard\n", set()),
+                "added-in-place": (original, guarded.replace("line 15\n", "line 15 tidy\n"), {a})}.items():
             with self.subTest(case=case):
-                cited = cleaned if case == "cleanups-kept" else fixed
+                cited = {"cleanups-kept": cleaned, "added-elsewhere": guarded, "added-in-place": guarded}.get(case, fixed)
                 tree, _ = self.committed(f"topic-stale-rename-{case}")
                 git(tree, "fetch", "-q", "origin")
                 git(tree, "reset", "-q", "--hard", "origin/main")
