@@ -8,9 +8,10 @@ Read in parallel; write one repo at a time.
 ## 0. Scope
 
 - Repos: the rows of `sd-db repo list` whose checkout is a research repo (it carries a `research.conf.py`).
-- Read only until step 4. Start no experiment, paid model run or upload, and publish no mirror, without the operator's answer.
+- Read only until every agent reports. Start no experiment, paid model run or upload, and publish no mirror, without the operator's answer.
 - Fan out one read-only agent per repo, 20 minutes each.
-  Each agent returns the step-1 facts, step-2 verdicts and step-3 candidate items for its repo.
+  Each agent returns the step-1 facts, step-2 verdicts, step-3 proposed rulings and step-4 candidate items for its repo.
+  The agents write nothing; the lead makes every write from step 3 on, after all agents report.
 
 ## 1. Collect, per repo
 
