@@ -691,6 +691,24 @@ class PriorVerdictReviewTests(RepeatFixture):
             *PRIOR, dict(finding(path="src.py", line=1, summary="advice"), disposition="advisory")]}))
         return report
 
+    def test_a_carried_blocker_follows_its_file_through_a_rename(self) -> None:
+        """Review of build/sd-2205 (bin/sd-review:2551): a carried blocker kept `src.py` after `git mv`, so the
+        next fix review read no source for it. Its path and instances follow the rename to this head."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 21)), encoding="utf-8")
+        prior_head = self.commit("add", "src.py") and self.commit("src")
+        report = self.tmp / "aggregate.json"
+        report.write_text(json.dumps({"scope": "branch", "subject": {"head": prior_head}, "findings": [
+            dict(PRIOR[0], instances=["src.py:10"])]}))
+        self.commit("mv", "src.py", "moved.py") and self.commit("rename")
+        prompts, _result, _stderr = self.prompts(scope="branch", resume_report=str(report))
+        self.assertIn("Current source for prior finding moved.py", prompts[0])
+        runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", "")},
+                            default=sd_review.Completed(0, json.dumps({"findings": [], "verdicts": []}), ""))
+        result = sd_review.review(self.root, namespace(scope="branch", resume_report=str(report)), runner,
+                                  self.environment(), self.chatgpt_home())
+        self.assertEqual([(row["path"], row["instances"]) for row in result["findings"] if row.get("prior_blocker")],
+                         [("moved.py", ["moved.py:10"])])
+
     def test_a_resumed_review_asks_each_blocker_by_id_and_holds_it_without_a_fixed_verdict(self) -> None:
         report = self.report()
         prompts, _result, _stderr = self.prompts(scope="branch", resume_report=str(report))

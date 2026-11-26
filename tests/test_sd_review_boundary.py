@@ -1149,11 +1149,16 @@ class LineBudgetTests(unittest.TestCase):
         # for its id (`carried`), so the prose matcher (`prior_evidence`),
         # the line map (`prior_at`, `moved_line`, `diff_lines`) and
         # `instance_rows` are deleted. Measured: `sd-review` is 3075 here.
+        #
+        # 5045 -> 5081 is the review of build/sd-2205: `bin/sd-review` +36.
+        # A failed reader's `open` verdict holds a blocker, and `followed`
+        # moves each carried blocker through a rename so the next fix
+        # review reads its source. Measured: `sd-review` is 3111 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5045,
+            5081,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
