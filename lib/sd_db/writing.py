@@ -240,6 +240,18 @@ def _carry_index_hash(fields: dict, before: bytes, after: bytes) -> None:
             gate["index_sha256"] = new
 
 
+def _headline(row, fields: dict) -> str:
+    """A hash of the headline a publication shows for this piece, read as the publication reads it (sd:10719).
+
+    It is not in the draft digest, and after cutover an edit moves no index.md byte: a gate holds this hash,
+    so an edit by any writer, to the file or the row, leaves the gate stale at its one reader, `_problems`.
+    A tip is not here: it is its own row with its own approval, which the publication checks.
+    """
+    metadata = fields.get("writing")
+    title = metadata.get("title") if isinstance(metadata, dict) else None
+    return _hash(json.dumps(title or row["title"]).encode("utf-8"))
+
+
 def _attested(report: str) -> str | None:
     """The index.md bytes a report's stamps attest, as one SHA-256; None when no stamp names any (sd:10719).
 
@@ -433,7 +445,8 @@ def _problems(row, snapshot: dict) -> list[str]:
         digits = stamped_generation.group(1) if stamped_generation else "0"
         if len(digits) > 18 or int(digits) != generation:
             problems.append("research.md belongs to an earlier gate generation")
-    gates = _fields(row["fields"], readable=True).get("writing_gates") or {}
+    fields = _fields(row["fields"], readable=True)
+    gates = fields.get("writing_gates") or {}
     for name in ("fact-check", "adversarial"):
         gate = gates.get(name) if isinstance(gates, dict) else None
         if name not in snapshot["files"]:
@@ -448,6 +461,8 @@ def _problems(row, snapshot: dict) -> list[str]:
         # The digest ignores whitespace; a gate bound to index.md bytes is stale once they move (sd:10719).
         if "index_sha256" in gate and gate["index_sha256"] != snapshot["hashes"].get("index"):
             problems.append(f"{name} index.md changed after its gate record; review the current layout")
+        if "title_sha256" in gate and gate["title_sha256"] != _headline(row, fields):
+            problems.append(f"{name} headline changed after its gate record; review it as shown")
         if gate.get("verdict") != "pass":
             problems.append(f"{name} verdict is not pass")
         for finding in gate.get("findings", []):
@@ -848,7 +863,8 @@ def record_gate(connection: sqlite3.Connection, item: int, artifact: str, *, ver
             raise WorkflowError("stored writing gate metadata is malformed")
         record = {"verdict": verdict, "findings": held, "reason": reason, "who": who,
                   "draft_digest": snapshot["digest"], "generation": row["gate_generation"],
-                  "evidence_sha256": snapshot["hashes"][artifact], "research_sha256": snapshot["hashes"]["research"]}
+                  "evidence_sha256": snapshot["hashes"][artifact], "research_sha256": snapshot["hashes"]["research"],
+                  "title_sha256": _headline(row, fields)}
         if attested:
             record["index_sha256"] = attested
         existing = gates.get(artifact)
@@ -1266,10 +1282,9 @@ def update_piece_metadata(connection: sqlite3.Connection, item: int, changes: di
                 source, original = snapshot["path"], snapshot["files"]["index"]
                 text = _rewrite(snapshot["text"], {key: metadata[key] for key in changes})
                 _replace(source, text.encode("utf-8"))
-                # A title or tip is shown on the page, so its rewrite is a change no reviewer read; only the
-                # URL bookkeeping, which no reader sees, carries the gate's index hash (sd:10719).
-                if not set(changes) & {"title", "tip"}:
-                    _carry_index_hash(fields, original, text.encode("utf-8"))
+                # These bytes are the pack's own rewrite, so the gate's index hash follows them. What the gate
+                # answers for a new headline is `title_sha256`, for either owner; a tip has its own approval.
+                _carry_index_hash(fields, original, text.encode("utf-8"))
                 values["body"] = {"source": text}
             set_item_fields(connection, item, **values)
             add_note(connection, item, "comment", f"Updated writing metadata: {', '.join(sorted(changes))}", session=who)

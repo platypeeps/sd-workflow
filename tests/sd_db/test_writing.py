@@ -268,15 +268,50 @@ class SharedTransitions(WritingCase):
         update_piece_metadata(self.db, self.item, {"review_urls": {"gdocs": "https://example.test/d"}}, who="operator")
         self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
 
-    def test_a_headline_or_tip_edit_leaves_the_gate_stale(self):
-        """sd:10719. A title or tip is shown on the page: a rewrite of it is a change no reviewer read."""
-        for change in ({"title": "A renamed piece"}, {"tip": "A new tip."}):
-            with self.subTest(change=next(iter(change))):
-                self.attest()
+    def test_a_headline_edit_stales_the_gate_whoever_owns_the_piece(self):
+        """sd:10719. After cutover a title lives in the row, so no index.md byte moves: the gate must still go stale."""
+        for owner in ("file", "file-unattested", "row"):
+            with self.subTest(owner=owner):
+                if owner != "file-unattested":
+                    self.attest()
+                if owner == "row":
+                    self.cutover()
+                    self.attest()
                 self.gates()
-                update_piece_metadata(self.db, self.item, change, who="operator")
-                self.assertIn("adversarial index.md changed after its gate record; review the current layout",
-                              readiness(self.db, self.item)["problems"])
+                self.assertEqual(readiness(self.db, self.item)["problems"], [])
+                before = self.index.read_bytes()
+                update_piece_metadata(self.db, self.item, {"title": f"Renamed under {owner}"}, who="operator")
+                if owner == "row":
+                    self.assertEqual(self.index.read_bytes(), before)
+                problems = readiness(self.db, self.item)["problems"]
+                for name in ("fact-check", "adversarial"):
+                    self.assertIn(f"{name} headline changed after its gate record; review it as shown", problems)
+                with self.assertRaisesRegex(WorkflowError, "headline changed"):
+                    change_stage(self.db, self.item, "ready", who="operator")
+                # The next owner starts from reports with no attestation.
+                (self.folder / "fact-check.md").write_text("Full claim ledger.\n")
+                (self.folder / "adversarial.md").write_text("Full adversarial report.\n")
+
+    def test_a_tip_keeps_its_own_approval_and_leaves_the_gate_current(self):
+        """sd:10719. A tip is a row with its own approval, attached to a ready piece: the piece's gates stand."""
+        for owner in ("file", "row"):
+            with self.subTest(owner=owner):
+                self.attest()
+                if owner == "row":
+                    self.cutover()
+                    self.attest()
+                self.gates()
+                update_piece_metadata(self.db, self.item, {"tip": f"A tip under {owner}"}, who="operator")
+                self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
+    def test_a_gate_recorded_before_the_headline_hash_still_passes(self):
+        self.gates()
+        fields = json.loads(piece_state(self.db, self.item)["item"]["fields"])
+        for gate in fields["writing_gates"].values():
+            del gate["title_sha256"]
+        writing.set_item_fields(self.db, self.item, fields=fields)
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        self.assertEqual(readiness(self.db, self.item)["problems"], [])
 
     def test_cutover_keeps_a_passing_gate_current(self):
         """sd:10719. Cutover drops status and published from index.md; the gate hash follows the pack's rewrite."""
@@ -453,6 +488,10 @@ writing.cutover_pieces(c, sys.argv[2], expected_fingerprint=p['fingerprint'], wh
                                                  "published_urls": {"blog": "https://blog.example.com/live"}}, who="operator")
         renamed = update_piece_metadata(self.db, self.item, {"title": "Row-owned title"}, who="operator")
         self.assertEqual(renamed["item"]["title"], "Row-owned title")
+        # sd:10719. The gates answered for the old headline: publishing the new one needs them recorded again.
+        with self.assertRaisesRegex(WorkflowError, "headline changed after its gate record"):
+            change_stage(self.db, self.item, "published", confirmed=True, who="operator")
+        self.gates()
         change_stage(self.db, self.item, "published", confirmed=True, who="operator")
         after = {path.relative_to(self.repo): path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}
         self.assertEqual(after, before)
