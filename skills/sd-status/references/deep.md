@@ -66,7 +66,8 @@ Then: the scope table; what shipped since the last run; the workflow trace; plan
 
 - Rule and ask as that file says. The options: build now, keep planned, defer to a date or item, or drop with a reason.
 - A routine ruling never builds: it keeps the item planned, defers it or drops it. Build now is the operator's answer alone, since a build spends a builder and a lane round.
-- The press, not this run, picks what a build queues, and a Retry takes a whole bundle. So this run presses only for an item this run filed in step 4: a new item has no earlier build, and its press queues that item alone.
+- The press, not this run, picks what a build queues: a Retry takes a whole bundle, and a claim bundles a new item with the other queued items of its repository. So this run presses only for an item this run filed in step 4, which has no earlier build to retry.
+  Before that press, read the open question notes of every planning, ready, blocked or parked item of the item's repository: one open question on any of them holds every press in that repository until the operator answers it, and a repository whose read failed is held too. A held build-now answer is recorded as the ruling, and the build is left to a triage run.
   For a finding noted on an older item, a build-now answer is recorded as the ruling and the item is left as it is: its build is a triage run's, which reads its whole repository first.
 - On a build-now answer: `sd task status N ready --if-revision <revision>`, then `sd assignments build N`.
   Write the status before the decision note: the note moves the item's revision.

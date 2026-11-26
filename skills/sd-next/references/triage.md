@@ -50,6 +50,7 @@ Budget: about 45 minutes. Follow `references/decide-ask-record.md` to decide, as
 
 "park review" runs only the parked part of the triage above, for this repo and its companion repos, with the same tag, budget and shared file.
 List them with `sd store items --parked --belongs-to <repo>` for each repo, plus blocked items whose reason says Parked.
+Before any press, read the open question notes of every planning, ready, blocked or parked item of each repository, as step 1 does: step 0's hold needs them, parked or not.
 For each, read why it was parked and what it waits on.
 
 - If that item is done, that date has passed, or that measurement now passes: unpark it (`sd task edit N --unpark`), set it ready (`sd task status N ready`), and run `sd assignments build N`; the press refuses an item already building, as in step 3.

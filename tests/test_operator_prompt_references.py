@@ -230,8 +230,19 @@ class ScopeOfEachWrite(unittest.TestCase):
         """A new item has no bundle: its press queues it alone. An older item's build is triage's."""
         rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
         self.assertIn("only for an item this run filed", rule)
-        self.assertIn("queues that item alone", rule)
         self.assertNotIn("is only retried with", rule)
+
+    def test_the_deep_run_holds_a_press_in_a_questioned_repository(self):
+        """deep.md:69: a claim bundles a fresh row with the repository's other queued rows (`_bundle`)."""
+        rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
+        self.assertNotIn("queues that item alone", rule)
+        self.assertIn("planning, ready, blocked or parked", rule)
+        self.assertIn("holds every press in that repository", rule)
+
+    def test_park_review_reads_the_whole_repository_before_a_press(self):
+        """triage.md:51: park review skips step 1, where the step-0 hold reads its questions."""
+        park = reference("sd-next", "triage.md").split("## Park review\n", 1)[1]
+        self.assertIn("open question notes of every planning, ready, blocked or parked item", park)
 
     def test_a_routine_ruling_queues_no_build(self):
         """deep.md:65: a routine ruling built items the operator did not choose."""
