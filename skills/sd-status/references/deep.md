@@ -66,8 +66,9 @@ Then: the scope table; what shipped since the last run; the workflow trace; plan
 
 - Rule and ask as that file says. The options: build now, keep planned, defer to a date or item, or drop with a reason.
 - A routine ruling never builds: it keeps the item planned, defers it or drops it. Build now is the operator's answer alone, since a build spends a builder and a lane round.
-- A Retry requeues every member of the item's bundle: the assignments with the same `build_run` in `sd assignments list --json` as the item's newest one. Before each `sd assignments build N`, read that list; if any member's item has an open question note or a Decisions row, press none of them until the operator answers, and note on the item which member it waits on.
-- On a build-now answer: `sd task status N ready --if-revision <revision>`, then `sd assignments build N`; an item whose build failed is only retried with `sd assignments build N`, never set ready.
+- The press, not this run, picks what a build queues, and a Retry takes a whole bundle. So this run presses only for an item this run filed in step 4: a new item has no earlier build, and its press queues that item alone.
+  For a finding noted on an older item, a build-now answer is recorded as the ruling and the item is left as it is: its build is a triage run's, which reads its whole repository first.
+- On a build-now answer: `sd task status N ready --if-revision <revision>`, then `sd assignments build N`.
   Write the status before the decision note: the note moves the item's revision.
   `<revision>` is the `revision:` line of the `sd task show N` read when you asked: a refusal means the item changed while the question waited, so read it again.
   Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing; report that as its state, and note the refusal on the item, so a ready item with no build says why.

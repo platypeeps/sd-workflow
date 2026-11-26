@@ -16,12 +16,12 @@ Budget: about 90 minutes. Follow `references/decide-ask-record.md` to decide, as
   Each agent returns the step-1 facts, step-2 verdicts, step-3 proposed rulings and step-4 candidate items for its repo.
   The agents write nothing; the lead makes every write from step 3 on, after all agents report.
 - Every write in this run, and every question it asks, is on an item of a reviewed repo; leave any other repo's item untouched.
-- A Retry requeues every member of the item's bundle: the assignments with the same `build_run` in `sd assignments list --json` as the item's newest one. Before each `sd assignments build N`, read that list; if any member's item has an open question note or a Decisions row, press none of them until the operator answers, and note on the item which member it waits on. This holds for every press below.
+- The press, not this run, picks what a build queues: a Retry takes a whole bundle of the item's repository, and not always the bundle of the item's last build. So name no bundle: step 1 reads the open question notes of every planning, ready, blocked or parked item of each repository, and one open question on any of them holds every press in that repository until the operator answers it. A repository whose read failed is held too. This holds for every press below.
 
 ## 1. Collect, per repo
 
 - Activity: last commit on origin/main, open branches and worktrees, and unpushed commits.
-- Items: every planning, ready, in_progress, blocked or parked item, its newest note, and any build or lane entry.
+- Items: every planning, ready, in_progress, blocked or parked item, its newest note, its open question notes, and any build or lane entry.
   Use `sd store items --parked --belongs-to <repo>` and `sd assignments list`.
 - Questions: open question notes on the repo's items, and the Decisions rows of `sd today --only <name>`, which holds that repo's rows alone.
   Count review questions and scores for the report only: a review batch's questions are labelled on the dashboard's Review page, not answered by this run.
@@ -59,7 +59,7 @@ Budget: about 90 minutes. Follow `references/decide-ask-record.md` to decide, as
   `<slug>` starts with the repo's short name, as `<name>-<finding>`, so two repos' findings never share a ref.
   After the ref line, the body says why, with file:line or source, and the done test: what a reader can check when it is finished.
 - Leave them planning, unclaimed, so they show in Today's Suggested list.
-  Set ready and build only a fix with no open question.
+  Set ready and build only a fix, and only in a repository that step 0 does not hold.
 - A candidate needing spend, a new experiment or a scope call goes on the item as a question note, not a build.
 - A repo with no candidate gets one line in the report saying why.
   If it is also stalled, it gets a question: continue, pause or close it.
@@ -67,7 +67,7 @@ Budget: about 90 minutes. Follow `references/decide-ask-record.md` to decide, as
 ## 5. Build
 
 - Run `sd assignments build N` for each item this run set ready in step 3 or 4, in the reviewed repos only. Respect the load limit.
-  Skip an item with an open question note or a Decisions row: step 6 asks first, then builds it.
+  Press nothing in a repository that step 0 holds: step 6 asks first, then builds there.
   Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing.
 - Note on each item touched what you did.
 
@@ -75,7 +75,8 @@ Budget: about 90 minutes. Follow `references/decide-ask-record.md` to decide, as
 
 Ask the questions step 1 collected and this run raised, on items of the reviewed repos only, oldest first, as that file says.
 Review questions stay on the dashboard's Review page.
-When an answer clears an item, decide it again as in step 3, so a failed item is retried and never set ready, then build it as in step 5.
+When the answers leave a repository no open question, decide its waiting items again as in step 3, so a failed item is retried and never set ready, then build them as in step 5.
+A repository with a question still open, or filed for the dashboard with no operator present, gets no build in this run.
 Whether a repo continues is never routine: ask it.
 
 ## 7. Report

@@ -188,15 +188,44 @@ class ScopeOfEachWrite(unittest.TestCase):
         ask = text.split("## 6. Ask\n", 1)[1].split("\n## ", 1)[0]
         self.assertIn("items of the reviewed repos only", ask)
 
-    def test_a_press_checks_every_bundle_member_for_an_open_question(self):
-        """triage.md:23: a Retry requeues every member of the item's bundle, a questioned one too."""
-        for path, text in all_references().items():
-            if "`sd assignments build N`" not in text:
-                continue
+    # Class pass, round 3 (sd:10821): a run predicts what a press will queue. The press picks the bundle a
+    # Retry takes (`_retry_row`: the one that ran last, past a newer build cancelled before its claim), so a
+    # check of the bundle the run guessed missed a questioned member. No run names a bundle now: a question
+    # on any item of a repository holds every press there, and the deep run presses only items it filed.
+
+    PRESSING = ("skills/sd-next/references/triage.md", "skills/sd-research-repo/references/fleet-review.md",
+                "skills/sd-status/references/deep.md")
+
+    def test_the_pressing_runs_are_the_ones_listed(self):
+        """Read from the files: every reference that prescribes a press is held to the rules below."""
+        found = tuple(sorted(path for path, text in all_references().items() if "`sd assignments build N`" in text))
+        self.assertEqual(found, tuple(sorted(self.PRESSING)))
+
+    def test_no_run_predicts_which_bundle_a_press_takes(self):
+        for path in self.PRESSING:
+            text = all_references()[path]
             with self.subTest(path=path):
-                self.assertIn("A Retry requeues every member of the item's bundle", text)
-                self.assertIn("the same `build_run` in `sd assignments list --json`", text)
-                self.assertIn("press none of them until the operator answers", text)
+                self.assertNotIn("build_run", text)
+                self.assertNotRegex(text, r"(?i)newest (one|assignment)")
+                self.assertNotRegex(text, r"(?i)every member of the item's bundle")
+
+    def test_a_question_holds_every_press_in_its_repository(self):
+        """Triage and the fleet review read every item a Retry can take, so the hold needs no bundle."""
+        for path in self.PRESSING[:2]:
+            text = all_references()[path]
+            with self.subTest(path=path):
+                self.assertIn("The press, not this run, picks what a build queues", text)
+                self.assertIn("holds every press in that repository", text)
+                self.assertIn("planning, ready, blocked or parked", text)
+                # No per-item skip stands in for the hold: a skipped item's sibling pressed it anyway.
+                self.assertNotRegex(text, r"Skip an item with an open question note")
+
+    def test_the_deep_run_presses_only_items_it_filed(self):
+        """A new item has no bundle: its press queues it alone. An older item's build is triage's."""
+        rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
+        self.assertIn("only for an item this run filed", rule)
+        self.assertIn("queues that item alone", rule)
+        self.assertNotIn("is only retried with", rule)
 
     def test_a_routine_ruling_queues_no_build(self):
         """deep.md:65: a routine ruling built items the operator did not choose."""
