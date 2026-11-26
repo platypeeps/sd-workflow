@@ -377,8 +377,11 @@ def own_only(line: bytes, flags: list[str], own: re.Pattern[str]) -> bool:
     either, since a cut hid a match that ran past the name. `grep -o -b`
     names each match by byte offset, and one that leaves the name fails the
     line. It steps over a match that starts inside another, so the first
-    byte of each match found becomes `_`, a word character like the one it
-    replaces, and the line is read again until no match is left. Anything
+    byte of the leftmost match found becomes `_`, a word character like the
+    one it replaces, and the line is read again until no match is left.
+    One byte a read: blanking every match found at once could erase a
+    skipped match that crosses two of them (`hop/shop` in `shop/shop`,
+    sd:10778). Each match is then the leftmost of some read. Anything
     unexpected fails: no offset, an empty match, a read that changes nothing."""
     try:
         text = line.decode("utf-8")
@@ -401,10 +404,9 @@ def own_only(line: bytes, flags: list[str], own: re.Pattern[str]) -> bool:
             if not any(low <= start and start + len(found) <= high for low, high in spans):
                 return False
             starts.append(start)
-        if done.returncode != 0 or not starts or all(work[start] == 0x5F for start in starts):
+        if done.returncode != 0 or not starts or work[starts[0]] == 0x5F:
             return False
-        for start in starts:
-            work[start] = 0x5F
+        work[starts[0]] = 0x5F
     return False
 
 

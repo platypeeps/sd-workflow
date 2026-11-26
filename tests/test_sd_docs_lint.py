@@ -713,6 +713,11 @@ class PullRequestPrivacyTests(LintFixture):
         """`grep -o` reports `shop` and steps over `op-private`, which starts inside it."""
         self.assertEqual(self.own_repo("shop\nop-private\n", "- the shop-private host\n"), self.line(3))
 
+    def test_a_match_crossing_two_name_matches_fails(self) -> None:
+        """`grep -o` reports both `shop`s and steps over `hop/shop`, which crosses them:
+        blanking both first bytes at once erased it before the next read."""
+        self.assertEqual(self.own_repo("shop\nhop/shop\n", "- read shop/shop/config\n"), self.line(3))
+
     def test_a_pattern_that_matches_nothing_at_all_still_fails_every_line(self) -> None:
         """An empty match selects each line and reports no text: nothing shows it lies inside the name."""
         self.assertEqual(self.own_repo("shop|x*\n", "- the shop-web image\n"), self.line(1, 2, 3))
