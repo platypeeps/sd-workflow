@@ -12,7 +12,8 @@ Triage every stalled item in this repo and its companion repos, then queue a bui
      Count the review questions and scores in its `+N review questions wait` line for the report, and leave them to the dashboard's Review page: a review batch's questions are labelled there, not answered with `--answers`.
 
 2. Decide, for each one. Read why it stopped and what it waits on.
-   An item with an open question note or a Decisions row waits for step 4: queue no build for it until the operator answers.
+   An item with an open question note or a Decisions row waits for step 4: queue no build for it until the operator answers,
+   then decide it here as below: an answered item that failed review or a build is still retried, never set ready.
    - Nothing it needs is missing (the item it waits on is done, the date has passed, the measurement now passes): unpark it if parked (`sd task edit N --unpark`), and set it ready (`sd task status N ready`).
      Add `--if-revision <revision>` to the item's first write, the `revision:` line of the `sd task show N` you decided from:
      a refusal means the item changed since, so read it again and decide again.
