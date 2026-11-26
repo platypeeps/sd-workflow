@@ -213,6 +213,11 @@ The hub's lock file sits beside the database; a satellite host's sits under `$XD
 
 The machine that hosts a repository gates and merges it, and no request crosses a machine.
 Schedule `sd-ship lane run --hosted` on every machine: it runs each lane the machine hosts.
+
+A satellite whose five-minute load is over its cap claims no build.
+Its queued builds wait for it unless the hub sets `sd config set sd.overload_fallback 1` (sd:10823).
+With it set, the hub builds the fresh rows of a repository it has checked out, and the satellite's lane lands them (sd:8991).
+A retry of such a bundle builds on the hub again, where its commits are.
 Each lane runs in its own child; up to three run at once while the gate has a free slot and load is under its limit.
 A lane that gets work while the run lasts starts then, on the same terms, not at the next scheduled run.
 [WORKFLOW.md § Parallel work](../WORKFLOW.md#parallel-work) covers the lane from the ship side.
