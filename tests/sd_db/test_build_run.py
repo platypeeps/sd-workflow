@@ -6168,16 +6168,24 @@ class Hosts(Case):
             self.assertEqual(self.tick()["spawned"], hub["claimed"], "nor the satellite's on the hub")
 
     def test_the_hub_builds_a_satellite_lane_while_its_host_is_over_the_load_cap(self):
-        """sd:8991: a satellite over its load cap claimed nothing, and the hub left its rows queued; the hub now
-        builds them itself, and the repository's one slot holds the satellite's claim off meanwhile."""
+        """sd:8991: a satellite over its load cap claimed nothing, and the hub left its rows queued; with
+        `sd.overload_fallback` set to 1 the hub builds them itself, and the repository's one slot holds the
+        satellite's claim off meanwhile. Unset, the hub leaves them queued for the satellite (sd:10823)."""
         (self.satellite / ".git").mkdir(parents=True)  # the hub builds only a repository checked out here
         _, sat = self.both()
         with self.on("work"):
             self.assertEqual(self.tick(load=30.0, load_cap=24.0)["claimed"], [])
         with self.on("hub"):
-            hub = self.tick()
-            taken = [build.run(self.db, ident) for ident in hub["claimed"]]
-            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.repo), "fixture")])
+            with mock.patch.object(build, "overload_fallback", return_value=False):
+                hub = self.tick()
+                taken = [build.run(self.db, ident) for ident in hub["claimed"]]
+                self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.repo), "fixture")])
+                self.assertEqual(self.tick()["claimed"], [], "unset: the satellite's row waits for the satellite")
+            self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE item = ?", (sat,)).fetchone()[0],
+                             "queued")
+            fallback = mock.patch.object(build, "overload_fallback", return_value=True)
+            fallback.start()
+            self.addCleanup(fallback.stop)
             taken = [build.run(self.db, ident) for ident in self.tick()["claimed"]]
             self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.satellite), "fixture")])
         later = create_item(self.db, kind="task", title="Later", repo=str(self.satellite), status="ready")
