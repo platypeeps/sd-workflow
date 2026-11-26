@@ -64,7 +64,7 @@ Then: the scope table; what shipped since the last run; the workflow trace; plan
 - Decide a routine one yourself: the options do not differ in money, risk, a standing ruling, or scope.
   Record the ruling and its reason as a decision note on its item, and act on it.
 - Ask the operator only about the rest, one per question (`AskUserQuestion`): one or two lines on the finding and its evidence, then the options, recommended first: build now (`sd task status N ready --if-revision <revision>`, then `sd assignments build N`), keep planned, defer to a date or item, or drop with a reason.
-  Record each answer at once as a decision note, and act on it.
+  Act on each answer at once, then record it as a decision note: the note moves the item's revision, so the status write goes first.
   `<revision>` is the `revision:` line of the `sd task show N` read when you asked: a refusal means the item changed while the question waited, so read it again.
   Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing; report that as its state.
 
