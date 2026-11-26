@@ -143,13 +143,42 @@ class OpenPrSweep(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn("<PR URL", command)
 
-    def test_a_retained_entry_matches_only_at_the_prs_head(self):
-        """The lane keeps old entries; a reused branch name alone names an old item."""
+    # Class pass 2 (sd:10803), identity by proxy: a lane entry holds no PR number, so branch and head only
+    # stand in for the PR. A strict match misses the PR's own entry after a catch-up push; a loose one
+    # takes a replaced PR's. So an entry never names the item or allows a write: any on the branch blocks.
+
+    def test_no_lane_entry_names_the_item(self):
+        """A replacement PR on the same branch and commit would inherit the old PR's item."""
         text = self.text()
-        match = text.index("whose `branch` equals the PR's head branch exactly")
-        self.assertIn("and whose `expected_head` is the PR's head commit", text[match:match + 200])
+        self.assertNotIn("Its item is the lane entry's `item`", text)
+        self.assertIn("A lane entry never names the item", text)
+        self.assertIn("as a whole word", text)
+
+    def test_an_entry_on_the_branch_at_any_head_blocks_the_enqueue(self):
+        """A catch-up push moves the head past a failed entry's; it is still this branch's."""
+        text = self.text()
+        seen = text.index("whose `branch` equals the PR's head branch exactly, at any `expected_head` and in any `status`")
+        self.assertLess(seen, text.index("4. Act on the rest"))
+        enqueue = text.index("- Enqueue a PR")
+        self.assertIn("only when the lane has no entry on its branch", text[enqueue:enqueue + 300])
+        self.assertNotIn("no lane entry at its head", text)
+
+    def test_item_entries_block_too(self):
+        """The item's failed entry on another branch is not this PR's to pass by."""
+        text = self.text()
+        enqueue = text.index("- Enqueue a PR")
+        self.assertIn("no entry of item N but `merged` ones", text[enqueue:enqueue + 300])
+
+    def test_a_failed_entry_is_reported_with_its_own_fields(self):
+        """The operator, not a head match, decides whether the entry is this PR's."""
+        text = self.text()
         retry = text.index("for the operator's Retry")
-        self.assertIn("at this PR's head", text[retry - 200:retry + 200])
+        self.assertIn("`item`, `status` and `expected_head`", text[retry - 400:retry + 400])
+        self.assertNotIn("at this PR's head", text)
+
+    def test_a_running_entry_is_read_by_branch_or_item(self):
+        text = self.text()
+        self.assertIn("an entry on its branch or of its item is `pending` or `running`", text)
 
     def test_a_stacked_pr_is_reported_not_queued(self):
         """A squash merge of a parent strands each PR whose base is its branch."""

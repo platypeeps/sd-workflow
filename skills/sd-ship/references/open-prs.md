@@ -6,17 +6,20 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
    Keep each PR's head branch, full head commit and base branch (`base.ref`) from that read; every later step binds to them.
    A PR whose head repo (`head.repo.full_name`) is not its base repo, or is absent, is a fork PR: report it and act on nothing.
    A branch name matches only inside one repo, so a fork's branch never names a lane entry, item or worktree here.
-2. For each PR, find what holds it: a failed `sd/local-gate`, open review findings, a merge conflict, a failed lane entry, or no lane entry.
-   Its item is the lane entry's `item` in `sd-ship -C <checkout> lane list` whose `branch` equals the PR's head branch exactly
-   and whose `expected_head` is the PR's head commit: the lane keeps old entries, and a reused branch name alone names an old item.
-   With no such entry, it is the one item whose note names the PR's full URL as a whole word:
+2. For each PR, find what holds it: a failed `sd/local-gate`, open review findings, a merge conflict, or a lane entry.
+   Its item is the one item whose note names the PR's full URL as a whole word:
    search with `sd store items --belongs-to <checkout> --grep "<PR URL>"`, then read each hit with `sd task show N`.
    No item, or more than one: report the PR and act on nothing there.
+   A lane entry never names the item: it holds a branch and a head, no PR number, and the lane keeps old entries,
+   so a PR that replaced another on the same branch and commit would take the old one's item.
+   Its lane entries are every entry in `sd-ship -C <checkout> lane list` whose `branch` equals the PR's head branch exactly, at any `expected_head` and in any `status`:
+   prepare's catch-up push moves the PR's head past its own entry's, so a head match would hide a failed entry.
+   One of them may be an older PR's, so any one stops the enqueue, and none permits a write.
    Every step-4 command names the item, not the PR, so the item must stand for this PR alone:
    when two or more open PRs in the step-1 list resolve to one item: report each and act on none.
    Step 4 acts only where no other open PR of the item is in that list.
 3. Skip, and only report, a PR in either case:
-   - its builder or its lane entry is still running: touching it races that writer;
+   - its builder is still running, or an entry on its branch or of its item is `pending` or `running`: touching it races that writer;
      this read can go stale, so enqueue checks again in its own write, and its refusal is a skip too;
    - its repo is one the operator does not manage (no row in `sd-db repo list`): report it, and act on nothing there.
 4. Act on the rest:
@@ -28,9 +31,10 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
      Never push by hand to a branch the lane holds.
    - Past round 3, counting builder and lane rounds, record fix, file or reject for each blocker with `sd task note N "<PR URL: fix, file or reject, and the reason>" --kind decision`.
    - Rebut a finding that doesn't hold, with a reason a reader can check.
-   - Report a failed lane entry for the operator's Retry only when it is the item's newest entry, at this PR's head, and its cause lay outside the branch and is gone (an sd outage, a gate that never ran).
+   - Report a PR whose branch has a lane entry, and queue nothing: give the newest entry's `item`, `status` and `expected_head` beside the PR's item and head, and let the operator decide whether it is this PR's.
+     Name it for the operator's Retry only when that entry failed and its cause lay outside the branch and is gone (an sd outage, a gate that never ran).
      A review blocker is fixed or rejected, never retried.
-   - Enqueue a PR that passes and has no lane entry at its head, from a worktree checked out on its head branch.
+   - Enqueue a PR that passes only when the lane has no entry on its branch and no entry of item N but `merged` ones, from a worktree checked out on its head branch.
      Report a stacked PR and queue nothing: another open PR's base is this PR's head branch, or its base is not the repo's default branch.
      The lane squash-merges into the default branch and deletes the head branch, which strands each PR stacked on it.
      Find it with `git -C <checkout> worktree list --porcelain`: the entry whose `branch` is `refs/heads/<head branch>` exactly.
