@@ -37,7 +37,8 @@ Read in parallel; write one repo at a time.
 
 - Stalled: no commit in 14 days and no in_progress item, or the Status names no next step.
 - For each stalled item, decide as in the sd-next triage run (`skills/sd-next/references/triage.md`):
-  - unblock it and set it ready (`sd task status N ready`) if nothing it needs is missing;
+  - unblock it and set it ready (`sd task status N ready --if-revision <revision>`, the `revision:` line of the `sd task show N` you decided from) if nothing it needs is missing;
+    a refusal means the item changed since: read it again;
   - fix it or split it if it failed review, with a decision note for each blocker past round 3;
   - otherwise leave a note naming what it waits on: an item, a date, a measurement, or the operator.
 
@@ -66,7 +67,8 @@ Read in parallel; write one repo at a time.
 
 ## 5. Build
 
-- Run `sd assignments build N` for each ready item with no queued or running build, including step-4 fixes. Respect the load limit.
+- Run `sd assignments build N` for each ready item, including step-4 fixes. Respect the load limit.
+  Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing.
 - Note on each item touched what you did.
 
 ## 6. Ask

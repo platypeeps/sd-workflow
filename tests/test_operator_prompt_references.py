@@ -270,18 +270,44 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
         self.assertIn("Cancel only an assignment whose run has ended or lost its beat", triage)
         self.assertIn("A member of a live bundle waits for its run to end", triage)
 
-    def test_sweep_retries_only_the_entry_of_this_pr(self):
-        """`lane retry` takes the item's newest entry, which may be another PR of the item (sd:10795)."""
-        sweep = reference("sd-ship", "open-prs.md")
-        self.assertIn("the item's newest entry in `sd-ship -C <worktree> lane list`", sweep)
-        self.assertIn("its `branch` is this PR's head branch and its `expected_head` this PR's head", sweep)
+    # Class pass (sd:10795): no reference predicts, from an earlier read, whether a write applies. The write
+    # checks in its own transaction; the reference binds it to what was read and says what a refusal means.
 
-    def test_sweep_sends_findings_only_to_builds_that_take_them(self):
-        """`--finding` goes to a Retry or a Fix; any other build refuses it (sd:10795)."""
+    def test_sweep_lets_the_finding_command_decide(self):
+        """`--finding` goes to a Retry or a Fix; only the command knows which a press would be."""
         sweep = reference("sd-ship", "open-prs.md")
-        self.assertIn("only when the item's build ended blocked or cancelled, or its lane entry failed", sweep)
+        self.assertNotIn("only when the item's build ended", sweep)
+        self.assertIn("let the command decide", sweep)
+        self.assertIn("`--finding goes to a Retry or a Fix`", sweep)
         self.assertIn("record the finding with `sd task note N \"<finding>\"`", sweep)
 
+    def test_sweep_binds_the_retry_in_its_own_write(self):
+        """`lane retry` takes the item's newest entry; a read before it of that entry goes stale."""
+        sweep = reference("sd-ship", "open-prs.md")
+        self.assertNotIn("Retry only when its `branch`", sweep)
+        self.assertIn("refuses `stale_head` and queues nothing", sweep)
+        self.assertIn("sd-ship -C <worktree> lane cancel N --expected-revision <revision>", sweep)
+
+    def test_sweep_enqueue_leaves_the_queued_check_to_the_command(self):
+        sweep = reference("sd-ship", "open-prs.md")
+        self.assertIn("enqueue refuses an item already queued", sweep)
+
+    def test_no_reference_prefilters_a_build_press(self):
+        """The press refuses an item it cannot build; a list read earlier says nothing by then."""
+        for path, text in all_references().items():
+            with self.subTest(path=path):
+                self.assertNotRegex(text, r"(with no|unless a build is already) queued or running")
+                if "sd assignments build N`" in text:
+                    self.assertIn("the press refuses", text)
+
+    def test_item_writes_bind_to_the_revision_read(self):
+        """A status move or a cancel decided from a read carries that read's revision."""
+        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md"),
+                            ("sd-status", "deep.md")):
+            with self.subTest(reference=name):
+                self.assertIn("--if-revision <revision>", reference(skill, name))
+        self.assertIn("sd assignments cancel <assignment> --if-revision <revision>",
+                      reference("sd-next", "triage.md"))
 
 if __name__ == "__main__":
     unittest.main()
