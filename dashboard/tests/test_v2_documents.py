@@ -1079,7 +1079,9 @@ class TheBooks(ScreenCase):
     def test_a_book_row_says_its_title_author_or_source_url_and_read_state(self):
         ids = seed_learning(self.connection)
         rows = {r["id"]: r for r in learning_screen.books(self.connection, now=NOW)["rows"]}
-        self.assertEqual(sorted(rows), sorted([ids["book"], ids["article"], ids["bare"]]), "a video or a course is no book")
+        # sd:10634: a course is in Books, the one learning list, rather than in no view at all.
+        self.assertEqual(sorted(rows), sorted([ids["book"], ids["article"], ids["bare"], ids["course"]]), "a video is no book")
+        self.assertEqual(rows[ids["course"]]["kind"], "course")
         book = rows[ids["book"]]
         self.assertEqual((book["title"], book["by"], book["url"], book["host"], book["stage"], book["state"], book["kind"]),
                          ("Agile Retrospectives", "A. Writer, B. Writer", "https://books.example.test/retro", "books.example.test",
@@ -1133,7 +1135,7 @@ class TheBooks(ScreenCase):
         seed_learning(self.connection)
         doc = v2.pages.documents._books(types.SimpleNamespace(connection=self.connection, now=NOW))
         self.assertEqual(doc["read"], NOW)
-        self.assertEqual(sorted(r["title"] for r in doc["rows"]), ["A Bare Book", "Agile Retrospectives", "On Queues"])
+        self.assertEqual(sorted(r["title"] for r in doc["rows"]), ["A Bare Book", "A Course", "Agile Retrospectives", "On Queues"])
 
 
 class TheVideos(ScreenCase):
@@ -1174,9 +1176,8 @@ class TheMovedRows(ScreenCase):
         books = {r["id"] for r in learning_screen.books(self.connection, now=NOW)["rows"]}
         videos = {r["id"] for r in learning_screen.videos(self.connection, now=NOW)["rows"]}
         # The note with no content type shows in Books; the listed video moved to Books and leaves Videos.
-        self.assertEqual(books, {ids["book"], ids["article"], ids["bare"], bare, ids["video"]})
+        self.assertEqual(books, {ids["book"], ids["article"], ids["bare"], ids["course"], bare, ids["video"]})
         self.assertEqual(videos, {ids["named"]})
-        self.assertNotIn(ids["course"], books | videos)
 
 
 class TheLearningScript(ScreenCase):
@@ -1208,7 +1209,7 @@ R.details0 = ELS.details.html; window.shell.view.show('books'); await flush();
 R.rows = ELS['books-rows'].html; R.head = ELS['books-head'].html; R.filters = ELS['books-filters'].html; R.details = ELS.details.html;
 R.facets = ELS.facets.hidden; R.tally = ELS['books-tally'].html;""", self.books())
         r = out["R"]
-        self.assertEqual(r["views"], [["documents", "Documents", None], ["books", "Books", "/api/documents/books"],
+        self.assertEqual(r["views"], [["documents", "Documents", None], ["books", "Books and courses", "/api/documents/books"],
                                       ["videos", "Videos", "/api/documents/videos"]])
         self.assertEqual(r["before"], ["/api/documents"], "Books reads only when it first shows")
         self.assertEqual(out["gets"], ["/api/documents", "/api/documents/books"])
@@ -1226,13 +1227,26 @@ R.facets = ELS.facets.hidden; R.tally = ELS['books-tally'].html;""", self.books(
         self.assertIn('data-sort="by"', r["head"])
         self.assertIn("Read state", r["head"])
         self.assertIn('data-f="state" data-v="in-progress"', r["filters"])
-        self.assertEqual(r["tally"], "3 titles")
-        self.assertEqual(out["counts"]["books"], 3)
+        self.assertEqual(r["tally"], "4 titles")
+        self.assertEqual(out["counts"]["books"], 4)
         # The first row by title shows in the one Details pane, with its facts and item link.
         self.assertIn("<h2>A Bare Book</h2>", r["details"])
         self.assertIn("<dt>Item</dt><dd><a href=\"/tasks?row=", r["details"])
         # The facets are the Documents list's: they hide while Books shows.
         self.assertTrue(r["facets"])
+
+    def test_a_kind_tile_leads_to_the_courses(self):
+        """sd:10634: courses were in no view; the Books and courses view lists them, and its Kind tile narrows to them."""
+        out = self.run_view("""R.label = window.PAGE_VIEWS.find(v => v.id === 'books').label;
+window.shell.view.show('books'); await flush(); R.filters = ELS['books-filters'].html;
+ELS['books-filters'].listeners.click[0]({ target: { closest: s => s === '[data-f="kind"]' ? { dataset: { f: 'kind', v: 'course' } } : null } });
+R.rows = ELS['books-rows'].html;""", self.books())
+        r = out["R"]
+        self.assertEqual(r["label"], "Books and courses")
+        self.assertIn('role="group" aria-label="Kind"', r["filters"])
+        self.assertIn('data-f="kind" data-v="course" aria-pressed="false" title="course: 1"', r["filters"])
+        self.assertIn("A Course", r["rows"])
+        self.assertNotIn("Agile Retrospectives", r["rows"])
 
     def test_the_state_filter_and_the_search_fields_words_narrow_the_books(self):
         """The page's one search field filters the shown view by its plain words; repo: and kind: are the list's tokens."""
@@ -1259,7 +1273,7 @@ press('Teams & Facilitation'); press('other'); R.other = ELS['books-rows'].html;
         r = out["R"]
         tiles = re.findall(r'data-f="category" data-v="([^"]*)"', r["filters"])
         self.assertEqual([html.unescape(t) for t in tiles], [*learning_screen.CATEGORIES["books"], "other"])
-        self.assertIn('title="Other: 2"', r["filters"])
+        self.assertIn('title="Other: 3"', r["filters"])
         self.assertIn("Agile Retrospectives", r["teams"])
         self.assertNotIn("On Queues", r["teams"])
         self.assertIn("<dt>Category</dt><dd>Teams &amp; Facilitation</dd>", r["details"])
@@ -1277,7 +1291,7 @@ ELS['books-filters'].listeners.click[0]({ target: { closest: s => s === '[data-f
 R.rows = ELS['books-rows'].html;""", self.books())
         r = out["R"]
         self.assertIn('title="Communication: 1"', r["filters"])
-        self.assertIn('title="Other: 2"', r["filters"])
+        self.assertIn('title="Other: 3"', r["filters"])
         self.assertIn("Listed Book", r["rows"])
         self.assertNotIn("On Queues", r["rows"])
 
@@ -1369,9 +1383,9 @@ window.shell.view.show('documents'); await flush(); await window.PAGE_AGAIN.run(
     def test_a_failed_read_says_so_and_the_documents_list_keeps_its_details(self):
         out = self.run_view("""window.shell.view.show('books'); await flush(); R.details = ELS.details.html;""",
                             {"/api/documents/books": [500, {"error": "no such table: item"}]})
-        self.assertIn({"kind": "error", "text": "The books and articles were not read: no such table: item. Reload retries it.", "source": "/api/documents/books"},
+        self.assertIn({"kind": "error", "text": "The books, articles and courses were not read: no such table: item. Reload retries it.", "source": "/api/documents/books"},
                       out["states"])
-        self.assertIn("The books and articles were not read, so nothing is selected.", out["R"]["details"])
+        self.assertIn("The books, articles and courses were not read, so nothing is selected.", out["R"]["details"])
 
 
 class TheAddActions(Run):

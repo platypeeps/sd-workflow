@@ -619,13 +619,15 @@ class TemplateDriftTests(unittest.TestCase):
         copy still describes a named CLI with `-s read-only`, so that drift is
         the signal the repos need. `## Layout` says an official repo you
         change is not vendored, which the long copy predates; that drift is a
-        signal too.
+        signal too. `## Publishing` says the vault copy is opt-in per document
+        (sd:10629), where the long copy promised one for every document.
         """
 
         found = self.findings(LONG_TEMPLATE.read_text(encoding="utf-8"))
         self.assertTrue(found)
         self.assertEqual({where for where, _, _ in found},
-                         {"`## Layout`", "`## Parallel work`", "`## Adversarial review before publishing`"}, found)
+                         {"`## Layout`", "`## Parallel work`", "`## Adversarial review before publishing`",
+                          "`## Publishing — local by default, mirrors on request`"}, found)
         review = [text for where, kind, text in found if "Adversarial" in where]
         self.assertEqual(len(review), 1, review)
         self.assertIn("sd-review --lens research-brief", review[0])

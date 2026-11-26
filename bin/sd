@@ -2336,6 +2336,7 @@ def store_set(args: argparse.Namespace) -> int:
     if args.field is not None and args.value is None:
         raise UsageError("the positional form is `set KIND TITLE FIELD VALUE`")
 
+    refuse_blank_revision(args)
     kind, _, name, _ = resolve_kind(args.kind)
     scalars, filled, order = set_request(args, kind)
     stage = scalars.pop("status", None)
@@ -2346,13 +2347,34 @@ def store_set(args: argparse.Namespace) -> int:
         body = row["body"]
         for section, text in filled.items():
             body = edit_section(body, section, text, order)
-        done = records.edit_row(connection, row["id"], rules, revision=row["revision"], who=STORE_WHO,
+        done = records.edit_row(connection, row["id"], rules, revision=read_revision(args, row), who=STORE_WHO,
                                 stage=stage, fields=scalars, body=body if filled else None)
     if done["revision"] == row["revision"]:
         print(f"item {row['id']} already holds that")
     else:
         print(f"set {', '.join([*(['status'] if stage else []), *scalars, *filled])} in item {row['id']}")
     return 0
+
+
+def refuse_blank_revision(args: argparse.Namespace) -> None:
+    """Refuse a `--revision` that is blank or padded: no stored revision is."""
+
+    if args.revision is not None and (not args.revision or args.revision != args.revision.strip()):
+        raise UsageError("--revision takes the revision `sd store get --json` reported, as printed")
+
+
+def read_revision(args: argparse.Namespace, row: dict[str, Any]) -> str:
+    """The revision an edit is based on: `--revision` when given, else the row as read here.
+
+    Reading the row inside the write guards only that write. An editor that
+    read the note earlier passes the revision `get --json` reported, so a
+    write between its read and this one refuses instead of being erased
+    (sd:10621).
+    """
+
+    if args.revision is None:
+        return row["revision"]
+    return args.revision
 
 
 def section_request(args: argparse.Namespace,
@@ -2382,6 +2404,7 @@ def store_set_section(args: argparse.Namespace) -> int:
     section outside it would be a row whose shape its own manifest calls wrong.
     """
 
+    refuse_blank_revision(args)
     kind, _, name, _ = resolve_kind(args.kind)
     filled, order = section_request(args, kind)
     with db_store(name) as (records, rules, connection):
@@ -2389,7 +2412,7 @@ def store_set_section(args: argparse.Namespace) -> int:
         body = row["body"]
         for section, text in filled.items():
             body = edit_section(body, section, text, order)
-        done = records.edit_row(connection, row["id"], rules, revision=row["revision"], who=STORE_WHO,
+        done = records.edit_row(connection, row["id"], rules, revision=read_revision(args, row), who=STORE_WHO,
                                 stage=None, fields={}, body=body)
     if done["revision"] == row["revision"]:
         print(f"item {row['id']} already holds that")
@@ -2442,12 +2465,6 @@ def section_of(kind: dict[str, object], args: argparse.Namespace, read: Callable
     `read` gives the whole note, called once the arguments are known good.
     """
 
-    if args.json:
-        # Refused rather than ignored. `--section` prints the text a caller
-        # feeds straight back to `set-section`, and quietly dropping a
-        # `--json` it asked for would hand back something it did not expect
-        # in a shape it could not tell apart from an empty section.
-        raise UsageError("--section prints one section's text; --json has no form for it")
     order = declared_sections(kind)
     if args.section not in order:
         raise Refusal(
@@ -2477,13 +2494,20 @@ def store_get(args: argparse.Namespace) -> int:
     with db_store(name, write=False) as (records, _, connection):
         row = records.get_row(connection, kind=name, title=args.title)
     if args.section:
-        if section_body := section_of(kind, args, lambda: db_text(kind, row)):
+        section_body = section_of(kind, args, lambda: db_text(kind, row))
+        if args.json:
+            # The revision rides with the text, read in the same query, so a
+            # `set-section --revision` writes back only over what was read.
+            json.dump({"section": args.section, "text": section_body, "revision": row["revision"]},
+                      sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+        elif section_body:
             print(section_body)
         return 0
     if args.json:
         json.dump(
             {"kind": args.kind, "title": args.title, "path": row["path"],
-             "fields": db_fields(kind, row), "body": row["body"]},
+             "fields": db_fields(kind, row), "body": row["body"], "revision": row["revision"]},
             sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0
@@ -2699,7 +2723,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="print only this `## ` section's text -- the read"
                            " half of a read-edit-write that `set-section`"
                            " writes back. A declared section the note does not"
-                           " carry reads as empty")
+                           " carry reads as empty. With --json, the text and"
+                           " the revision it was read at")
     note.add_argument("--json", action="store_true", help="machine-readable")
     note.set_defaults(handler=store_get)
 
@@ -2757,6 +2782,10 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--section-file", dest="section", action=Pair, const=True,
                       metavar="NAME=PATH",
                       help="the same, with the text read from a file")
+    edit.add_argument("--revision", metavar="REV",
+                      help="the revision `get --json` reported when the editor"
+                           " read the note; a write since then refuses the edit"
+                           " instead of erasing it")
     edit.set_defaults(handler=store_set)
 
     # Still a sibling verb, though `set` now takes `--section` too. The two
@@ -2780,6 +2809,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="the same, with the text read from a file -- use"
                            " this whenever the text carries backticks, which a"
                            " shell would run")
+    part.add_argument("--revision", metavar="REV",
+                      help="the revision `get --json` reported when the editor"
+                           " read the note; a write since then refuses the edit"
+                           " instead of erasing it")
     part.set_defaults(handler=store_set_section)
     config = groups.add_parser("config", help="read and write declared core or plugin settings")
     setting_verbs = config.add_subparsers(dest="verb", required=True)

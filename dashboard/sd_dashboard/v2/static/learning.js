@@ -1,4 +1,4 @@
-// Books (sd:6260) and Videos (sd:6261): Documents views over the vault's learning rows (learning_screen.py), beside the Documents list.
+// Books (sd:6260; courses too, sd:10634) and Videos (sd:6261): Documents views over the vault's learning rows (learning_screen.py), beside the Documents list.
 // The view reads its document when it first shows (shell.read with its api, its own state slot and active only while it
 // shows), and draws the Documents list grammar: a filter bar, a sorted and paged ledger, and the one Details pane, which
 // the Documents list leaves alone while another view shows. Nothing here writes: a row's stage and kind stay as the
@@ -19,10 +19,10 @@
   const minutes = d => /^\d+$/.test(d || '') ? `${Math.floor(d / 60)}:${String(d % 60).padStart(2, '0')}` : d;
   // Each type: its view, read, object type, nouns, the stages in its words, and the facts its Details list.
   const TYPES = {
-    books: { api: '/api/documents/books', title: 'Books', added: 'to read', what: 'the books and articles', type: 'book', noun: 'book or article', nouns: 'books and articles', counted: 'title',
+    books: { api: '/api/documents/books', title: 'Books and courses', added: 'to read', what: 'the books, articles and courses', type: 'book', noun: 'book, article or course', nouns: 'books, articles and courses', counted: 'title',
       states: [['queued', 'to read'], ['in-progress', 'reading'], ['done', 'done'], ['dropped', 'dropped']], stateName: 'Read state',
       by: ['by', 'Author or source'], sort: 'title', dir: 1,
-      none: 'No book or article in the vault\'s Learning base: its content-type book or article rows show here.',
+      none: 'No book, article or course in the vault\'s Learning base: its content-type book, article or course rows show here.',
       facts: r => [['Author or source', r.by || '— none recorded'], ['Kind', r.kind], ['Subtitle', r.subtitle], ['Published', r.published],
         ['Pages', r.pages], ['ISBN', r.isbn]] },
     // sd:6261: a video's date is the newest first.
@@ -35,7 +35,7 @@
   const COLS = t => [[null, html`<span class="sr">State</span>`, 'g'], ['title', 'Title'], [t.by[0], t.by[1], 'repo'],
     ...(t.when ? [[t.when[0], t.when[1], 'num']] : []), ['state', t.stateName, 'kind'], ['host', 'URL', 'mod'], [null, html`<span class="sr">Actions</span>`, 'acts']];
   const V = Object.fromEntries(Object.entries(TYPES).map(([id, t]) => [id, { rows: [], doc: null, reader: null, selected: null,
-    F: { state: '', category: '', q: '' }, L: { sort: t.sort, dir: t.dir, page: 1, size: 50 } }]));
+    F: { state: '', category: '', kind: '', q: '' }, L: { sort: t.sort, dir: t.dir, page: 1, size: 50 } }]));
   const current = () => window.shell.view?.current?.();
   const words = (t, stage) => t.states.find(s => s[0] === stage)?.[1] || stage || 'no stage';
   // A row's category tile: the set's value the read filed it under (pack sd:7695), else other.
@@ -44,7 +44,7 @@
   function shown(id) {
     const v = V[id], t = TYPES[id], q = v.F.q.toLowerCase().split(/\s+/).filter(Boolean);
     const key = { title: r => r.title.toLowerCase(), state: r => order(t, r.stage), host: r => r.host || r.url_text }[v.L.sort] || (r => String(r[v.L.sort] || '').toLowerCase());
-    return v.rows.filter(r => (!v.F.state || r.stage === v.F.state) && (!v.F.category || catOf(v, r) === v.F.category)
+    return v.rows.filter(r => (!v.F.state || r.stage === v.F.state) && (!v.F.category || catOf(v, r) === v.F.category) && (!v.F.kind || r.kind === v.F.kind)
       && q.every(w => `${r.title} ${r.by || ''} ${r.channel || ''} ${r.category || ''} ${r.url || r.url_text} ${r.description}`.toLowerCase().includes(w)))
       .sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0) * v.L.dir);
   }
@@ -64,10 +64,14 @@
     const n = stage => v.rows.filter(r => r.stage === stage).length;
     const nc = c => v.rows.filter(r => catOf(v, r) === c).length;
     const cats = [...(v.doc?.categories || []).map(c => [c, c]), ...(nc('other') ? [['other', 'Other']] : [])];
+    // sd:10634: a Kind tile per content type the read lists (Books: book, article, course), so a course is one press away.
+    const nk = k => v.rows.filter(r => r.kind === k).length, kinds = v.doc?.kinds || [];
     put($(`${id}-filters`), L_.fbar(html`${L_.fseg('state', t.stateName, t.states.map(([s, w]) => ({ v: s, pressed: v.F.state === s, title: `${w}: ${n(s)}`,
       label: html`<span class="g-${glyph(s)[0]}" aria-hidden="true">${glyph(s)[1]}</span>${w} <span class="n">${n(s)}</span>` })))}${cats.length
       ? L_.fseg('category', 'Category', cats.map(([c, w]) => ({ v: c, pressed: v.F.category === c, title: `${w}: ${nc(c)}`,
-        label: html`${w} <span class="n">${nc(c)}</span>` }))) : ''}`, { clear: !!(v.F.state || v.F.category) }));
+        label: html`${w} <span class="n">${nc(c)}</span>` }))) : ''}${kinds.length
+      ? L_.fseg('kind', 'Kind', kinds.map(k => ({ v: k, pressed: v.F.kind === k, title: `${k}: ${nk(k)}`,
+        label: html`${k} <span class="n">${nk(k)}</span>` }))) : ''}`, { clear: !!(v.F.state || v.F.category || v.F.kind) }));
     put($(`${id}-head`), L_.sortHead(COLS(t), v.L));
     put($(`${id}-rows`), html`${slice.map(r => row(id, r))}`);
     const empty = $(`${id}-empty`);
@@ -141,15 +145,15 @@
   Object.keys(TYPES).forEach(id => {
     const v = V[id], redraw = () => { v.L.page = 1; draw(id); };
     $(`${id}-filters`).addEventListener('click', e => {
-      if (e.target.closest('[data-fclear]')) { v.F.state = ''; v.F.category = ''; return redraw(); }
-      const c = e.target.closest('[data-f="state"]') || e.target.closest('[data-f="category"]'); if (!c) return;
+      if (e.target.closest('[data-fclear]')) { v.F.state = ''; v.F.category = ''; v.F.kind = ''; return redraw(); }
+      const c = e.target.closest('[data-f="state"]') || e.target.closest('[data-f="category"]') || e.target.closest('[data-f="kind"]'); if (!c) return;
       v.F[c.dataset.f] = v.F[c.dataset.f] === c.dataset.v ? '' : c.dataset.v;
       redraw();
     });
     // The empty state's Clear filters empties the search field too, and tells the Documents list (sd:6285).
     $(`${id}-empty`).addEventListener('click', e => {
       if (!e.target.closest('[data-fclear]')) return;
-      v.F.state = ''; v.F.category = ''; v.F.q = ''; $('shift').value = ''; $('shift').dispatchEvent?.(new Event('input')); redraw();
+      v.F.state = ''; v.F.category = ''; v.F.kind = ''; v.F.q = ''; $('shift').value = ''; $('shift').dispatchEvent?.(new Event('input')); redraw();
     });
     $(`${id}-head`).addEventListener('click', e => { if (window.shell.list.sortBy(e, v.L)) window.shell.list.keepFocus(e, () => draw(id)); });
     $(`${id}-pager`).addEventListener('click', e => { if (window.shell.list.paging(e, v.L)) window.shell.list.keepFocus(e, () => draw(id)); });
