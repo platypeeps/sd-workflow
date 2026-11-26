@@ -657,6 +657,85 @@ class PullRequestPrivacyTests(LintFixture):
         self.assertEqual(len(report.failures), 1, report.failures)
         self.assertIn("holds no privacy pattern, so the body is unchecked", report.failures[0])
 
+    def test_an_alternative_naming_this_repo_does_not_apply_in_it(self) -> None:
+        """sd:10720: a site repo's short-name pattern refused its own image names, `shop-web:scan`."""
+        self.patterns.write_text("operator|shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        body = "## Summary\n\n- scan the shop-web:scan image\n"
+        self.assertEqual(self.run_lint(body, body_only=True).failures, [])
+        report = self.run_lint(body + "- ask the operator\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 4 matches a privacy pattern in {self.patterns}"])
+
+    def test_a_pattern_that_matches_inside_the_repo_name_still_guards_other_text(self) -> None:
+        """Review of sd:10720: `operator` matched inside `operators-site`, so it was dropped there and the
+        operator's name passed in any body of that repo. Only the repo's own name is exempt."""
+        self.patterns.write_text("operator|shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/operators-site.git")
+        report = self.run_lint("## Summary\n\n- ask the operator\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 3 matches a privacy pattern in {self.patterns}"])
+
+    def test_a_valid_pattern_reaches_grep_unchanged(self) -> None:
+        """Review of sd:10720: splitting at `|` broke `[[:alpha:]|]x`, a valid ERE, into two invalid ones."""
+        self.patterns.write_text("[[:alpha:]|]operator\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        report = self.run_lint("## Summary\n\n- x|operator\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 3 matches a privacy pattern in {self.patterns}"])
+
+    def test_only_the_whole_leading_segment_is_left_out(self) -> None:
+        """`shops`, `my-shop` and `shop_key` are other text, and the pattern still guards them."""
+        self.patterns.write_text("shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        body = "## Summary\n\n- shop shop-web:scan shop-website\n- shops\n- my-shop\n- shop_key\n"
+        self.assertEqual(self.run_lint(body, body_only=True).failures,
+                         [f"pull request body: line {n} matches a privacy pattern in {self.patterns}"
+                          for n in (4, 5, 6)])
+
+    def own_repo(self, patterns: str, body: str) -> list[str]:
+        """The failures for `body` in a repo whose origin names it `shop-website`."""
+        self.patterns.write_text(patterns, encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        return self.run_lint("## Summary\n\n" + body, body_only=True).failures
+
+    def line(self, *numbers: int) -> list[str]:
+        return [f"pull request body: line {n} matches a privacy pattern in {self.patterns}" for n in numbers]
+
+    def test_a_match_that_runs_past_the_own_name_fails(self) -> None:
+        """Round 3 class pass, sd:10720: with the name cut from the scanned text, `shop/keys` was never seen."""
+        self.assertEqual(self.own_repo("shop/keys\nshop\n", "- see shop/keys\n- the shop-web image\n"), self.line(3))
+
+    def test_a_match_that_runs_into_the_own_name_fails(self) -> None:
+        self.assertEqual(self.own_repo("keys/shop\nshop\n", "- see keys/shop-web\n"), self.line(3))
+
+    def test_a_match_another_match_overlaps_fails(self) -> None:
+        """`grep -o` reports `shop` and steps over `op-private`, which starts inside it."""
+        self.assertEqual(self.own_repo("shop\nop-private\n", "- the shop-private host\n"), self.line(3))
+
+    def test_a_match_crossing_two_name_matches_fails(self) -> None:
+        """`grep -o` reports both `shop`s and steps over `hop/shop`, which crosses them:
+        blanking both first bytes at once erased it before the next read."""
+        self.assertEqual(self.own_repo("shop\nhop/shop\n", "- read shop/shop/config\n"), self.line(3))
+
+    def test_a_pattern_that_matches_nothing_at_all_still_fails_every_line(self) -> None:
+        """An empty match selects each line and reports no text: nothing shows it lies inside the name."""
+        self.assertEqual(self.own_repo("shop|x*\n", "- the shop-web image\n"), self.line(1, 2, 3))
+
+    def test_a_name_only_the_folder_carries_exempts_nothing(self) -> None:
+        """A PR publishes origin's name; a checkout's folder name is local, so it frees no text."""
+        self.patterns.write_text("shop\n", encoding="utf-8")
+        with mock.patch.object(lint.sd_lib, "main_worktree_root", return_value=pathlib.Path("/x/shop-website")):
+            report = self.run_lint("## Summary\n\n- the shop-web image\n", body_only=True)
+        self.assertEqual(report.failures, self.line(3))
+
+    def test_an_alternative_naming_another_repo_still_applies(self) -> None:
+        self.patterns.write_text("operator|shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "https://github.com/example/other-site")
+        report = self.run_lint("## Summary\n\n- scan the shop-web:scan image\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 3 matches a privacy pattern in {self.patterns}"])
+
     def test_green_no_body_needs_no_pattern_file(self) -> None:
         self.patterns.unlink()
         self.assertEqual(self.run_lint().failures, [])
