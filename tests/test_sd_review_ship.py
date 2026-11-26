@@ -86,13 +86,12 @@ class FixReviewTests(ReviewFixture):
 
     def test_an_uncited_repeat_at_a_remaining_instance_still_blocks(self):
         """build/sd-1623 review (bin/sd-review:1833): a blocker at src.py:1 that also lists second.py:1. With
-        src.py fixed, its uncited repeat at second.py posted as advisory: the prior match read the reported
-        place alone. Each listed instance now holds the blocker, mapped through the diff as its place is."""
-        self.remaining_instance_repeat("")
+        src.py fixed, its uncited repeat at second.py posted as advisory. With no `fixed` verdict the prior
+        blocker is carried whatever the repeat says or where it moved (pack sd:10087)."""
+        self.remaining_instance_repeat("# a comment\n" * 12)
 
-    def test_a_remaining_instance_moved_by_an_insertion_still_blocks(self):
-        """build/sd-1623 review (bin/sd-review:1928): the instance's line moves through the diff too."""
-        self.remaining_instance_repeat("# a comment\n" * (sd_review.ECHO_LINES + 2))  # past an echo
+    def test_a_remaining_instance_in_place_still_blocks(self):
+        self.remaining_instance_repeat("")
 
     def remaining_instance_repeat(self, above):
         sd_review.READER_GROUPS.reopen_groups()  # a failed reader in an earlier test closes them
@@ -115,7 +114,8 @@ class FixReviewTests(ReviewFixture):
                                   FakeRunner({"codex": sd_review.Completed(0, repeat, "")}),
                                   self.environment(), self.chatgpt_home())
         self.assertEqual(result["status"], "blocking")
-        self.assertEqual([row.get("evidence") for row in result["findings"]], ["python3 src.py: Traceback"])
+        self.assertEqual([row.get("evidence") for row in result["findings"] if row.get("prior_blocker") == "B1"],
+                         ["python3 src.py: Traceback"])
 
     def test_a_respelled_repeat_of_a_prior_blocker_still_blocks(self):
         """build/sd-1423 class pass: a finding is matched across reports and readers in any spelling the review
@@ -141,7 +141,7 @@ class FixReviewTests(ReviewFixture):
                                           FakeRunner({"codex": sd_review.Completed(0, repeat, "")}),
                                           self.environment(), self.chatgpt_home())
                 self.assertEqual(result["status"], "blocking")
-                self.assertEqual([(row["path"], row["evidence"]) for row in result["findings"]],
+                self.assertEqual([(row["path"], row["evidence"]) for row in result["findings"] if row.get("prior_blocker")],
                                  [("src.py", "python3 src.py: Traceback")])
 
     def test_an_absolute_prior_path_is_read_by_its_repository_spelling(self):
@@ -474,7 +474,7 @@ class FixReviewTests(ReviewFixture):
         prompt = next(call["stdin"] for call in codex_sessions(runner))
         self.assertIn("[file absent at current HEAD]", prompt)
         recovered, _ = json.JSONDecoder().raw_decode(prompt.split("Prior findings:\n", 1)[1])
-        self.assertEqual(recovered, findings)
+        self.assertEqual(recovered, [{"id": "B1", **findings[0]}])
         self.assertEqual(report.read_text(), original)
 
     def test_prior_blob_read_failure_refuses_before_check_or_provider(self):
@@ -497,7 +497,7 @@ class FixReviewTests(ReviewFixture):
                     for index in range(60)]
         prior = {"scope": "branch", "subject": {"head": first}, "status": "blocking",
                  "findings": findings}
-        evidence = json.dumps(findings, sort_keys=True)
+        evidence = json.dumps([{"id": f"B{index}", **row} for index, row in enumerate(findings, 1)], sort_keys=True)
         self.assertGreater(len(evidence.encode()), 65536)
         report = self.tmp / "large-prior.json"
         original = json.dumps(prior).encode()
@@ -508,12 +508,12 @@ class FixReviewTests(ReviewFixture):
             with self.subTest(mode=mode):
                 result = sd_review.review(root, namespace(scope="branch", **kwargs), runner,
                                           self.environment(), self.chatgpt_home())
-                self.assertEqual(result["status"], "clean")
+                self.assertEqual(result["status"], "blocking")  # no reader said `fixed` (pack sd:10087)
                 prompts = [call["stdin"] for call in codex_sessions(runner)]
                 self.assertEqual(len(prompts), 1)
                 self.assertIn("Prior findings:\n" + evidence, prompts[0])
                 recovered, _ = json.JSONDecoder().raw_decode(prompts[0].split("Prior findings:\n", 1)[1])
-                self.assertEqual(recovered, findings)
+                self.assertEqual(recovered, json.loads(evidence))
                 self.assertIn("the_original_defect = True", prompts[0])
                 self.assertEqual(report.read_bytes(), original)
 

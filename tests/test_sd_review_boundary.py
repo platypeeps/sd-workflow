@@ -1143,11 +1143,17 @@ class LineBudgetTests(unittest.TestCase):
         # conditions, so a lane host's miss named no cause; the table is
         # its own function to keep `record_lead_review` under the branch
         # ceiling. Measured: `sd-review` is 3176 here.
+        #
+        # 5146 -> 5045 is pack sd:10087: `bin/sd-review` -101. A prior
+        # blocker clears only on each completed reader's `fixed` verdict
+        # for its id (`carried`), so the prose matcher (`prior_evidence`),
+        # the line map (`prior_at`, `moved_line`, `diff_lines`) and
+        # `instance_rows` are deleted. Measured: `sd-review` is 3075 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5146,
+            5045,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
