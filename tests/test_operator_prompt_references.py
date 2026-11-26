@@ -108,8 +108,50 @@ class ReviewRoundFixes(unittest.TestCase):
                         self.assertTrue(loaders, trigger)
 
 def all_references() -> dict[str, str]:
-    return {f"skills/{skill}/references/{name}": reference(skill, name)
-            for skill, files in PROMPTS.items() for name in files}
+    found = {f"skills/{skill}/references/{name}": reference(skill, name)
+             for skill, files in PROMPTS.items() for name in files}
+    found[SHARED_RELATIVE] = SHARED.read_text(encoding="utf-8")
+    return found
+
+
+#: The one copy of the decide-ask-record rules every operator run follows (sd:10800).
+SHARED_RELATIVE = "skills/_shared/references/decide-ask-record.md"
+SHARED = ROOT / SHARED_RELATIVE
+#: What makes a question routine; only the shared block may say it.
+ROUTINE = "money, risk, a standing ruling or scope"
+
+
+class SharedDecideAskRecord(unittest.TestCase):
+    """Each operator run names the shared block, a ref tag and a RESULT line (sd:10800)."""
+
+    def test_the_shared_block_holds_the_rules(self):
+        text = SHARED.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("# "))
+        for phrase in (ROUTINE, "AskUserQuestion", "(Recommended)", "--answers", "veto table",
+                       "RESULT: filed <n>, built <n>, asked <n>"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_each_reference_names_the_block_a_ref_tag_and_a_result_line(self):
+        for skill, files in PROMPTS.items():
+            for name in files:
+                text = reference(skill, name)
+                with self.subTest(skill=skill, reference=name):
+                    self.assertIn("references/decide-ask-record.md", text)
+                    self.assertRegex(text, r"`--ref [a-z-]+(:<repo>)?:<date>:<slug>`")
+                    self.assertRegex(text, r"(?m)^End with .*`RESULT: ")
+                    self.assertRegex(text, r"(?i)budget: about \d+ minutes")
+
+    def test_each_citing_skill_ships_the_block(self):
+        """Only a SKILL.md citation copies a shared file into the installed skill."""
+        for skill in PROMPTS:
+            with self.subTest(skill=skill):
+                self.assertIn("references/decide-ask-record.md`", skill_text(skill))
+
+    def test_no_other_file_repeats_the_routine_definition(self):
+        repeats = [str(path.relative_to(ROOT)) for path in sorted((ROOT / "skills").rglob("*.md"))
+                   if path != SHARED and ROUTINE in path.read_text(encoding="utf-8")]
+        self.assertEqual(repeats, [])
 
 
 def prescribed_commands(text: str) -> list[str]:
@@ -177,7 +219,8 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
             ("sd", "task", "note"): r"note N \S",
             ("sd", "task", "status"): r"status N \w+",
             ("sd", "task", "edit"): r"edit N --",
-            ("sd", "store", "items"): r"--(belongs-to PLACEHOLDER|here)",
+            # A run's follow-up reads every repo's tagged items in one window (sd:10800).
+            ("sd", "store", "items"): r"--(belongs-to PLACEHOLDER|here)|^sd store items --since 40d --json$",
             ("sd-ship", "lane", "enqueue"): r"--item N .*--title .*--body-file .*--expected-head ",
             ("sd-ship", "lane", "retry"): r"retry N\b",
         }
