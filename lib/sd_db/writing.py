@@ -429,7 +429,7 @@ def _piece(connection: sqlite3.Connection, item: int, expected: str | None = Non
     return state
 
 
-def _problems(row, snapshot: dict) -> list[str]:
+def _problems(row, snapshot: dict, owner: str) -> list[str]:
     problems = []
     digest, generation = snapshot["digest"], row["gate_generation"]
     if not digest:
@@ -463,6 +463,10 @@ def _problems(row, snapshot: dict) -> list[str]:
             problems.append(f"{name} index.md changed after its gate record; review the current layout")
         if "title_sha256" in gate and gate["title_sha256"] != _headline(row, fields):
             problems.append(f"{name} headline changed after its gate record; review it as shown")
+        # After cutover the headline lives in the row, where no index.md byte binds it: a gate older than
+        # `title_sha256` cannot say which headline it reviewed, so it authorizes none (sd:10719).
+        if "title_sha256" not in gate and owner != "file":
+            problems.append(f"{name} gate names no headline; record it again for the piece as shown")
         if gate.get("verdict") != "pass":
             problems.append(f"{name} verdict is not pass")
         for finding in gate.get("findings", []):
@@ -486,7 +490,7 @@ def piece_state(connection: sqlite3.Connection, item: int) -> dict:
         owner, unowned = "", str(error)
     try:
         snapshot = _snapshot(row)
-        problems = _problems(row, snapshot)
+        problems = _problems(row, snapshot, owner)
         digest = snapshot["digest"]
         document = snapshot["text"]
         companions = {name: _companion(snapshot, name) for name in COMPANIONS}
@@ -868,6 +872,11 @@ def record_gate(connection: sqlite3.Connection, item: int, artifact: str, *, ver
         if attested:
             record["index_sha256"] = attested
         existing = gates.get(artifact)
+        # A report answers for the headline its first record bound: the same bytes recorded again after a
+        # rename would certify a headline no reviewer read (sd:10719).
+        if (isinstance(existing, dict) and existing.get("evidence_sha256") == record["evidence_sha256"]
+                and "title_sha256" in existing and existing["title_sha256"] != record["title_sha256"]):
+            raise WorkflowError(f"{artifact} report reviewed another headline; review the piece as shown")
         if isinstance(existing, dict) and {key: value for key, value in existing.items() if key != "at"} == record:
             return piece_state(connection, item)
         gates[artifact] = {**record, "at": now()}
@@ -1150,7 +1159,7 @@ def change_stage(connection: sqlite3.Connection, item: int, target: str, *, acto
                 raise WorkflowError(f"writing stage cannot move from {current} to {target} without an explicit correction")
             snapshot = _snapshot(row)
             if target in ("ready", "published"):
-                problems = _problems(row, snapshot)
+                problems = _problems(row, snapshot, owner)
                 if problems:
                     raise WorkflowError("writing gate refused: " + "; ".join(problems))
                 if target == "published" and row["ready_digest"] != snapshot["digest"]:

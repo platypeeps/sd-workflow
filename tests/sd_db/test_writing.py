@@ -313,6 +313,41 @@ class SharedTransitions(WritingCase):
         update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
         self.assertEqual(readiness(self.db, self.item)["problems"], [])
 
+    def test_after_cutover_a_gate_without_the_headline_hash_cannot_authorize(self):
+        """sd:10719. After cutover no index.md byte holds the headline: a legacy gate cannot say which it reviewed."""
+        self.gates()
+        self.cutover()
+        fields = json.loads(piece_state(self.db, self.item)["item"]["fields"])
+        for gate in fields["writing_gates"].values():
+            gate.pop("title_sha256")
+            gate.pop("index_sha256", None)
+        writing.set_item_fields(self.db, self.item, fields=fields)
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        problems = readiness(self.db, self.item)["problems"]
+        for name in ("fact-check", "adversarial"):
+            self.assertIn(f"{name} gate names no headline; record it again for the piece as shown", problems)
+        with self.assertRaisesRegex(WorkflowError, "names no headline"):
+            change_stage(self.db, self.item, "ready", who="operator")
+        self.gates()
+        self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
+    def test_an_unchanged_report_cannot_certify_a_headline_it_never_reviewed(self):
+        """sd:10719. Re-recording the same report after a rename would bind the new headline to the old review."""
+        for owner in ("file", "row"):
+            with self.subTest(owner=owner):
+                if owner == "row":
+                    self.cutover()
+                self.gates()
+                update_piece_metadata(self.db, self.item, {"title": f"Renamed under {owner}"}, who="operator")
+                with self.assertRaisesRegex(WorkflowError, "reviewed another headline"):
+                    self.gates()
+                self.assertIn("fact-check headline changed after its gate record; review it as shown",
+                              readiness(self.db, self.item)["problems"])
+                for name in ("fact-check", "adversarial"):
+                    (self.folder / f"{name}.md").write_text(f"Report reviewed as {owner}.\n")
+                self.gates()
+                self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
     def test_cutover_keeps_a_passing_gate_current(self):
         """sd:10719. Cutover drops status and published from index.md; the gate hash follows the pack's rewrite."""
         self.attest()
@@ -491,6 +526,13 @@ writing.cutover_pieces(c, sys.argv[2], expected_fingerprint=p['fingerprint'], wh
         # sd:10719. The gates answered for the old headline: publishing the new one needs them recorded again.
         with self.assertRaisesRegex(WorkflowError, "headline changed after its gate record"):
             change_stage(self.db, self.item, "published", confirmed=True, who="operator")
+        # The same reports cannot answer for the new headline: a fresh review writes new ones.
+        with self.assertRaisesRegex(WorkflowError, "reviewed another headline"):
+            self.gates()
+        for name in ("fact-check", "adversarial"):
+            report = self.folder / f"{name}.md"
+            report.write_text("Report on the row-owned title.\n")
+            before[report.relative_to(self.repo)] = report.read_bytes()
         self.gates()
         change_stage(self.db, self.item, "published", confirmed=True, who="operator")
         after = {path.relative_to(self.repo): path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}
