@@ -1132,11 +1132,18 @@ class LineBudgetTests(unittest.TestCase):
         # the carry read it. Without it a blocker fixed at one instance and
         # rebutted at another stayed open on the reader's reading of the
         # rebuttal prose. Measured: `sd-review` is 3159 here.
+        #
+        # 5129 -> 5137 is the build/sd-1675 lane review: `bin/sd-review`
+        # +8 for `reopened`, so a rebuttal neither clears nor narrows a
+        # blocker the preceding pass reopened with cited evidence, and a
+        # retry's reopen stays on the merged record; +1 for the comment
+        # that maps each prior place before a rebuttal matches it.
+        # Measured: `sd-review` is 3167 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5129,
+            5137,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

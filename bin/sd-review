@@ -1811,7 +1811,7 @@ def unanswered(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> dict[str
     own, found = f"{row.get('path')}:{row['line']}" if type(row.get("line")) is int else row.get("path"), row.get("instances")
     places = list(dict.fromkeys([own, *(entry.strip() for entry in (found if isinstance(found, list) else []) if isinstance(entry, str) and entry.strip())]))
     left = [place for place in places if not getattr(recorded_at(rebutted, place, row.get("summary"), None), "listed", False)]
-    first = instance_place(left[0]) if row.get("disposition") == "blocking" and 0 < len(left) < len(places) else None
+    first = instance_place(left[0]) if row.get("disposition") == "blocking" and not reopened(row) and 0 < len(left) < len(places) else None
     return dict(row, path=first[0], line=first[1], instances=left) if first else dict(row)
 
 
@@ -1856,8 +1856,14 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome],
     With no reader answered only a cited `open` carries, for the retry (lane review); the review is incomplete."""
     answered = [outcome for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)]
     return [row for old in prior if old.get("disposition") == "blocking" and (answered or _opened(old.get("id"), outcomes))
-            and (not is_rebutted(rebutted, old) or _opened(old.get("id"), outcomes))
+            and (not is_rebutted(rebutted, old) or reopened(old) or _opened(old.get("id"), outcomes))
             and (row := _carry(old, answered, outcomes)) is not None]
+
+
+def reopened(row: Mapping[str, Any]) -> bool:
+    """Whether the preceding pass carried `row` on a reader's cited `open`: no rebuttal answers it then, at any place,
+    only fixed verdicts do (build/sd-1675 review, bin/sd-review:1859)."""
+    return isinstance(row.get("carried"), dict) and row["carried"].get("verdict") == "open" and isinstance(row.get("evidence"), str) and bool(row["evidence"].strip())
 
 
 def _said(ident: Any, outcome: Outcome) -> list[dict[str, str]]:
@@ -1942,6 +1948,8 @@ def prior_blockers(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
     for row in previous["findings"]:
         record, again = {key: value for key, value in row.items() if key != "id"}, row["carried"].get("id") if isinstance(row.get("carried"), dict) else None
         if id(row) in open_rows and isinstance(again, str) and (target := named.get(again)) and target.get("prior_review") != row.get("prior_review"):
+            if reopened(record):  # a retry's cited open stays on the one record (bin/sd-review:1859)
+                target["carried"] = record["carried"]
             target["evidence"] = "\n".join(dict.fromkeys(line for told in (target.get("evidence"), record.get("evidence")) if isinstance(told, str) for line in told.splitlines() if line.strip()))
         else:
             rows.append(named.setdefault(f"B{len(named) + 1}", dict(record, id=f"B{len(named) + 1}")) if id(row) in open_rows else record)

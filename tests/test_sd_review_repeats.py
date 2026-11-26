@@ -569,6 +569,30 @@ class PriorVerdictTests(unittest.TestCase):
                 rows = sd_review.carried(prior, [self.answer(verdicts=[verdict("open", evidence)])], rebutted)
                 self.assertEqual(len(rows), count)
 
+    def test_a_rebuttal_does_not_clear_a_blocker_the_preceding_pass_reopened(self) -> None:
+        """build/sd-1675 review (bin/sd-review:1859): a preceding pass reopened a rebutted blocker with
+        cited evidence, and the rebuttal cleared it again unless this pass's reader repeated the `open`.
+        It also narrowed the reopened blocker. Only fixed verdicts clear it; a blocker not reopened is
+        answered by the rebuttal as before."""
+        rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
+        rows = dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", id="B1")
+        reopened = dict(rows, carried={"id": "B1", "verdict": "open"}, evidence="one: python3 t.py []: IndexError")
+        fixed = verdict("fixed", "src.py:10 checks []")
+        for label, old, answers, count in (
+                ("reopened, no verdict", reopened, [], 1),
+                ("reopened, fixed", reopened, [fixed], 0),
+                ("not reopened", rows, [], 0)):
+            with self.subTest(label):
+                carry = sd_review.carried([sd_review.unanswered(rebutted, old)],
+                                          [self.answer(verdicts=answers)], rebutted)
+                self.assertEqual(len(carry), count)
+        found = dict(rows, prior_review={"pass": 1})
+        retry = dict(reopened, prior_review={"pass": 2})
+        [merged] = sd_review.prior_blockers({"findings": [found, retry]})
+        self.assertTrue(sd_review.reopened(merged))
+        both = dict(reopened, instances=["src.py:10", "b.py:40"])
+        self.assertEqual(sd_review.unanswered(rebutted, both)["instances"], ["src.py:10", "b.py:40"])
+
     def test_no_completed_reader_carries_nothing(self) -> None:
         failed = sd_review.Outcome("one", sd_review.UNAVAILABLE, (), "", (), ())
         result = self.settle(failed, reviewed=[])
