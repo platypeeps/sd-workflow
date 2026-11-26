@@ -8,8 +8,10 @@ the trigger the operator types, so this checks both, exactly.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -150,23 +152,13 @@ class SharedDecideAskRecord(unittest.TestCase):
             with self.subTest(skill=skill):
                 self.assertIn("references/decide-ask-record.md`", skill_text(skill))
 
-    def test_the_last_run_lookup_reaches_done_and_parked_items_of_any_age(self):
-        """A plain list hides done items past a week and every parked item (review of sd:10800)."""
-        text = SHARED.read_text(encoding="utf-8")
-        lookup = text.split("## Open with the last run", 1)[1].split("\n## ", 1)[0]
-        self.assertNotIn("--since", lookup)
-        self.assertIn("`sd store items --grep '<tag>:' --json`", lookup)
-        self.assertIn("`sd store items --parked --grep '<tag>:' --json`", lookup)
-        # --grep reads the title, body and notes, never the ref: the body must carry it.
-        self.assertIn("--body 'ref: <tag>:<date>:<slug>", text)
-
     def test_a_machine_run_puts_its_host_in_the_tag(self):
         """Two machines' health checks file the same finding as two items (review of sd:10800)."""
         self.assertIn("`<host>`", SHARED.read_text(encoding="utf-8"))
         for skill, name in MACHINE_RUNS:
             with self.subTest(reference=name):
                 text = reference(skill, name)
-                self.assertIn("this run's tag is `health:<host>`", text)
+                self.assertIn("this run's base tag is `health` and its tag `health:<host>`", text)
                 self.assertNotRegex(text, r"--ref health:<date>")
 
     def test_no_other_file_repeats_the_routine_definition(self):
@@ -242,7 +234,9 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
             ("sd", "task", "edit"): r"edit N --",
             # A run's follow-up reads every repo's tagged items in one window (sd:10800).
             ("sd", "store", "items"): (r"--(belongs-to PLACEHOLDER|here)"
-                                       r"|^sd store items (--parked )?--grep 'PLACEHOLDER:' --json$"),
+                                       r"|^sd store items (--parked )?(--grep 'PLACEHOLDER:' )?--json$"),
+            # A task filed with no priority is refused (sd:10800 class pass).
+            ("sd", "task", "add"): r"--priority PLACEHOLDER .*--ref \S+ --body ",
             ("sd-ship", "lane", "enqueue"): r"--item N .*--title .*--body-file .*--expected-head ",
             ("sd-ship", "lane", "retry"): r"retry N\b",
         }
@@ -278,6 +272,98 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
                 self.assertNotRegex(text, r"(with no|unless a build is already) queued or running")
                 if "sd assignments build N`" in text:
                     self.assertIn("the press refuses", text)
+
+
+def section(title: str) -> str:
+    return SHARED.read_text(encoding="utf-8").split(f"## {title}\n", 1)[1].split("\n## ", 1)[0]
+
+
+class LastRunLookup(unittest.TestCase):
+    """Class pass (sd:10800): the lookup reached an item only through what its filing may not have written.
+
+    Each instance is an item in a scratch store that one filter of the earlier lookups hid; the commands
+    are read from the shared block and run, so the block cannot name a read that misses one.
+    """
+
+    FILL = {"<base>": "health", "<tag>": "health:hub", "<date>": "2026-11-20", "<slug>": "swap",
+            "<title>": "swap is full", "<1-4>": "3", "<path>": "PLACEHOLDER"}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(scratch.cleanup)
+        cls.home = Path(scratch.name)
+        cls.run_tool("sd-db", "init")
+
+    @classmethod
+    def run_tool(cls, tool: str, *words: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "bin" / tool), *words], capture_output=True, text=True, check=False,
+            env=clean_environment(HOME=str(cls.home), XDG_CONFIG_HOME=str(cls.home)))
+
+    def filled(self, command: str) -> list[str]:
+        for placeholder, value in self.FILL.items():
+            command = command.replace(placeholder, value)
+        self.assertNotRegex(command, r"<[^>]*>")
+        return shlex.split(command)
+
+    def add(self, title: str, ref: str, *more: str) -> int:
+        done = self.run_tool("sd", "task", "add", title, "--no-repo", "--priority", "3", "--ref", ref, "--json", *more)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)["item"]["id"]
+
+    def lookup(self) -> dict[int, str]:
+        commands = [c for c in prescribed_commands(section("Open with the last run")) if c.startswith("sd store items")]
+        self.assertGreater(len(commands), 0)
+        found: dict[int, str] = {}
+        for command in commands:
+            answer = self.run_tool(*self.filled(command))
+            self.assertEqual(answer.returncode, 0, answer.stderr)
+            found.update({row["id"]: row["ref"] for row in json.loads(answer.stdout)})
+        return found
+
+    def test_the_lookup_reads_every_way_an_item_was_filed_or_hidden(self):
+        cases = {
+            "an open item filed before the host and body-line rules": self.add("low disk", "health:2026-11-25:low-disk"),
+            "an open item whose body line was edited away": self.add("load", "health:hub:2026-11-24:load", "--body", "x"),
+            "a parked item with no body line": self.add("fan", "health:hub:2026-09-01:fan"),
+            "a parked item with its body line": self.add("temp", "health:hub:2026-09-02:temp", "--body",
+                                                         "ref: health:hub:2026-09-02:temp"),
+            "a done item past the list's week": self.add("swap", "health:hub:2026-10-01:swap", "--body",
+                                                         "ref: health:hub:2026-10-01:swap"),
+        }
+        old = cases["a done item past the list's week"]
+        self.assertEqual(self.run_tool("sd", "task", "status", str(old), "done", "--reason", "fixed").returncode, 0)
+        store = sqlite3.connect(self.home / ".local" / "share" / "sd" / "sd.db")
+        self.addCleanup(store.close)
+        store.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (old,))
+        for name in ("a parked item with no body line", "a parked item with its body line"):
+            store.execute("UPDATE item SET parked_at = '2026-01-01T00:00:00+00:00' WHERE id = ?", (cases[name],))
+        store.commit()
+        found = self.lookup()
+        for name, item in cases.items():
+            with self.subTest(case=name):
+                self.assertIn(item, found)
+
+    def test_the_filing_command_is_accepted_and_refuses_its_rerun(self):
+        commands = [c for c in prescribed_commands(section("Tag what the run files")) if c.startswith("sd task add")]
+        self.assertEqual(len(commands), 1, commands)
+        words = [word for word in self.filled(commands[0]) if word != "PLACEHOLDER"]
+        words = [word if word != "--belongs-to" else "--no-repo" for word in words]
+        first = self.run_tool(*words)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        again = self.run_tool(*words)
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("already carries --ref health:hub:2026-11-20:swap", again.stderr)
+
+    def test_the_lookup_drops_no_tagged_item_in_silence(self):
+        """Each ref under the base tag gets a named place; none is filtered out unseen."""
+        text = section("Open with the last run")
+        for phrase in ("`host unknown`", "another host", "`unreadable ref`", "not as no previous run",
+                       "older than a week"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+        self.assertNotIn("'<tag>:'", text)
 
 
 if __name__ == "__main__":

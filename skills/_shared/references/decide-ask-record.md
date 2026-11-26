@@ -15,21 +15,29 @@ A run's own file names its tag, its time budget and its steps; this file names h
 
 ## Tag what the run files
 
-- A run's file names its tag. A run about one machine adds `<host>`, the short host name in lowercase (`hostname -s`), as `health:<host>`: two machines' runs then never share a ref.
-- File each item with a ref, and the same ref as the body's first line: `--ref <tag>:<date>:<slug> --body 'ref: <tag>:<date>:<slug>'`, with any further body text after it. The lookup below finds the item by that line.
+- A run's file names its base tag, as `health`. A run about one machine adds `<host>`, the short host name in lowercase (`hostname -s`), so its tag is `health:<host>`: two machines' runs then never share a ref. Any other run's tag is its base tag.
+- File each item with its ref, and the same ref as the body's first line:
+  `sd task add "<title>" --priority <1-4> --belongs-to <path> --ref <tag>:<date>:<slug> --body 'ref: <tag>:<date>:<slug>'`.
+  Put any further body text after that line, and keep the line in every later body edit: it is how a done item is found after a week.
 - `<date>` is the run's start date in the machine's local zone, as `YYYY-MM-DD`, kept for the whole run even past midnight.
 - `<slug>` names the finding in lowercase ASCII letters, digits and hyphens, at most 40 characters: no space, colon or newline.
-- A rerun files the same finding under the same ref. `sd task add` then refuses and names the item filed before: use that item; do not file it again.
+- A rerun files the same finding under the same ref. The add then refuses and names the item filed before: use that item, and do not file it again.
 
 ## Open with the last run
 
 Before the first step, report what the previous run's items became:
 
-1. Run `sd store items --grep '<tag>:' --json` and `sd store items --parked --grep '<tag>:' --json`, with the run's tag. Both read done items of any age; the second adds the parked items a plain list hides.
-2. Keep the items whose `ref` field starts with the tag and a colon, exactly; `--grep` matches text anywhere, so drop every other hit.
-3. The previous run is the newest `<date>` among them before today's; items under today's date are this run's own, from an interrupted start.
+1. Run all four reads with the run's base tag and merge their rows by item id:
+   `sd store items --json`, `sd store items --parked --json`, `sd store items --grep '<base>:' --json` and `sd store items --parked --grep '<base>:' --json`.
+   The first two list every open item, whatever its body holds; the two `--grep` reads add the done items of any age that carry the ref line.
+2. Keep every item whose `ref` field starts with the base tag and a colon, exactly. Read the ref, never the matched text. Place each kept item; drop none:
+   - `<tag>:<date>:<slug>`: this run's own history.
+   - `<base>:<date>:<slug>` in a run about one machine: filed before the host rule. Count it as this machine's, and mark its row `host unknown`.
+   - `<base>:<other host>:<date>:<slug>`: another host's. Leave it out of the rows, and say how many there are.
+   - any other shape: one row marked `unreadable ref`, with the ref as written.
+3. The previous run is the newest `<date>` before today's among the first two kinds; items under today's date are this run's own, from an interrupted start.
 4. Give each of its items one row: item, title, state: `done`, `open`, or `stale` (open, and `updated_at` more than 7 days ago, read as UTC).
-5. Say the run has no previous run only when both reads succeed and step 2 keeps no item. A read that fails is reported as failed, not as no previous run.
+5. A read that fails is reported as failed, not as no previous run. When all four succeed and step 3 finds no earlier date, say: no tagged item found. Name the limit with it: a done item older than a week that lacks the ref line is in none of these reads.
 
 ## Report
 
