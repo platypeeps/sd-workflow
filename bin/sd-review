@@ -1809,15 +1809,15 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     An uncited repeat of a `prior` report's blocker, not rebutted, still blocks and keeps any evidence it stored.
     """
 
-    threshold = BLOCKING_ORDER[floor]
+    threshold, saved = BLOCKING_ORDER[floor], instance_rows(*prior)
     def _floor(row: Mapping[str, Any]) -> bool:
         return 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold
     def _rebutted(row: Mapping[str, Any], cited: str | None = None) -> bool:  # the newest record at every place it names is a listed rebuttal
         record = recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances"))
         # Or a build's ruling: it holds an uncited repeat, and one citing the evidence it judged, never a fresh
         # reproduction; a build clears exactly those, or it enqueues what blocks here (class pass 4, sd:10286).
-        ruled = getattr(record, "ruled", None)
-        return ruled is not None and (cited is None or cited == ruled) or cited is None and getattr(record, "listed", False)
+        ruled = getattr(record, "ruled", None)  # an uncited one carries the repro the prior review saved there (sd:10286)
+        return (cited if cited is not None else prior_evidence(saved, row) or None) in (None, ruled) if ruled is not None else cited is None and getattr(record, "listed", False)
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
         evidence = row.get("evidence")
         return _floor(row) and _rebutted(row, evidence if isinstance(evidence, str) and evidence.strip() else None)

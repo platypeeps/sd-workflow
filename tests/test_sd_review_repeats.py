@@ -1377,6 +1377,18 @@ class RebuttalIdentityTests(unittest.TestCase):
             with self.subTest(ruled=value):
                 self.assertEqual(gate([cited], ruled_body(ruled=value)), ["blocking"], "only a literal true")
 
+    def test_a_ruling_holds_no_uncited_repeat_of_another_saved_repro(self) -> None:
+        """Review of sd:10286 (bin/sd-review:1823, :1827, :1842): an uncited repeat carries the repro the
+        prior review saved at its place. A ruling judged one repro; another saved there blocks, keeps its
+        evidence, and the prior blocker is no rebutted place. The saved ruled repro still holds."""
+        fresh = "python3 t.py --empty: IndexError"
+        prior = [dict(row(evidence=fresh), disposition="blocking")]
+        disposed = sd_review.dispose([row()], "high", listed(ruled_body()), prior=prior)
+        self.assertEqual([(r["disposition"], r.get("evidence")) for r in disposed], [("blocking", fresh)])
+        same = [dict(row(evidence=REPRO), disposition="blocking")]
+        disposed = sd_review.dispose([row()], "high", listed(ruled_body()), prior=same)
+        self.assertEqual([r["disposition"] for r in disposed], ["advisory"])
+
     def test_every_ruling_rebuttal_holds_past_the_prompts_cap(self) -> None:
         """Class pass 4 (build_run.py:2199): a build clears each exact repeat its ruling round ruled, however
         many; the prompt's cap listed ten rebuttals, so the lane blocked the eleventh. A ruling's hold reads
