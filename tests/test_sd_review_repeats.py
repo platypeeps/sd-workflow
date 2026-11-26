@@ -1286,7 +1286,11 @@ class RebuttalIdentityTests(unittest.TestCase):
         cited = row(evidence=REPRO)
         self.assertEqual(gate([cited], plain), ["blocking"])
         self.assertEqual(gate([cited], ruled_body()), ["advisory"])
-        self.assertEqual(gate([row(evidence=" " + REPRO.upper() + "\n")], ruled_body()), ["advisory"], "folded")
+        # Night triage (bin/sd-review:1801): the build clears only the exact evidence, so a repro that
+        # differs in case or spacing is a fresh one here too: `-k ABC` is not `-k abc`.
+        for fresh in (" " + REPRO.upper() + "\n", REPRO.upper(), REPRO.replace(" ", "  ", 1)):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(gate([row(evidence=fresh)], ruled_body()), ["blocking"], "folded")
         self.assertEqual(gate([row()], ruled_body()), ["advisory"], "an uncited repeat holds as ever")
         self.assertEqual(gate([row(evidence="python3 t.py --empty: IndexError")], ruled_body()), ["blocking"],
                          "a fresh reproduction was held back")

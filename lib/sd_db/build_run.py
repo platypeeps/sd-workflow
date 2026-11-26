@@ -2187,7 +2187,8 @@ class Supervisor:
         same line, are another claim, and a fix that moved the line parks the run, fail closed. A FIX ruling,
         an unruled blocker or a new one still blocks."""
         key = f"{RULED}{self.ident}:{head}:"
-        ruled = set()
+        ruled: set[str] = set()
+        twins: dict[str, set[str]] = {}
         for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND substr(key, 1, ?) = ?",
                                        (len(key), key)):
             try:
@@ -2196,6 +2197,12 @@ class Supervisor:
                 continue
             if isinstance(row, dict) and ruleable(row):
                 ruled.add(self.place(row))
+                said = " ".join(str(row.get("summary") or "").split()).casefold()
+                twins.setdefault(said, set()).add(self.place(row))
+        # The lane holds back only the newest record with a ruling's folded words at any place it shares
+        # (`recorded_at`), its instances among them, so two rulings with those words clear neither repeat
+        # here: the run parks, fail closed (night triage).
+        ruled -= {place for places in twins.values() if len(places) > 1 for place in places}
         left = [row for row in answer["blockers"] if self.place(row) not in ruled]
         if len(left) == len(answer["blockers"]):
             return answer

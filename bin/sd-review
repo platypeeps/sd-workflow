@@ -793,8 +793,9 @@ def _bounded(value: Any, limit: int) -> str:
 
 def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str | None]]]:
     """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, ruled) per accepted
-    finding; malformed: none. `ruled`: the evidence a build's ruling round judged, folded, "" for none, when that
-    round wrote the row (sd:10286); None from `sd-ship adjudicate`, which cannot mark one."""
+    finding; malformed: none. `ruled`: the evidence a build's ruling round judged, as recorded, "" for none, when
+    that round wrote the row (sd:10286); None from `sd-ship adjudicate`, which cannot mark one. Never folded: the
+    build clears only the exact evidence, and `-k ABC` is another repro than `-k abc` (night triage, sd:10286)."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -805,7 +806,7 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
          tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()),
-         (_folded(raw["evidence"]) if isinstance(raw.get("evidence"), str) else "") if row.get("ruled") is True else None)
+         (raw["evidence"] if isinstance(raw.get("evidence"), str) else "") if row.get("ruled") is True else None)
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -1798,7 +1799,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         return ruled is not None and (cited is None or cited == ruled) or cited is None and getattr(record, "listed", False)
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
         evidence = row.get("evidence")
-        return _floor(row) and _rebutted(row, _folded(evidence) if isinstance(evidence, str) and evidence.strip() else None)
+        return _floor(row) and _rebutted(row, evidence if isinstance(evidence, str) and evidence.strip() else None)
     def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
         return dict(old, disposition="rebutted") if old.get("disposition") == "blocking" and _rebutted(old) else old
     # Only a finding that blocks releases a hold: not a medium copy (build/sd-1423 review), not a rebutted repeat (sd-review:1783).

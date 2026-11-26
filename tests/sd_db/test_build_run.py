@@ -263,13 +263,15 @@ FAKE = textwrap.dedent('''
         short = mode == "repeat2_short"
         uncovered = mode in ("repeat2_uncovered", "blocking2_uncovered")
         mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered else mode
-        if mode in ("blocking2", "repeat2", "moved2"):  # sd:10286: two blockers in the changed file, the second with a newline
+        if mode in ("blocking2", "repeat2", "moved2", "twin2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
                       "evidence": "the original evidence"}
             # repeat2: the second alone, its original evidence cited, so a rebuttal holds it back nowhere;
             # moved2: the same file and words at another line, another defect
+            # twin2: a third, the second's words and place with other evidence (night triage, sd:10286)
             rows = ([{**second, **({"line": 5} if mode == "moved2" else {})}]
-                    if mode in ("repeat2", "moved2") else [raw, second])
+                    if mode in ("repeat2", "moved2") else [raw, second, {**second, "evidence": "other evidence"}]
+                    if mode == "twin2" else [raw, second])
             findings, mode = review.dispose([review._finding(row) for row in rows], "high"), "blocking"
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
@@ -1262,6 +1264,17 @@ class Supervise(Case):
                           "severity": "high", "family": "correctness", "instances": [], "evidence": evidence}
                 (found,) = review.dispose([review._finding(repeat)], "high", seen)
                 self.assertEqual(found["disposition"], lane)
+
+    def test_two_rulings_one_words_and_place_clear_no_repeat(self):
+        """Night triage of sd:10286 (bin/sd-review:917, build_run.py:2199): two ruled blockers with one summary
+        and place but other evidence. The lane reads only the newest record there, so it blocked the repeat of
+        the older one that `settled` cleared and the run enqueued. Neither clears now: the run parks."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"},
+                                   {"blocker": 3, "ruling": "reject", "reason": "no failing input"}],
+                                  last="twin2", after=("repeat2",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
 
     def test_a_ruling_the_lane_cannot_read_clears_nothing(self):
         """Class pass 4 on sd:10286: `settled` cleared a ruled repeat from its own checkpoint, written even
