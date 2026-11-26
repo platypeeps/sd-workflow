@@ -1986,15 +1986,15 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
             return moved, line if diff is None else moved_line(diff, line)
 
         path, line = _place(row["path"], row.get("line"))
-        found = row.get("instances")
+        found, row = row.get("instances"), dict(row, path=path, **({"line": line} if "line" in row else {}))  # an absent line stays absent
         if not isinstance(found, list):
-            return dict(row, path=path, line=line)
+            return row
         places = []
         for entry in found:
             place = instance_place(entry)
             at, number = _place(*place) if place else (entry, None)
             places.append(f"{at}:{number}" if place and type(number) is int else at)
-        return dict(row, path=path, line=line, instances=places)
+        return dict(row, instances=places)
     return [_remapped(row) for row in rows]
 
 

@@ -60,7 +60,9 @@ class URLContractTests(ReviewFixture):
         material = sd_review.review_material(root, subject, prompt)
         prefix = f"{prompt}\nSchema: {json.dumps(sd_review.CODEX_OUTPUT_SCHEMA)}\n\nReview input:\n{material}"
         self.assertGreater(len(prefix.encode()), 150000)
-        self.assertIn(json.dumps([dict(row, id="B1") for row in prior["findings"]], sort_keys=True), prompt)
+        # each place as moved to the reviewed head (build/sd-1675 review, bin/sd-review:2465)
+        moved = sd_review.prior_at(root, prior["subject"]["head"], subject.head, prior["findings"])
+        self.assertIn(json.dumps([dict(row, id="B1") for row in moved], sort_keys=True), prompt)
         self.assertIn((root / "prior.py").read_text(), prompt)
         self.assertIn("keep-the-complete-local-provenance", prompt)
         self.assertIn("+# first input marker", material)
