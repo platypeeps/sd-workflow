@@ -1422,6 +1422,70 @@ class Supervise(Case):
                     self.assertIn(said, reach[0])
         self.assertTrue(supervisor.reaches(row, None, base), "an unread delta reaches every blocker")
 
+    def test_a_rounds_reach_reads_a_statement_past_what_its_text_holds(self):
+        """Class pass on sd:10286: a statement's bounds were counted from its brackets as text, so a bracket
+        in a string or a comment, or a continuation with no bracket, cut it short and its binding or its
+        entries were missed. Each instance from the code: the changed line's binding (`round_words`), a
+        table's later entries (`calls_into`), a reference inside a table (`called_from`), and a hunk that
+        does not hold the statement's first line, which reaches every blocker."""
+        self.press()
+        supervisor = self.supervisor()
+        work = Path(self.bundle["work_path"])
+        work.mkdir(parents=True, exist_ok=True)
+        support.git(work, "init", "-q")
+
+        def commit(files):
+            for name, text in files.items():
+                (work / name).parent.mkdir(parents=True, exist_ok=True)
+                (work / name).write_text(text)
+            support.git(work, "add", "-A")
+            support.git(work, "-c", "user.name=operator", "-c", "user.email=operator@example.test",
+                        "-c", "commit.gpgsign=false", "commit", "-qm", "fix: a round")
+            return support.git(work, "rev-parse", "HEAD")
+
+        size = "import table\n\ndef size(text):\n    return len(text) + table.{}['count']\n"
+        base = commit({
+            "src/string.py": "QUOTED = {\n    'close': ')}',\n    'count': 3,\n}\n",
+            "src/use_string.py": size.format("QUOTED"),
+            "src/comment.py": "NOTED = {\n    'a': 1,  # see a)\n    'count': 3,\n}\n",
+            "src/use_comment.py": size.format("NOTED"),
+            "src/text.py": "TEXT = \"\"\"\n    three\n\"\"\"\n",
+            "src/use_text.py": "import text\n\ndef size():\n    return int(text.TEXT)\n",
+            "src/slash.py": "TOTAL = 1 + \\\n    2\n",
+            "src/use_slash.py": "import slash\n\ndef size():\n    return slash.TOTAL\n",
+            "src/entries.py": "ENTRIES = {\n    'close': ')}',\n    'count': count_of,\n}\n",
+            "src/use_entries.py": size.format("ENTRIES"),
+            "src/count.py": "def count_of():\n    return 3\n",
+            "src/handlers.py": "HANDLERS = {\n    'close': ')}',\n    'a': handler_a,\n}\n",
+            "src/handle.py": "def handler_a(text):\n    return int(text)\n",
+            "src/serve.py": "def serve(key, text):\n    return HANDLERS[key](text)\n",
+            "src/far.py": "def far():\n    return 1\n"})
+        cases = {
+            "a bracket in a string": ("src/string.py", "QUOTED = {\n    'close': ')}',\n    'count': '',\n}\n",
+                                      "src/use_string.py", 4, "a name"),
+            "a bracket in a comment": ("src/comment.py", "NOTED = {\n    'a': 1,  # see a)\n    'count': '',\n}\n",
+                                       "src/use_comment.py", 4, "a name"),
+            "a string over lines": ("src/text.py", "TEXT = \"\"\"\n    none\n\"\"\"\n", "src/use_text.py", 4, "a name"),
+            "a backslash": ("src/slash.py", "TOTAL = 1 + \\\n    ''\n", "src/use_slash.py", 4, "a name"),
+            "a table's later entry": ("src/count.py", "def count_of():\n    return ''\n",
+                                      "src/use_entries.py", 4, "a name"),
+            "a reference in a table": ("src/serve.py", "def serve(key, text):\n    return HANDLERS[key](text or '')\n",
+                                       "src/handle.py", 2, "a caller of"),
+            "unrelated": ("src/far.py", "def far():\n    return 2\n", "src/use_string.py", 4, None)}
+        for name, (path, text, cited, line, said) in cases.items():
+            with self.subTest(name):
+                support.git(work, "reset", "-q", "--hard", base)
+                head = commit({path: text})
+                row = {"path": cited, "line": line, "summary": "a text count is no int"}
+                reach = supervisor.reaches(row, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
+                self.assertEqual(bool(reach), said is not None, reach)
+                if said:
+                    self.assertIn(said, reach[0])
+        # A hunk that starts inside a statement names no binding: the delta is unknown, and reaches all.
+        cut = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -3 +3 @@\n     'a': 1,\n-    'count': 3,\n+    'count': '',\n"
+        with mock.patch.object(build_run, "_read", return_value=cut):
+            self.assertIsNone(build_run.round_words(["git"], str(work), base, base))
+
     def test_a_ruling_clears_no_gate_blocker(self):
         """Review of sd:10286: the review gate's own blocker (a response past its byte limit, a finding it could
         not place) names no code a ruling judged. A reject of it records nothing, and its repeat still blocks:

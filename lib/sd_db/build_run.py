@@ -696,15 +696,20 @@ def round_words(git: Collection[str], work: str, base: str, head: str, *,
     defined = {name for line in lines for name in defined_names(line[1:])}
     # A changed line binds what its whole statement binds: `TABLE = {` over lines, its entry changed. Each
     # side of each hunk is read as text, its context included (`--function-context`), so the statement's
-    # first line is there; one indented at its start binds nothing at module level.
+    # first line is there.
     for hunk in re.split(r"^(?:@@|diff --git ).*$", diff, flags=re.M)[1:]:
         rows = [line for line in hunk.splitlines() if line and line[0] in "+- " and not line.startswith(("+++", "---"))]
         for side in "+-":
             text = [line[1:] for line in rows if line[0] in (" ", side)]
             marks = [index for index, line in enumerate(line for line in rows if line[0] in (" ", side))
                      if line[0] == side]
-            defined |= {name for index in marks for first in statement(text, index)[:1]
-                        if not first[:1].isspace() for name in bound_names(first)}
+            for index in marks:
+                first = statement(text, index)[0]
+                # Still indented: the hunk holds no first line for it. Inside a definition the hunk shows,
+                # it binds nothing at module level; else what it binds is unknown, and reaches all.
+                if first.strip() and first[:1].isspace() and not any(map(defined_names, text[:index + 1])):
+                    return None
+                defined |= set() if first[:1].isspace() else bound_names(first)
     return {name for line in lines for name in re.findall(r"[A-Za-z_]\w*", line[1:])}, defined
 
 
@@ -750,7 +755,8 @@ def bound_names(line: str) -> set[str]:
 def statement(lines: list[str], index: int) -> list[str]:
     """The lines of the statement that holds `lines[index]`: back to the last line no bracket is open at,
     on to the line that closes the brackets left open, so a table written over lines is one statement
-    (pack sd:9769). ponytail: brackets inside strings count, which only widens the statement."""
+    (pack sd:9769), then out to the lines indentation gives it, which only widens it.
+    ponytail: text at column 0 inside a string over lines still ends it; a tokenizer if that costs."""
     depths, depth = [], 0
     for text in lines:
         depths.append(depth)
@@ -760,6 +766,17 @@ def statement(lines: list[str], index: int) -> list[str]:
         return []
     start = next(row for row in range(index, -1, -1) if depths[row] == 0)
     end = next((row for row in range(index + 1, len(depths)) if depths[row] == 0), len(lines))
+    # The count reads text, so a `)` in a string or a comment ends it early, and a string or a backslash
+    # over lines opens nothing: an indented line belongs to the last line above that is not indented, and
+    # the statement runs on over indented lines, blank ones and closing brackets (class pass, sd:10286).
+    if lines[start].strip() and lines[start][:1].isspace():
+        start = next((row for row in range(start, -1, -1) if lines[row].strip() and not lines[row][:1].isspace()), 0)
+    stop = end
+    while end < len(lines) and (not lines[end].strip() or lines[end][:1].isspace()
+                                or lines[end].startswith((")", "]", "}", '"""', "'''"))):
+        end += 1
+    while end > stop and not lines[end - 1].strip():  # the blank lines after it are not its own
+        end -= 1
     return lines[start:end]
 
 
