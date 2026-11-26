@@ -55,7 +55,7 @@ import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from . import build, contributions, draft, paths, remote, runner_journal, sessions
@@ -777,6 +777,18 @@ def implicit(lines: list[str], start: int, *, named: Collection[str] = ()) -> bo
         if parts and parts[-1] not in WRAPPERS and parts[0] not in TEST_DECORATORS:
             return True
     return False
+
+
+# Files code reads as data, not by name: a value a round changes there reaches code no name edge finds, so it
+# lapses every reject or file ruling (review of sd:10286). ponytail: a suffix list; a data file of another
+# kind still needs the finding to name it.
+CONFIG_SUFFIXES = frozenset({".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf", ".env", ".properties"})
+
+
+def configuration(paths: Collection[str]) -> list[str]:
+    """Each of `paths` a configuration file by its suffix or its name (`.env`), as `configuration <path>`."""
+    return [f"configuration {path}" for path in sorted(paths) if (name := PurePosixPath(path)).suffix.lower()
+            in CONFIG_SUFFIXES or name.name.lower() in CONFIG_SUFFIXES]
 
 
 def round_words(git: Collection[str], work: str, base: str, head: str, *,
@@ -2297,7 +2309,7 @@ class Supervisor:
                  if reviewed and moved is not None else None)
         for number, (ruling, reason) in sorted(found.items()):
             row = blockers[number - 1]
-            reached = (self.reaches(row, words, head)
+            reached = (self.reaches(row, words, head) + configuration(moved or {})
                        if ruling in ("reject", "file") and ruleable(row) and words is not None else [])
             self.once(f"ruling:{head}:{number}", functools.partial(
                 self.rule, number, row, ruling, reason, head, repository, changed,

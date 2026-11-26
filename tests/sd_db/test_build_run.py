@@ -165,7 +165,9 @@ FAKE = textwrap.dedent('''
             added = "def rule_caller(): fix1()\\n"
         if mode == "rule_apart":  # no `pass`: the first round's function has that name, and a call is a caller
             added = "def rule_apart(): return 0\\n"
-        target = Path("apart.txt" if mode in ("rule_apart", "rule_caller") else "work.txt")
+        # `rule_config`: one whose fix changes a settings file only, as a config the code reads
+        target = Path("apart.txt" if mode in ("rule_apart", "rule_caller") else "settings.json"
+                      if mode == "rule_config" else "work.txt")
         target.write_text(target.read_text() + added if target.exists() else added)
         git("add", str(target))
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
@@ -200,7 +202,7 @@ FAKE = textwrap.dedent('''
         prompt = sys.argv[sys.argv.index("-p") + 1]
         # `rule`: the ruling round's builder writes plans/rulings.txt to the file its brief names (sd:10286).
         named = re.search(r"JSON list to `([^`]+)`", prompt)
-        if mode in ("rule_here", "rule_apart", "rule_caller") and named and (plans / "rulings.txt").exists():
+        if mode in ("rule_here", "rule_apart", "rule_caller", "rule_config") and named and (plans / "rulings.txt").exists():
             Path(named.group(1)).write_bytes((plans / "rulings.txt").read_bytes())
         items = re.findall(r"^- sd:(\\d+)", prompt, re.M)
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
@@ -1361,6 +1363,18 @@ class Supervise(Case):
         self.assertNotIn("--verify-report", self.calls("sd-review")[-1]["argv"], "a delta, not the branch")
         self.assertEqual(ended.get("outcome"), "blocked", ended)
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_ruling_lapses_when_its_round_changes_a_configuration_file(self):
+        """Review of sd:10286 (build_run.py:2325, :782, :2445): an unchanged function reads a setting the
+        round's fix changed; the finding names neither the file nor a name it defines, and no name edge
+        reaches it. A ruling judged the old value, so a round that changes a configuration file applies no
+        reject or file ruling: the repeat parks the run."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",), rule="rule_config")
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.rebuttals(), [])
+        self.assertIn("not applied: the round changed configuration settings.json", self.decisions()[1])
 
     def test_a_ruling_lapses_when_its_round_changes_the_ruled_file(self):
         """Class pass 3 on sd:10286: a ruling judged the code at the reviewed head. A fix in the same round
