@@ -1,6 +1,6 @@
 ---
 name: sd-next
-description: 'Use when the operator asks for status, "what next", recommendations, followups or "what do you need from me" across all their work: done recently, landing soon, open items, numbered next steps, then the waiting questions one at a time; when the operator says "grill", to walk the weekly grill questions; and for the run "health check".'
+description: 'Use when the operator asks for status, "what next", recommendations, followups or "what do you need from me" across all their work: done recently, landing soon, open items, numbered next steps, then the waiting questions one at a time; when the operator says "grill", to walk the weekly grill questions; and for the runs "health check" or "check open PRs".'
 ---
 
 # sd-next
@@ -65,6 +65,7 @@ When the operator says "grill":
 Each run below lives in its own file; read it in full when its trigger comes, and follow it in place of the steps above.
 
 - `references/health.md`: "health check" (this machine's health and open findings).
+- `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout: "check open PRs" (every open pull request and the lane action); sd-ship is operator-invoked only, so this skill routes the plain ask.
 
 ## Never
 

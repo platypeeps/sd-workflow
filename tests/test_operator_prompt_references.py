@@ -25,6 +25,9 @@ PROMPTS = {
     "sd-next": {
         "health.md": ("health check",),
     },
+    "sd-ship": {
+        "open-prs.md": ("check open PRs",),
+    },
 }
 
 
@@ -82,14 +85,35 @@ def reference(skill: str, name: str) -> str:
     return (ROOT / "skills" / skill / "references" / name).read_text(encoding="utf-8")
 
 
-class OpenPrSweepMovedOut(unittest.TestCase):
-    def test_no_skill_carries_or_routes_the_open_pr_sweep(self):
-        """The open-PR sweep moved to sd:10803 (ruling on sd:10795)."""
-        self.assertFalse((ROOT / "skills" / "sd-ship" / "references" / "open-prs.md").exists())
-        for skill in ("sd-next", "sd-ship"):
-            with self.subTest(skill=skill):
-                self.assertNotIn("open-prs", skill_text(skill))
-                self.assertNotIn("check open PRs", skill_text(skill))
+class OpenPrSweep(unittest.TestCase):
+    """The open-PR sweep (sd:10803), split from sd:10795 after review rounds."""
+
+    def text(self) -> str:
+        return reference("sd-ship", "open-prs.md")
+
+    def test_sd_next_routes_the_plain_ask(self):
+        self.assertIn("check open PRs", description("sd-next"))
+        self.assertIn("skills/sd-ship/references/open-prs.md`", skill_text("sd-next"))
+
+    def test_sweep_queues_nothing_it_must_cancel_after(self):
+        """A wrong entry queued then cancelled sat in the lane between the two writes."""
+        self.assertNotIn("lane cancel", self.text())
+
+    def test_sweep_checks_the_worktree_branch_before_it_enqueues(self):
+        text = self.text()
+        check = text.index("refs/heads/<head branch>")
+        self.assertLess(check, text.index("lane enqueue"))
+
+    def test_every_finding_refusal_falls_back_to_a_note(self):
+        """The fallback does not hang on one refusal's wording."""
+        text = self.text()
+        self.assertIn("If it refuses, for any reason, it writes nothing", text)
+        self.assertNotIn("refuses with `--finding goes to", text)
+
+    def test_item_is_matched_exactly(self):
+        text = self.text()
+        self.assertIn("equals the PR's head branch exactly", text)
+        self.assertIn("as a whole word", text)
 
 
 class ReviewRoundFixes(unittest.TestCase):
