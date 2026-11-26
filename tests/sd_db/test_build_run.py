@@ -166,8 +166,9 @@ FAKE = textwrap.dedent('''
         if mode == "rule_apart":  # no `pass`: the first round's function has that name, and a call is a caller
             added = "def rule_apart(): return 0\\n"
         # `rule_config`: one whose fix changes a settings file only, as a config the code reads
-        target = Path("apart.txt" if mode in ("rule_apart", "rule_caller") else "settings.json"
-                      if mode == "rule_config" else "work.txt")
+        # `rule_data`: the same under a name no list of configuration kinds holds
+        target = Path({"rule_apart": "apart.py", "rule_caller": "apart.py", "rule_config": "settings.json",
+                       "rule_data": "limits.dat"}.get(mode, "work.txt"))
         target.write_text(target.read_text() + added if target.exists() else added)
         git("add", str(target))
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
@@ -202,7 +203,7 @@ FAKE = textwrap.dedent('''
         prompt = sys.argv[sys.argv.index("-p") + 1]
         # `rule`: the ruling round's builder writes plans/rulings.txt to the file its brief names (sd:10286).
         named = re.search(r"JSON list to `([^`]+)`", prompt)
-        if mode in ("rule_here", "rule_apart", "rule_caller", "rule_config") and named and (plans / "rulings.txt").exists():
+        if mode in ("rule_here", "rule_apart", "rule_caller", "rule_config", "rule_data") and named and (plans / "rulings.txt").exists():
             Path(named.group(1)).write_bytes((plans / "rulings.txt").read_bytes())
         items = re.findall(r"^- sd:(\\d+)", prompt, re.M)
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
@@ -1369,12 +1370,27 @@ class Supervise(Case):
         round's fix changed; the finding names neither the file nor a name it defines, and no name edge
         reaches it. A ruling judged the old value, so a round that changes a configuration file applies no
         reject or file ruling: the repeat parks the run."""
-        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
-                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
-                                  after=("repeat2",), rule="rule_config")
-        self.assertEqual(ended.get("outcome"), "blocked", ended)
-        self.assertEqual(self.rebuttals(), [])
-        self.assertIn("not applied: the round changed configuration settings.json", self.decisions()[1])
+        # Class pass 7 (build_run.py:788): any file the name walk does not read as Python, whatever its name.
+        for mode, name in (("rule_config", "settings.json"), ("rule_data", "limits.dat")):
+            with self.subTest(name):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=("repeat2",), rule=mode)
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual(self.rebuttals(), [])
+                self.assertIn(f"not applied: the round changed {name} (no Python source)", self.decisions()[1])
+
+    def test_only_python_source_is_a_file_the_name_walk_reads(self):
+        """Class pass 7: a `.py` file, or a regular file whose first line is a Python shebang; a symlink, a
+        missing file, a file that does not read or any other is none, fail closed."""
+        (self.root / "tool").write_text("#!/usr/bin/env python3\nx = 1\n")
+        (self.root / "run.sh").write_text("#!/bin/sh\n")
+        (self.root / "link.py").symlink_to("tool")
+        (self.root / "bytes").write_bytes(b"\xff\xfe#!python")
+        self.assertEqual(build_run.unwalked(self.root, ["a/b.py", "tool", "run.sh", "link.py", "gone", "bytes", ""]),
+                         [" (no Python source)", "bytes (no Python source)", "gone (no Python source)",
+                          "link.py (no Python source)", "run.sh (no Python source)"])
 
     def test_a_ruling_lapses_when_its_round_changes_the_ruled_file(self):
         """Class pass 3 on sd:10286: a ruling judged the code at the reviewed head. A fix in the same round

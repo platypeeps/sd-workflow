@@ -779,16 +779,23 @@ def implicit(lines: list[str], start: int, *, named: Collection[str] = ()) -> bo
     return False
 
 
-# Files code reads as data, not by name: a value a round changes there reaches code no name edge finds, so it
-# lapses every reject or file ruling (review of sd:10286). ponytail: a suffix list; a data file of another
-# kind still needs the finding to name it.
-CONFIG_SUFFIXES = frozenset({".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf", ".env", ".properties"})
-
-
-def configuration(paths: Collection[str]) -> list[str]:
-    """Each of `paths` a configuration file by its suffix or its name (`.env`), as `configuration <path>`."""
-    return [f"configuration {path}" for path in sorted(paths) if (name := PurePosixPath(path)).suffix.lower()
-            in CONFIG_SUFFIXES or name.name.lower() in CONFIG_SUFFIXES]
+def unwalked(work: Path, paths: Collection[str]) -> list[str]:
+    """Each of `paths` the name walk does not read: anything but Python source, a `.py` file or a regular file
+    under `work` whose first line is a Python shebang (class pass 7 on sd:10286). Code reads such a file as
+    data, by no name, so a round's change there reaches a blocker no edge finds. A closed test, not a list of
+    configuration kinds: a symlink, a missing file or one that does not read is none, fail closed."""
+    def python(path: str) -> bool:
+        if not path or (work / path).is_symlink():
+            return False
+        if PurePosixPath(path).suffix == ".py":
+            return True
+        try:
+            with open(work / path, "rb") as file:
+                first = file.readline(200)
+        except OSError:
+            return False
+        return first.startswith(b"#!") and b"python" in first
+    return [f"{path} (no Python source)" for path in sorted(paths) if not python(path)]
 
 
 def round_words(git: Collection[str], work: str, base: str, head: str, *,
@@ -2309,7 +2316,7 @@ class Supervisor:
                  if reviewed and moved is not None else None)
         for number, (ruling, reason) in sorted(found.items()):
             row = blockers[number - 1]
-            reached = (self.reaches(row, words, head) + configuration(moved or {})
+            reached = (self.reaches(row, words, head) + unwalked(self.work, moved or {})
                        if ruling in ("reject", "file") and ruleable(row) and words is not None else [])
             self.once(f"ruling:{head}:{number}", functools.partial(
                 self.rule, number, row, ruling, reason, head, repository, changed,
