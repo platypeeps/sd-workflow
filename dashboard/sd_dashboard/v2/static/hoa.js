@@ -214,7 +214,7 @@ let polling = 0;
     if (a.type === 'well' && /A2/.test(a.id)) {
       const lp = m.pump[m.pump.length - 1], a2 = AL.filter(x => /A2/.test(x.event));
       extra = html`${lp ? html`<h3 class="label">Latest pump row · ${lp.date}</h3>${dl([['Runtime', `${lp.a2_runtime_hours} h`], ['Starts', lp.a2_starts], ['Gallons', gal(lp.a2_gallons)], ['Flow running', `${lp.a2_flow_gpm_running} gpm`]])}` : ''}
-        <h3 class="label">A2 alarms · last 30 days of export</h3>${a2.length ? html`<ul class="note">${a2.slice(0, 12).map(x => html`<li><code>${x.datetime.slice(0, 16)}</code> ${x.event}</li>`)}</ul>` : html`<p class="note">None.</p>`}`;
+        <h3 class="label">A2 alarms · last 30 days</h3>${a2.length ? html`<ul class="note">${a2.slice(0, 12).map(x => html`<li><code>${x.datetime.slice(0, 16)}</code> ${x.event}</li>`)}</ul>` : html`<p class="note">None.</p>`}`;
     }
     if (a.type === 'tank') {
       const la = m.analog[m.analog.length - 1];
@@ -521,7 +521,7 @@ let polling = 0;
       : shown.length ? html`${shown.map(a => html`<tr data-id="${a.id}" aria-selected="${a.id === selected ? 'true' : 'false'}"${a.acked ? html` data-acked` : ''}><td class="g g-${a.st}" aria-label="${a.st}">${GLYPH[a.st]}</td><td class="what"><button type="button">${a.event}</button>${a.acked ? html` <span class="tag">acknowledged</span>` : ''}</td><td class="src">${a.datetime.slice(5, 16)}</td><td class="detail hide-sm">${a.kind}</td><td class="num hide-sm">${a.minutes}</td><td class="detail hide-sm">${a.notified}</td><td class="act">${C.rowActions(a.id)}</td></tr>`)}`
       : alView === 'acked' && AL.length ? html`<tr><td colspan="7" class="why">No alarm event in the last 30 days is acknowledged.</td></tr>`
       : AL.length ? html`<tr><td colspan="7" class="why">Every alarm event in the last 30 days is acknowledged. The Acknowledged view lists them.</td></tr>`
-      : html`<tr><td colspan="7" class="why">No alarm event in the last 30 days of the export.</td></tr>`);
+      : html`<tr><td colspan="7" class="why">No alarm event in the last 30 days.</td></tr>`);
   }
   const alarmState = a => a.kind === 'generator' ? ['queued', 'weekly generator test'] : /Normal/.test(a.event) ? ['ok', 'return to normal'] : ['warning', 'alarm'];
 
@@ -616,7 +616,10 @@ let polling = 0;
     TD = window.taskDetails.attach({ details: $('details'), rows: TASKS, selected: () => own() ? selected : null, read: () => DOC?.read, view: () => 'place',
       render: () => { drawTasks(); if (own() && TASKS().some(o => o.key === selected)) TD.renderDetails(); }, reread: () => reader.reread(), load: () => reader.load(),
       select: (key, open) => select(key, open), draftFirst: t => t.kind === 'followup',
-      note: t => html`<p class="why"><span class="g-${t.state}" aria-hidden="true">${GLYPH[t.state]}</span> ${t.due ? `${t.due.slice(0, 10)} · ${dueText(t)}` : 'no due date'}</p>`,
+      // sd:10600: the latest decision sits under the title, before the fields, as the filing evidence; read with the Details.
+      note: (t, d) => { const dec = (d?.notes || []).filter(n => n.kind === 'decision').reduce((a, n) => !a || n.id > a.id ? n : a, null);
+        return html`<p class="why"><span class="g-${t.state}" aria-hidden="true">${GLYPH[t.state]}</span> ${t.due ? `${t.due.slice(0, 10)} · ${dueText(t)}` : 'no due date'}</p>${dec ? html`
+        <p><b>Latest decision</b> · <time class="rel" datetime="${dec.at}"></time> ${dec.body}</p>` : ''}`; },
       foot: () => DOC ? html`Rows read <time class="rel" datetime="${DOC.read}"></time> from /api/hoa.` : '',
       more: t => html`<p class="why"><a href="${S.itemHref(t.id)}">Open on Tasks</a>: the board, the matrix and every task.</p>` });
     reader = S.read(spec);
