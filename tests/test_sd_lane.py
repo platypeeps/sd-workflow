@@ -6550,6 +6550,21 @@ class Watch(Lane):
             code, lines = self.watch_items(self.repo, item)
         self.assertEqual((code, lines), (0, [f"pack sd:{item} merged at merged-{item}"]))
 
+    def test_watch_item_follows_a_bundle_member_to_the_entry_that_closes_it(self) -> None:
+        """Review of sd:10908: a bundle's entry is keyed by its lead; a member rides in `closes`."""
+        lead, member = self.register_items(2)
+        builds = [self.build(lead, "running"), self.build(member, "running")]
+
+        def pause() -> None:
+            for assignment in builds:
+                self.end_build(assignment, "done", "build run r1 enqueued in the lane")
+            sd_lane.enqueue_entry(self.feature, lead, "fix: both", self.body, self.environ, manual=True,
+                                  claim="deliver", closes=(member,))
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, member)
+        self.assertEqual((code, lines), (0, [f"pack sd:{member} merged at merged-{lead}"]))
+
     def test_watch_item_names_the_newer_of_a_blocked_build_and_an_ended_entry(self) -> None:
         one, two = self.register_items(2)
         for item in (one, two):

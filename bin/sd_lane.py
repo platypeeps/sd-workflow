@@ -5098,6 +5098,18 @@ def watch_pause() -> None:
 BUILDING = ("queued", "running", "ending")
 
 
+def delivering_entry(connection: Any, repository: str, item: int) -> dict[str, Any] | None:
+    """The newest entry not cancelled that delivers `item`: its own, or a bundle's that `closes` it.
+
+    A bundle's entry is keyed by its lead; each other member rides in
+    `closes`, so `newest_entry` alone found none for it (review of sd:10908).
+    """
+    order = enqueue_order(connection, repository)
+    return max((row for row in stored(connection, repository) if row.get("status") != "cancelled"
+                and str(item) in {str(row.get("item")), *(str(number) for number in row.get("closes") or ())}),
+               key=lambda row: order.get(row["id"], 0), default=None)
+
+
 def newest_build(connection: Any, item: int) -> dict[str, Any] | None:
     """`item`'s newest build assignment, its status, result and end, or None."""
     row = connection.execute("SELECT status, result, ended FROM assignment WHERE item = ? AND scope = 'build' "
@@ -5167,7 +5179,7 @@ def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = pr
     while True:
         try:
             newest = on_hub(queue, lambda connection: {
-                item: (newest_entry(connection, queue.repository, item, skip=("cancelled",)),
+                item: (delivering_entry(connection, queue.repository, item),
                        newest_build(connection, item)) for item in left},
                 write=False)
         except BuildRefused:
