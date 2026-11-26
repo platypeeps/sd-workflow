@@ -63,6 +63,7 @@ When the operator says "grill":
 ## Operator runs
 
 Each run below lives in its own file; read it in full when its trigger comes, and follow it in place of the steps above.
+Every run decides, asks, records and reports as `references/decide-ask-record.md` says.
 
 - `references/health.md`: "health check" (this machine's health and open findings).
 
