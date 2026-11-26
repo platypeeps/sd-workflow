@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import quote, unquote, urlsplit
 
-from sd_lib import git_output, import_sd_db, main_worktree_root
+from sd_lib import git_output, git_show, import_sd_db, main_worktree_root
 
 
 def dashboard_config(environ: Mapping[str, str]) -> Path:
@@ -948,6 +948,27 @@ def _into_trash(target: Path, trash: Path) -> tuple[str, str]:
     return "trashed", "obsidian: trashed %s -> %s" % (target, place)
 
 
+def committed_source(repo: Path, src: str, rev: str) -> tuple[str | None, str]:
+    """`(text, revision)`: the file as commit `rev` holds it, or `(None,
+    "uncommitted")` when that commit holds no regular file there.
+
+    The vault copy names its revision, so it carries that commit's bytes,
+    not a working-tree edit made since (sd:10629). A file the commit lacks,
+    or holds as a link or submodule, is written from disk and names none.
+    """
+    if rev == "unknown":  # not a checkout: nothing to record, as before
+        return None, rev
+    listed = git_output(["ls-tree", rev, "--", src], repo)
+    if listed and "\n" not in listed and listed.split(" ", 1)[0] in ("100644", "100755"):
+        try:
+            text = git_show(repo, "%s:./%s" % (rev, src))
+        except UnicodeDecodeError:
+            text = None
+        if text is not None:
+            return text, rev
+    return None, "uncommitted"
+
+
 def write_obsidian(repo: Path, docs: list[dict[str, Any]],
                    wrote: list[dict[str, Any]] | None = None,
                    channels: dict[str, dict[str, str]] | None = None) -> list[str]:
@@ -998,12 +1019,13 @@ def write_obsidian(repo: Path, docs: list[dict[str, Any]],
         out = str(cfg.get("out", "")).strip()
         if not src or not out:
             continue
-        source = repo / src
-        try:
-            body = source.read_text(encoding="utf-8")
-        except OSError as problem:
-            reports.append("obsidian: cannot read %s (%s)" % (src, problem))
-            continue
+        body, stamp = committed_source(repo, src, rev)
+        if body is None:
+            try:
+                body = (repo / src).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as problem:
+                reports.append("obsidian: cannot read %s (%s)" % (src, problem))
+                continue
         # Frontmatter, not a prose header: Obsidian reads these as properties,
         # so the provenance is queryable in the vault rather than being a line
         # a reader has to notice. Written by this tool on every render, so it
@@ -1014,7 +1036,7 @@ def write_obsidian(repo: Path, docs: list[dict[str, Any]],
             "source_repo: %s" % home.name,
             "source_checkout: %s" % checkout,
             "source_path: %s" % src,
-            "revision: %s" % rev,
+            "revision: %s" % stamp,
             "rendered_by: sd-research-kit",
             "---",
             "",

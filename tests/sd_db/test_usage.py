@@ -78,6 +78,44 @@ class TheVerb(UsageCase):
         self.assertEqual((assignments[0]["usd"], assignments[0]["estimated"]), (2.0, 1))
 
     @hub_only
+    def test_it_reports_token_use_by_area(self):
+        """Builder runs (role author) are coding, reviewer calls review (sd:10307)."""
+        self.month()
+        found = reads.usage_month(self.db, month="2026-09")
+        self.assertEqual([(area["area"], area["calls"], area["tokens_out"]) for area in found.areas],
+                         [("coding", 2, 0), ("review", 1, 20)])
+        completed = self.sd_db("usage", "--month", "2026-09")
+        self.assertIn("areas:\n  coding: 2 call(s), spent $5.00, tokens 0 in / 0 out\n"
+                      "  review: 1 call(s), spent $0.50, tokens 10 in / 20 out\n", completed.stdout)
+
+    def test_a_draft_runs_tokens_are_design_not_coding(self):
+        """A specification draft is an author run on a `draft` assignment;
+        its tokens are not coding's (sd:10307 review)."""
+        draft = self.assignment()
+        self.db.execute("UPDATE assignment SET scope = 'draft' WHERE id = ?", (draft,))
+        writes.record_cost(self.db, source="run", role="author", assignment=draft, tokens_in=7, tokens_out=900,
+                           usd=4.0)
+        writes.record_cost(self.db, source="run", role="author", assignment=self.assignment(), tokens_in=3,
+                           tokens_out=50, usd=1.0)
+        found = reads.usage_month(self.db)
+        self.assertEqual([(area["area"], area["calls"], area["spent"], area["tokens_in"], area["tokens_out"])
+                          for area in found.areas],
+                         [("coding", 1, 1.0, 3, 50), ("design", 1, 4.0, 7, 900)])
+
+    def test_area_totals_past_sqlite_integers_keep_the_report(self):
+        """Two providers' author rows whose token sum passes SQLite's
+        64-bit range: each provider group holds, so the area total
+        must too (sd:10307 lane review)."""
+        big = 2**63 - 1
+        for provider, tokens in (("kimi", big), ("mini", 1)):
+            writes.record_cost(self.db, source="run", provider=provider, role="author",
+                               assignment=self.assignment(), tokens_in=tokens, tokens_out=tokens, usd=1.0)
+        found = reads.usage_month(self.db)
+        self.assertEqual([(area["area"], area["calls"], area["spent"], area["tokens_in"], area["tokens_out"])
+                          for area in found.areas],
+                         [("coding", 2, 2.0, big + 1, big + 1)])
+
+    @hub_only
     def test_json_is_the_read_byte_for_byte(self):
         self.month()
         completed = self.sd_db("usage", "--month", "2026-09", "--json")

@@ -602,8 +602,8 @@ class DoneResolvesOpenNotes(WorkflowCase):
         self.assertEqual(self.notes(item), {note: ("followup", False) for note in machine})
 
     def test_a_close_leaves_a_post_merge_followup_open_and_kept(self):
-        """sd:10407 B2: done resolved `Post-merge: ` before any target passed; only a passing
-        refresh answers it (sd:10529). It blocks no close, and Today keeps it."""
+        """sd:10407 B2: done resolved `Post-merge: ` before any target passed; only a covering
+        pass answers it (`resolve_post_merge`). It blocks no close, and Today keeps it."""
         cases: tuple[tuple[str | None, bool], ...] = ((None, False), ("none", False), (None, True), ("named", False))
         for followups, asked in cases:
             with self.subTest(followups=followups, resolve_followups=asked):
@@ -649,6 +649,65 @@ class DoneResolvesOpenNotes(WorkflowCase):
                 self.db.commit()
             with self.subTest(body=body), self.assertRaises(TransitionRefused):
                 change_status(self.db, item, "done", who="operator")
+
+    def test_a_passing_post_merge_resolves_its_repositorys_earlier_ones(self):
+        """sd:10406: a refresh refused while a lane held its lock filed a followup on every merge,
+        each answered by the next refresh that passed. A pass answers one only when it holds the
+        merge the followup names. Class pass: one that names none is unknown, never guessed from
+        the item's recorded deliveries, so no pass resolves it."""
+        from sd_db.workflow import resolve_post_merge
+        upsert_repo(self.db, "/repos/example")
+        upsert_repo(self.db, "/repos/other")
+        covered, newer = "a" * 40, "b" * 40
+        failure = "Post-merge: make post-merge failed (exit 2)"
+        earlier = create_item(self.db, kind="task", title="Earlier", repo="/repos/example", status="done")
+        later = create_item(self.db, kind="task", title="Later", repo="/repos/example", status="done")
+        unknown = create_item(self.db, kind="task", title="No stamp", repo="/repos/example", status="done")
+        landed = create_item(self.db, kind="task", title="Landed", repo="/repos/example", status="done")
+        elsewhere = create_item(self.db, kind="task", title="Other", repo="/repos/other", status="done")
+        add_note(self.db, unknown, "comment", f"Code delivery https://example.test/pull/2 at {covered}")
+        failed = add_note(self.db, earlier, "followup", f"{failure}\nMerged at {covered}", session=LANE_SESSION)
+        person = add_note(self.db, earlier, "followup", "Check the refresh by hand")
+        pasted = add_note(self.db, earlier, "followup", f"Post-merge: by hand\nMerged at {covered}", session="operator")
+        pinned = add_note(self.db, later, "followup", f"{failure}\nMerged at {newer}", session=LANE_SESSION)
+        bare = [add_note(self.db, unknown, "followup", body, session=LANE_SESSION) for body in (
+            failure, f"{failure}\nMerged at {covered}\nMerge commit not recorded", f"{failure}\nMerged at {covered[:39]}",
+            f"{failure} Merged at {covered}", f"{failure}\nMerged at {covered}\n")]
+        foreign = add_note(self.db, elsewhere, "followup", f"{failure}\nMerged at {covered}", session=LANE_SESSION)
+        owed = lambda item: {note: row for note, row in self.notes(item).items() if row[0] == "followup"}  # noqa: E731
+
+        def holds(commit: str) -> bool:
+            return commit == covered
+
+        self.assertEqual(resolve_post_merge(self.db, [landed], holds), [failed])
+        self.assertEqual(owed(earlier), {failed: ("followup", False), person: ("followup", True),
+                                         pasted: ("followup", True)})
+        self.assertEqual(owed(later), {pinned: ("followup", True)})
+        self.assertEqual(owed(unknown), {note: ("followup", True) for note in bare})
+        self.assertEqual(owed(elsewhere), {foreign: ("followup", True)})
+        self.assertEqual(resolve_post_merge(self.db, [landed], holds), [])
+        self.assertEqual(resolve_post_merge(self.db, [], holds), [])
+        self.assertEqual(resolve_post_merge(self.db, [landed], lambda commit: True), [pinned])
+        self.assertEqual(owed(unknown), {note: ("followup", True) for note in bare})
+
+    def test_a_followup_naming_its_merge_is_answered_only_by_a_pass_that_holds_it(self):
+        """Round 2: the item's latest recorded delivery stood for each followup, so a pass at an
+        older pin answered a newer merge's failure whose delivery note had not landed yet."""
+        from sd_db.workflow import resolve_post_merge
+        upsert_repo(self.db, "/repos/example")
+        older, newer = "a" * 40, "b" * 40
+        item = create_item(self.db, kind="task", title="Twice", repo="/repos/example", status="done")
+        add_note(self.db, item, "comment", f"Code delivery https://example.test/pull/1 at {older}")
+        fresh = add_note(self.db, item, "followup", f"Post-merge: make post-merge failed (exit 2)\nMerged at {newer}",
+                         session=LANE_SESSION)
+        self.assertEqual(resolve_post_merge(self.db, [item], lambda commit: commit == older), [])
+        self.assertEqual(resolve_post_merge(self.db, [item], lambda commit: commit == newer), [fresh])
+        again = create_item(self.db, kind="task", title="Again", repo="/repos/example", status="done")
+        add_note(self.db, again, "comment", f"Code delivery https://example.test/pull/2 at {older}")
+        first = add_note(self.db, again, "followup", f"Post-merge: make post-merge failed (exit 2)\nMerged at {older}",
+                         session=LANE_SESSION)
+        add_note(self.db, again, "comment", f"Code delivery https://example.test/pull/3 at {newer}")
+        self.assertEqual(resolve_post_merge(self.db, [again], lambda commit: commit == older), [first])
 
     def test_resolve_followups_is_exactly_a_bool(self):
         item = self.capture()["item"]["id"]
