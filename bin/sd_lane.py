@@ -996,14 +996,14 @@ def work_left(now: bool, revert: bool, held: list[tuple[bool, bool | None]], bac
     `now` says its files read as before the cited commit, `revert` that its
     subject is a revert's, and `held` gives each parent's own reading and
     verdict. `back` answers whether the files read as the cited commit left
-    them; `forked_in` whether its two parents forked with the work in.
+    them; `forked_in` whether its parents, two or more, forked with the work in.
 
     Files that do not read as before hold the work when no parent had it
     out, when a merged parent holds it, or when they are `back`. Any other
     content at the path is not the work: the parents' verdict stands.
     Files that read as before are carried from the parents when all had the
-    work out, or when a merge's two lines forked with it in: one side
-    reverted it. Forked without it, the other side put it back, and the
+    work out, or when a merge's lines, two or more, all forked with it in:
+    one side reverted it. Forked without it, the other side put it back, and the
     merge took it out itself, as any commit no parent explains: its own
     subject decides. A carry from a parent with other content at the path
     needs this commit to be a revert too, or the close is kept.
@@ -1011,7 +1011,7 @@ def work_left(now: bool, revert: bool, held: list[tuple[bool, bool | None]], bac
     out = [(was, verdict) for was, verdict in held if verdict is not None]
     if not now:
         return None if not out or len(out) < len(held) or back() else all(verdict for _, verdict in out)
-    if out and (len(out) == len(held) or (len(held) == 2 and forked_in())):
+    if out and (len(out) == len(held) or (len(held) > 1 and forked_in())):
         return all(verdict and (was or revert) for was, verdict in out)
     return revert
 
@@ -1190,7 +1190,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             held = [parent for parent in parents[later] if parent in left]
 
             def forked_in(held: list[str] = held) -> bool:
-                forked = (lane_git(worktree, "merge-base", *held) or "").strip()
+                forked = (lane_git(worktree, "merge-base", "--octopus", *held) or "").strip()
                 return forked in left and left[forked] is None
 
             def back(later: str = later) -> bool:

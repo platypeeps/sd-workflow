@@ -3888,6 +3888,38 @@ class CitedCloses(SharedQueue):
                 kept = sd_lane.unreverted(tree, head, commits, "main")
                 self.assertEqual([sha for sha, message in kept if f"sd:{a}" in message], [])
 
+    def test_a_three_parent_merge_that_keeps_a_revert_closes_nothing_it_undid(self) -> None:
+        """sd:10214 review: an octopus merge of a revert and two lines that still hold the work, forked with
+        it in, carries the revert, as a two-parent merge does; its own subject is no revert's."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-octopus-keeps-revert")
+        (tree / "work.txt").write_text("the reader\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        base = git(tree, "rev-parse", "HEAD")
+        lines = []
+        for name in ("one.txt", "two.txt"):
+            git(tree, "checkout", "-q", "--detach", base)
+            (tree / name).write_text(f"{name}\n", encoding="utf-8")
+            git(tree, "add", name)
+            git(tree, "commit", "-q", "-m", f"docs: {name}")
+            lines.append(git(tree, "rev-parse", "HEAD"))
+        for revert_first in (True, False):
+            with self.subTest(revert_first=revert_first):
+                git(tree, "checkout", "-q", "--detach", base)
+                git(tree, "rm", "-q", "work.txt")
+                git(tree, "commit", "-q", "-m", "revert: hold the reader")
+                reverted = git(tree, "rev-parse", "HEAD")
+                first, *rest = [reverted, *lines] if revert_first else [lines[0], reverted, lines[1]]
+                git(tree, "checkout", "-q", "--detach", first)
+                git(tree, "merge", "-q", "--no-ff", "-m", "Merge the three lines", *rest)
+                self.assertEqual(len(git(tree, "rev-list", "--parents", "-n", "1", "HEAD").split()), 4)
+                git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{b}")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertFalse((tree / "work.txt").exists())
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
+
     def test_a_merge_of_two_partial_reverts_closes_nothing_it_undid(self) -> None:
         """sd:10214 review: each side of a merge reverts one of the cited commit's two files; the merge carries
         both removals, so reverts alone took all the work out, though neither side read as before on its own."""
