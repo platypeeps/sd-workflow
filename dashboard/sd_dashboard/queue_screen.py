@@ -390,23 +390,37 @@ def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[st
     return lines, hashlib.sha256(json.dumps([*review, lines]).encode()).hexdigest()[:16]
 
 
-#: sd:10814: each failed row's review fields, keyed by its lane, item, head and prepare log (path, mtime): they move
-#: only when a retry makes a new entry or a rebut through this page, which `forget` drops. Only a template that
-#: answered is kept, so a timed-out adjudicate is asked again on the next build.
+#: sd:10814: each failed row's review fields, keyed by its lane, item, head, prepare log (path, mtime) and the store's
+#: review generation (`_review_generation`): a retry writes a new log, and a review run again or an adjudication
+#: from the CLI writes a `ship` checkpoint; `forget` drops them after a page write. Only a template that answered
+#: is kept, so a timed-out adjudicate is asked again on the next build.
 _REVIEWS: dict[tuple, dict] = {}
 #: The most `_REVIEWS` keeps before it starts again: a lane holds a few failed rows.
 REVIEWS_KEPT = 512
 
 
-def _review_fields(entry: dict, lane: Path) -> dict:
-    """`_read_review_fields`, kept per entry in `_REVIEWS` while its prepare log is unchanged (sd:10814)."""
+def _review_generation(connection) -> int | None:
+    """The newest `ship:` or `ship-adjudication:` checkpoint's id: a review saved, run again or adjudicated, from
+    this page or the CLI, moves it. 0 for none; None when the store did not answer, so nothing is kept."""
+    try:
+        row = connection.execute("SELECT max(id) FROM state WHERE kind = 'checkpoint' AND (key >= 'ship:' "
+                                 "AND key < 'ship;' OR key >= 'ship-adjudication:' "
+                                 "AND key < 'ship-adjudication;')").fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row[0] or 0) if row else None
+
+
+def _review_fields(entry: dict, lane: Path, generation: int | None = None) -> dict:
+    """`_read_review_fields`, kept per entry in `_REVIEWS` while its prepare log and the store's reviews are
+    unchanged (sd:10814); read afresh when `generation` is None."""
     log = str(entry.get("prepare_log") or "")
     try:
-        mtime = os.stat(log).st_mtime_ns if log else None
+        mtime = os.stat(log).st_mtime_ns if log and generation is not None else None
     except OSError:
         mtime = None
     key = (str(lane), entry.get("item"), str(entry.get("expected_head") or ""), str(entry.get("worktree") or ""),
-           log, mtime)
+           log, mtime, generation)
     # A worktree gone since is no row to rebut: `_here` is read on every build, the kept answer only beside it.
     kept = _REVIEWS.get(key) if mtime is not None and _here(entry) else None
     if kept is not None:
@@ -555,10 +569,12 @@ def shots(entry: dict, lane: Path) -> dict:
     return found
 
 
-def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozenset | set = frozenset()) -> list[dict]:
+def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozenset | set = frozenset(),
+         reviews: int | None = None) -> list[dict]:
     """The lane's rows in page order: merging, next, building, blocked, cancelled, landed.
 
-    `done` holds the items that are `done` in the database: none of them is a blocked row (sd:5847).
+    `done` holds the items that are `done` in the database: none of them is a blocked row (sd:5847). `reviews` is
+    `_review_generation`'s answer; None reads each failed row's review afresh.
     """
     today = time.strftime("%Y-%m-%d", time.localtime(now))
     merging, following, blocked, cancelled, landed = [], [], [], [], []
@@ -593,7 +609,7 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
                 # The log of the step that failed: a merge failure's prepare log is of a prepare that passed (sd:8601).
                 log = entry.get("merge_log" if entry.get("step") == "merge" else "prepare_log")
                 failed = {"branch": entry.get("branch"), "unchanged": _unchanged(entry), "failure": _failure(entry, lane),
-                          "log": str(log or "") or None, **_review_fields(entry, lane)
+                          "log": str(log or "") or None, **_review_fields(entry, lane, reviews)
                           } if status == "failed" else {}
                 blocked.append({**base, "state": "blocked", "status": status, "step": entry.get("step"),
                                 "reason": reason, "who": who, "finished": entry.get("finished_at"),
@@ -766,6 +782,7 @@ def document(connection, *, now: str = "") -> dict:
         answers.update(zip(left, pool.map(lane_list, left), strict=True))
         gates, probe = gates.result(), probe.result()
     lanes, root = [], None
+    generation = _review_generation(connection)  # read once, before the lanes' rows (sd:10814)
     for path, answer in answers.items():
         if not answer.get("ok") or not isinstance(answer.get("queue"), str):
             problems.append({"repo": path, "key": managed[path]["path"],
@@ -775,7 +792,7 @@ def document(connection, *, now: str = "") -> dict:
         root = root or lane.parent.parent
         entries = answer.get("entries") or []
         # pack sd:6016: the realm tab that lists the lane, its checkout's realm (None: the realm list was not read).
-        shown = rows(entries, path=path, lane=lane, now=clock, done=closed(connection, entries))
+        shown = rows(entries, path=path, lane=lane, now=clock, done=closed(connection, entries), reviews=generation)
         for row in shown:
             if row["state"] == "blocked" and row["status"] == "failed":
                 row["fix"] = lane_fix_state(connection, row["branch"])
