@@ -3105,6 +3105,26 @@ def recorded_base(root: pathlib.Path, result: dict[str, Any], head: str, verifie
     return str(result["covers_from"])
 
 
+def unrecorded_reason(result: dict[str, Any], head: str, current: str, branch: str | None,
+                      imported: Any, binding: dict | None) -> str | None:
+    """The first condition that keeps a passing review from its lane receipt (sd:10380): one reason each,
+    so a lane host's missing receipt names its cause. `binding` must be the review's own, read again now."""
+    short, reviewed = result.get("review_shortfall"), result.get("binding") or {}
+    requested, completed = result.get("requested_reviews", 0), result.get("completed_reviews", 0)
+    moved = sorted(k for k in set(binding or {}) | set(reviewed) if (binding or {}).get(k) != reviewed.get(k))
+    for failed, reason in (
+            (not 1 <= requested <= completed or short, f"the review fell short of its policy: {completed} of "
+             f"{requested} requested reviews completed{', shortfall ' + json.dumps(short) if short else ''}"),
+            (not current, "origin is not one github.com repository, or HEAD does not read"),
+            (current != head, f"HEAD moved from {head[:12]} to {current[:12]}"), (not branch, "HEAD is on no branch"),
+            (imported.module is None, f"the workflow database module does not import: {imported.problem}"),
+            (binding is None, "the review binding does not read"),
+            (moved, f"the review binding changed during the review: {', '.join(moved)}")):
+        if failed:
+            return reason
+    return None
+
+
 def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dict[str, Any],
                        env: Mapping[str, str]) -> None:
     """Record a passing plain `--scope branch` review of HEAD, so lane prepare can skip its own (sd:5988).
@@ -3115,16 +3135,16 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
     status = result.get("status")
     verified = bool(getattr(args, "verify_report", None) and getattr(args, "base", None))
     if (args.scope != "branch" or status not in ("clean", "advisory") or any(
-            getattr(args, name, None) for name in UNRECORDED_OPTIONS if not (verified and name in ("base", "verify_report")))
-            or not 1 <= result.get("requested_reviews", 0) <= result.get("completed_reviews", 0) or result.get("review_shortfall")):
+            getattr(args, name, None) for name in UNRECORDED_OPTIONS if not (verified and name in ("base", "verify_report")))):
         return
-    head = result["subject"]["head"]
     try:
+        head = result["subject"]["head"]
         owner, name, current = sd_lib.github_head(root) or ("", "", "")
         branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root)
-        binding, library = sd_lib.lead_review_binding(root), sd_lib.import_sd_db().module
-        if current != head or not branch or not (None is not binding == result.get("binding")) or library is None:  # read, and the review's own
-            raise Refusal("HEAD moved, is on no branch or no GitHub origin, or the binding changed or the database does not read")
+        imported, binding = sd_lib.import_sd_db(), sd_lib.lead_review_binding(root)
+        library = imported.module
+        if reason := unrecorded_reason(result, head, current, branch, imported, binding):
+            raise Refusal(reason)
         base = recorded_base(root, result, head, verified)
         copilot = (result.get("remote_reviews") or {}).get("copilot") or {}
         with contextlib.closing(library.connect(args.database or library.default_path(env.get("HOME")))) as connection:
