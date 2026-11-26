@@ -4193,20 +4193,27 @@ class CitedCloses(SharedQueue):
         a, *_ = self.open
         original = "".join(f"line {n}\n" for n in range(20))
         fixed = original.replace("line 7\n", "line 7 fixed\n")
+        cleaned = fixed.replace("line 3\n", "line 3 tidy\n").replace("line 12\n", "line 12 tidy\n")
         for case, (old_text, new_text, closes) in {
                 "reverted": (original, "unrelated text\n", set()),
                 "kept": (fixed, original, {a}),
                 # Class pass 14: the fix kept at the new name with one more edit still ships; the old
                 # content there with one more edit does not.
                 "edited": (original, fixed + "one more line\n", {a}),
-                "edited-old": (original, original + "one more line\n", set())}.items():
+                "edited-old": (original, original + "one more line\n", set()),
+                # The ruling on class pass 14: the fix's content decides, not a line count. An inline edit
+                # of the fixed line keeps the work; the old line back beside the fix's cleanups does not.
+                "inline": (original, fixed.replace("line 7 fixed\n", "line 7 fixed # note\n"), {a}),
+                "cleanups-kept": (original, cleaned.replace("line 7 fixed\n", "line 7\n"), set()),
+                "fix-deleted": (original, fixed.replace("line 7 fixed\n", ""), set())}.items():
             with self.subTest(case=case):
+                cited = cleaned if case == "cleanups-kept" else fixed
                 tree, _ = self.committed(f"topic-stale-rename-{case}")
                 git(tree, "fetch", "-q", "origin")
                 git(tree, "reset", "-q", "--hard", "origin/main")
                 if not (tree / "x.txt").exists():  # the second case builds on the first's main
                     self.on_main(tree, {"x.txt": original})
-                (tree / "x.txt").write_text(fixed, encoding="utf-8")
+                (tree / "x.txt").write_text(cited, encoding="utf-8")
                 git(tree, "commit", "-q", "-am", f"fix: line 7\n\nCloses: sd:{a}")
                 git(tree, "mv", "x.txt", "y.txt")
                 git(tree, "commit", "-q", "-m", "refactor: rename x to y")

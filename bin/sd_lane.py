@@ -248,8 +248,10 @@ speculative gate still waiting at the run's deadline is cancelled.
 from __future__ import annotations
 
 import calendar
+import collections
 import contextlib
 import dataclasses
+import difflib
 import fcntl
 import functools
 import hashlib
@@ -1016,6 +1018,33 @@ def work_left(now: bool, revert: bool, held: list[tuple[bool, bool | None]], bac
     return revert
 
 
+def holds_fix(old: list[str], fixed: list[str], text: list[str]) -> bool:
+    """Whether `text` holds the content `fixed` changed in `old` (sd:10214, the ruling on class pass 14: the
+    fix's content decides, not a count of lines). Each place the fix changed must hold: the lines it took
+    out stay out there, the lines it wrote there stand, edited or not, and the lines around the place are
+    kept; a place it only added to needs the added lines. So an edit of the fixed line keeps the work, and
+    the old line back, or the fixed line deleted, does not."""
+    edits = [(tag, i1, i2) for tag, i1, i2, _, _ in
+             difflib.SequenceMatcher(None, old, text, autojunk=False).get_opcodes() if tag != "equal"]
+    gone = {at for _, i1, i2 in edits for at in range(i1, i2)}
+    rewritten = {at for tag, i1, i2 in edits if tag == "replace" for at in range(i1, i2)}
+    return all(fix_place_holds(tag, set(range(i1, i2)), [at for at in (i1 - 1, i2) if 0 <= at < len(old)],
+                               collections.Counter(fixed[j1:j2]) - collections.Counter(text), gone, rewritten)
+               for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, fixed, autojunk=False).get_opcodes()
+               if tag != "equal")
+
+
+def fix_place_holds(tag: str, place: set[int], around: list[int], missing: collections.Counter[str],
+                    gone: set[int], rewritten: set[int]) -> bool:
+    """One place `holds_fix` reads: `place` the old lines the fix changed, `around` the lines beside them,
+    `missing` the fix's lines the text lacks; `gone` and `rewritten` the old lines the text took out."""
+    if not place:  # the fix only added here
+        return not missing
+    # ponytail: a place with no line around it, or an added line edited, reads as undone (a lost close,
+    # fixed by hand). Read the edit's lineage if that matters.
+    return place <= (rewritten if tag == "replace" else gone) and bool(around) and not gone & set(around)
+
+
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
                base: str = "") -> list[tuple[str, str]]:
     """`commits` (newest first), each cited one a later hand-written revert undid with its message emptied (sd:8373).
@@ -1106,15 +1135,18 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             at += 1 + names
         return found
 
-    def apart(one: str | None, other: str | None) -> int | None:
-        """How many lines differ between two entries (`blobs`); None when git counts none: an absent entry,
-        a binary file or a failed read."""
-        if not one or not other:
+    def lines(entry: str | None) -> list[str] | None:
+        """The lines of a text entry (`blobs`); None for an absent entry, a binary file or a failed read."""
+        try:  # a file that is not UTF-8 text decodes to no answer
+            done = publish_git(worktree, "cat-file", "blob", entry.split()[-1]) if entry else None
+        except ValueError:
             return None
-        if one == other:
-            return 0
-        counted = (lane_git(worktree, "diff", "--numstat", one.split()[-1], other.split()[-1]) or "").split()[:2]
-        return int(counted[0]) + int(counted[1]) if len(counted) == 2 and all(n.isdigit() for n in counted) else None
+        return done.stdout.splitlines() if done and done.returncode == 0 and "\0" not in done.stdout else None
+
+    def keeps_fix(entry: str | None, fix: str | None, before: str | None) -> bool:
+        """Whether `entry` holds what the cited commit's `fix` changed in `before` (`holds_fix`)."""
+        text, fixed, old = lines(entry), lines(fix), lines(before)
+        return text is not None and fixed is not None and old is not None and holds_fix(old, fixed, text)
 
     def reads_before(where: dict[str, str], rev: str, names: list[str], before: str,
                      home: dict[str, str] | None = None, cited: str = "") -> bool | None:
@@ -1131,8 +1163,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         `cited`, the commit that left the work, both names are read there.
         Either reading as `cited` left the file holds the work. Else one must
         read as `before` held it, and the other holds the work only while it
-        reads nearer (`apart`) to what `cited` left than to `before`: the fix
-        with one more edit ships, other text does not (class passes 13, 14).
+        holds what `cited` changed (`keeps_fix`): the fix with one more edit
+        ships, the old lines or other text do not (class passes 13, 14).
         """
         home = home or {}
         held = [where.get(name, name) for name in names]
@@ -1150,10 +1182,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 if (fix.get(name) is not None and fix[name] in found) or want.get(name) not in found:
                     return False
                 found.remove(want.get(name))
-                # ponytail: nearness is a count of differing lines; a binary file, which git counts no lines
-                # of, reads as undone (a lost close, fixed by hand). Read the edit's lineage if that matters.
-                near, far = apart(found[0], fix.get(name)), apart(found[0], want.get(name))
-                return near is None or far is None or near >= far
+                return not keeps_fix(found[0], fix.get(name), want.get(name))
             return now.get(at) == want.get(name)
         return all(one(at, name) for at, name in zip(held, names, strict=True))
 
