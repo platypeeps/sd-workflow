@@ -68,12 +68,14 @@ class RepeatFixture(ReviewFixture):
 
     def adjudication(self, *rows: tuple[str, str, str], branch: str = BRANCH, repository: str = REPOSITORY,
                      head: Any = "", days: float = 0.5, prefix: str = "ship-adjudication:", key: str = "k",
-                     line: Any = 3, instances: Any = None) -> None:
+                     line: Any = 3, instances: Any = None, ruled: str | None = None) -> None:
         """One `sd-ship adjudicate` record: each (summary, disposition, reason) a blocking finding's answer,
-        at the reviewed head unless `head` names another."""
+        at the reviewed head unless `head` names another; `ruled`: a build ruling's, judging that evidence."""
         findings = [{"index": index, "finding_digest": "0" * 64, "response_disposition": answer, "reason": reason,
                      "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "instances": instances or [f"bin/tool.py:{line}"], "summary": summary,
-                                     "family": "correctness", "disposition": "blocking"}}
+                                     "family": "correctness", "disposition": "blocking",
+                                     **({} if ruled is None else {"evidence": ruled})},
+                     **({} if ruled is None else {"ruled": True})}
                     for index, (summary, answer, reason) in enumerate(rows, 1)]
         bindings = {"repository": repository, "branch": branch, "head": head if head != "" else self.head}
         self.write_row(f"{prefix}{key}", {"decision": "accepted", "proposal": {
@@ -1085,6 +1087,13 @@ class RepeatRuleTests(unittest.TestCase):
         long = sd_review.parse_findings(json.dumps({"findings": [row(evidence="x" * 50_000)]}))
         assert long is not None
         self.assertEqual(len(long.findings[0]["evidence"]), sd_review.EVIDENCE_CHARS)
+        # Review of sd:10286 (bin/sd-review:1799): two repros that share the kept prefix stay two, or a
+        # ruling on one holds back the other in the build and the lane alike.
+        shared = "python3 t.py --input " + "a" * 2000
+        cut = [sd_review.parse_findings(json.dumps({"findings": [row(evidence=shared + tail)]})) for tail in "12"]
+        self.assertNotEqual(*(answer.findings[0]["evidence"] for answer in cut if answer is not None))
+        self.assertEqual({len(answer.findings[0]["evidence"]) for answer in cut if answer is not None},
+                         {sd_review.EVIDENCE_CHARS})
         nested = sd_review.parse_findings(json.dumps({"findings": [row(evidence={"command": {"argv": ["git"]}})]}))
         assert nested is not None
         self.assertEqual(sd_review.dispose(nested.findings, "high", self.REBUTTED)[0]["disposition"], "advisory")
@@ -1497,6 +1506,24 @@ class RebuttalScopeTests(RepeatFixture):
                 seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
                                                    self.environment())
                 self.assertEqual([entry.text for entry in seen if entry.listed], [])
+
+    def test_a_ruling_lapses_on_any_later_change_of_the_branch(self) -> None:
+        """Review of sd:10286 (bin/sd-review:919): a ruling judged the code at its head; a later commit to a
+        file it does not name (a new caller) can make the crash reachable, yet the ruling held its cited
+        repeat. A ruling holds only while the branch has no change of its own since its head."""
+        self.adjudication(("lane claim", "rebutted", "x"), ruled="the repro")
+        def ruled(scope: str) -> list[Any]:
+            seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                               self.environment())
+            return [entry.ruled for entry in seen]
+        self.assertEqual(ruled("branch"), ["the repro"])
+        (self.root / "caller.py").write_text("import tool\n", encoding="utf-8")
+        self.assertEqual(ruled("worktree"), [None], "an uncommitted caller kept the ruling")
+        self.commit("add", "caller.py")
+        self.commit("a new caller")
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                self.assertEqual(ruled(scope), [None], "a later commit kept the ruling")
 
     def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))
