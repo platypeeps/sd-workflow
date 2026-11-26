@@ -4074,6 +4074,29 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
+    def test_a_plain_text_copy_of_a_reverted_executable_closes_nothing(self) -> None:
+        """sd:10214 review: a revert that removes a cited executable and keeps its text in a plain file took
+        the work out: the copy does not run. The same text in an executable file still keeps the close."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-executable-copied-as-text")
+        script = "".join(f"echo step {n}\n" for n in range(20))
+        (tree / "run.sh").write_text(script, encoding="utf-8")
+        (tree / "run.sh").chmod(0o755)
+        git(tree, "add", "run.sh")
+        git(tree, "commit", "-q", "-m", f"feat: the runner\n\nCloses: sd:{a}")
+        start = git(tree, "rev-parse", "HEAD")
+        for executable, expected in ((False, set()), (True, {a})):
+            with self.subTest(executable=executable):
+                git(tree, "checkout", "-q", "--detach", start)
+                git(tree, "rm", "-q", "run.sh")
+                (tree / "notes.txt").write_text("# notes\n" + script, encoding="utf-8")
+                (tree / "notes.txt").chmod(0o755 if executable else 0o644)
+                git(tree, "add", "notes.txt")
+                git(tree, "commit", "-q", "-m", "revert: keep the runner as notes")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), expected)
+
     def on_main(self, tree: pathlib.Path, files: dict[str, str]) -> None:
         """`files` committed on the branch and pushed as `origin/main`, the merge base."""
         for name, text in files.items():

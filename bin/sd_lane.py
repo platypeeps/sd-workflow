@@ -1078,12 +1078,19 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                                             (line.partition("\t") for line in listed if line)}
 
     def renames_since(sha: str, rev: str) -> dict[str, str] | None:
-        """Where `rev` holds each file of `sha` that a commit between them renamed."""
-        status = fields("diff", "-M", "--name-status", "-z", sha, rev)
+        """Where `rev` holds each file of `sha` that a commit between them renamed. A pair of two modes is
+        no rename: a plain-text copy of an executable does not run (sd:10214 review)."""
+        status = fields("diff", "-M", "--raw", "-z", sha, rev)
         if status is None:
             return None
-        return {status[at + 1]: status[at + 2] for at, field in enumerate(status[:-2])
-                if field[:1] == "R" and field[1:].isdigit()}
+        found, at = {}, 0
+        while at < len(status) and status[at].startswith(":"):  # `:old new blob blob status`, then the names
+            meta = status[at].split()
+            names = 2 if meta[-1][:1] in "RC" else 1
+            if meta[-1][:1] == "R" and meta[0][1:] == meta[1] and at + 2 < len(status):
+                found[status[at + 1]] = status[at + 2]
+            at += 1 + names
+        return found
 
     def reads_before(sha: str, rev: str, names: list[str], before: str,
                      home: dict[str, str] | None = None) -> bool | None:
@@ -1120,9 +1127,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             return None
         return b"\n" + b"\n".join(done.stdout.splitlines()) + b"\n" if done.returncode == 0 else None
 
-    def changed_since(sha: str, skip: list[str], before: str) -> list[tuple[bytes, bytes]] | None:
-        """Each other file `head` changed since `sha` and holds otherwise than `before` did, as its text now
-        and at `before` (empty where `before` lacks it); None when git gave no answer."""
+    def changed_since(sha: str, skip: list[str], before: str) -> list[tuple[str, bytes, bytes]] | None:
+        """Each other file `head` changed since `sha` and holds otherwise than `before` did, as its mode and
+        text now and its text at `before` (empty where `before` lacks it); None when git gave no answer."""
         changed = fields("diff", "--no-renames", "--name-only", "-z", sha, head)
         others = [path for path in changed or [] if path and path not in skip]
         now, then = blobs(head, others), blobs(before, others)
@@ -1135,7 +1142,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 held, had = run_of_lines(head, path), run_of_lines(before, path) if path in then else b""
                 if held is None or had is None:
                     return None
-                pairs.append((held, had))
+                pairs.append((now[path].split()[0], held, had))
         return pairs
 
     def copied(sha: str, names: list[str], before: str) -> bool | None:
@@ -1143,7 +1150,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         the cited commit left there, as one exact run of lines, and did not at `before`; None when git gave
         no answer. A revert that moves the fixed file into a new or an existing file and puts the old one
         back took nothing out (sd:10214 lane review). Part of that text is not the work: a line the fix
-        added, found in another file, proves no move (class pass 7)."""
+        added, found in another file, proves no move (class pass 7), nor is the text in a file of another
+        mode: a plain copy of an executable does not run."""
         own = blobs(sha, names)
         pairs = changed_since(sha, names + [moved[name] for name in names if name in moved], before)
         if own is None or pairs is None:
@@ -1154,7 +1162,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             work = run_of_lines(sha, name)
             if work is None:
                 return None
-            if work.strip() and any(work in held and work not in had for held, had in pairs):
+            # Same mode too: a plain-text copy of an executable does not run (sd:10214 review).
+            mode = own[name].split()[0]
+            if work.strip() and any(work in held and work not in had and kept == mode for kept, held, had in pairs):
                 return True
         return False
 
