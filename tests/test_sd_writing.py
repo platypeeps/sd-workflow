@@ -270,6 +270,7 @@ class WritingContentCheckout(unittest.TestCase):
 DRAFT = b"---\ntitle: A\n---\n\n## Draft\n\nProse.\n"
 BRIEF = {"piece": "2026/a", "draft": "content/2026/a/index.md", "research": "content/2026/a/research.md",
          "research_exists": True, "digest": "0123456789ab", "generation": 2, "index_sha256": hashlib.sha256(DRAFT).hexdigest(),
+         "title": "A <b>héadline</b>\nsecond line", "title_sha256": "1" * 64,
          "record": "<!-- adversarial-reviewed: words=150 sentences=0123abcd -->", "words": 150}
 
 
@@ -349,9 +350,12 @@ class WritingReview(unittest.TestCase):
         self.assertEqual(argv[:6] + argv[7:], ["exec", "-s", "read-only", "-C", str(self.repo), "-o", "-"])
         self.assertTrue(argv[6].endswith("report.md"))
         self.assertTrue((self.stubs / "codex.stdin").read_text().startswith("word word"))
+        # sd:10719. After cutover the headline is a row the file does not hold: the reviewer reads it in the prompt.
+        self.assertTrue((self.stubs / "codex.stdin").read_text().endswith(
+            '\nThe headline readers see above this draft: "A <b>héadline</b>\\nsecond line"\n'))
         self.recorded.assert_called_once_with(self.connection, 7, "# Review\n", digest="0123456789ab",
                                               record=BRIEF["record"], generation=2,
-                                              index_sha256=BRIEF["index_sha256"])
+                                              index_sha256=BRIEF["index_sha256"], title_sha256="1" * 64)
         self.connect.assert_called_once_with(sd_db, write=False)
         self.connection.close.assert_called_once()
 

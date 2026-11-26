@@ -6,6 +6,7 @@ import importlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -802,7 +803,8 @@ class ReviewCompanions(WritingCase):
         brief = adversarial_brief(self.db, self.item)
         return brief, record_adversarial(self.db, self.item, report, digest=brief["digest"],
                                          record=brief["record"], generation=brief["generation"],
-                                         index_sha256=brief["index_sha256"])
+                                         index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
 
     def reconcile(self, artifact="adversarial"):
         return reconcile_companion(self.db, self.item, artifact, note="Each finding was checked against the revision.")
@@ -833,7 +835,7 @@ class ReviewCompanions(WritingCase):
         text = (self.folder / "adversarial.md").read_text()
         lines = text.split("\n\n")
         self.assertRegex(lines[0], rf"^<!-- reconciled-with-draft: {brief['digest']} on \d{{4}}-\d\d-\d\d gen=0 "
-                                   rf"index={brief['index_sha256']} -->$")
+                                   rf"index={brief['index_sha256']} title={brief['title_sha256']} -->$")
         self.assertEqual(lines[1], brief["record"])
         self.assertIn("Findings are HYPOTHESES", lines[2])
         self.assertTrue(text.endswith(REPORT))
@@ -850,22 +852,24 @@ class ReviewCompanions(WritingCase):
         brief = adversarial_brief(self.db, self.item)
         between()
         return brief, record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                                         generation=brief["generation"], index_sha256=brief["index_sha256"])
+                                         generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
 
     def test_a_run_attests_its_brief_index_bytes(self):
         self.write_draft(SENTENCES)
         brief, result = self.attested_run()
         self.assertEqual(result["index_sha256"], hashlib.sha256(self.index.read_bytes()).hexdigest())
-        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} -->$")
+        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} title={brief['title_sha256']} -->$")
 
     def test_a_run_refuses_a_missing_or_malformed_index_hash(self):
         self.write_draft(SENTENCES)
         brief = adversarial_brief(self.db, self.item)
-        for extra in ({"index_sha256": None}, {"index_sha256": "abc"}, {"index_sha256": 5},
-                      {"index_sha256": brief["index_sha256"].upper()}):
-            with self.assertRaisesRegex(WorkflowError, "brief"):
-                record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                                   generation=brief["generation"], **extra)
+        good = {"index_sha256": brief["index_sha256"], "title_sha256": brief["title_sha256"]}
+        for key in good:
+            for bad in (None, "abc", 5, good[key].upper()):
+                with self.subTest(key=key, bad=bad), self.assertRaisesRegex(WorkflowError, "brief"):
+                    record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
+                                       generation=brief["generation"], **{**good, key: bad})
 
     def cli_run(self, during):
         """Run `sd writing adversarial` with codex stubbed; `during(read)` edits disk, and `read()` is the reviewer
@@ -880,6 +884,7 @@ class ReviewCompanions(WritingCase):
             return "prompt"
 
         def codex(root, prompt, **_):
+            self.prompt = prompt
             during(lambda: read.setdefault("bytes", (Path(root) / handed["draft"]).read_bytes()))
             return REPORT
         args = argparse.Namespace(model=None, timeout=60, effort=None)
@@ -908,6 +913,30 @@ class ReviewCompanions(WritingCase):
         gate = json.loads(piece_state(self.db, self.item)["item"]["fields"])["writing_gates"]["adversarial"]
         self.assertEqual(gate["index_sha256"], hashlib.sha256(seen).hexdigest())
 
+    def test_a_review_cannot_certify_a_headline_its_reviewer_never_saw(self):
+        """sd:10719. After cutover the headline is a row, not index.md bytes: the run shows it and attests it."""
+        self.write_draft(SENTENCES)
+        self.cutover()
+        update_piece_metadata(self.db, self.item, {"title": "Row headline: Über café"}, who="operator")
+        result, _ = self.cli_run(lambda read: (read(), update_piece_metadata(
+            self.db, self.item, {"title": "Renamed mid-review"}, who="operator")))
+        self.assertIn('"Row headline: Über café"', self.prompt)
+        self.assertFalse(result["current"])
+        with self.assertRaisesRegex(WorkflowError, "headline changed after the review"):
+            self.adversarial_gate(result["digest"])
+        result, _ = self.cli_run(lambda read: read())
+        self.assertIn('"Renamed mid-review"', self.prompt)
+        self.adversarial_gate(result["digest"])
+
+    def test_a_gate_refuses_a_run_report_that_names_no_headline(self):
+        """sd:10719. A run report that lost its `title=` would certify whatever headline the row holds."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.run_review()
+        report = self.folder / "adversarial.md"
+        report.write_text(re.sub(r" title=\S+", "", report.read_text(), count=1))
+        with self.assertRaisesRegex(WorkflowError, "names no headline"):
+            self.adversarial_gate(brief["digest"])
+
     def test_certify_refuses_index_bytes_other_than_the_reviewer_read(self):
         """sd:10719. A layout edit mid-review leaves disk bytes the reviewer did not read: certify refuses."""
         self.write_draft(SENTENCES)
@@ -927,7 +956,7 @@ class ReviewCompanions(WritingCase):
         self.write_draft(SENTENCES)
         brief, _ = self.attested_run()
         self.reconcile()
-        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} -->$")
+        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} title={brief['title_sha256']} -->$")
         self.assertEqual(self.companions()["adversarial"], "current")
 
     def test_a_reconcile_after_a_layout_edit_cannot_clear_the_gate(self):
@@ -936,7 +965,7 @@ class ReviewCompanions(WritingCase):
         brief, _ = self.attested_run()
         self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
         self.reconcile()
-        self.assertRegex(self.stamp_line(), rf" index={brief['index_sha256']} -->$")
+        self.assertRegex(self.stamp_line(), rf" index={brief['index_sha256']} title={brief['title_sha256']} -->$")
         with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
             record_gate(self.db, self.item, "adversarial", verdict="pass", findings=[], who="operator",
                         reason="Reviewed full report", reviewed_digest=brief["digest"])
@@ -967,7 +996,7 @@ class ReviewCompanions(WritingCase):
         self.attested_run()
         self.restamp(lambda line: f"{bare}\n{line}")
         self.reconcile()
-        self.assertRegex(self.stamp_line(), rf" index={seen} -->$")
+        self.assertRegex(self.stamp_line(), rf" index={seen} title=[0-9a-f]{{64}} -->$")
 
     def test_a_gate_refuses_a_run_report_that_names_no_index_bytes(self):
         """sd:10719. A report the pack's run wrote always attests; one that lost its `index=` certifies nothing."""
@@ -1041,7 +1070,8 @@ class ReviewCompanions(WritingCase):
         brief = adversarial_brief(self.db, self.item)
         self.write_draft(SENTENCES[:-1])
         result = record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                                    generation=brief["generation"], index_sha256=brief["index_sha256"])
+                                    generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
         self.assertFalse(result["current"])
         self.assertEqual(self.companions()["adversarial"], "stale")
 
@@ -1051,7 +1081,8 @@ class ReviewCompanions(WritingCase):
         brief = adversarial_brief(self.db, self.item)
         with self.assertRaisesRegex(WorkflowError, "no report"):
             record_adversarial(self.db, self.item, "  \n", digest=brief["digest"], record=brief["record"],
-                               generation=brief["generation"], index_sha256=brief["index_sha256"])
+                               generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
         self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)
 
     def test_companion_states_are_missing_unstamped_current_or_stale(self):
@@ -1298,7 +1329,8 @@ class WorktreeCheckout(WritingCase):
         with checkout(str(self.repo), self.worktree):
             brief = adversarial_brief(self.db, self.item)
             record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                               generation=brief["generation"], index_sha256=brief["index_sha256"])
+                               generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
         self.assertEqual(brief["root"], str(self.worktree.resolve()))
         self.assertIn(brief["record"], (self.worktree / "content" / self.piece / "adversarial.md").read_text())
         self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)

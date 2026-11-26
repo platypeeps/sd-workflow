@@ -247,22 +247,27 @@ def _headline(row, fields: dict) -> str:
     so an edit by any writer, to the file or the row, leaves the gate stale at its one reader, `_problems`.
     A tip is not here: it is its own row with its own approval, which the publication checks.
     """
+    return _hash(json.dumps(_title(row, fields)).encode("utf-8"))
+
+
+def _title(row, fields: dict) -> str:
+    """The headline a publication shows for this piece, as text."""
     metadata = fields.get("writing")
     title = metadata.get("title") if isinstance(metadata, dict) else None
-    return _hash(json.dumps(title or row["title"]).encode("utf-8"))
+    return title or row["title"]
 
 
-def _attested(report: str) -> str | None:
+def _attested(report: str, key: str = "index") -> str | None:
     """The index.md bytes a report's stamps attest, as one SHA-256; None when no stamp names any (sd:10719).
 
     The one reader of `index=`, for the gate and the reconcile alike: a value it cannot read, or a second one on
     any stamp, is refused, never dropped, since a dropped attestation reads as nothing to check.
     """
-    found = [value for stamp in STAMP.finditer(report) for value in re.findall(r"\bindex=(\S*)", stamp.group(2))]
+    found = [value for stamp in STAMP.finditer(report) for value in re.findall(rf"\b{key}=(\S*)", stamp.group(2))]
     if not found:
         return None
     if len(found) > 1 or re.fullmatch(r"[0-9a-f]{64}", found[0]) is None:
-        raise WorkflowError("report's index stamp is not one SHA-256; run the review again")
+        raise WorkflowError(f"report's {key} stamp is not one SHA-256; run the review again")
     return found[0]
 
 
@@ -281,6 +286,21 @@ def _layout(report: str, artifact: str, index: str) -> str | None:
     if attested is None and artifact == "adversarial" and _REVIEWED.search(report):
         raise WorkflowError("adversarial report names no index.md bytes; run the review again")
     return attested
+
+
+def _reviewed_headline(report: str, artifact: str, headline: str) -> str:
+    """The headline hash a gate on `report` answers for, once it is the one shown now (sd:10719).
+
+    After cutover the headline is a row, not index.md bytes, so the pack's run shows it to the reviewer and
+    stamps `title=`. A run report without one lost it and is refused; a report the pack did not write names
+    none, and its gate stands on the recorder's word for the headline shown now, as for layout.
+    """
+    attested = _attested(report, "title")
+    if attested and attested != headline:
+        raise WorkflowError("the headline changed after the review; review the piece as shown before recording it")
+    if attested is None and artifact == "adversarial" and _REVIEWED.search(report):
+        raise WorkflowError("adversarial report names no headline; run the review again")
+    return headline
 
 
 def _draft(text: str) -> str | None:
@@ -868,7 +888,8 @@ def record_gate(connection: sqlite3.Connection, item: int, artifact: str, *, ver
         record = {"verdict": verdict, "findings": held, "reason": reason, "who": who,
                   "draft_digest": snapshot["digest"], "generation": row["gate_generation"],
                   "evidence_sha256": snapshot["hashes"][artifact], "research_sha256": snapshot["hashes"]["research"],
-                  "title_sha256": _headline(row, fields)}
+                  "title_sha256": _reviewed_headline(snapshot["files"][artifact].decode("utf-8"), artifact,
+                                                     _headline(row, fields))}
         if attested:
             record["index_sha256"] = attested
         existing = gates.get(artifact)
@@ -1022,7 +1043,9 @@ def adversarial_brief(connection: sqlite3.Connection, item: int) -> dict:
                             "draft it before running an adversarial pass")
     disk = _disk(row["repo"])
     draft = snapshot["path"]
-    return {"piece": row["piece"], "root": str(disk), "draft": draft.relative_to(disk).as_posix(),
+    fields = _fields(row["fields"], readable=True)
+    return {"piece": row["piece"], "root": str(disk), "title": _title(row, fields),
+            "title_sha256": _headline(row, fields), "draft": draft.relative_to(disk).as_posix(),
             "research": draft.with_name(REPORTS["research"]).relative_to(disk).as_posix(),
             "research_exists": "research" in snapshot["files"], "digest": snapshot["digest"],
             "generation": row["gate_generation"], "record": reviewed_record(prose), "words": words,
@@ -1037,7 +1060,7 @@ def _write_report(path: Path, text: str) -> None:
 
 
 def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *, digest: str, record: str,
-                       generation: int, index_sha256: str) -> dict:
+                       generation: int, index_sha256: str, title_sha256: str) -> dict:
     """Write `adversarial.md` for one run: draft stamp, run record, provenance, then the report.
 
     `digest`, `record`, `generation` and `index_sha256` come from the `adversarial_brief`
@@ -1051,8 +1074,10 @@ def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *
     if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{12}", digest) is None
             or not isinstance(record, str) or _REVIEWED.fullmatch(record) is None
             or type(generation) is not int
-            or not isinstance(index_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", index_sha256) is None):
-        raise WorkflowError("adversarial run needs the digest, run record, generation and index hash from its brief")
+            or not isinstance(index_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", index_sha256) is None
+            or not isinstance(title_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", title_sha256) is None):
+        raise WorkflowError("adversarial run needs the digest, run record, generation, index and headline hashes "
+                            "from its brief")
     row = _piece(connection, item)["item"]
     snapshot = _snapshot(row)
     day = now()[:10]
@@ -1063,14 +1088,15 @@ def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *
     # changed index.md needs a fresh run, and that run must not erase the ledger (sd:10719).
     previous = snapshot["files"].get("adversarial", b"").decode("utf-8")
     ledger = _LEDGER.search(previous)
-    _write_report(target, f"<!-- reconciled-with-draft: {digest} on {day} gen={generation} index={index_sha256} -->\n\n{record}\n\n"
+    _write_report(target, f"<!-- reconciled-with-draft: {digest} on {day} gen={generation} index={index_sha256} title={title_sha256} -->\n\n{record}\n\n"
                           f"<!-- codex adversarial review of {row['piece']}, {day}. Findings are HYPOTHESES: "
                           "verify each against the source before acting. Nothing here edited the draft. -->\n\n"
                           + (report if report.endswith("\n") else report + "\n")
                           + (f"\n{previous[ledger.start():].rstrip()}\n" if ledger else ""))
     verdict = re.findall(r"(?im)^.*survive[s]? hostile reading.*$", report)
     return {"piece": row["piece"], "path": target.relative_to(_disk(row["repo"])).as_posix(), "digest": digest,
-            "current": snapshot["digest"] == digest and snapshot["hashes"]["index"] == index_sha256,
+            "current": (snapshot["digest"] == digest and snapshot["hashes"]["index"] == index_sha256
+                        and _headline(row, _fields(row["fields"], readable=True)) == title_sha256),
             "index_sha256": index_sha256,
             "confidence": {tag: len(re.findall(rf"\b{tag}\b", report)) for tag in ("CERTAIN", "LIKELY", "SPECULATIVE")},
             "verdict": verdict[-1].strip() if verdict else None}
@@ -1115,8 +1141,8 @@ def reconcile_companion(connection: sqlite3.Connection, item: int, artifact: str
     body = _STAMP_LINE.sub("", text).strip()
     # A reconcile answers for the prose, never the layout: it keeps the last run's attestation as it was, so a
     # gate on this report still refuses bytes no reviewer read; only a fresh run moves it (sd:10719).
-    kept = _attested(text)
-    layout = f" index={kept}" if kept else ""
+    kept, shown = _attested(text), _attested(text, "title")
+    layout = (f" index={kept}" if kept else "") + (f" title={shown}" if shown else "")
     _write_report(snapshot["path"].with_name(name),
                   f"<!-- reconciled-with-draft: {digest} on {day} gen={row['gate_generation']}{layout} -->\n\n"
                   f"{body}\n\n{heading} — {day}\n\n{note}\n")
