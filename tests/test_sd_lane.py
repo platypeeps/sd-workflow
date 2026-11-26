@@ -6500,6 +6500,71 @@ class Watch(Lane):
         self.assertEqual(lines, ["pack sd:3 merged at merged-3", "pack sd:4 none: no lane entry that is not cancelled",
                                  "pack sd:5 none: no lane entry that is not cancelled"])
 
+    def build(self, item: int, status: str, result: str | None = None, ended: str | None = None) -> int:
+        """A build assignment of `item`, as the build dispatcher writes one."""
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            with connection:
+                return connection.execute(
+                    "INSERT INTO assignment (item, role, status, scope, result, ended) "
+                    "VALUES (?, 'build', ?, 'build', ?, ?)", (item, status, result, ended)).lastrowid
+        finally:
+            connection.close()
+
+    def end_build(self, assignment: int, status: str, result: str) -> None:
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            with connection:
+                connection.execute("UPDATE assignment SET status = ?, result = ?, ended = ? WHERE id = ?",
+                                   (status, result, "2999-01-01T00:00:00+00:00", assignment))
+        finally:
+            connection.close()
+
+    def test_watch_item_waits_on_a_running_build_and_ends_on_its_block(self) -> None:
+        """sd:10908: a build that blocked after round 3 sat parked; no lane watch saw it."""
+        [item] = self.register_items(1)
+        assignment = self.build(item, "running")
+        pauses: list[int] = []
+
+        def pause() -> None:
+            pauses.append(len(pauses))
+            if len(pauses) == 2:
+                self.end_build(assignment, "blocked", "3 review rounds left blockers:\nround 3")
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, pauses), (1, [0, 1]))
+        self.assertEqual(lines, [f"pack sd:{item} build blocked: 3 review rounds left blockers: round 3"])
+
+    def test_watch_item_waits_on_a_build_then_on_the_entry_it_enqueued(self) -> None:
+        [item] = self.register_items(1)
+        assignment = self.build(item, "queued")
+
+        def pause() -> None:
+            self.end_build(assignment, "done", "build run r1 enqueued in the lane")
+            sd_lane.enqueue_entry(self.feature, item, "fix: one", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (0, [f"pack sd:{item} merged at merged-{item}"]))
+
+    def test_watch_item_names_the_newer_of_a_blocked_build_and_an_ended_entry(self) -> None:
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            self.answers[(item, "prepare")] = {"ok": False, "phase": "review_blocked", "error": "a finding"}
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.build(one, "blocked", "a retried build blocked", "2999-01-01T00:00:00+00:00")
+        self.build(two, "blocked", "an older build blocked", "2000-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual(code, 1)
+        self.assertEqual(lines, [f"pack sd:{one} build blocked: a retried build blocked",
+                                 f"pack sd:{two} failed: a finding"])
+
     def test_watch_item_reads_again_after_a_hub_fault(self) -> None:
         """A read the hub did not answer is unknown, not an end."""
         sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
