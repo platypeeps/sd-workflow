@@ -27,6 +27,7 @@ Triage every stalled item in this repo and its companion repos, then queue a bui
 
 3. Build
    Run `sd assignments build N` for every ready item, including items that were ready before this run.
+   Skip an item with an open question note or a Decisions row: step 4 asks first, then builds it.
    Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing.
    Report a refusal as that item's state.
 
@@ -50,7 +51,8 @@ For each, read why it was parked and what it waits on.
 - If that item is done, that date has passed, or that measurement now passes: unpark it (`sd task edit N --unpark`), set it ready (`sd task status N ready`), and run `sd assignments build N`; the press refuses an item already building, as in step 3.
   Bind the first write with `--if-revision <revision>`, as in step 2.
 - If it was parked by a failed review or build: fix or split it, then retry its build with `sd assignments build N`, the dashboard's Retry.
-- If it waits on the operator: ask, one question at a time.
+- If it waits on the operator: ask, one question at a time, and build it only after the answer.
+- An item with an open question note or a Decisions row is asked first in every case, then built.
 - Otherwise: leave it parked, with a note naming what it still waits on.
 
 End with a table: item, park reason, new state, build, reason.
