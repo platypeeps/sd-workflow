@@ -12,10 +12,11 @@ Triage every stalled item in this repo and its companion repos, then queue a bui
      Count the review questions and scores in its `+N review questions wait` line for the report, and leave them to the dashboard's Review page: a review batch's questions are labelled there, not answered with `--answers`.
 
 2. Decide, for each one. Read why it stopped and what it waits on.
+   An item with an open question note or a Decisions row waits for step 4: queue no build for it until the operator answers.
    - Nothing it needs is missing (the item it waits on is done, the date has passed, the measurement now passes): unpark it if parked (`sd task edit N --unpark`), and set it ready (`sd task status N ready`).
      Add `--if-revision <revision>` to the item's first write, the `revision:` line of the `sd task show N` you decided from:
      a refusal means the item changed since, so read it again and decide again.
-   - It failed review or a build: fix it or split it, then set it ready.
+   - It failed review or a build: fix it or split it, then retry it with `sd assignments build N`, the dashboard's Retry; do not set it ready first, which would start a fresh build.
      Past round 3, record fix, file or reject for each blocker with `sd task note N "<fix, file or reject: reason>" --kind decision`.
    - A stale assignment: retry it with `sd assignments build N` if its item is still wanted; if the item is done or superseded, cancel it with `sd assignments cancel <assignment> --if-revision <revision>` and put the reason in `sd task note N "<reason>"`.
      `<revision>` is the assignment's `revision` in the `sd assignments list --json` you decided from: a refusal means it changed since, so read it again.
