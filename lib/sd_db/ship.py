@@ -33,15 +33,6 @@ def identity(connection: sqlite3.Connection, item: int) -> dict:
     return {"item": row, "repo": dict(repo)}
 
 
-def review_generation(connection: sqlite3.Connection) -> int:
-    """The newest `ship:` or `ship-adjudication:` checkpoint's id, 0 for none: a review saved, run again or
-    adjudicated moves it, so a reader that kept a review's answer knows to read it again (sd:10814)."""
-    row = connection.execute("SELECT max(id) FROM state WHERE kind = 'checkpoint' AND (key >= 'ship:' "
-                             "AND key < 'ship;' OR key >= 'ship-adjudication:' "
-                             "AND key < 'ship-adjudication;')").fetchone()
-    return int(row[0] or 0) if row else 0
-
-
 def receipt_key(repository: str, branch: str, item: int) -> str:
     return "ship:" + hashlib.sha256(f"{repository}\0{branch}\0{item}".encode()).hexdigest()
 

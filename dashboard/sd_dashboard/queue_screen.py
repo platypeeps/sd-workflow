@@ -400,12 +400,10 @@ REVIEWS_KEPT = 512
 
 
 def _review_generation(connection) -> int | None:
-    """`sd_db.ship.review_generation`: the store's newest review checkpoint, which a review saved, run again or
+    """`sd_db.reads.review_generation`: the store's newest review checkpoint, which a review saved, run again or
     adjudicated, from this page or the CLI, moves. None when the store did not answer, so nothing is kept."""
-    from sd_db import ship
-
     try:
-        return ship.review_generation(connection)
+        return reads.review_generation(connection)
     except sqlite3.Error:
         return None
 
