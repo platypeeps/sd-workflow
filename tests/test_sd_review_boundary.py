@@ -1146,11 +1146,17 @@ class LineBudgetTests(unittest.TestCase):
         # blocker, which asks that the rebuttal answered that same
         # reopen. A reopen kept in the last verdict alone lapsed after
         # one silent pass. Measured: `sd-review` is 3177 here.
+        #
+        # 5147 -> 5155 is the lead ruling on sd:10087: `bin/sd-review`
+        # +8 for `repeat_count` and its call in `dispose`, so a fresh cited
+        # repeat of a listed rebuttal takes a reopen count no rebuttal saw,
+        # and an old rebuttal cannot clear it. A helper, as `dispose` sits
+        # at the complexity ceiling. Measured: `sd-review` is 3185 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5147,
+            5155,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

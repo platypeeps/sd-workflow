@@ -617,6 +617,24 @@ class PriorVerdictTests(unittest.TestCase):
         [merged] = sd_review.prior_blockers({"findings": [found, retry, later]})
         self.assertEqual(merged["reopened"], 2)
 
+    def test_a_fresh_cited_repeat_of_a_rebuttal_takes_a_count_no_record_saw(self) -> None:
+        """Lead ruling on sd:10087 (bin/sd-review:1813): a fresh review's cited repeat of a listed rebuttal
+        started at count 0, so a rebuttal that saw an earlier reopen cleared it at the next verify. It takes
+        max(saw of matching records) + 1; a reader's own count is no count, and no repeat gets none."""
+        older = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10)
+        seen = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10, reopened=1)
+        fresh = dict(finding("python3 t.py []: IndexError", line=10, summary="Empty input crashes"), reopened=1)
+        [record] = sd_review.dispose([fresh], "high", listed(seen, older))
+        self.assertEqual((record["disposition"], record["reopened"]), ("blocking", 2))
+        silent = self.answer(verdicts=[])
+        [first] = sd_review.carried([dict(record, id="B1")], [silent], listed(seen, older))
+        [second] = sd_review.carried([dict(first, id="B1")], [silent], listed(seen, older))
+        self.assertEqual(second["reopened"], 2)  # two verifies later it still blocks
+        answered = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10, reopened=2)
+        self.assertEqual(sd_review.carried([dict(second, id="B1")], [silent], listed(answered, seen, older)), [])
+        [plain] = sd_review.dispose([dict(fresh, summary="Another defect")], "high", listed(seen, older))
+        self.assertNotIn("reopened", plain)
+
     def test_no_completed_reader_carries_nothing(self) -> None:
         failed = sd_review.Outcome("one", sd_review.UNAVAILABLE, (), "", (), ())
         result = self.settle(failed, reviewed=[])

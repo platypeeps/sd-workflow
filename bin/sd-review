@@ -1829,6 +1829,12 @@ def unanswered(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> dict[str
     return dict(row, path=first[0], line=first[1], instances=left) if first else dict(row)
 
 
+def repeat_count(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> dict[str, int]:
+    """For a repeat of a listed rebuttal, a reopen count no record with its summary saw (sd:10087 ruling); else none."""
+    key = summary_key(row.get("summary"))
+    return {"reopened": max([found.saw for found in rebutted if found.summary == key], default=0) + 1} if is_rebutted(rebutted, row) else {}
+
+
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
             rebutted: Sequence[Rebuttal] = (), *, repro: bool = False) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
@@ -1846,10 +1852,12 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         return isinstance(row.get("evidence"), str) and bool(row["evidence"].strip())
     disposed = []
     for finding in findings:
-        record, blocking = dict(finding), _floor(finding)
+        record, blocking = {key: value for key, value in finding.items() if key != "reopened"}, _floor(finding)
+        if blocking and _cited(record):
+            record.update(repeat_count(rebutted, record))
         # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
-        note = REPEAT_NOTE if blocking and not _cited(finding) and is_rebutted(rebutted, finding) else None
-        if blocking and not note and not _cited(finding) and repro and str(record.get("path") or "").strip() not in LANE_PATHS:
+        note = REPEAT_NOTE if blocking and not _cited(record) and is_rebutted(rebutted, record) else None
+        if blocking and not note and not _cited(record) and repro and str(record.get("path") or "").strip() not in LANE_PATHS:
             note = NO_REPRO_NOTE
         if note:
             blocking = False
