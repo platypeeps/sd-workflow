@@ -4095,44 +4095,10 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
-    def test_a_revert_that_moves_the_fix_into_a_new_file_keeps_the_close(self) -> None:
-        """sd:10214 lane review: a cited commit fixes a draft of a base file; a revert-titled commit puts the
-        fixed text in a new file and the old one back as the base has it. Git pairs no rename, yet the work
-        ships in the new file: a file added since the cited commit that git pairs as a copy of the fixed
-        text, closer to it than to the text before, holds the work. Dropping the copy too closes nothing."""
-        import sd_operations
-        a, *_ = self.open
-        tree, _ = self.committed("topic-fix-moved-to-a-new-file")
-        lines = "".join(f"reader line {n}\n" for n in range(20))
-        (tree / "reader.txt").write_text(lines, encoding="utf-8")
-        git(tree, "add", "reader.txt")
-        git(tree, "commit", "-q", "-m", "docs: the reader")
-        git(tree, "push", "-q", "origin", "HEAD:main")
-        git(tree, "fetch", "-q", "origin")
-        draft = lines.replace("line 3\n", "line 3 draft\n")
-        (tree / "reader.txt").write_text(draft, encoding="utf-8")
-        git(tree, "commit", "-q", "-am", "feat: a draft reader")
-        fixed = draft.replace("line 3 draft\n", "line 3 fixed\n") + "the fix\n"
-        (tree / "reader.txt").write_text(fixed, encoding="utf-8")
-        git(tree, "commit", "-q", "-am", f"fix: the reader\n\nCloses: sd:{a}")
-        cited = git(tree, "rev-parse", "HEAD")
-        (tree / "caller.txt").write_text(fixed, encoding="utf-8")
-        (tree / "reader.txt").write_text(lines, encoding="utf-8")
-        git(tree, "add", "caller.txt", "reader.txt")
-        git(tree, "commit", "-q", "-m", "revert: move the reader into the caller")
-        head = git(tree, "rev-parse", "HEAD")
-        status = git(tree, "diff", "-M", "--name-status", cited, head)
-        self.assertNotIn("R", "".join(line[:1] for line in status.splitlines()),
-                         "the fixture must be a move git does not pair as a rename")
-        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
-        git(tree, "rm", "-q", "caller.txt")
-        git(tree, "commit", "-q", "-m", "revert: drop the caller")
-        head = git(tree, "rev-parse", "HEAD")
-        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
-
     def test_a_plain_text_copy_of_a_reverted_executable_closes_nothing(self) -> None:
         """sd:10214 review: a revert that removes a cited executable and keeps its text in a plain file took
-        the work out: the copy does not run. The same text in an executable file still keeps the close."""
+        the work out: the copy does not run. Nor does the same text in an executable file keep the close: a
+        revert moves no work (class pass 12)."""
         import sd_operations
         a, *_ = self.open
         tree, _ = self.committed("topic-executable-copied-as-text")
@@ -4142,7 +4108,7 @@ class CitedCloses(SharedQueue):
         git(tree, "add", "run.sh")
         git(tree, "commit", "-q", "-m", f"feat: the runner\n\nCloses: sd:{a}")
         start = git(tree, "rev-parse", "HEAD")
-        for executable, expected in ((False, set()), (True, {a})):
+        for executable, expected in ((False, set()), (True, set())):
             with self.subTest(executable=executable):
                 git(tree, "checkout", "-q", "--detach", start)
                 git(tree, "rm", "-q", "run.sh")
@@ -4152,39 +4118,6 @@ class CitedCloses(SharedQueue):
                 git(tree, "commit", "-q", "-m", "revert: keep the runner as notes")
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), expected)
-
-    def test_a_moved_script_made_executable_keeps_the_close(self) -> None:
-        """sd:10214 class pass 10: a plain file can do no more than the same text made executable, so a
-        revert-titled commit that moves a cited script and sets its executable bit took nothing out, whether
-        git pairs the move as a rename or the old path goes back to the base."""
-        import sd_operations
-        a, *_ = self.open
-        script = "".join(f"echo step {n}\n" for n in range(20))
-        for paired in (True, False):  # the unpaired case moves main, so it runs last
-            with self.subTest(paired=paired):
-                tree, _ = self.committed(f"topic-moved-and-made-executable-{paired}")
-                if not paired:
-                    (tree / "run.sh").write_text("echo draft\n", encoding="utf-8")
-                    git(tree, "add", "run.sh")
-                    git(tree, "commit", "-q", "-m", "docs: the base")
-                    git(tree, "push", "-q", "origin", "HEAD:main")
-                    git(tree, "fetch", "-q", "origin")
-                (tree / "run.sh").write_text(script, encoding="utf-8")
-                git(tree, "add", "run.sh")
-                git(tree, "commit", "-q", "-m", f"feat: the runner\n\nCloses: sd:{a}")
-                cited = git(tree, "rev-parse", "HEAD")
-                (tree / "tool.sh").write_text(script, encoding="utf-8")
-                (tree / "tool.sh").chmod(0o755)
-                if paired:
-                    git(tree, "rm", "-q", "run.sh")
-                else:
-                    (tree / "run.sh").write_text("echo draft\n", encoding="utf-8")
-                git(tree, "add", "-A")
-                git(tree, "commit", "-q", "-m", "revert: move the runner to the tools")
-                head = git(tree, "rev-parse", "HEAD")
-                status = git(tree, "diff", "-M", "--name-status", cited, head)
-                self.assertEqual(paired, status.startswith("R"), status)
-                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
 
     def test_a_reverted_script_kept_only_in_documentation_closes_nothing(self) -> None:
         """sd:10214 class pass 11: a file of another kind than the cited one cannot hold its work. A revert
@@ -4213,6 +4146,44 @@ class CitedCloses(SharedQueue):
                 status = git(tree, "diff", "-M", "--name-status", cited, head)
                 self.assertEqual(paired, status.startswith("R"), status)
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
+    def test_a_revert_moves_no_work_unless_it_cites_the_item(self) -> None:
+        """sd:10214 class pass 12: no path proves that reverted work still ships. A revert-titled commit that
+        moves a cited script to a fixture of the same suffix, as a rename git pairs or as text in a file
+        main already holds, took the work out. The same commit keeps the close by citing the item itself."""
+        import sd_operations
+        a, *_ = self.open
+        script = "".join(f"print('step {n}')\n" for n in range(20))
+        for paired, cites in ((True, False), (True, True), (False, False), (False, True)):  # unpaired moves main
+            with self.subTest(paired=paired, cites=cites):
+                tree, _ = self.committed(f"topic-script-kept-as-a-fixture-{paired}-{cites}")
+                if not paired:
+                    git(tree, "fetch", "-q", "origin")
+                    git(tree, "reset", "-q", "--hard", "origin/main")
+                    if not (tree / "run.py").exists():  # the second unpaired case builds on the first's main
+                        self.on_main(tree, {"run.py": "print('draft')\n", "sample.py": "print('sample')\n"})
+                (tree / "run.py").write_text(script, encoding="utf-8")
+                git(tree, "add", "run.py")
+                git(tree, "commit", "-q", "-m", f"feat: the runner\n\nCloses: sd:{a}")
+                cited = git(tree, "rev-parse", "HEAD")
+                if paired:
+                    git(tree, "mv", "run.py", "unused.py")
+                else:
+                    (tree / "sample.py").write_text("print('sample')\n" + script, encoding="utf-8")
+                    (tree / "run.py").write_text("print('draft')\n", encoding="utf-8")
+                git(tree, "add", "-A")
+                git(tree, "commit", "-q", "-m", "revert: keep the runner as a fixture"
+                    + (f"\n\nCloses: sd:{a}" if cites else ""))
+                head = git(tree, "rev-parse", "HEAD")
+                status = git(tree, "diff", "-M", "--name-status", cited, head)
+                self.assertEqual(paired, status.startswith("R"), status)
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a} if cites else set())
+                # A later commit that is no revert does not bring the work back by touching another file.
+                (tree / "other.txt").write_text("other\n", encoding="utf-8")
+                git(tree, "add", "other.txt")
+                git(tree, "commit", "-q", "-m", "docs: another file")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a} if cites else set())
 
     def test_a_submodule_link_holds_no_text_and_hides_no_revert(self) -> None:
         """sd:10214 class pass 10: a submodule link is a commit, not text. An unrelated link the head changed
@@ -4246,31 +4217,6 @@ class CitedCloses(SharedQueue):
         git(tree, "push", "-q", "origin", "HEAD:main")
         git(tree, "fetch", "-q", "origin")
 
-    def test_a_revert_that_moves_the_fix_into_an_existing_file_keeps_the_close(self) -> None:
-        """sd:10214 review: as the new-file case, but the fixed text goes into a file main already holds, so git
-        reports a modification, no copy. The lines the cited commit added are read wherever the head gained
-        them. Taking them out of that file too closes nothing."""
-        import sd_operations
-        a, *_ = self.open
-        tree, _ = self.committed("topic-fix-moved-to-an-existing-file")
-        lines = "".join(f"reader line {n}\n" for n in range(20))
-        self.on_main(tree, {"reader.txt": lines, "caller.txt": "the caller\n"})
-        draft = lines.replace("line 3\n", "line 3 draft\n")
-        (tree / "reader.txt").write_text(draft, encoding="utf-8")
-        git(tree, "commit", "-q", "-am", "feat: a draft reader")
-        fixed = draft.replace("line 3 draft\n", "line 3 fixed\n") + "the fix\n"
-        (tree / "reader.txt").write_text(fixed, encoding="utf-8")
-        git(tree, "commit", "-q", "-am", f"fix: the reader\n\nCloses: sd:{a}")
-        (tree / "caller.txt").write_text("the caller\n" + fixed, encoding="utf-8")
-        (tree / "reader.txt").write_text(lines, encoding="utf-8")
-        git(tree, "commit", "-q", "-am", "revert: move the reader into the caller")
-        head = git(tree, "rev-parse", "HEAD")
-        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
-        (tree / "caller.txt").write_text("the caller\n", encoding="utf-8")
-        git(tree, "commit", "-q", "-am", "revert: drop it from the caller")
-        head = git(tree, "rev-parse", "HEAD")
-        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
-
     def reverted_reader(self, name: str, before: bytes, fixed: bytes, caller: bytes) -> set[int]:
         """What stays cited when a cited fix turns a base reader from `before` into `fixed`, and a revert puts
         the reader back and leaves the base caller as `caller`: `{0}` for the cited item, else nothing."""
@@ -4294,10 +4240,10 @@ class CitedCloses(SharedQueue):
         return {0 for item in sd_operations.cited(tree, "origin/main", head, "Words.\n") if item == a}
 
     def test_a_line_of_the_fix_in_another_file_does_not_keep_the_close(self) -> None:
-        """sd:10214 class pass 7: part of the cited text found elsewhere is not the work. A revert restores the
+        """sd:10214 class pass 7: the cited text found elsewhere is not the work. A revert restores the
         reader and adds, on its own, a line the fix also added to a caller: the close drops. So does one that
-        leaves every fixed line in the caller, scattered or re-indented. Only the reader's whole fixed text,
-        as one exact run of lines, is the work moved."""
+        leaves every fixed line in the caller, scattered, re-indented or whole: no path proves that reverted
+        work still ships (class pass 12)."""
         lines = [f"reader line {n}\n" for n in range(6)]
         before = "".join(lines) + "    return True\n"
         fixed = "".join(lines) + "    return False\n"
@@ -4305,17 +4251,17 @@ class CitedCloses(SharedQueue):
                 ("one-line", "the caller\n    return False\n", set()),
                 ("scattered", "the caller\n" + "between\n".join(lines) + "    return False\n", set()),
                 ("re-indented", "the caller\n" + fixed.replace("    return", "return"), set()),
-                ("whole", "the caller\n" + fixed + "more\n", {0})):
+                ("whole", "the caller\n" + fixed + "more\n", set())):
             with self.subTest(label):
                 self.assertEqual(self.reverted_reader(f"topic-partial-{label}", before.encode(), fixed.encode(),
                                                       caller.encode()), kept)
 
     def test_a_revert_of_a_file_git_cannot_decode_closes_nothing(self) -> None:
-        """sd:10214 class pass 7: the cited text is compared as bytes, so a file that is not UTF-8 is read
-        like any other: its revert drops the close, and its whole text in another file keeps it."""
+        """sd:10214 class pass 7: a file that is not UTF-8 is read like any other: its revert drops the
+        close, with or without its whole text in another file (class pass 12)."""
         before, fixed = b"caf\xe9 one\n", b"caf\xe9 one\ncaf\xe9 two\n"
         self.assertEqual(self.reverted_reader("topic-latin-reverted", before, fixed, b"the caller\nmore\n"), set())
-        self.assertEqual(self.reverted_reader("topic-latin-moved", before, fixed, b"the caller\n" + fixed), {0})
+        self.assertEqual(self.reverted_reader("topic-latin-moved", before, fixed, b"the caller\n" + fixed), set())
 
     def test_a_revert_that_restores_a_deleted_base_file_closes_nothing(self) -> None:
         """sd:10214 review: a draft deletes a base file, the cited commit adds its text under a new name, and a
