@@ -248,7 +248,6 @@ speculative gate still waiting at the run's deadline is cancelled.
 from __future__ import annotations
 
 import calendar
-import collections
 import contextlib
 import dataclasses
 import difflib
@@ -1018,11 +1017,12 @@ def work_left(now: bool, revert: bool, held: list[tuple[bool, bool | None]], bac
     return revert
 
 
-def holds_fix(old: list[str], fixed: list[str], text: list[str]) -> bool:
-    """Whether `text` holds the content `fixed` changed in `old` (sd:10214, the ruling on class pass 14: the
-    fix's content decides, not a count of lines). Each place the fix changed is read in `text` between the
-    old lines around it, which must stand there (class pass 16): a line elsewhere in the file says
-    nothing of the place. There the text must read as the fix (`fix_place_holds`)."""
+def holds_fix(old: list[bytes], fixed: list[bytes], text: list[bytes]) -> bool:
+    """Whether `text` holds what `fixed` changed in `old` (sd:10214, the ruling on class pass 14: the fix's
+    content decides, not a count of lines). Each place the fix changed is read in `text` between the old
+    lines around it, which must stand there, and must read exactly as the fix wrote it: an edit elsewhere
+    in the file keeps the work. No text tells an edited fix line from an undone one, so nothing nearer
+    is guessed (class pass 17); a revert that keeps an edited fix cites the item itself."""
     kept = {at + n: to + n for at, to, size in
             difflib.SequenceMatcher(None, old, text, autojunk=False).get_matching_blocks() for n in range(size)}
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, fixed, autojunk=False).get_opcodes():
@@ -1031,31 +1031,7 @@ def holds_fix(old: list[str], fixed: list[str], text: list[str]) -> bool:
         # ponytail: a place with no old line kept around it reads as undone (a lost close, fixed by hand).
         if (i1 == 0 and i2 == len(old)) or (i1 > 0 and i1 - 1 not in kept) or (i2 < len(old) and i2 not in kept):
             return False
-        region = text[kept[i1 - 1] + 1 if i1 > 0 else 0:kept[i2] if i2 < len(old) else len(text)]
-        if not fix_place_holds(old[i1:i2], fixed[j1:j2], region):
-            return False
-    return True
-
-
-def fix_place_holds(was: list[str], wrote: list[str], region: list[str]) -> bool:
-    """Whether `region`, the text at one place the fix changed `was` into `wrote`, holds the fix. A place the
-    fix only added to needs the added lines there. Else each edit the fix made to the old text, read by
-    character, must stand in the region at the same spot: the old text there is taken out and the fix's
-    text is in what replaced it. An edit of the fixed line keeps the work; the old line back, edited or
-    not, or deleted, does not (class pass 16)."""
-    if not was:
-        return not collections.Counter(wrote) - collections.Counter(region)
-    old, here = "\n".join(was), "\n".join(region)
-    edits = [(i1, i2, here[j1:j2]) for tag, i1, i2, j1, j2 in
-             difflib.SequenceMatcher(None, old, here, autojunk=False).get_opcodes() if tag != "equal"]
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, "\n".join(wrote), autojunk=False).get_opcodes():
-        if tag == "equal":
-            continue
-        # ponytail: difflib's alignment stands for the edit's spot; a fixed line rewritten past it reads as
-        # undone (a lost close, fixed by hand). Read the edit's lineage if that matters.
-        there = [(a, b, put) for a, b, put in edits if a <= i2 and b >= i1]
-        if not set(range(i1, i2)) <= {at for a, b, _ in there for at in range(a, b)} or \
-                "\n".join(wrote)[j1:j2] not in "".join(put for _, _, put in there):
+        if text[kept[i1 - 1] + 1 if i1 > 0 else 0:kept[i2] if i2 < len(old) else len(text)] != fixed[j1:j2]:
             return False
     return True
 
@@ -1150,13 +1126,17 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             at += 1 + names
         return found
 
-    def lines(entry: str | None) -> list[str] | None:
-        """The lines of a text entry (`blobs`); None for an absent entry, a binary file or a failed read."""
-        try:  # a file that is not UTF-8 text decodes to no answer
-            done = publish_git(worktree, "cat-file", "blob", entry.split()[-1]) if entry else None
-        except ValueError:
+    def lines(entry: str | None) -> list[bytes] | None:
+        """The lines of a text entry (`blobs`), as bytes split at each newline alone: a decoded read would
+        join or split lines at other separators. None for an absent entry, a binary file or a failed read."""
+        if not entry:
             return None
-        return done.stdout.splitlines() if done and done.returncode == 0 and "\0" not in done.stdout else None
+        try:
+            done = subprocess.run(["git", "cat-file", "blob", entry.split()[-1]], cwd=worktree, capture_output=True,
+                                  timeout=PUBLISH_SECONDS, check=False, env=sd_lib.without_fsmonitor(os.environ))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.split(b"\n") if done.returncode == 0 and b"\0" not in done.stdout else None
 
     def keeps_fix(entry: str | None, fix: str | None, before: str | None) -> bool:
         """Whether `entry` holds what the cited commit's `fix` changed in `before` (`holds_fix`)."""
@@ -1178,8 +1158,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         `cited`, the commit that left the work, both names are read there.
         Either reading as `cited` left the file holds the work. Else one must
         read as `before` held it, and the other holds the work only while it
-        holds what `cited` changed (`keeps_fix`): the fix with one more edit
-        ships, the old lines or other text do not (class passes 13, 14).
+        holds what `cited` changed (`keeps_fix`): the fix with an edit
+        elsewhere in the file ships; the old lines, other text or an edited
+        fix line do not (class passes 13, 14, 17).
         """
         home = home or {}
         held = [where.get(name, name) for name in names]

@@ -4195,6 +4195,8 @@ class CitedCloses(SharedQueue):
         fixed = original.replace("line 7\n", "line 7 fixed\n")
         cleaned = fixed.replace("line 3\n", "line 3 tidy\n").replace("line 12\n", "line 12 tidy\n")
         guarded = original.replace("line 7\n", "line 7\nguard\n")
+        audited = original.replace("line 7\n", "line 7\nguard\naudit\n")
+        removed = original.replace("line 7\n", "")
         for case, (old_text, new_text, closes) in {
                 "reverted": (original, "unrelated text\n", set()),
                 "kept": (fixed, original, {a}),
@@ -4204,7 +4206,16 @@ class CitedCloses(SharedQueue):
                 "edited-old": (original, original + "one more line\n", set()),
                 # The ruling on class pass 14: the fix's content decides, not a line count. An inline edit
                 # of the fixed line keeps the work; the old line back beside the fix's cleanups does not.
-                "inline": (original, fixed.replace("line 7 fixed\n", "line 7 fixed # note\n"), {a}),
+                "other-line": (original, fixed.replace("line 12\n", "line 12 # note\n"), {a}),
+                # Class pass 17: no text tells an edited fix line from an undone one, so each place the fix
+                # changed reads exactly as the fix wrote it; a revert that keeps an edited fix cites the item.
+                "inline": (original, fixed.replace("line 7 fixed\n", "line 7 fixed # note\n"), set()),
+                "negated": (original, fixed.replace("line 7 fixed\n", "line 7 fixed, not\n"), set()),
+                "added-swapped": (original, original.replace("line 7\n", "line 7\naudit\nguard\n"), set()),
+                "added-split": (original, original.replace("line 7\n", "line 7\nguard\nskip\naudit\n"), set()),
+                "added-joined": (original, original.replace("line 7\n", "line 7\nguard\raudit\n"), set()),
+                "removed-replaced": (original, original.replace("line 7\n", "other text\n"), set()),
+                "removed": (original, original.replace("line 7\n", "").replace("line 12\n", "line 12 # note\n"), {a}),
                 "cleanups-kept": (original, cleaned.replace("line 7 fixed\n", "line 7\n"), set()),
                 "fix-deleted": (original, fixed.replace("line 7 fixed\n", ""), set()),
                 # The review of class pass 15: an edit of the old line is no fix, and a line the fix
@@ -4213,7 +4224,9 @@ class CitedCloses(SharedQueue):
                 "added-elsewhere": (original, original + "guard\n", set()),
                 "added-in-place": (original, guarded.replace("line 15\n", "line 15 tidy\n"), {a})}.items():
             with self.subTest(case=case):
-                cited = {"cleanups-kept": cleaned, "added-elsewhere": guarded, "added-in-place": guarded}.get(case, fixed)
+                cited = {"cleanups-kept": cleaned, "added-elsewhere": guarded, "added-in-place": guarded,
+                         "added-swapped": audited, "added-split": audited, "added-joined": audited,
+                         "removed-replaced": removed, "removed": removed}.get(case, fixed)
                 tree, _ = self.committed(f"topic-stale-rename-{case}")
                 git(tree, "fetch", "-q", "origin")
                 git(tree, "reset", "-q", "--hard", "origin/main")
