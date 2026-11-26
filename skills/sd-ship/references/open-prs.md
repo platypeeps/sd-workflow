@@ -4,6 +4,8 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
 
 1. List them with `mcp__github__list_pull_requests`, and read each one's state with `pull_request_read` `get`.
    Keep each PR's head branch and full head commit from that read; every later step binds to them.
+   A PR whose head repo (`head.repo.full_name`) is not its base repo, or is absent, is a fork PR: report it and act on nothing.
+   A branch name matches only inside one repo, so a fork's branch never names a lane entry, item or worktree here.
 2. For each PR, find what holds it: a failed `sd/local-gate`, open review findings, a merge conflict, a failed lane entry, or no lane entry.
    Its item is the lane entry's `item` in `sd-ship -C <checkout> lane list` whose `branch` equals the PR's head branch exactly.
    With no such entry, it is the one item whose note names the PR's full URL as a whole word:
@@ -26,10 +28,12 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
    - Rebut a finding that doesn't hold, with a reason a reader can check.
    - Retry a failed lane entry only when its cause lay outside the branch and is gone (an sd outage, a gate that never ran).
      A review blocker is fixed or rejected, never retried.
-     Run `sd-ship -C <checkout> lane retry N --expected-head <head>`, `<head>` the full head commit step 1 read.
+     Two PRs of one item can sit at one commit, so the commit alone does not pick this PR.
+     Retry only when the item's newest entry in `sd-ship -C <checkout> lane list` is one whose `branch` equals this PR's head branch and whose `expected_head` is the head step 1 read,
+     and no other open PR of the item, in the step-1 list, has that head commit; otherwise report the PR and retry nothing.
+     Then run `sd-ship -C <checkout> lane retry N --expected-head <head>`, `<head>` that full head commit.
      The retry checks `<head>` against the item's newest entry in its own write:
-     an entry at another commit, such as another PR of the item, refuses `stale_head` and queues nothing.
-     A full commit names this PR's work, so a retry that passes requeues this PR. Report a refusal; never retry without the head.
+     an entry queued since at another commit refuses `stale_head` and queues nothing. Report a refusal; never retry without the head.
    - Enqueue a PR that passes and has no lane entry, from a worktree checked out on its head branch.
      Find it with `git -C <checkout> worktree list --porcelain`: the entry whose `branch` is `refs/heads/<head branch>` exactly.
      No such worktree, or one whose `HEAD` is not the head step 1 read: report the PR and queue nothing.

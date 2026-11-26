@@ -110,6 +110,21 @@ class OpenPrSweep(unittest.TestCase):
         self.assertIn("If it refuses, for any reason, it writes nothing", text)
         self.assertNotIn("refuses with `--finding goes to", text)
 
+    def test_a_fork_pr_is_reported_before_any_match(self):
+        """A fork's head branch can share a name with one in the base repo."""
+        text = self.text()
+        fork = text.index("head.repo.full_name")
+        self.assertLess(fork, text.index("lane list"))
+        self.assertIn("is a fork PR: report it and act on nothing", text)
+
+    def test_retry_binds_branch_and_head_not_the_commit_alone(self):
+        """Two PRs of one item can sit at one commit; the commit alone picks neither."""
+        text = self.text()
+        retry = text.index("lane retry N")
+        self.assertLess(text.index("`branch` equals this PR's head branch and whose `expected_head`"), retry)
+        self.assertLess(text.index("no other open PR of the item"), retry)
+        self.assertNotIn("A full commit names this PR's work", text)
+
     def test_item_is_matched_exactly(self):
         text = self.text()
         self.assertIn("equals the PR's head branch exactly", text)
