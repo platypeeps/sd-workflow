@@ -5,6 +5,7 @@ Triage every stalled item in this repo and its companion repos, then queue a bui
 Budget: about 45 minutes. Follow `references/decide-ask-record.md` to decide, ask, record and report; this run's tag is `triage`.
 
 0. Report what the previous triage's items became, as that file says.
+   A Retry requeues every member of the item's bundle: the assignments with the same `build_run` in `sd assignments list --json` as the item's newest one. Before each `sd assignments build N`, read that list; if any member's item has an open question note or a Decisions row, press none of them until the operator answers, and note on the item which member it waits on. This holds for every press below, park review included.
 
 1. Collect
    - every planning or blocked item;

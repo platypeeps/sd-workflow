@@ -16,6 +16,7 @@ Budget: about 90 minutes. Follow `references/decide-ask-record.md` to decide, as
   Each agent returns the step-1 facts, step-2 verdicts, step-3 proposed rulings and step-4 candidate items for its repo.
   The agents write nothing; the lead makes every write from step 3 on, after all agents report.
 - Every write in this run, and every question it asks, is on an item of a reviewed repo; leave any other repo's item untouched.
+- A Retry requeues every member of the item's bundle: the assignments with the same `build_run` in `sd assignments list --json` as the item's newest one. Before each `sd assignments build N`, read that list; if any member's item has an open question note or a Decisions row, press none of them until the operator answers, and note on the item which member it waits on. This holds for every press below.
 
 ## 1. Collect, per repo
 

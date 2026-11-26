@@ -188,6 +188,16 @@ class ScopeOfEachWrite(unittest.TestCase):
         ask = text.split("## 6. Ask\n", 1)[1].split("\n## ", 1)[0]
         self.assertIn("items of the reviewed repos only", ask)
 
+    def test_a_press_checks_every_bundle_member_for_an_open_question(self):
+        """triage.md:23: a Retry requeues every member of the item's bundle, a questioned one too."""
+        for path, text in all_references().items():
+            if "`sd assignments build N`" not in text:
+                continue
+            with self.subTest(path=path):
+                self.assertIn("A Retry requeues every member of the item's bundle", text)
+                self.assertIn("the same `build_run` in `sd assignments list --json`", text)
+                self.assertIn("press none of them until the operator answers", text)
+
     def test_a_routine_ruling_queues_no_build(self):
         """deep.md:65: a routine ruling built items the operator did not choose."""
         rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
