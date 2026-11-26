@@ -75,7 +75,7 @@ class OperatorPromptReferences(unittest.TestCase):
             for name in files:
                 text = (ROOT / "skills" / skill / "references" / name).read_text(encoding="utf-8")
                 with self.subTest(skill=skill, reference=name):
-                    self.assertNotRegex(text, r"~/|/Users/|/Volumes/")
+                    self.assertNotRegex(text, r"~/|/(Users|Volumes)/")
 
     def test_open_prs_routes_fixes_through_the_build_verb(self):
         text = (ROOT / "skills" / "sd-ship" / "references" / "open-prs.md").read_text(encoding="utf-8")
