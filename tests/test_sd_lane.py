@@ -4146,9 +4146,9 @@ class CitedCloses(SharedQueue):
             with self.subTest(executable=executable):
                 git(tree, "checkout", "-q", "--detach", start)
                 git(tree, "rm", "-q", "run.sh")
-                (tree / "notes.txt").write_text("# notes\n" + script, encoding="utf-8")
-                (tree / "notes.txt").chmod(0o755 if executable else 0o644)
-                git(tree, "add", "notes.txt")
+                (tree / "notes.sh").write_text("# notes\n" + script, encoding="utf-8")
+                (tree / "notes.sh").chmod(0o755 if executable else 0o644)
+                git(tree, "add", "notes.sh")
                 git(tree, "commit", "-q", "-m", "revert: keep the runner as notes")
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), expected)
@@ -4185,6 +4185,34 @@ class CitedCloses(SharedQueue):
                 status = git(tree, "diff", "-M", "--name-status", cited, head)
                 self.assertEqual(paired, status.startswith("R"), status)
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+
+    def test_a_reverted_script_kept_only_in_documentation_closes_nothing(self) -> None:
+        """sd:10214 class pass 11: a file of another kind than the cited one cannot hold its work. A revert
+        that moves a cited script into a document, whether git pairs the move as a rename or the text lands
+        in a document main already holds, took the work out: the document does not run."""
+        import sd_operations
+        a, *_ = self.open
+        script = "".join(f"print('step {n}')\n" for n in range(20))
+        for paired in (True, False):  # the unpaired case moves main, so it runs last
+            with self.subTest(paired=paired):
+                tree, _ = self.committed(f"topic-script-kept-as-docs-{paired}")
+                if not paired:
+                    self.on_main(tree, {"run.py": "print('draft')\n", "notes.md": "# notes\n"})
+                (tree / "run.py").write_text(script, encoding="utf-8")
+                git(tree, "add", "run.py")
+                git(tree, "commit", "-q", "-m", f"feat: the runner\n\nCloses: sd:{a}")
+                cited = git(tree, "rev-parse", "HEAD")
+                if paired:
+                    git(tree, "mv", "run.py", "run.md")
+                else:
+                    (tree / "notes.md").write_text("# notes\n" + script, encoding="utf-8")
+                    (tree / "run.py").write_text("print('draft')\n", encoding="utf-8")
+                git(tree, "add", "-A")
+                git(tree, "commit", "-q", "-m", "revert: keep the runner as notes")
+                head = git(tree, "rev-parse", "HEAD")
+                status = git(tree, "diff", "-M", "--name-status", cited, head)
+                self.assertEqual(paired, status.startswith("R"), status)
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
     def test_a_submodule_link_holds_no_text_and_hides_no_revert(self) -> None:
         """sd:10214 class pass 10: a submodule link is a commit, not text. An unrelated link the head changed

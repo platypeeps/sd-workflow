@@ -1081,10 +1081,14 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     # holds text; a submodule link and a symlink hold none.
     text_modes = ("100644", "100755")
 
-    def mode_holds(cited: str, holder: str) -> bool:
-        """Whether an entry of mode `holder` can hold the work of one of mode `cited`: the same kind, or an
-        executable file for a plain one. A plain-text copy of an executable does not run."""
-        return holder == cited or (cited, holder) == text_modes
+    def mode_holds(cited: str, holder: str, cited_path: str, holder_path: str) -> bool:
+        """Whether an entry of mode `holder` at `holder_path` can hold the work of one of mode `cited` at
+        `cited_path`: the same kind, or an executable file for a plain one, with the same file suffix. A
+        plain-text copy of an executable does not run, nor does a script kept in a document (class pass 11)."""
+        # ponytail: the suffix stands for the file's kind; a move that renames `tool` to `tool.py` loses its
+        # close (fixed by hand), never a false close. Read the language if that matters.
+        return (holder == cited or (cited, holder) == text_modes) and \
+            pathlib.PurePosixPath(cited_path).suffix == pathlib.PurePosixPath(holder_path).suffix
 
     def renames_since(sha: str, rev: str) -> dict[str, str] | None:
         """Where `rev` holds each file of `sha` that a commit between them renamed. A pair whose new mode
@@ -1096,7 +1100,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         while at < len(status) and status[at].startswith(":"):  # `:old new blob blob status`, then the names
             meta = status[at].split()
             names = 2 if meta[-1][:1] in "RC" else 1
-            if meta[-1][:1] == "R" and mode_holds(meta[0][1:], meta[1]) and at + 2 < len(status):
+            if meta[-1][:1] == "R" and at + 2 < len(status) and \
+                    mode_holds(meta[0][1:], meta[1], status[at + 1], status[at + 2]):
                 found[status[at + 1]] = status[at + 2]
             at += 1 + names
         return found
@@ -1136,8 +1141,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             return None
         return b"\n" + b"\n".join(done.stdout.splitlines()) + b"\n" if done.returncode == 0 else None
 
-    def changed_since(sha: str, skip: list[str], before: str) -> list[tuple[str, bytes, bytes]] | None:
-        """Each other file `head` changed since `sha` and holds otherwise than `before` did, as its mode and
+    def changed_since(sha: str, skip: list[str], before: str) -> list[tuple[str, str, bytes, bytes]] | None:
+        """Each other file `head` changed since `sha` and holds otherwise than `before` did, as its mode, path and
         text now and its text at `before` (empty where `before` lacks it); None when git gave no answer."""
         changed = fields("diff", "--no-renames", "--name-only", "-z", sha, head)
         others = [path for path in changed or [] if path and path not in skip]
@@ -1153,7 +1158,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 held, had = run_of_lines(head, path), run_of_lines(before, path) if had_text else b""
                 if held is None or had is None:
                     return None
-                pairs.append((now[path].split()[0], held, had))
+                pairs.append((now[path].split()[0], path, held, had))
         return pairs
 
     def copied(sha: str, names: list[str], before: str) -> bool | None:
@@ -1162,7 +1167,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         no answer. A revert that moves the fixed file into a new or an existing file and puts the old one
         back took nothing out (sd:10214 lane review). Part of that text is not the work: a line the fix
         added, found in another file, proves no move (class pass 7), nor is the text in an entry that
-        cannot hold the work (`mode_holds`, class pass 10)."""
+        cannot hold the work (`mode_holds`, class passes 10 and 11)."""
         own = blobs(sha, names)
         pairs = changed_since(sha, names + [moved[name] for name in names if name in moved], before)
         if own is None or pairs is None:
@@ -1176,8 +1181,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             work = run_of_lines(sha, name)
             if work is None:
                 return None
-            if work.strip() and any(work in held and work not in had and mode_holds(mode, kept)
-                                    for kept, held, had in pairs):
+            if work.strip() and any(work in held and work not in had and mode_holds(mode, kept, name, path)
+                                    for kept, path, held, had in pairs):
                 return True
         return False
 
