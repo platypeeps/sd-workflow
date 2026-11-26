@@ -17,7 +17,8 @@ Read in parallel; write one repo at a time.
 - Activity: last commit on origin/main, open branches and worktrees, and unpushed commits.
 - Items: every planning, blocked, parked or ready item, its newest note, and any build or lane entry.
   Use `sd store items --parked` and `sd assignments list`.
-- Questions: open question notes, research rows in the Decisions list of `sd today --here`, and review questions or scores.
+- Questions: open question notes and research rows in the Decisions list of `sd today --here`.
+  Count review questions and scores for the report only: a review batch's questions are labelled on the dashboard's Review page, not answered with `--answers`.
 - Kit checks, run from a worktree: `sd-research-kit review`, `checklinks` and `pins`. Quote each one's failing lines.
 - The Status section of each top document: its date, and whether it names a next step.
 - Open research questions: `00-overview/next-research.md` or its equivalent.
@@ -46,11 +47,11 @@ Read in parallel; write one repo at a time.
   - Fix: a contradicted, outdated or unsourced claim, a failing kit check, a moved pin, or an inconsistency.
   - Forward: the top 1-2 open research questions, a missing next step, or a stale Status, each scoped to one PR's work.
 - Before filing, drop a candidate that an open item already covers. Note the existing item instead.
-- File each surviving one as its own item, 1 to 5 per repo, ranked:
+- File each surviving one as its own item, 1 to 5 per repo, ranked; `<n>` is its rank, since a ref names one item:
 
   ```bash
   sd task add --priority <2 fix of a wrong claim | 3 the rest> \
-    --belongs-to <repo> --ref research-review:<date> \
+    --belongs-to <repo> --ref research-review:<repo>:<date>:<n> \
     --body "<why, with file:line or source; the done test: what a reader can check when it is finished>" \
     "<repo>: <action verb> <what>"
   ```
@@ -68,7 +69,7 @@ Read in parallel; write one repo at a time.
 
 ## 6. Ask
 
-Walk the open questions oldest first, one per question: one or two lines of context, the recommended option first.
+Walk the open question notes and Decisions rows oldest first, one per question (review questions stay on the dashboard's Review page): one or two lines of context, the recommended option first.
 Record each answer at once with `sd task note N "<ruling>" --kind decision --answers <note>`.
 If an answer unblocks an item, set it ready and build it.
 Decide routine ones yourself; ask only where the options differ in money, risk, a standing ruling, or whether a repo continues.

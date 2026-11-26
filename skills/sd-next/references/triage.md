@@ -8,7 +8,8 @@ Triage every stalled item in this repo and its companion repos, then queue a bui
    - every parked item: `sd store items --parked` in each repo, plus blocked items whose reason says Parked;
    - every assignment in `sd assignments list` for these repos that is blocked, cancelled, or running with no recent beat;
    - every open review advisory: the weekly "Open review advisories" items and any advisory finding a review report names but no item holds yet;
-   - everything that waits on the operator: open question notes, the Decisions rows in `sd today --here`, review questions or scores counted in its `+N review questions wait` line, and any question this run raises.
+   - everything that waits on the operator: open question notes, the Decisions rows in `sd today --here`, and any question this run raises.
+     Count the review questions and scores in its `+N review questions wait` line for the report, and leave them to the dashboard's Review page: a review batch's questions are labelled there, not answered with `--answers`.
 
 2. Decide, for each one. Read why it stopped and what it waits on.
    - Nothing it needs is missing (the item it waits on is done, the date has passed, the measurement now passes): unpark it if parked, and set it ready.
@@ -23,7 +24,7 @@ Triage every stalled item in this repo and its companion repos, then queue a bui
    Run `sd assignments build` for every ready item with no queued or running build, including items that were ready before this run.
 
 4. Ask
-   Walk every open question, decision and score, oldest first, one per question.
+   Walk every open question note and Decisions row, oldest first, one per question; the review questions stay on the dashboard's Review page.
    Give one or two lines of context and the recommended option first.
    Record each answer at once with `sd task note N "<ruling>" --kind decision --answers <note>`.
    If an answer unblocks an item, set it ready and build it as in step 3.

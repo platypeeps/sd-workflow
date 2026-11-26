@@ -85,5 +85,50 @@ class OperatorPromptReferences(unittest.TestCase):
                 self.assertIn(phrase, text)
 
 
+def model_invocable(skill: str) -> bool:
+    head = skill_text(skill).split("\n---", 1)[0]
+    return "disable-model-invocation: true" not in head
+
+
+def reference(skill: str, name: str) -> str:
+    return (ROOT / "skills" / skill / "references" / name).read_text(encoding="utf-8")
+
+
+class ReviewRoundFixes(unittest.TestCase):
+    def test_a_plain_trigger_reaches_a_skill_the_model_may_load(self):
+        """sd-ship is operator-invoked only, so "check open PRs" must route elsewhere."""
+        for skill, files in PROMPTS.items():
+            for name, triggers in files.items():
+                for trigger in triggers:
+                    if trigger.startswith("/"):
+                        continue
+                    with self.subTest(trigger=trigger):
+                        loaders = [s for s in PROMPTS if model_invocable(s)
+                                   and trigger in description(s)
+                                   and f"skills/{skill}/references/{name}`" in skill_text(s)
+                                   or (s == skill and model_invocable(s) and trigger in description(s))]
+                        self.assertTrue(loaders, trigger)
+
+    def test_each_filed_finding_gets_its_own_ref(self):
+        """A ref names one item, so one ref per run files only the first finding."""
+        self.assertIn("`deep-review:<repo>:<date>:<rank>`", reference("sd-status", "deep.md"))
+        self.assertNotIn("--ref research-review:<date> ", reference("sd-research-repo", "fleet-review.md"))
+        self.assertIn("--ref research-review:<repo>:<date>:<n>", reference("sd-research-repo", "fleet-review.md"))
+
+    def test_review_batch_questions_go_to_the_review_page(self):
+        """A review batch's questions are labelled on the dashboard, not answered with --answers."""
+        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md")):
+            text = reference(skill, name)
+            with self.subTest(reference=name):
+                self.assertIn("dashboard's Review page", text)
+                self.assertNotRegex(text, r"Walk every open question, decision and score")
+                self.assertNotRegex(text, r"review questions or scores\.?\n")
+
+    def test_enqueue_binds_the_head_the_sweep_checked(self):
+        text = reference("sd-ship", "open-prs.md")
+        self.assertIn("sd-ship -C <worktree> lane enqueue", text)
+        self.assertIn("--expected-head <head>", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -45,7 +45,7 @@ e. Cross-repo agreement: for each link from step 0, check that both sides agree 
 ## 4. File
 
 - Dedupe each surviving finding against open items; note the existing item instead of filing a copy.
-- File the top 20 as items in their own repo: priority 2 for a reproduced defect, 3 for the rest, ref `deep-review:<repo>:<date>`, body: file:line, trigger, consequence, smallest fix, done test.
+- File the top 20 as items in their own repo: priority 2 for a reproduced defect, 3 for the rest, ref `deep-review:<repo>:<date>:<rank>` (a ref names one item, so each finding takes its own), body: file:line, trigger, consequence, smallest fix, done test.
   Leave them planning, so they show in Suggested.
 - Past the top 20, also file every finding that is high priority or high value: a reproduced defect, a data-loss, security or wrong-result risk, or a fix that removes a recurring manual step.
   The cap of 20 never drops one of these.

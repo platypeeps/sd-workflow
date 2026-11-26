@@ -1,6 +1,6 @@
 ---
 name: sd-ship
-description: Take committed work from a verified branch to a merged pull request, committing only enumerated paths; or, on "check open PRs", sweep every open pull request.
+description: Take committed work from a verified branch to a merged pull request, committing only enumerated paths; `/sd-ship open-prs` sweeps every open pull request.
 disable-model-invocation: true
 ---
 
@@ -12,7 +12,7 @@ Post-merge closeout removes the merged PR's safe branches, stashes, refs and sta
 Invocation alone authorizes no checkout deletion.
 Use STE-Concise; report delivery state, decisive checks, blockers, and retained worktrees.
 
-On "check open PRs", read `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout and follow it: every open pull request, what holds it, and the lane action.
+On `/sd-ship open-prs`, or "check open PRs" routed from sd-next, read `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout and follow it: every open pull request, what holds it, and the lane action.
 
 ## Standing permission
 

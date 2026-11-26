@@ -1,6 +1,6 @@
 # Open pull requests
 
-Run when the operator says "check open PRs": every open PR in this repo and its companion repos.
+Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next routes it): every open PR in this repo and its companion repos.
 
 1. List them with `mcp__github__list_pull_requests`, and read each one's state with `pull_request_read` `get`.
 2. For each PR, find what holds it: a failed `sd/local-gate`, open review findings, a merge conflict, a failed lane entry, or no lane entry.
@@ -15,7 +15,9 @@ Run when the operator says "check open PRs": every open PR in this repo and its 
    - Past round 3, counting builder and lane rounds, record fix, file or reject for each blocker with `sd task note N --kind decision`.
    - Rebut a finding that doesn't hold, with a reason a reader can check.
    - Retry a failed lane entry once its cause is fixed.
-   - Enqueue a PR that passes and has no lane entry: `sd-ship lane enqueue`.
+   - Enqueue a PR that passes and has no lane entry, from the worktree on its head branch, at the head step 2 read:
+     `sd-ship -C <worktree> lane enqueue --item N --title "<title>" --body-file <body> --expected-head <head>`.
+     A worktree on another branch, or a head that moved since step 2, is a stop: read the PR again.
 5. Ask the operator first, one question at a time, before you close a PR, merge one by hand, or request a person's review.
 
 End with a table: PR, item, what held it, action, new state.
