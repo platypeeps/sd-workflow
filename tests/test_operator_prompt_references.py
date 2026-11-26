@@ -264,6 +264,12 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
         self.assertIn("sd assignments cancel <assignment>", triage)
         self.assertIn("sd-ship -C <worktree> lane retry N", reference("sd-ship", "open-prs.md"))
 
+    def test_triage_cancels_no_member_of_a_live_bundle(self):
+        """Cancelling one member of a running bundle parks the whole run (sd:10795)."""
+        triage = reference("sd-next", "triage.md")
+        self.assertIn("Cancel only an assignment whose run has ended or lost its beat", triage)
+        self.assertIn("A member of a live bundle waits for its run to end", triage)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,8 @@ Triage every stalled item in this repo and its companion repos, then queue a bui
    - It failed review or a build: fix it or split it, then set it ready.
      Past round 3, record fix, file or reject for each blocker with `sd task note N "<fix, file or reject: reason>" --kind decision`.
    - A stale assignment: retry it with `sd assignments build N` if its item is still wanted; if the item is done or superseded, cancel it with `sd assignments cancel <assignment>` and put the reason in `sd task note N "<reason>"`.
+     Cancel only an assignment whose run has ended or lost its beat: cancelling one member of a running bundle stops and parks the whole run.
+     A member of a live bundle waits for its run to end, with a note naming that run.
    - An advisory: file it as an item for the repo's next PR, or close it with a reason a reader can check. Never treat one as a blocker.
    - It waits on the operator: add it to the questions for step 4.
    - Otherwise: leave it as it is, with a note naming what it still waits on: an item, a date, a measurement, or the operator.
