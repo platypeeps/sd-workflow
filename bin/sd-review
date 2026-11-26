@@ -122,6 +122,8 @@ OPTIONAL_FINDING_KEYS = frozenset({"evidence", "instances"})
 #: The most of one finding's evidence a report keeps, and the note an uncited repeat of a rebuttal gets (pack sd:9270).
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
+#: A cited repeat of a blocker a build's ruling round rejected or filed (sd:10286).
+RULED_NOTE = "[downgraded: repeats a blocker a build ruling rejected]"
 #: What a reader puts in `evidence`, and the note a finding without it gets (pack sd:9867, note #70162).
 EVIDENCE_ASK = ("a failing input and its path:line route, showing a failure this change causes in code "
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
@@ -789,8 +791,9 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...]]]]:
-    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances) per accepted finding; malformed: none."""
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], bool]]]:
+    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, ruled) per accepted
+    finding; malformed: none. `ruled`: a build's ruling round wrote it (sd:10286), never `sd-ship adjudicate`."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -800,7 +803,8 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
     bindings = proposal.get("bindings") if isinstance(proposal, dict) else None
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
-         tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()))
+         tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()),
+         row.get("ruled") is True)
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -826,6 +830,7 @@ class Rebuttal(NamedTuple):
     text: str
     reason: str
     instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
+    ruled: bool = False  # a build's ruling round rejected the blocker and its evidence: a cited repeat holds too (sd:10286)
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
@@ -873,7 +878,7 @@ def _folded(value: Any) -> str:
 
 def summary_key(summary: Any) -> str:
     """The whole summary, case and whitespace folded, the repeat note dropped; the path is compared as recorded."""
-    return _folded(str(summary).replace(REPEAT_NOTE, "") if isinstance(summary, str) else summary)
+    return _folded(str(summary).replace(REPEAT_NOTE, "").replace(RULED_NOTE, "") if isinstance(summary, str) else summary)
 
 
 def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any, instances: Any = ()) -> Rebuttal | None:
@@ -898,10 +903,10 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     The lane's own blockers (`LANE_PATHS`) are never recorded: a later truncated review must still block."""
     records = [Rebuttal(head, path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
                         _bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
-                        _bounded(reason, REBUTTED_REASON_CHARS), instances)
+                        _bounded(reason, REBUTTED_REASON_CHARS), instances, ruled)
                for body, *_rest in rows for head, found in [_adjudicated(body)]
                if isinstance(head, str) and on_branch(head)
-               for path, summary, line, disposition, reason, instances in found
+               for path, summary, line, disposition, reason, instances, ruled in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
     shown = 0
     for index, record in enumerate(records):
@@ -1781,10 +1786,12 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     threshold = BLOCKING_ORDER[floor]
     def _floor(row: Mapping[str, Any]) -> bool:
         return 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold
-    def _rebutted(row: Mapping[str, Any]) -> bool:  # the newest record at every place it names is a listed rebuttal
-        return getattr(recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances")), "listed", False)
+    def _rebutted(row: Mapping[str, Any], cited: bool = False) -> bool:  # the newest record at every place it names is a listed rebuttal
+        record = recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances"))
+        return getattr(record, "listed", False) and (not cited or getattr(record, "ruled", False))
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
-        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row)
+        # A cited one too when a build's ruling rejected it, or the build enqueues what blocks here (sd:10286).
+        return _floor(row) and _rebutted(row, isinstance(row.get("evidence"), str) and bool(row["evidence"].strip()))
     def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
         return dict(old, disposition="rebutted") if old.get("disposition") == "blocking" and _rebutted(old) else old
     # Only a finding that blocks releases a hold: not a medium copy (build/sd-1423 review), not a rebutted repeat (sd-review:1783).
@@ -1792,7 +1799,8 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     prior, disposed = [*map(_prior, instance_rows(*prior))], []
     for finding in findings:
         record, blocking = dict(finding), _floor(finding)
-        evidence, note = record.get("evidence"), REPEAT_NOTE if _repeat(finding) else None
+        evidence = record.get("evidence")
+        note = (RULED_NOTE if isinstance(evidence, str) and evidence.strip() else REPEAT_NOTE) if _repeat(finding) else None
         if blocking and not note and not (isinstance(evidence, str) and evidence.strip()):
             stored = prior_evidence(prior, record, at_floor)
             if stored:

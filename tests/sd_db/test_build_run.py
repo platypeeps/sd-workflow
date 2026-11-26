@@ -1239,6 +1239,24 @@ class Supervise(Case):
                 self.assertEqual(ended["outcome"], "blocked", ended)
                 self.assertIn("work.txt:1 a blocker", self.latest()["detail"])
 
+    def test_the_lane_holds_back_the_ruled_repeat_the_build_cleared(self):
+        """Review of sd:10286 (build_run.py:2199, :2256): `settled` clears a ruled repeat that cites evidence,
+        and the run enqueues; the lane's `sd-review` blocked that same repeat, a rebuttal holding back only an
+        uncited one. The ruling's rebuttal now holds back the cited repeat there too."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        review = importlib.import_module("tests.test_sd_review").sd_review
+        (body,) = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE "
+                                  "'ship-adjudication:build-run:%'").fetchone()
+        ruled = json.loads(body)["proposal"]["findings"][0]["raw_finding"]
+        repeat = {"path": ruled["path"], "line": ruled["line"], "summary": ruled["summary"], "severity": "high",
+                  "family": "correctness", "instances": [], "evidence": "the original evidence"}
+        seen = review.rebuttals([(body,)], lambda _head: True, lambda _head, _path: True)
+        (lane,) = review.dispose([review._finding(repeat)], "high", seen)
+        self.assertEqual(lane["disposition"], "advisory", "the lane blocks the repeat the build cleared")
+
     def test_a_settled_review_runs_the_gate_its_blocking_report_skipped(self):
         """Review of sd:10286: `sd-review` runs no gate on a blocking report, so a managed run whose ruled
         repeat settles to a pass runs the repository's checks before it enqueues; a failed one delivers

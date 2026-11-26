@@ -2256,7 +2256,9 @@ class Supervisor:
                 record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:ruling:{head}:{number}",
                              body={"decision": "accepted", "proposal": {
                                  "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},
-                                 "findings": [{"raw_finding": raw, "response_disposition": "rebutted",
+                                 # `ruled`: the lane's `sd-review` holds back its cited repeat too, as
+                                 # `settled` does here; else the run enqueues what the lane blocks.
+                                 "findings": [{"raw_finding": raw, "response_disposition": "rebutted", "ruled": True,
                                                "reason": f"filed as follow-up sd:{filed}: {reason}" if filed else reason}]}})
 
     def own_checks(self, head: str) -> list[dict] | dict:

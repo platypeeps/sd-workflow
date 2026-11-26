@@ -1267,6 +1267,22 @@ class RebuttalIdentityTests(unittest.TestCase):
         self.assertEqual(gate([row()], parked, rebutted), ["blocking"])
         self.assertEqual(gate([row()], rebutted, parked), ["advisory"])
 
+    def test_a_ruling_rebuttal_holds_back_a_cited_repeat(self) -> None:
+        """Review of sd:10286 (build_run.py:2199): a build's ruling round rejected the blocker and its
+        evidence, so the cited repeat it clears posts as advice here too. An `sd-ship adjudicate` rebuttal
+        still holds back only an uncited repeat."""
+        plain = adjudicated(("src.py", "defect", "rebutted"))
+        ruled = json.loads(plain)
+        ruled["proposal"]["findings"][0]["ruled"] = True
+        cited = row(evidence=REPRO)
+        self.assertEqual(gate([cited], plain), ["blocking"])
+        self.assertEqual(gate([cited], json.dumps(ruled)), ["advisory"])
+        self.assertEqual(gate([row(summary="another defect", evidence=REPRO)], json.dumps(ruled)), ["blocking"])
+        for value in ("true", 1, None):
+            with self.subTest(ruled=value):
+                ruled["proposal"]["findings"][0]["ruled"] = value
+                self.assertEqual(gate([cited], json.dumps(ruled)), ["blocking"], "only a literal true")
+
     def test_only_an_accepted_adjudication_rebuts(self) -> None:
         for decision in ("rejected", "", "proposed"):
             with self.subTest(decision=decision):
