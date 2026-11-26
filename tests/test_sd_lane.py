@@ -4097,6 +4097,62 @@ class CitedCloses(SharedQueue):
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), expected)
 
+    def test_a_moved_script_made_executable_keeps_the_close(self) -> None:
+        """sd:10214 class pass 10: a plain file can do no more than the same text made executable, so a
+        revert-titled commit that moves a cited script and sets its executable bit took nothing out, whether
+        git pairs the move as a rename or the old path goes back to the base."""
+        import sd_operations
+        a, *_ = self.open
+        script = "".join(f"echo step {n}\n" for n in range(20))
+        for paired in (True, False):  # the unpaired case moves main, so it runs last
+            with self.subTest(paired=paired):
+                tree, _ = self.committed(f"topic-moved-and-made-executable-{paired}")
+                if not paired:
+                    (tree / "run.sh").write_text("echo draft\n", encoding="utf-8")
+                    git(tree, "add", "run.sh")
+                    git(tree, "commit", "-q", "-m", "docs: the base")
+                    git(tree, "push", "-q", "origin", "HEAD:main")
+                    git(tree, "fetch", "-q", "origin")
+                (tree / "run.sh").write_text(script, encoding="utf-8")
+                git(tree, "add", "run.sh")
+                git(tree, "commit", "-q", "-m", f"feat: the runner\n\nCloses: sd:{a}")
+                cited = git(tree, "rev-parse", "HEAD")
+                (tree / "tool.sh").write_text(script, encoding="utf-8")
+                (tree / "tool.sh").chmod(0o755)
+                if paired:
+                    git(tree, "rm", "-q", "run.sh")
+                else:
+                    (tree / "run.sh").write_text("echo draft\n", encoding="utf-8")
+                git(tree, "add", "-A")
+                git(tree, "commit", "-q", "-m", "revert: move the runner to the tools")
+                head = git(tree, "rev-parse", "HEAD")
+                status = git(tree, "diff", "-M", "--name-status", cited, head)
+                self.assertEqual(paired, status.startswith("R"), status)
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+
+    def test_a_submodule_link_holds_no_text_and_hides_no_revert(self) -> None:
+        """sd:10214 class pass 10: a submodule link is a commit, not text. An unrelated link the head changed
+        is no failed read that keeps a reverted item's close, and a cited link a revert set back is undone."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-submodule-link")
+        first, second = git(tree, "rev-parse", "HEAD"), git(tree, "rev-parse", "HEAD^{tree}")
+        (tree / "work.txt").write_text("the reader\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        git(tree, "update-index", "--add", "--cacheinfo", f"160000,{first},vendor")
+        git(tree, "commit", "-q", "-m", "chore: pin the vendored library")
+        git(tree, "rm", "-q", "--cached", "work.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the reader")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+        git(tree, "update-index", "--cacheinfo", f"160000,{second},vendor")
+        git(tree, "commit", "-q", "-m", f"chore: move the vendored library\n\nCloses: sd:{b}")
+        git(tree, "update-index", "--cacheinfo", f"160000,{first},vendor")
+        git(tree, "commit", "-q", "-m", "revert: the vendored library goes back")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
     def on_main(self, tree: pathlib.Path, files: dict[str, str]) -> None:
         """`files` committed on the branch and pushed as `origin/main`, the merge base."""
         for name, text in files.items():
