@@ -227,7 +227,8 @@ Your final message is your report: the commits, the tests run with their result 
 ADJUDICATE = """A finding that rejects a review finding adds no commit; record its disposition instead, at the
 reviewed head: `sd-ship -C {worktree} adjudicate --item {item} --expected-head <HEAD> --json` prints the
 template; set each rejected row's `response_disposition` to `rebutted` and `reason` to the ruling's reason,
-then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
+and its `test` to the argv of a test for it that runs and passes at that head, one committed there or an inline
+`python3 -c` script: a failing one reproduces the finding, so fix it instead (sd:10893). Then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
 """
 
 FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in

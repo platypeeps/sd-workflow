@@ -232,6 +232,50 @@ class DispositionTests(unittest.TestCase):
         ):
             self.prepare()
 
+    def with_test(self, argv):
+        proposal = self.filled()
+        for row in proposal["findings"]:
+            row["test"] = argv
+        return proposal
+
+    def test_a_rebuttal_whose_test_passes_clears_and_one_whose_test_fails_keeps_the_blocker(self):
+        """sd:10893. A high blocks only while a failing test reproduces it: the builder's attempted test
+        passes, so the rebuttal records and prepare clears; a failing one refuses and nothing is written."""
+        self.blocked()
+        for argv in ([sys.executable, "-c", "raise SystemExit(1)"], ["tests/example_missing_test"]):
+            with self.subTest(argv=argv):
+                self.rejected_proposal(self.with_test(argv))
+        self.accepted(self.with_test([sys.executable, "-c", "pass"]))
+        with patch.object(ship, "review_process", side_effect=AssertionError("dispatched")):
+            self.prepare()
+
+    def test_prepare_reruns_the_test_and_a_failing_one_reopens_the_blocker(self):
+        """sd:10893. The lane counts a blocker open while its test fails, read at prepare, not only at record."""
+        self.blocked()
+        flag = self.directory / "reproduced"
+        script = f"import pathlib, sys; sys.exit(pathlib.Path({str(flag)!r}).exists())"
+        self.accepted(self.with_test([sys.executable, "-c", script]))
+        flag.write_text("x")
+        with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
+            self.prepare()
+
+    def test_a_test_that_dirties_the_checkout_or_is_malformed_refuses(self):
+        """sd:10893. The record binds the clean exact head; `test` is an argv list, not a shell string."""
+        self.blocked()
+        dirty = [sys.executable, "-c", "open('example-left-behind.txt', 'w').close()"]
+        self.rejected_proposal(self.with_test(dirty))
+        (self.root / "example-left-behind.txt").unlink()
+        for value in ("python3 -c pass", [""], [1], {"argv": []}, ["a\0b"]):
+            with self.subTest(value=value):
+                self.rejected_proposal(self.with_test(value))
+
+    def test_the_template_offers_an_empty_test(self):
+        """sd:10893. The template names the field; [] and an absent `test` both record as before."""
+        self.blocked()
+        template = json.loads(self.command().stdout)["proposal"]
+        self.assertEqual([row["test"] for row in template["findings"]], [[]])
+        self.accepted(self.with_test([]))
+
     def test_the_template_and_the_refusal_name_the_allowed_values(self):
         """sd:9881: a blank template and `rebut` left the values unnamed."""
         self.blocked()
