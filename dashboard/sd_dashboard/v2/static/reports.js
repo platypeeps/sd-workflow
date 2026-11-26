@@ -119,7 +119,7 @@ function fillFilters() {
   // Every job the reading names, not only jobs with a report row: a cadence row sets this filter, and readURL takes ?job=
   // only when the list has it (sd:2430). A job with no report shows "Nothing matches".
   jobs = [...new Set([...ROWS.map(r => r.job), ...Object.keys(JOBS), ...Object.keys(CAD)])].sort();
-  days = [...new Set(ROWS.map(r => r.at.slice(0, 10)))].sort().reverse();
+  days = [...new Set(ROWS.map(r => r.day))].sort().reverse();
 }
 function setJob(j) { jobFilter = j; F.job = j; L.page = 1; renderCad(); renderRows(); }
 // The filter bar (sd:5463), Activity's layout from shell.list: Status as a segment with its counts, Job and Day as picks,
@@ -184,13 +184,24 @@ function matches(r) {
   if (F.status === 'act' && !r.act) return false;
   if (F.status === 'open' && !r.open) return false;
   if (F.status === 'done' && r.open) return false;
-  if (F.day && r.at.slice(0, 10) !== F.day) return false;
+  if (F.day && r.day !== F.day) return false;
   if (F.fam && FAM_OF[r.job] !== F.fam) return false;
   if (F.q && !(r.what + ' ' + r.detail + ' ' + r.job + ' ' + (r.source.body || '')).toLowerCase().includes(F.q)) return false;
   return true;
 }
 function stCell(r) {
   return r.open ? html`<td class="st open">${I('inbox')}open</td>` : html`<td class="st">${I('check')}acknowledged</td>`;
+}
+// sd:10438: a job's filter that shows no report says whether the filters hide its reports or it filed none, then
+// offers the list's Clear all and the Cadence view, so a cadence row's "show its reports" has a way back.
+function nothing() {
+  if (!DOC.reports) return `The reports were not read: ${why('reports')}.`;
+  if (!F.job) return 'Nothing matches. Clear a filter, or press → in the bar to capture it as a task.';
+  const all = ROWS.filter(r => r.job === F.job).length, last = CAD[F.job] ? lastState(F.job) : '';
+  const said = F.status === 'act' ? `No ${F.job} report needs action` : `No ${F.job} report matches these filters`;
+  const runs = last === 'ok' ? ' Its last run succeeded.' : '';
+  return html`${all ? `${said}: the filters hide its ${all} report${all === 1 ? '' : 's'}.` : `${F.job} has filed no report.`}${runs}
+    <button type="button" data-empty="all">Show all reports</button>${CAD[F.job] ? html` <button type="button" data-empty="cadence">Back to run history</button>` : ''}`;
 }
 // read: the reader draws, and its settle picks the selection, so no reconcile runs here.
 function renderRows(read) {
@@ -208,10 +219,11 @@ function renderRows(read) {
   const byDay = L.sort === 'at';
   let lastDay = '';
   put(tbody, html`${slice.length ? slice.map(r => {
-    const d = r.at.slice(0, 10), head = byDay && d !== lastDay; lastDay = d;
-    return [head ? html`<tr class="day" aria-hidden="true"><td colspan="6">${new Date(d + 'T12:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' })} · UTC</td></tr>` : '',
+    // sd:10438: the server's local day, the one the Cadence columns use; the time cell keeps the stamp.
+    const d = r.day, head = byDay && d !== lastDay; lastDay = d;
+    return [head ? html`<tr class="day" aria-hidden="true"><td colspan="6">${new Date(d + 'T12:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' })} · local time</td></tr>` : '',
     html`<tr data-id="${r.id}" data-changed="${r.at}" aria-selected="${String(r.id === sel)}"${picks.has(r.id) ? html` data-picked` : ''}><td class="g g-${r.s}">${G[r.s]}<span class="sr">${r.s}</span></td><td class="what"><button type="button">${r.what}</button></td><td class="detail">${r.detail}</td><td class="when"><time class="rel" datetime="${r.at}"></time></td>${stCell(r)}<td class="act">${window.shell.commands.rowActions(r.id)}</td></tr>`];
-  }) : html`<tr class="day"><td colspan="6">${DOC.reports ? 'Nothing matches. Clear a filter, or press → in the bar to capture it as a task.' : `The reports were not read: ${why('reports')}.`}</td></tr>`}`);
+  }) : html`<tr class="day"><td colspan="6">${nothing()}</td></tr>`}`);
   put(byId('pager'), list.pager(shown.length, L, 'reports'));
   // A filter or a page change that drops the selected report from the slice moves the selection to a row on screen (sd:2306).
   // With no row on screen, Details clears too, so its buttons never act on a report the list does not show.
@@ -256,7 +268,11 @@ function writeURL() {
   window.shell.url(p); // the shell keeps ?row=
 }
 function select(id, open) { show(id); writeURL(); if (open) window.shell.openPane('tab-details'); }
-tbody.addEventListener('click', e => { const tr = e.target.closest('tr[data-id]'); if (tr) select(tr.dataset.id, true); });
+tbody.addEventListener('click', e => {
+  const b = e.target.closest('[data-empty]');
+  if (b) return b.dataset.empty === 'all' ? clearAll() : window.shell.view.show('cadence');
+  const tr = e.target.closest('tr[data-id]'); if (tr) select(tr.dataset.id, true);
+});
 
 // The shell's Shapeshift bar (sd:5539) gives the list its text, bodies included; the cadence table takes it from the shell.
 document.addEventListener('shell:filter', e => { const q = e.detail.q.toLowerCase(); if (q === F.q) return; F.q = q; L.page = 1; if (DOC) renderRows(); });
