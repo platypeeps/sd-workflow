@@ -1738,3 +1738,16 @@ def ref_items(connection: sqlite3.Connection, prefix: str) -> list[sqlite3.Row]:
 
 
 __all__ += ["ref_items"]
+
+
+def review_generation(connection: sqlite3.Connection) -> int:
+    """The newest `ship:` or `ship-adjudication:` checkpoint's id, 0 for none: a review saved, run again or
+    adjudicated moves it, so a reader that kept a review's answer knows to read it again (sd:10814).
+    Not in `ship`: `adjudicator_binding` hashes that file, so a read there voids adjudications."""
+    row = connection.execute("SELECT max(id) FROM state WHERE kind = 'checkpoint' AND (key >= 'ship:' "
+                             "AND key < 'ship;' OR key >= 'ship-adjudication:' "
+                             "AND key < 'ship-adjudication;')").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+__all__ += ["review_generation"]
