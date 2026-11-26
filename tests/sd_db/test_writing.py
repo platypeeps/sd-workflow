@@ -913,6 +913,28 @@ class ReviewCompanions(WritingCase):
         self.assertIn("adversarial evidence or research changed after its gate record",
                       readiness(self.db, self.item)["problems"])
 
+    def test_a_fresh_run_after_an_applied_fix_keeps_the_ledger(self):
+        """sd:10719. A one-sentence fix needs a fresh run for its layout; the run kept no earlier decision."""
+        self.write_draft(SENTENCES)
+        self.run_review()
+        revised = list(SENTENCES)
+        revised[0] = "Sentence 0 now hedges its claim about the fixture."
+        self.write_draft(revised)
+        reconcile_companion(self.db, self.item, "adversarial", note="Finding 1 resolved: sentence 0 hedged.")
+        brief, _ = self.run_review("# Second review\n\nDoes the central argument survive hostile reading: YES\n")
+        text = (self.folder / "adversarial.md").read_text()
+        self.assertIn("## Resolution ledger", text)
+        self.assertIn("Finding 1 resolved: sentence 0 hedged.", text)
+        self.assertIn("# Second review", text)
+        self.assertNotIn("1. A finding. CERTAIN", text)
+        self.assertEqual(self.companions()["adversarial"], "current")
+        self.adversarial_gate(brief["digest"])
+        self.assertNotIn("adversarial evidence or research changed after its gate record",
+                         readiness(self.db, self.item)["problems"])
+        # A second fresh run keeps the ledger once, not twice.
+        self.run_review("# Third review\n")
+        self.assertEqual((self.folder / "adversarial.md").read_text().count("Finding 1 resolved"), 1)
+
     def test_a_draft_changed_during_the_run_leaves_a_stale_report(self):
         self.write_draft(SENTENCES)
         brief = adversarial_brief(self.db, self.item)

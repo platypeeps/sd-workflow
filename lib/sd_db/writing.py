@@ -887,6 +887,8 @@ _STAMP_LINE = re.compile(r"(?m)^<!-- reconciled-with-draft: ([0-9a-f]{12}) .*-->
 #: A run record. Its word count takes at most 18 digits, so int() never meets one past its 4,300-digit limit: a
 #: longer count is no record, and a reconcile then refuses (pack sd:7242).
 _REVIEWED = re.compile(r"(?m)^<!-- adversarial-reviewed: words=(\d{1,18}) sentences=([0-9a-f,]*) -->$")
+#: Where a report's resolution ledger starts: every reconcile appends its section after the run's report.
+_LEDGER = re.compile(r"(?m)^## Resolution ledger — ")
 #: A reconcile stamps prose the run never read; past this share of the draft it refuses (sd:2025).
 REWRITE_LIMIT = 0.25
 #: A shorter draft is not ready for a hostile reader.
@@ -1032,10 +1034,15 @@ def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *
     target = snapshot["path"].with_name(REPORTS["adversarial"])
     # `index_sha256` names the frozen copy the reviewer read, not the live file: what lands on disk meanwhile, a
     # restored backup too, changes nothing here, and `record_gate` refuses bytes other than these (sd:10719).
+    # The run replaces the report and its layout proof, never the decisions on earlier findings: a fix that
+    # changed index.md needs a fresh run, and that run must not erase the ledger (sd:10719).
+    previous = snapshot["files"].get("adversarial", b"").decode("utf-8")
+    ledger = _LEDGER.search(previous)
     _write_report(target, f"<!-- reconciled-with-draft: {digest} on {day} gen={generation} index={index_sha256} -->\n\n{record}\n\n"
                           f"<!-- codex adversarial review of {row['piece']}, {day}. Findings are HYPOTHESES: "
                           "verify each against the source before acting. Nothing here edited the draft. -->\n\n"
-                          + (report if report.endswith("\n") else report + "\n"))
+                          + (report if report.endswith("\n") else report + "\n")
+                          + (f"\n{previous[ledger.start():].rstrip()}\n" if ledger else ""))
     verdict = re.findall(r"(?im)^.*survive[s]? hostile reading.*$", report)
     return {"piece": row["piece"], "path": target.relative_to(_disk(row["repo"])).as_posix(), "digest": digest,
             "current": snapshot["digest"] == digest and snapshot["hashes"]["index"] == index_sha256,
