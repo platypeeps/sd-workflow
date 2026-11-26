@@ -801,8 +801,8 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...]]]]:
-    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances) per accepted finding; malformed: none."""
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], int]]]:
+    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, the reopen it answered) per accepted finding; malformed: none."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -812,7 +812,7 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
     bindings = proposal.get("bindings") if isinstance(proposal, dict) else None
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
-         tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()))
+         tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()), reopen_count(raw))
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -838,6 +838,7 @@ class Rebuttal(NamedTuple):
     text: str
     reason: str
     instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
+    saw: int = 0  # the reopen count of the row it answered (`reopen_count`)
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
@@ -910,10 +911,10 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     The lane's own blockers (`LANE_PATHS`) are never recorded: a later truncated review must still block."""
     records = [Rebuttal(head, path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
                         _bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
-                        _bounded(reason, REBUTTED_REASON_CHARS), instances)
+                        _bounded(reason, REBUTTED_REASON_CHARS), instances, saw)
                for body, *_rest in rows for head, found in [_adjudicated(body)]
                if isinstance(head, str) and on_branch(head)
-               for path, summary, line, disposition, reason, instances in found
+               for path, summary, line, disposition, reason, instances, saw in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
     shown = 0
     for index, record in enumerate(records):
@@ -1799,9 +1800,22 @@ def run_provider(
 # Disposition -- local, and only local
 
 
+def reopen_count(row: Mapping[str, Any]) -> int:
+    """How many times a reader's cited `open` carried `row`; 0 for never. The row keeps the count through later
+    passes, so a reopen cannot lapse (build/sd-1675 class pass). Anything but a positive int is no count."""
+    return row["reopened"] if type(row.get("reopened")) is int and row["reopened"] > 0 else 0
+
+
+def rebuttal_answers(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], path: Any, line: Any) -> bool:
+    """Whether the newest record at this place of `row` is a listed rebuttal and, for a reopened row, a record
+    there answered that same reopen: one written before it answers nothing since (build/sd-1675 class pass)."""
+    return getattr(recorded_at(rebutted, path, row.get("summary"), line), "listed", False) and (
+        not reopen_count(row) or recorded_at([record for record in rebutted if record.saw == reopen_count(row)], path, row.get("summary"), line) is not None)
+
+
 def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> bool:
     """Whether the newest record at every place `row` names is a listed rebuttal, one record or one per place."""
-    return all(getattr(recorded_at(rebutted, path, row.get("summary"), line), "listed", False) for path, line in [(row.get("path"), row.get("line")), *((entry.strip(), None) for entry in (row.get("instances") if isinstance(row.get("instances"), list) else None) or [] if isinstance(entry, str) and entry.strip())])
+    return all(rebuttal_answers(rebutted, row, path, line) for path, line in [(row.get("path"), row.get("line")), *((entry.strip(), None) for entry in (row.get("instances") if isinstance(row.get("instances"), list) else None) or [] if isinstance(entry, str) and entry.strip())])
 
 
 def unanswered(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1810,8 +1824,8 @@ def unanswered(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> dict[str
     place (`is_rebutted`) or at none, and any row that is no blocker, is as it was."""
     own, found = f"{row.get('path')}:{row['line']}" if type(row.get("line")) is int else row.get("path"), row.get("instances")
     places = list(dict.fromkeys([own, *(entry.strip() for entry in (found if isinstance(found, list) else []) if isinstance(entry, str) and entry.strip())]))
-    left = [place for place in places if not getattr(recorded_at(rebutted, place, row.get("summary"), None), "listed", False)]
-    first = instance_place(left[0]) if row.get("disposition") == "blocking" and not reopened(row) and 0 < len(left) < len(places) else None
+    left = [place for place in places if not rebuttal_answers(rebutted, row, place, None)]
+    first = instance_place(left[0]) if row.get("disposition") == "blocking" and 0 < len(left) < len(places) else None
     return dict(row, path=first[0], line=first[1], instances=left) if first else dict(row)
 
 
@@ -1852,18 +1866,13 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome],
     `open`, no verdict, a blank one or a conflicting one carries it, with each `open` verdict's evidence, else
     its own. An answer that did not complete (a failed or retried attempt, a voided or partial one) clears
     nothing and answers for no other, yet its `open` carries (build/sd-1675 review). A rebutted blocker is
-    answered unless a reader's `open` gives evidence, as a cited repeat of a rebutted finding blocks.
+    answered unless a reader's `open` gives evidence, as a cited repeat of a rebutted finding blocks; that reopen
+    is counted on the row (`reopen_count`), and only a rebuttal of that same reopen answers it afterwards.
     With no reader answered only a cited `open` carries, for the retry (lane review); the review is incomplete."""
     answered = [outcome for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)]
     return [row for old in prior if old.get("disposition") == "blocking" and (answered or _opened(old.get("id"), outcomes))
-            and (not is_rebutted(rebutted, old) or reopened(old) or _opened(old.get("id"), outcomes))
+            and (not is_rebutted(rebutted, old) or _opened(old.get("id"), outcomes))
             and (row := _carry(old, answered, outcomes)) is not None]
-
-
-def reopened(row: Mapping[str, Any]) -> bool:
-    """Whether the preceding pass carried `row` on a reader's cited `open`: no rebuttal answers it then, at any place,
-    only fixed verdicts do (build/sd-1675 review, bin/sd-review:1859)."""
-    return isinstance(row.get("carried"), dict) and row["carried"].get("verdict") == "open" and isinstance(row.get("evidence"), str) and bool(row["evidence"].strip())
 
 
 def _said(ident: Any, outcome: Outcome) -> list[dict[str, str]]:
@@ -1890,7 +1899,8 @@ def _carry(old: Mapping[str, Any], answered: Sequence[Outcome], outcomes: Sequen
     stored = old.get("evidence") if isinstance(old.get("evidence"), str) else ""
     return dict({key: value for key, value in old.items() if key != "id"}, disposition="blocking",
                 evidence="\n".join(dict.fromkeys(_opened(ident, outcomes))) or stored,
-                carried={"id": ident, "verdict": "open" if still else "none"})
+                carried={"id": ident, "verdict": "open" if still else "none"},
+                **({"reopened": reopen_count(old) + 1} if _opened(ident, outcomes) else {}))
 
 
 def instance_place(entry: Any) -> tuple[str, int | None] | None:
@@ -1948,8 +1958,8 @@ def prior_blockers(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
     for row in previous["findings"]:
         record, again = {key: value for key, value in row.items() if key != "id"}, row["carried"].get("id") if isinstance(row.get("carried"), dict) else None
         if id(row) in open_rows and isinstance(again, str) and (target := named.get(again)) and target.get("prior_review") != row.get("prior_review"):
-            if reopened(record):  # a retry's cited open stays on the one record (bin/sd-review:1859)
-                target["carried"] = record["carried"]
+            if reopen_count(record) > reopen_count(target):  # a retry's reopen stays on the one record
+                target["reopened"] = reopen_count(record)
             target["evidence"] = "\n".join(dict.fromkeys(line for told in (target.get("evidence"), record.get("evidence")) if isinstance(told, str) for line in told.splitlines() if line.strip()))
         else:
             rows.append(named.setdefault(f"B{len(named) + 1}", dict(record, id=f"B{len(named) + 1}")) if id(row) in open_rows else record)

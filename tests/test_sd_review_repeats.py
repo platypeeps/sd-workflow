@@ -569,29 +569,53 @@ class PriorVerdictTests(unittest.TestCase):
                 rows = sd_review.carried(prior, [self.answer(verdicts=[verdict("open", evidence)])], rebutted)
                 self.assertEqual(len(rows), count)
 
-    def test_a_rebuttal_does_not_clear_a_blocker_the_preceding_pass_reopened(self) -> None:
-        """build/sd-1675 review (bin/sd-review:1859): a preceding pass reopened a rebutted blocker with
-        cited evidence, and the rebuttal cleared it again unless this pass's reader repeated the `open`.
-        It also narrowed the reopened blocker. Only fixed verdicts clear it; a blocker not reopened is
-        answered by the rebuttal as before."""
-        rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
-        rows = dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", id="B1")
-        reopened = dict(rows, carried={"id": "B1", "verdict": "open"}, evidence="one: python3 t.py []: IndexError")
-        fixed = verdict("fixed", "src.py:10 checks []")
-        for label, old, answers, count in (
-                ("reopened, no verdict", reopened, [], 1),
-                ("reopened, fixed", reopened, [fixed], 0),
-                ("not reopened", rows, [], 0)):
+    def test_a_rebuttal_answers_a_reopened_blocker_only_when_it_answered_that_reopen(self) -> None:
+        """build/sd-1675 class pass: a reopen lived in the last pass's verdict alone, so it lapsed. After a
+        reader's cited `open`, one pass with no verdict wrote `none`, and at the next an older rebuttal
+        cleared the blocker. The reopen is now a count the row keeps, and a rebuttal answers the blocker
+        only when the row it answered carried that count."""
+        older = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10)
+        prior = dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", id="B1")
+        cited = self.answer(verdicts=[verdict("open", "python3 t.py []: IndexError")])
+        silent, fixed = self.answer(verdicts=[]), self.answer(verdicts=[verdict("fixed", "src.py:10 checks []")])
+        [first] = sd_review.carried([prior], [cited], listed(older))
+        self.assertEqual((first["reopened"], first["carried"]["verdict"]), (1, "open"))
+        [second] = sd_review.carried([dict(first, id="B1")], [silent], listed(older))  # the reopen outlives one silent pass
+        self.assertEqual((second["reopened"], second["carried"]["verdict"]), (1, "none"))
+        [third] = sd_review.carried([dict(second, id="B1")], [silent], listed(older))  # and a second (bin/sd-review:1859)
+        self.assertEqual(third["reopened"], 1)
+        seen = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10, reopened=1)
+        for label, bodies, answer, count in (
+                ("an older rebuttal", (older,), silent, 1),
+                ("one that answered this reopen", (seen, older), silent, 0),
+                ("fixed verdicts", (older,), fixed, 0)):
             with self.subTest(label):
-                carry = sd_review.carried([sd_review.unanswered(rebutted, old)],
-                                          [self.answer(verdicts=answers)], rebutted)
-                self.assertEqual(len(carry), count)
-        found = dict(rows, prior_review={"pass": 1})
-        retry = dict(reopened, prior_review={"pass": 2})
-        [merged] = sd_review.prior_blockers({"findings": [found, retry]})
-        self.assertTrue(sd_review.reopened(merged))
-        both = dict(reopened, instances=["src.py:10", "b.py:40"])
-        self.assertEqual(sd_review.unanswered(rebutted, both)["instances"], ["src.py:10", "b.py:40"])
+                self.assertEqual(len(sd_review.carried([dict(third, id="B1")], [answer], listed(*bodies))), count)
+        [again] = sd_review.carried([dict(third, id="B1")], [cited], listed(seen, older))  # a second reopen
+        self.assertEqual(again["reopened"], 2)
+        self.assertEqual(len(sd_review.carried([dict(again, id="B1")], [silent], listed(seen, older))), 1)
+        self.assertEqual(len(sd_review.carried([prior], [silent], listed(older))), 0)  # never reopened: answered
+
+    def test_a_reopened_blocker_narrows_only_by_a_rebuttal_of_that_reopen(self) -> None:
+        """Class pass (bin/sd-review:1814): `unanswered` reads the same rule place by place, also after the
+        verdict lapsed to `none`; a count that is no positive int is no reopen."""
+        row = dict(finding(REPRO, line=10, summary="Empty input crashes", instances=["src.py:10", "b.py:40"]),
+                   disposition="blocking", id="B1", reopened=1, carried={"id": "B1", "verdict": "none"})
+        older = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10)
+        seen = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10, reopened=1)
+        self.assertEqual(sd_review.unanswered(listed(older), row)["instances"], ["src.py:10", "b.py:40"])
+        self.assertEqual(sd_review.unanswered(listed(seen, older), row)["instances"], ["b.py:40"])
+        for value in (0, -1, True, "1", None, 1.0, [1]):
+            with self.subTest(value=value):
+                self.assertEqual(sd_review.unanswered(listed(older), dict(row, reopened=value))["instances"], ["b.py:40"])
+
+    def test_a_retry_keeps_its_reopen_on_the_one_record(self) -> None:
+        """Class pass (bin/sd-review:1951): the merged record keeps the highest reopen count of its rows."""
+        found = dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", prior_review={"pass": 1})
+        retry = dict(found, reopened=2, evidence="one: IndexError", carried={"id": "B1", "verdict": "open"}, prior_review={"pass": 2})
+        later = dict(retry, reopened=1, evidence="two: IndexError", prior_review={"pass": 3})
+        [merged] = sd_review.prior_blockers({"findings": [found, retry, later]})
+        self.assertEqual(merged["reopened"], 2)
 
     def test_no_completed_reader_carries_nothing(self) -> None:
         failed = sd_review.Outcome("one", sd_review.UNAVAILABLE, (), "", (), ())
@@ -993,11 +1017,13 @@ class RepeatReviewTests(RepeatFixture):
 ON_BRANCH = "c" * 40
 
 
-def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 1, instances: Any = None) -> str:
+def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 1, instances: Any = None,
+                reopened: Any = None) -> str:
     """One adjudication body at `ON_BRANCH`: each (path, summary, disposition[, line]) a blocking finding's answer."""
     return json.dumps({"decision": decision, "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
         {"response_disposition": answer, "reason": "a reason",
          "raw_finding": {"path": path, "line": at, "severity": "high", "summary": summary, "family": "correctness",
+                         **({} if reopened is None else {"reopened": reopened}),
                          "instances": instances or [f"{path}:{at}" if type(at) is int else str(path)]}}  # its own place
         for path, summary, answer, *rest in rows for at in [(*rest, line)[0]]]}})
 

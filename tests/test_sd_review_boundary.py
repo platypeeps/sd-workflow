@@ -1139,11 +1139,18 @@ class LineBudgetTests(unittest.TestCase):
         # retry's reopen stays on the merged record; +1 for the comment
         # that maps each prior place before a rebuttal matches it.
         # Measured: `sd-review` is 3167 here.
+        #
+        # 5137 -> 5147 is the build/sd-1675 class pass on reopens:
+        # `bin/sd-review` +10 for the reopen count a carried row keeps
+        # and `rebuttal_answers`, the one place a rebuttal is matched to a prior
+        # blocker, which asks that the rebuttal answered that same
+        # reopen. A reopen kept in the last verdict alone lapsed after
+        # one silent pass. Measured: `sd-review` is 3177 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5137,
+            5147,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
