@@ -145,7 +145,7 @@ def _mission(folder: Path | None, today: date) -> dict:
         latest = rows[-1][stamp] if rows else ""
         out["files"].append({"name": name, "rows": len(rows), "latest": latest, "error": ""})
         if key == "alarms":
-            since = (_day(latest) - timedelta(days=ALARM_DAYS)).isoformat() if rows else ""
+            since = (today - timedelta(days=ALARM_DAYS)).isoformat()  # the HOA's last 30 days (sd:10599)
             out[key] = [row for row in rows if row[stamp] >= since]
         else:
             out[key] = rows
@@ -506,7 +506,8 @@ def document(connection, *, now: str, jobs=None) -> dict:
     `jobs` is the operations backend the refresh jobs are read from, `operations.LaunchdBackend` by default."""
     recorded, place, problems = checkout(connection)
     state = "error" if problems else "read" if recorded else "missing"
-    today = datetime.fromisoformat(now.replace("Z", "+00:00")).date()
+    # The HOA's calendar date, this machine's zone, as Tasks counts due days: not UTC's (sd:10599).
+    today = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone().date()
     paths = _paths(place)
     mission, items = _mission(paths["mission"], today), _items(connection, recorded, now, today)
     if problems:
@@ -518,6 +519,8 @@ def document(connection, *, now: str, jobs=None) -> dict:
     ages = sources(place) if not problems else {"error": problems[0], "rows": [], "command": "", "repo": ""}
     if ages["rows"]:
         _refresh_jobs(connection, ages["rows"], jobs or operations.LaunchdBackend())
+    swept = sweep.status(place) if not problems else {**sweep.status(None), "error": problems[0]}
+    downloads = {source: _download(source, place) for source in hoa_download.SOURCES} if place else {}
     return {
         "read": now,
         "config": {"state": state, "source": "the repo table", "problems": problems},
@@ -528,10 +531,38 @@ def document(connection, *, now: str, jobs=None) -> dict:
         "items": items,
         "thresholds": thresholds(connection),
         "sources": ages,
-        "sweep": sweep.status(place) if not problems else {**sweep.status(None), "error": problems[0]},
-        "downloads": {source: _download(source, place) for source in hoa_download.SOURCES} if place else {},
+        "sweep": swept,
+        "downloads": downloads,
         "attention": _attention(mission, items),
+        "status": _status(ages, swept, downloads),
     }
+
+
+#: The fields of a download's status that move while it runs; its log tail is left out, as it moves on every line.
+DOWNLOAD_STATE = ("running", "state", "phase", "reason", "finished")
+
+
+def _status(ages: dict, swept: dict, downloads: dict) -> dict:
+    """sd:10610: what a running refresh job, sweep or download has to say, and nothing more. `running` is whether any
+    runs; `parts` is the state the page compares with its last full read's, which it reads again only on a change."""
+    jobs = {row.get("source"): [row["job"].get("state"), row["job"].get("last_exit")]
+            for row in ages.get("rows", []) if isinstance(row.get("job"), dict)}
+    parts = {"jobs": jobs, "sweep": [swept.get("running"), swept.get("error"), swept.get("last")],
+             "downloads": {source: [out.get(key) for key in DOWNLOAD_STATE] for source, out in downloads.items()}}
+    running = (any(state == "running" for state, _ in jobs.values()) or bool(swept.get("running"))
+               or any(out.get("running") for out in downloads.values()))
+    return {"running": running, "parts": parts}
+
+
+def status(connection, *, now: str, jobs=None) -> dict:
+    """`GET /api/hoa/status` (sd:10610): `document`'s `status`, read without the map, the export or its trends."""
+    _, place, problems = checkout(connection)
+    ages = sources(place) if not problems else {"rows": []}
+    if ages["rows"]:
+        _refresh_jobs(connection, ages["rows"], jobs or operations.LaunchdBackend())
+    swept = sweep.status(place) if not problems else {**sweep.status(None), "error": problems[0]}
+    downloads = {source: hoa_download.status(source, place) for source in hoa_download.SOURCES} if place else {}
+    return {"read": now, **_status(ages, swept, downloads)}
 
 
 def _attention(mission: dict, items: dict) -> dict:
