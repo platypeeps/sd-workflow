@@ -66,6 +66,6 @@ Then: the scope table; what shipped since the last run; the workflow trace; plan
 - Ask the operator only about the rest, one per question (`AskUserQuestion`): one or two lines on the finding and its evidence, then the options, recommended first: build now (`sd task status N ready --if-revision <revision>`, then `sd assignments build N`; an item whose build failed is only retried with `sd assignments build N`, never set ready), keep planned, defer to a date or item, or drop with a reason.
   Act on each answer at once, then record it as a decision note: the note moves the item's revision, so the status write goes first.
   `<revision>` is the `revision:` line of the `sd task show N` read when you asked: a refusal means the item changed while the question waited, so read it again.
-  Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing; report that as its state.
+  Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing; report that as its state, and note the refusal on the item, so a ready item with no build says why.
 
 End with the report path, a table (rank, item, ruling, state), and under it the veto table of the rulings made without asking.
