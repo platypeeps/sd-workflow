@@ -2587,9 +2587,62 @@ class Landing(Lane):
                           (2, f"Post-merge: make post-merge passed in {self.repo}")])
         self.assertEqual(self.note_kinds[-2:], ["comment", "comment"])
 
+    def test_a_passing_post_merge_resolves_the_repositorys_earlier_post_merge_followups(self) -> None:
+        """sd:10406, sd:10407: a refresh refused while a lane held its lock filed a followup on every merge,
+        217 of them, each answered by the next refresh that passed. A pass resolves one only when the main
+        checkout holds its item's delivered commit (B1): an older pin, another repository's, a person's stay."""
+        import sd_db
+        covered, pinned, landed = self.register_items(3)
+        held = git(self.repo, "rev-parse", "HEAD")
+        newer = self.advance_origin_main()  # on origin, not in the pinned checkout the pass runs in
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            sd_db.upsert_repo(connection, str(self.tmp / "other"), remote="https://github.com/example/other.git",
+                              managed=1)
+            other = sd_db.create_item(connection, kind="task", title="other", status="done", repo=str(self.tmp / "other"))
+            failed, late, foreign = (
+                sd_db.add_note(connection, item, "followup",
+                               f"Post-merge: make post-merge failed (exit 2)\nMerged at {commit}",
+                               session=sd_lane.LANE_SESSION)
+                for item, commit in ((covered, held), (pinned, newer), (other, held)))
+            person = sd_db.add_note(connection, covered, "followup", "Post-merge: I check the refresh by hand",
+                                    session="operator")
+            connection.commit()
+        finally:
+            connection.close()
+        tree, head = self.topic()
+        git(self.repo, "switch", "-q", "--detach")  # a deploying checkout is pinned (sd:3647)
+        self.post_merge("touch ran")
+        self.merge_lands(tree, landed, head)
+        answer = self.drain()
+        self.assertEqual(answer["post_merge"],
+                         f"make post-merge passed in {self.repo}; resolved earlier post-merge followups #{failed}")
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            still = [row[0] for row in connection.execute(
+                "SELECT id FROM note WHERE kind = 'followup' AND resolved_at IS NULL ORDER BY id")]
+        finally:
+            connection.close()
+        self.assertNotIn(newer, git(self.repo, "rev-list", "HEAD").split())  # the pin holds the older commit only
+        self.assertEqual(still, [late, foreign, person])
+
     def test_the_library_knows_the_lanes_session_by_the_lanes_own_name(self) -> None:
         from sd_db import workflow
         self.assertEqual(workflow.LANE_SESSION, sd_lane.LANE_SESSION)
+
+    def test_the_library_reads_the_merge_the_lanes_followup_names(self) -> None:
+        from sd_db import workflow
+        commit = "ab" * 20
+        body = "Post-merge: make post-merge failed (exit 2)" + sd_lane.post_merge_stamp({"merge_commit": commit})
+        self.assertEqual(workflow.stamped_merge(body), commit)
+        # Class pass: a row with no full commit says so on the last line, so the line is always the
+        # lane's own: a target's output that ends like a stamp is not read as one.
+        forged = f"Post-merge: make post-merge failed: stderr: x\nMerged at {commit}"
+        for merged in (None, "", "not-a-sha", "AB" * 20, commit + "\nMerged at " + commit, 7):
+            with self.subTest(merged=merged):
+                stamp = sd_lane.post_merge_stamp({"merge_commit": merged})
+                self.assertEqual(stamp, "\nMerge commit not recorded: no pass resolves this, resolve it by hand")
+                self.assertIsNone(workflow.stamped_merge(forged + stamp))
 
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()
@@ -2617,7 +2670,9 @@ class Landing(Lane):
         self.assertEqual(self.entries()[0]["status"], "merged")
         self.assertTrue(answer["post_merge"].startswith(f"make post-merge failed (exit 2) in {self.repo}:"), answer)
         self.assertIn("the install broke", answer["post_merge"])
-        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]), (f"Post-merge: {answer['post_merge']}", "followup"))
+        # Round 2: the followup names the merge it reports, so only a pass that holds it answers it.
+        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]),
+                         (f"Post-merge: {answer['post_merge']}\nMerged at {'c0ffee' * 6 + 'c0ff'}", "followup"))
         tree, head = self.topic("slow")
         self.post_merge("sleep 60")
         self.merge_lands(tree, 2, head)
@@ -2656,7 +2711,8 @@ class Landing(Lane):
         self.assertTrue(answer["post_merge"].startswith("make post-merge skipped: the main checkout did not "
                                                         "fast-forward (fast-forward skipped: the main checkout is on "
                                                         "elsewhere"), answer["post_merge"])
-        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]), (f"Post-merge: {answer['post_merge']}", "followup"))
+        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]),
+                         (f"Post-merge: {answer['post_merge']}\nMerged at {'c0ffee' * 6 + 'c0ff'}", "followup"))
 
     def test_a_variable_the_lanes_environment_omits_never_reaches_the_post_merge(self) -> None:
         """sd:7051: `{**os.environ, **environ}` put back what the caller dropped, such as a GIT_DIR naming
@@ -5459,6 +5515,162 @@ class PostMergeOwed(RefusingHub):
         sd_lane.run_lane(self.repo, self.environ, self.ship)
         self.assertEqual((self.runs(), self.noted(), self.entries()[0]["post_merge"]["ran"]),
                          (1, [], f"make post-merge passed in {self.repo}"))
+
+    def open_followups(self) -> list[int]:
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            return [row[0] for row in connection.execute(
+                "SELECT id FROM note WHERE kind = 'followup' AND resolved_at IS NULL ORDER BY id")]
+        finally:
+            connection.close()
+
+    def an_earlier_failure(self) -> int:
+        """An open lane followup on another item of this repository, for a merge the pinned checkout holds."""
+        import sd_db
+        self.assertEqual(self.register_items(1), [1])  # the queued entry's item, in this repository
+        held = git(self.repo, "rev-parse", "HEAD")
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            earlier = sd_db.create_item(connection, kind="task", title="earlier", status="done", repo=str(self.repo))
+            failed = sd_db.add_note(connection, earlier, "followup",
+                                    f"Post-merge: make post-merge failed (exit 2)\nMerged at {held}",
+                                    session=sd_lane.LANE_SESSION)
+            connection.commit()
+        finally:
+            connection.close()
+        return failed
+
+    def git_cannot(self, *verb: str) -> Any:
+        """`publish_git` with no answer for `git <verb> ...`, as a timeout gives; every other read is real."""
+        real = sd_lane.publish_git
+        return mock.patch.object(sd_lane, "publish_git", lambda root, *args: (
+            None if args[:len(verb)] == verb else real(root, *args)))
+
+    def test_a_git_that_cannot_say_what_a_pass_holds_keeps_the_settle_for_the_next_run(self) -> None:
+        """Failure table, coverage (sd:10407 class pass: an unknown read as an answer): a git that could not
+        answer was read as "not held", and the settle mark was cleared with the followup still open."""
+        failed = self.an_earlier_failure()
+        for verb in (("cat-file",), ("merge-base",)):
+            with self.subTest(verb=verb), self.git_cannot(*verb):
+                answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+                self.assertIn("earlier post-merge followups stay open", answer["post_merge"])
+                self.assertEqual((self.runs(), self.open_followups()), (1, [failed]))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertNotIn("settle", self.entries()[0]["post_merge"])
+
+    def test_a_target_whose_commit_git_cannot_read_does_not_start_and_stays_owed(self) -> None:
+        """Failure table, pass commit (sd:10529): with HEAD unread before the target, a pass would have no
+        commit to settle against. The target does not start; it stays owed and runs in the next run."""
+        failed = self.an_earlier_failure()
+        with self.git_cannot("rev-parse", "--verify", "HEAD"):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertTrue(answer["post_merge"].startswith(sd_lane.NOT_STARTED), answer["post_merge"])
+        self.assertEqual((self.runs(), self.open_followups(), self.entries()[0]["post_merge"]),
+                         (0, [failed], sd_lane.POST_MERGE_OWED))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+
+    def test_a_failed_rerun_keeps_the_settle_an_earlier_pass_owed(self) -> None:
+        """Failure table, rerun (sd:10529, sd:10407 round 3): a pass whose HEAD read timed out after the target
+        stored only `owed`; the rerun failed, recorded a failure and no settle, and the followup the pass
+        covered stayed open for good. The pass settles at the commit it started from."""
+        failed = self.an_earlier_failure()
+        self.assertEqual(self.open_followups(), [failed])
+        real, out = sd_lane.publish_git, self.repo / "post-merge.out"
+        with mock.patch.object(sd_lane, "publish_git", lambda root, *args: (
+                None if args[:1] == ("rev-parse",) and out.exists() else real(root, *args))):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        (self.repo / "Makefile").write_text("post-merge:\n\t@echo ran >> post-merge.out; exit 2\n", encoding="utf-8")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+
+    def test_a_settle_mark_that_is_no_commit_is_left_alone(self) -> None:
+        """Stored data, not trusted: a mark that names no full commit settles nothing and is not cleared."""
+        for mark in ("HEAD", "", "--all", 7, None, "ab" * 19):
+            with self.subTest(mark=mark):
+                self.assertIsNone(sd_lane.unsettled({"post_merge": {"ran": "x", "settle": mark}}))
+        self.assertIsNone(sd_lane.unsettled({"post_merge": "owed"}))
+        self.assertEqual(sd_lane.unsettled({"post_merge": {"settle": "ab" * 20}}), "ab" * 20)
+
+    def test_the_settle_runs_git_with_no_hub_write_lock_and_keeps_a_mark_set_meanwhile(self) -> None:
+        """Failure table, settle git (sd:10529 review): the settle ran `cat-file` and `merge-base` for each
+        followup inside the hub's `BEGIN IMMEDIATE`, so a slow git held every hub writer. Git now runs
+        between a read and a write; a mark another run set meanwhile is a new pass, left for its own settle."""
+        failed = self.an_earlier_failure()
+        real, locked, newer = sd_lane.read_git, [], "cd" * 20
+
+        def git_free_of_the_lock(tree: Any, *args: str, **kwargs: Any) -> Any:
+            if args[0] in ("cat-file", "merge-base"):
+                probe = sqlite3.connect(sd_lane.hub_database(self.environ), timeout=0)
+                try:
+                    probe.execute("BEGIN IMMEDIATE")
+                    probe.execute("ROLLBACK")
+                    locked.append(False)
+                except sqlite3.OperationalError:
+                    locked.append(True)
+                finally:
+                    probe.close()
+                if args[0] == "merge-base" and len(locked) == 2:  # another run's pass lands meanwhile
+                    sd_lane.update(self.store(), lambda rows: [row["post_merge"].update(settle=newer) for row in rows
+                                                               if isinstance(row.get("post_merge"), dict)])
+            return real(tree, *args, **kwargs)
+
+        with mock.patch.object(sd_lane, "read_git", git_free_of_the_lock):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(locked, [False, False])
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertEqual((self.open_followups(), self.entries()[0]["post_merge"].get("settle")), ([], newer))
+
+    def test_a_followup_filed_while_git_ran_keeps_the_settle_for_the_next_run(self) -> None:
+        """Failure table, settle write (sd:10529 class pass: a value read, then used after it changed): a
+        followup filed between the read and the write had no ancestry answer, yet the write cleared the
+        pass's mark, so no later run settled it. A mark with an unchecked followup stays."""
+        import sd_db
+        parent = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "a later merge")  # the pin holds two merges
+        failed = self.an_earlier_failure()
+        real, late = sd_lane.read_git, []
+
+        def a_followup_lands_meanwhile(tree: Any, *args: str, **kwargs: Any) -> Any:
+            if args[0] == "merge-base" and not late:
+                connection = sd_db.connect(home=self.tmp)
+                try:
+                    late.append(sd_db.add_note(connection, 1, "followup",
+                                               f"Post-merge: make post-merge failed (exit 2)\nMerged at {parent}",
+                                               session=sd_lane.LANE_SESSION))
+                    connection.commit()
+                finally:
+                    connection.close()
+            return real(tree, *args, **kwargs)
+
+        with mock.patch.object(sd_lane, "read_git", a_followup_lands_meanwhile):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertEqual((self.open_followups(), "settle" in self.entries()[0]["post_merge"]), (late, True))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{late[0]}", answer["post_merge"])
+        self.assertNotIn("settle", self.entries()[0]["post_merge"])
+
+    def test_a_settle_the_hub_refused_is_done_by_the_next_run_without_running_the_target(self) -> None:
+        """Failure table, settle (sd:10407 round 2): the pass was recorded, then the write that resolves the
+        followups it answered failed; no entry owed the target again, so no later run resolved them."""
+        from sd_db import workflow
+        failed = self.an_earlier_failure()
+        locked = sqlite3.OperationalError("database is locked")
+        with mock.patch.object(workflow, "resolve_post_merge", side_effect=locked):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn("stay open", answer["post_merge"])
+        self.assertEqual((self.runs(), self.open_followups()), (1, [failed]))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(("post_merge" in answer, self.runs()), (False, 1))
 
     def test_a_merge_the_next_run_applies_from_a_hub_stop_record_runs_the_target_there(self) -> None:
         """Failure table, hub stop (sd:4184): the outcome write was refused, then the run died before the target."""
