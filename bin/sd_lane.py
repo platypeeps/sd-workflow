@@ -1106,6 +1106,16 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             at += 1 + names
         return found
 
+    def apart(one: str | None, other: str | None) -> int | None:
+        """How many lines differ between two entries (`blobs`); None when git counts none: an absent entry,
+        a binary file or a failed read."""
+        if not one or not other:
+            return None
+        if one == other:
+            return 0
+        counted = (lane_git(worktree, "diff", "--numstat", one.split()[-1], other.split()[-1]) or "").split()[:2]
+        return int(counted[0]) + int(counted[1]) if len(counted) == 2 and all(n.isdigit() for n in counted) else None
+
     def reads_before(where: dict[str, str], rev: str, names: list[str], before: str,
                      home: dict[str, str] | None = None, cited: str = "") -> bool | None:
         """Whether the files `names`, at `where` in `rev`, read as `before` held them; None when git gave no answer.
@@ -1118,9 +1128,11 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         held it: git paired a restored file, not the work (sd:10214 review).
         A mapping goes stale when the file's old name comes back while the
         new one still stands: no read says which name holds the work. Given
-        `cited`, the commit that left the work, both names are read there:
-        either reading as `cited` left the file holds the work, else either
-        reading as `before` held it does not (sd:10214 review, stale rename).
+        `cited`, the commit that left the work, both names are read there.
+        Either reading as `cited` left the file holds the work. Else one must
+        read as `before` held it, and the other holds the work only while it
+        reads nearer (`apart`) to what `cited` left than to `before`: the fix
+        with one more edit ships, other text does not (class passes 13, 14).
         """
         home = home or {}
         held = [where.get(name, name) for name in names]
@@ -1134,10 +1146,14 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             if name in home:
                 return at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))
             if cited and at != name and name in now:  # both names stand: the mapping may be stale
-                # ponytail: the old content back at the old name beside an edited fix at the new one reads as
-                # undone (a lost close, fixed by hand); read the edit's lineage if that matters.
-                found = (now.get(at), now.get(name))
-                return (fix.get(name) is None or fix.get(name) not in found) and want.get(name) in found
+                found = [now.get(at), now.get(name)]
+                if (fix.get(name) is not None and fix[name] in found) or want.get(name) not in found:
+                    return False
+                found.remove(want.get(name))
+                # ponytail: nearness is a count of differing lines; a binary file, which git counts no lines
+                # of, reads as undone (a lost close, fixed by hand). Read the edit's lineage if that matters.
+                near, far = apart(found[0], fix.get(name)), apart(found[0], want.get(name))
+                return near is None or far is None or near >= far
             return now.get(at) == want.get(name)
         return all(one(at, name) for at, name in zip(held, names, strict=True))
 

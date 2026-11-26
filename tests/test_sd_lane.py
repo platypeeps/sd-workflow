@@ -4195,7 +4195,11 @@ class CitedCloses(SharedQueue):
         fixed = original.replace("line 7\n", "line 7 fixed\n")
         for case, (old_text, new_text, closes) in {
                 "reverted": (original, "unrelated text\n", set()),
-                "kept": (fixed, original, {a})}.items():
+                "kept": (fixed, original, {a}),
+                # Class pass 14: the fix kept at the new name with one more edit still ships; the old
+                # content there with one more edit does not.
+                "edited": (original, fixed + "one more line\n", {a}),
+                "edited-old": (original, original + "one more line\n", set())}.items():
             with self.subTest(case=case):
                 tree, _ = self.committed(f"topic-stale-rename-{case}")
                 git(tree, "fetch", "-q", "origin")
@@ -4212,6 +4216,27 @@ class CitedCloses(SharedQueue):
                 git(tree, "commit", "-q", "-m", "revert: line 7")
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
+
+    def test_a_reverted_fix_put_back_with_one_more_edit_keeps_the_close(self) -> None:
+        """sd:10214 class pass 14: the exact read of what the cited commit left (`back`) drops no close. A
+        fix a revert took out and a later commit put back with one more edit still ships, also after a
+        refactor moves it."""
+        import sd_operations
+        a, *_ = self.open
+        original = "".join(f"line {n}\n" for n in range(20))
+        fixed = original.replace("line 7\n", "line 7 fixed\n")
+        tree, _ = self.committed("topic-put-back-edited")
+        self.on_main(tree, {"x.txt": original})
+        for text, subject in ((fixed, f"fix: line 7\n\nCloses: sd:{a}"), (original, "revert: line 7"),
+                              (fixed + "one more line\n", "fix: line 7 again")):
+            (tree / "x.txt").write_text(text, encoding="utf-8")
+            git(tree, "commit", "-q", "-am", subject)
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+        git(tree, "mv", "x.txt", "y.txt")
+        git(tree, "commit", "-q", "-m", "refactor: rename x to y")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
 
     def test_a_submodule_link_holds_no_text_and_hides_no_revert(self) -> None:
         """sd:10214 class pass 10: a submodule link is a commit, not text. An unrelated link the head changed
