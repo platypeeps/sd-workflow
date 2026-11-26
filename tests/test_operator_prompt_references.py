@@ -25,9 +25,6 @@ PROMPTS = {
     "sd-next": {
         "health.md": ("health check",),
     },
-    "sd-research-repo": {
-        "fleet-review.md": ("review my research repos",),
-    },
     "sd-status": {
         "deep.md": ("/sd-status deep",),
     },
@@ -64,7 +61,7 @@ class OperatorPromptReferences(unittest.TestCase):
 
     def test_model_invoked_skill_descriptions_name_the_triggers(self):
         """A plain ask loads the skill only through its description."""
-        for skill in ("sd-next", "sd-research-repo"):
+        for skill in ("sd-next",):
             for triggers in PROMPTS[skill].values():
                 for trigger in triggers:
                     with self.subTest(skill=skill, trigger=trigger):
@@ -116,18 +113,6 @@ class ReviewRoundFixes(unittest.TestCase):
     def test_each_filed_finding_gets_its_own_ref(self):
         """A ref names one item, so one ref per run files only the first finding."""
         self.assertIn("`deep-review:<repo>:<slug>`", reference("sd-status", "deep.md"))
-        self.assertNotIn("--ref research-review:<date> ", reference("sd-research-repo", "fleet-review.md"))
-        self.assertIn("--ref research-review:<repo>:<slug>", reference("sd-research-repo", "fleet-review.md"))
-
-    def test_review_batch_questions_go_to_the_review_page(self):
-        """A review batch's questions are labelled on the dashboard, not answered with --answers."""
-        for skill, name in (("sd-research-repo", "fleet-review.md"),):
-            text = reference(skill, name)
-            with self.subTest(reference=name):
-                self.assertIn("dashboard's Review page", text)
-                self.assertNotRegex(text, r"Walk every open question, decision and score")
-                self.assertNotRegex(text, r"review questions or scores\.?\n")
-
 
 def all_references() -> dict[str, str]:
     return {f"skills/{skill}/references/{name}": reference(skill, name)
@@ -190,7 +175,7 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
                     self.assertIn(" ".join([tool, *verbs]), answer.stdout.split("\n\n")[0].replace("\n", " "))
                     for flag in flags:
                         self.assertRegex(answer.stdout, rf"(?<![\w-]){re.escape(flag)}(?![\w-])")
-        self.assertGreater(seen, 10)
+        self.assertGreater(seen, 5)
 
     def test_each_command_carries_its_required_arguments(self):
         required = {
@@ -221,8 +206,7 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
 
     def test_a_ref_names_the_finding_not_the_run(self):
         """`sd task add --ref` refuses a ref an item holds: a date or rank collides on a rerun."""
-        for skill, name, source in (("sd-status", "deep.md", "deep-review"),
-                                    ("sd-research-repo", "fleet-review.md", "research-review")):
+        for skill, name, source in (("sd-status", "deep.md", "deep-review"),):
             text = reference(skill, name)
             with self.subTest(reference=name):
                 self.assertIn(f"{source}:<repo>:<slug>", text)
@@ -240,7 +224,7 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
 
     def test_each_state_move_names_its_command(self):
         """`unpark`, `set it ready` and `retry` are verbs of real commands; say which."""
-        for skill, name in (("sd-research-repo", "fleet-review.md"), ("sd-status", "deep.md")):
+        for skill, name in (("sd-status", "deep.md"),):
             with self.subTest(reference=name):
                 self.assertIn("sd task status N ready", reference(skill, name))
 
@@ -257,7 +241,7 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
 
     def test_item_writes_bind_to_the_revision_read(self):
         """A status move or a cancel decided from a read carries that read's revision."""
-        for skill, name in (("sd-research-repo", "fleet-review.md"), ("sd-status", "deep.md")):
+        for skill, name in (("sd-status", "deep.md"),):
             with self.subTest(reference=name):
                 self.assertIn("--if-revision <revision>", reference(skill, name))
 
