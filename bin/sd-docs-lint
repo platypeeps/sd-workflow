@@ -445,10 +445,10 @@ def check_pr_privacy(body: str | None, report: Report, repo: pathlib.Path | None
         report.fail(str(path), "grep -E refused the privacy patterns: " + done.stderr.decode("utf-8", "replace").strip())
         return
     own = own_segment(repo) if repo is not None else None
-    lines, flags, freed = body.encode("utf-8").split(b"\n"), argv[3:], 0
+    raw, flags, freed = body.encode("utf-8").split(b"\n"), argv[3:], 0
     for match in done.stdout.splitlines():
         number = match.split(b":", 1)[0].decode()
-        if own is not None and number.isdigit() and own_only(lines[int(number) - 1], flags, own):
+        if own is not None and number.isdigit() and own_only(raw[int(number) - 1], flags, own):
             freed += 1
             continue
         report.fail("pull request body", f"line {number} matches a privacy pattern in {path}")
