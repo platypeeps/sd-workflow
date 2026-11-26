@@ -691,6 +691,8 @@ The reserved `sd` namespace declares these settings:
   machine, 1 to 16. Absence reads 6 (sd:8158, sd:9891); the load guard still holds builds back. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
   1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
+- `sd.overload_fallback`: `1` lets the hub build an overloaded satellite's fresh queued builds of a
+  repository checked out there (sd:8991). Absence or `0` leaves them for the satellite (sd:10823). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.
   Below 90% CPU busy, averaged over at least the last minute and over the last few seconds, load1 and load5 read busy times cores instead (sd:9946).
   Absence is no load condition (sd:2607). `SD_GATE_LOAD_MAX` overrides it for one run. It grants nothing.
