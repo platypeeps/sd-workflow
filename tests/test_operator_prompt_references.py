@@ -143,6 +143,22 @@ class OpenPrSweep(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn("<PR URL", command)
 
+    def test_a_retained_entry_matches_only_at_the_prs_head(self):
+        """The lane keeps old entries; a reused branch name alone names an old item."""
+        text = self.text()
+        match = text.index("whose `branch` equals the PR's head branch exactly")
+        self.assertIn("and whose `expected_head` is the PR's head commit", text[match:match + 200])
+        retry = text.index("for the operator's Retry")
+        self.assertIn("at this PR's head", text[retry - 200:retry + 200])
+
+    def test_a_stacked_pr_is_reported_not_queued(self):
+        """A squash merge of a parent strands each PR whose base is its branch."""
+        text = self.text()
+        enqueue = text.index("lane enqueue")
+        self.assertLess(text.index("`base.ref`"), enqueue)
+        self.assertLess(text.index("another open PR's base is this PR's head branch"), enqueue)
+        self.assertLess(text.index("its base is not the repo's default branch"), enqueue)
+
     def test_item_is_matched_exactly(self):
         text = self.text()
         self.assertIn("equals the PR's head branch exactly", text)

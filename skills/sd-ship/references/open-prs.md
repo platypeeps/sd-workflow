@@ -3,11 +3,12 @@
 Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next routes it): every open PR in this repo and its companion repos.
 
 1. List them with `mcp__github__list_pull_requests`, and read each one's state with `pull_request_read` `get`.
-   Keep each PR's head branch and full head commit from that read; every later step binds to them.
+   Keep each PR's head branch, full head commit and base branch (`base.ref`) from that read; every later step binds to them.
    A PR whose head repo (`head.repo.full_name`) is not its base repo, or is absent, is a fork PR: report it and act on nothing.
    A branch name matches only inside one repo, so a fork's branch never names a lane entry, item or worktree here.
 2. For each PR, find what holds it: a failed `sd/local-gate`, open review findings, a merge conflict, a failed lane entry, or no lane entry.
-   Its item is the lane entry's `item` in `sd-ship -C <checkout> lane list` whose `branch` equals the PR's head branch exactly.
+   Its item is the lane entry's `item` in `sd-ship -C <checkout> lane list` whose `branch` equals the PR's head branch exactly
+   and whose `expected_head` is the PR's head commit: the lane keeps old entries, and a reused branch name alone names an old item.
    With no such entry, it is the one item whose note names the PR's full URL as a whole word:
    search with `sd store items --belongs-to <checkout> --grep "<PR URL>"`, then read each hit with `sd task show N`.
    No item, or more than one: report the PR and act on nothing there.
@@ -27,9 +28,11 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
      Never push by hand to a branch the lane holds.
    - Past round 3, counting builder and lane rounds, record fix, file or reject for each blocker with `sd task note N "<PR URL: fix, file or reject, and the reason>" --kind decision`.
    - Rebut a finding that doesn't hold, with a reason a reader can check.
-   - Report a failed lane entry for the operator's Retry only when its cause lay outside the branch and is gone (an sd outage, a gate that never ran).
+   - Report a failed lane entry for the operator's Retry only when it is the item's newest entry, at this PR's head, and its cause lay outside the branch and is gone (an sd outage, a gate that never ran).
      A review blocker is fixed or rejected, never retried.
-   - Enqueue a PR that passes and has no lane entry, from a worktree checked out on its head branch.
+   - Enqueue a PR that passes and has no lane entry at its head, from a worktree checked out on its head branch.
+     Report a stacked PR and queue nothing: another open PR's base is this PR's head branch, or its base is not the repo's default branch.
+     The lane squash-merges into the default branch and deletes the head branch, which strands each PR stacked on it.
      Find it with `git -C <checkout> worktree list --porcelain`: the entry whose `branch` is `refs/heads/<head branch>` exactly.
      No such worktree, or one whose `HEAD` is not the head step 1 read: report the PR and queue nothing.
      Then run `sd-ship -C <worktree> lane enqueue --item N --deliver|--associate-only --title "<title>" --body-file <body> --expected-head <head>`.
