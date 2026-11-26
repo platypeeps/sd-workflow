@@ -4707,6 +4707,19 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
         self.assertTrue(any(f"sd:{kept}" in note and "outside" in note for note in notes), notes)
 
+    def test_a_fenced_refs_line_keeps_no_outside_citation_open(self):
+        """Ruling on sd:10379: a `Refs:` line inside a code fence names nothing (`sd_ship_body.referenced_ids`),
+        so the delivery still adds a live one for a citation outside the bundle."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        support.git(Path(self.bundle["work_path"]), "revert", "--no-edit", "HEAD")
+        self.write_pr(body=f"## Summary\n\nx\n\n## Test plan\n\n```\nRefs: sd:{kept}\n```\n")
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertTrue(body.endswith(f"```\n\nRefs: sd:{kept}\n"), body)
+
     def test_a_member_cancelled_out_of_the_new_bundle_sends_it_to_main(self):
         """Review of build/sd-1808: the bundle read counted a member cancelled out of it (`ALONE`) as selected."""
         head, _ = self.rebuilt_after_lane_failure(2, left_out=True)

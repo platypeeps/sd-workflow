@@ -1257,6 +1257,15 @@ def _gate_slots():
     return module
 
 
+@functools.cache
+def _ship_body():
+    """`bin/sd_ship_body.py`, the lane's own reader of a body's `Refs:` lines; it imports its `bin/` siblings."""
+    import importlib  # noqa: PLC0415 - only a delivery needs it
+    if str(PACK / "bin") not in sys.path:
+        sys.path.append(str(PACK / "bin"))
+    return importlib.import_module("sd_ship_body")
+
+
 def thread_cap(env: dict, *, load: float | None, cores: int | None = None) -> int:
     """How many test threads one builder's child may start (sd:10393): no more than a gate holder's share of the
     cores, nor than the cores the five-minute `load` leaves idle, and at least one. On 2026-11-24 builders' own
@@ -2421,8 +2430,9 @@ class Supervisor:
                 f"body keeps each open"))
         if asked or outside:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
+            # Only a live line counts: one in a code fence or a comment names nothing (ruling on sd:10379).
             refs = f"Refs: {' '.join(f'sd:{item}' for item in [*asked, *outside])}"
-            if refs not in body.splitlines():
+            if not {*asked, *outside} <= _ship_body().referenced_ids(body):
                 body = body.rstrip("\n") + f"\n\n{refs}\n"
                 self.body.write_text(body, encoding="utf-8")
         if not delivered:
