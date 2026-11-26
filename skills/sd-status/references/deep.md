@@ -67,9 +67,12 @@ Then: the scope table; what shipped since the last run; the workflow trace; plan
 - Rule and ask as that file says. The options: build now, keep planned, defer to a date or item, or drop with a reason.
 - A routine ruling never builds: it keeps the item planned, defers it or drops it. Build now is the operator's answer alone, since a build spends a builder and a lane round.
 - The press, not this run, picks what a build queues: a Retry takes a whole bundle, and a claim bundles a new item with the other queued items of its repository. So this run presses only for an item this run filed in step 4, which has no earlier build to retry.
-  Before that press, read the open question notes of every planning, ready, blocked or parked item of the item's repository: one open question on any of them holds every press in that repository until the operator answers it, and a repository whose read failed is held too. A held build-now answer is recorded as the ruling, and the build is left to a triage run.
+  Before that press, read the open question notes of every planning, ready, blocked or parked item of the item's repository: one open question on any of them holds every press in that repository until the operator answers it, and a repository whose read failed is held too.
   For a finding noted on an older item, a build-now answer is recorded as the ruling and the item is left as it is: its build is a triage run's, which reads its whole repository first.
-- On a build-now answer: `sd task status N ready --if-revision <revision>`, then `sd assignments build N`.
+- On a build-now answer, in this order:
+  1. Read the hold now, not from an earlier read. The question note this answer answers, named by its note id, does not count: it is answered, and only its record waits. File each question as you ask it, never ahead: one filed ahead would hold the builds ruled before it.
+  2. Held: record the answer as the ruling and leave the item planned; never set it ready, since a ready item builds without a press. Its build is a triage run's.
+  3. Not held: `sd task status N ready --if-revision <revision>`, then `sd assignments build N`, then the decision note.
   Write the status before the decision note: the note moves the item's revision.
   `<revision>` is the `revision:` line of the `sd task show N` read when you asked: a refusal means the item changed while the question waited, so read it again.
   Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing; report that as its state, and note the refusal on the item, so a ready item with no build says why.

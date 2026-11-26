@@ -76,6 +76,7 @@ Budget: about 90 minutes. Follow `references/decide-ask-record.md` to decide, as
 Ask the questions step 1 collected and this run raised, on items of the reviewed repos only, oldest first, as that file says.
 Review questions stay on the dashboard's Review page.
 When the answers leave a repository no open question, decide its waiting items again as in step 3, so a failed item is retried and never set ready, then build them as in step 5.
+Before that, read its open question notes again: the read before the asking is older than the answers, and only a question whose answer is recorded, as that file says, stops holding.
 A repository with a question still open, or filed for the dashboard with no operator present, gets no build in this run.
 Whether a repo continues is never routine: ask it.
 

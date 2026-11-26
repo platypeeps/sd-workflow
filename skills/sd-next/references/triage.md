@@ -40,6 +40,7 @@ Budget: about 45 minutes. Follow `references/decide-ask-record.md` to decide, as
 4. Ask
    Ask the open question notes and Decisions rows, oldest first, as that file says; the review questions stay on the dashboard's Review page.
    When the answers leave a repository no open question, decide its waiting items again as in step 2, so a failed item is retried and never set ready, then build them as in step 3.
+   Before that, read its open question notes again: the read before the asking is older than the answers, and only a question whose answer is recorded, as that file says, stops holding.
    A repository with a question still open, or filed for the dashboard with no operator present, gets no build in this run: report each of its ready items as waiting on that question.
 
 5. Report
@@ -57,7 +58,7 @@ For each, read why it was parked and what it waits on.
   Bind the first write with `--if-revision <revision>`, as in step 2.
 - If it was parked by a failed review or build: fix or split it, then retry its build with `sd assignments build N`, the dashboard's Retry.
 - If it waits on the operator: ask, as that file says, and build it only after the answer, decided again as in step 2.
-- A repository that step 0 holds is asked first in every case, then built in.
+- A repository that step 0 holds is asked first in every case, then built in. Before that, read its open question notes again: the read before the asking is older than the answers, and only a question whose answer is recorded, as that file says, stops holding.
 - Otherwise: leave it parked, with a note naming what it still waits on.
 
 End with a table: item, park reason, new state, build, reason; then the veto table and the line `RESULT: filed <n>, built <n>, asked <n>`.

@@ -239,6 +239,33 @@ class ScopeOfEachWrite(unittest.TestCase):
         self.assertIn("planning, ready, blocked or parked", rule)
         self.assertIn("holds every press in that repository", rule)
 
+    # Class pass, round 6 (sd:10821): the hold reads a question's state at a moment that disagrees with its
+    # answer's record. Every press that follows an answer, read from the files: deep step 6, triage step 4,
+    # park review, fleet review step 6.
+
+    def test_a_build_now_answer_is_not_held_by_its_own_question(self):
+        """deep.md:70: the status is written before the decision note, so the answered question reads open."""
+        rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
+        self.assertIn("named by its note id, does not count", rule)
+        self.assertIn("Read the hold now, not from an earlier read", rule)
+
+    def test_a_held_build_now_sets_nothing_ready(self):
+        """A ready item builds without a press, so a held answer leaves its item planned."""
+        rule = reference("sd-status", "deep.md").split("## 6.", 1)[1]
+        self.assertIn("Held: record the answer", rule)
+        self.assertIn("never set it ready", rule)
+        self.assertLess(rule.index("Held: record the answer"), rule.index("`sd task status N ready --if-revision"))
+
+    def test_a_press_after_an_answer_reads_the_questions_again(self):
+        """The read before the asking is older than the answers: an answered question would still hold."""
+        triage, fleet = reference("sd-next", "triage.md"), reference("sd-research-repo", "fleet-review.md")
+        parts = {"triage step 4": triage.split("\n4. Ask\n", 1)[1].split("\n5. Report", 1)[0],
+                 "park review": triage.split("## Park review\n", 1)[1],
+                 "fleet step 6": fleet.split("## 6. Ask\n", 1)[1]}
+        for name, part in parts.items():
+            with self.subTest(part=name):
+                self.assertIn("read its open question notes again", part)
+
     def test_park_review_reads_the_whole_repository_before_a_press(self):
         """triage.md:51: park review skips step 1, where the step-0 hold reads its questions."""
         park = reference("sd-next", "triage.md").split("## Park review\n", 1)[1]
