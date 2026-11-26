@@ -2462,7 +2462,8 @@ def review(
     database = getattr(args, "database", None)
     rebutted, spelled = [] if preflight else rebutted_findings(root, subject, database, env), repo_spelling(root)  # build/sd-1423: one spelling before any match
     rebutted = [row._replace(path=spelled(row.path), instances=tuple(respelled(spelled, {"instances": list(row.instances)})["instances"])) for row in rebutted]
-    shown = previous and dict(previous, findings=[unanswered(rebutted, respelled(spelled, row)) for row in previous["findings"]])
+    # each prior place moved to this head before a rebuttal, recorded here, answers it (build/sd-1675 review)
+    shown = previous and dict(previous, findings=[unanswered(rebutted, row) for row in prior_at(root, previous["subject"].get("head"), subject.head, [respelled(spelled, row) for row in previous["findings"]])])
     checklist = "" if preflight else blocker_checklist(root, subject, database, env) + rebuttal_section(rebutted)
     prompt, prepended, context = ("", False, []) if preflight else prepared_prompt(root, subject, args, shown, env, checklist)
     try:
@@ -2649,8 +2650,7 @@ def review(
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
         outcomes = [row._replace(findings=tuple(respelled(spelled, found) for found in row.findings)) for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
-                      rebutted, subject.scope != "planning", prior_at(root, shown["subject"].get("head"), subject.head,
-                                                                      [found for found in prior_blockers(shown) if "id" in found]) if shown else ())
+                      rebutted, subject.scope != "planning", [found for found in prior_blockers(shown) if "id" in found] if shown else ())
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:

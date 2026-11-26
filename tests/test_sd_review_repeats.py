@@ -926,6 +926,31 @@ class RepeatReviewTests(RepeatFixture):
                                           runner, self.environment(), self.chatgpt_home())
                 self.assertEqual([(r["path"], r["line"], r["instances"]) for r in result["findings"] if "carried" in r], carried)
 
+    def test_a_rebuttal_answers_a_blocker_at_its_place_at_the_head_not_its_old_line(self) -> None:
+        """build/sd-1675 review (bin/sd-review:2465): the rebuttal match ran on a prior blocker's lines at
+        the prior head, before they moved to this head. Five lines above `src.py:10` moved it to 15, and a
+        newer rebuttal at `src.py:10`, another line now, answered and cleared it."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
+        base = self.commit("add", "src.py") and self.commit("src")
+        (self.root / "src.py").write_text("".join(f"new{n}\n" for n in range(5)) + "".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
+        moved = self.commit("add", "src.py") and self.commit("move")
+        self.adjudication(("lane claim", "rebutted", "line 10 is a comment"), head=moved,
+                          instances=["bin/tool.py:3", "src.py:10"])
+        blocker = dict(finding(REPRO, path="bin/tool.py", line=3, summary="lane claim",
+                               instances=["bin/tool.py:3", "src.py:10"]), disposition="blocking")
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps({"scope": "branch", "subject": {"head": base}, "status": "blocking",
+                                      "findings": [blocker]}))
+        prompts, _result, _stderr = self.prompts(scope="branch", base=base, verify_report=str(report))
+        [shown] = json.loads(prompts[0].split("Prior findings:\n", 1)[1].split("\n", 1)[0])
+        self.assertEqual((shown["path"], shown["line"], shown["instances"]), ("src.py", 15, ["src.py:15"]))
+        runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", "")},
+                            default=sd_review.Completed(0, json.dumps({"findings": [], "verdicts": []}), ""))
+        result = sd_review.review(self.root, namespace(scope="branch", base=base, verify_report=str(report)),
+                                  runner, self.environment(), self.chatgpt_home())
+        self.assertEqual([(r["path"], r["line"], r["instances"]) for r in result["findings"] if "carried" in r],
+                         [("src.py", 15, ["src.py:15"])])
+
     def test_a_prior_report_with_a_nul_in_a_path_is_refused_before_any_provider(self) -> None:
         """build/sd-1423 class pass (bin/sd-review:1865): the prompt's source read resolves each prior blocker's
         path, and a NUL raised `ValueError` there. Validation refuses the report as it refuses a non-string."""
