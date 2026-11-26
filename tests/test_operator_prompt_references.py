@@ -23,9 +23,7 @@ from clean_env import clean_environment  # noqa: E402
 #: skill -> reference file -> the triggers the operator types.
 PROMPTS = {
     "sd-next": {
-        "triage.md": ("triage", "park review"),
         "health.md": ("health check",),
-        "open-threads.md": ("open threads", "collect followups"),
     },
     "sd-research-repo": {
         "fleet-review.md": ("review my research repos",),
@@ -123,7 +121,7 @@ class ReviewRoundFixes(unittest.TestCase):
 
     def test_review_batch_questions_go_to_the_review_page(self):
         """A review batch's questions are labelled on the dashboard, not answered with --answers."""
-        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md")):
+        for skill, name in (("sd-research-repo", "fleet-review.md"),):
             text = reference(skill, name)
             with self.subTest(reference=name):
                 self.assertIn("dashboard's Review page", text)
@@ -192,7 +190,7 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
                     self.assertIn(" ".join([tool, *verbs]), answer.stdout.split("\n\n")[0].replace("\n", " "))
                     for flag in flags:
                         self.assertRegex(answer.stdout, rf"(?<![\w-]){re.escape(flag)}(?![\w-])")
-        self.assertGreater(seen, 20)
+        self.assertGreater(seen, 10)
 
     def test_each_command_carries_its_required_arguments(self):
         required = {
@@ -242,19 +240,9 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
 
     def test_each_state_move_names_its_command(self):
         """`unpark`, `set it ready` and `retry` are verbs of real commands; say which."""
-        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md"),
-                            ("sd-status", "deep.md")):
+        for skill, name in (("sd-research-repo", "fleet-review.md"), ("sd-status", "deep.md")):
             with self.subTest(reference=name):
                 self.assertIn("sd task status N ready", reference(skill, name))
-        triage = reference("sd-next", "triage.md")
-        self.assertIn("sd task edit N --unpark", triage)
-        self.assertIn("sd assignments cancel <assignment>", triage)
-
-    def test_triage_cancels_no_member_of_a_live_bundle(self):
-        """Cancelling one member of a running bundle parks the whole run (sd:10795)."""
-        triage = reference("sd-next", "triage.md")
-        self.assertIn("Cancel only an assignment whose run has ended or lost its beat", triage)
-        self.assertIn("A member of a live bundle waits for its run to end", triage)
 
     # Class pass (sd:10795): no reference predicts, from an earlier read, whether a write applies. The write
     # checks in its own transaction; the reference binds it to what was read and says what a refusal means.
@@ -269,12 +257,9 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
 
     def test_item_writes_bind_to_the_revision_read(self):
         """A status move or a cancel decided from a read carries that read's revision."""
-        for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md"),
-                            ("sd-status", "deep.md")):
+        for skill, name in (("sd-research-repo", "fleet-review.md"), ("sd-status", "deep.md")):
             with self.subTest(reference=name):
                 self.assertIn("--if-revision <revision>", reference(skill, name))
-        self.assertIn("sd assignments cancel <assignment> --if-revision <revision>",
-                      reference("sd-next", "triage.md"))
 
 if __name__ == "__main__":
     unittest.main()

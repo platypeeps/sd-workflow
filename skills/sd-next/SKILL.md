@@ -1,6 +1,6 @@
 ---
 name: sd-next
-description: 'Use when the operator asks for status, "what next", recommendations, followups or "what do you need from me" across all their work: done recently, landing soon, open items, numbered next steps, then the waiting questions one at a time; when the operator says "grill", to walk the weekly grill questions; and for the runs "triage", "park review", "health check", "open threads" or "collect followups".'
+description: 'Use when the operator asks for status, "what next", recommendations, followups or "what do you need from me" across all their work: done recently, landing soon, open items, numbered next steps, then the waiting questions one at a time; when the operator says "grill", to walk the weekly grill questions; and for the run "health check".'
 ---
 
 # sd-next
@@ -64,9 +64,7 @@ When the operator says "grill":
 
 Each run below lives in its own file; read it in full when its trigger comes, and follow it in place of the steps above.
 
-- `references/triage.md`: "triage" (every stalled item, then builds) and "park review" (its parked items alone).
 - `references/health.md`: "health check" (this machine's health and open findings).
-- `references/open-threads.md`: "open threads" or "collect followups" (this session's unfiled threads, filed and ruled).
 
 ## Never
 

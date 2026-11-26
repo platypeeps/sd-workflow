@@ -37,7 +37,7 @@ Read in parallel; write one repo at a time.
 ## 3. Judge "moving forward", per repo
 
 - Stalled: no commit in 14 days and no in_progress item, or the Status names no next step.
-- For each stalled item, decide as in the sd-next triage run (`skills/sd-next/references/triage.md`):
+- For each stalled item, decide:
   - unblock it and set it ready (`sd task status N ready --if-revision <revision>`, the `revision:` line of the `sd task show N` you decided from) if nothing it needs is missing;
     a refusal means the item changed since: read it again;
   - fix it or split it if it failed review, with a decision note for each blocker past round 3;
@@ -84,6 +84,6 @@ Decide routine ones yourself; ask only where the options differ in money, risk, 
 
 - Table 1, one row per repo: repo, last commit, solid (claims n/5 supported, kit checks pass/fail), moving (yes, stalled or paused), suggested items (sd:N list), action (fixed, built #N, or needs the operator).
 - Table 2, the suggested items: item, repo, kind (fix or forward), priority, title, done test, state (planning, ready, built #N).
-- Table 3: each existing item touched, as in the triage report.
+- Table 3: each existing item touched: item, old state, new state, build, reason.
 
 Under them, put the veto table of decisions made without asking.
