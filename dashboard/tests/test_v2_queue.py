@@ -174,6 +174,8 @@ class Lane:
                  "expected_head": self.merged, "branch": "main", "worktree": str(self.checkout),
                  "enqueued_on": ship.this_host(), "prepare_log": str(log), **extra}
         self.list(self.entries() + [entry])
+        # Each case's stub may answer adjudicate otherwise for the same entry; the page keeps the last (sd:10814).
+        queue_screen.forget()
         return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"] if row.get("item") == 14)
 
     def shot_entries(self):
@@ -988,6 +990,43 @@ class TheMove(Lane, BrowserSession):
                 self.assertIs(row["held"], held)
                 self.assertIsNotNone(row["review"])
         self.assertIsNone(self.failed(enqueued_on="satellite-1")["held"])
+
+    def test_a_second_build_over_an_unchanged_failed_row_runs_no_adjudicate(self):
+        """sd:10814: a failed row's review moves only with its entry; a build asked adjudicate on every poll."""
+        first = self.failed()
+        self.log.write_text("")
+        again = next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                     if row.get("item") == 14)
+        self.assertEqual([c for c in self.calls() if "adjudicate" in c], [])
+        self.assertEqual(again["review"], first["review"])
+        log = Path(again["log"])
+        os.utime(log, ns=(log.stat().st_atime_ns, log.stat().st_mtime_ns + 1))  # a retry's new prepare log
+        queue_screen.document(self.connection, now=NOW)
+        self.assertEqual(len([c for c in self.calls() if "adjudicate" in c]), 1)
+
+    def test_an_adjudication_or_review_rerun_from_the_cli_reads_the_review_again(self):
+        """sd:10814 lead review: the kept fields outlived a CLI adjudication and a review run again at the same
+        head, so Retry and Reject stood on a review that had moved. Each writes a `ship` checkpoint."""
+        def build():
+            return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                        if row.get("item") == 14)
+
+        def adjudicated():
+            return [c for c in self.calls() if "adjudicate" in c]
+        self.assertIs(self.failed()["held"], False)
+        for key, env, want in (("ship-adjudication:" + "a" * 64, {"QUEUE_RECORDED": "7"}, ("review", True)),
+                               ("ship:" + "b" * 64, {"QUEUE_DIGEST": "f9"}, (None, None))):
+            with self.subTest(key=key[:20]):
+                self.log.write_text("")
+                with mock.patch.dict(os.environ, env):
+                    build()
+                    self.assertEqual(adjudicated(), [], "unchanged: kept")
+                    self.connection.execute("INSERT INTO state(kind, key, timestamp, body) "
+                                            "VALUES ('checkpoint', ?, ?, '{}')", (key, NOW))
+                    self.connection.commit()
+                    row = build()
+                self.assertEqual(len(adjudicated()), 1)
+                self.assertEqual(("review" if row["review"] else None, row["held"]), want)
 
     def test_a_review_run_again_at_the_same_head_offers_retry_not_reject(self):
         """sd:9966 lane review: the review at that head ran again with other findings; the prepare log still

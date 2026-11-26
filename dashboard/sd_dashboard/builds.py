@@ -148,8 +148,8 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
     waits = build.waits(connection, [row["id"] for row in taken]) if taken else {}
     room = _room(connection, now=now, sessions=sessions, gate=gate)
     # A design rides the first fresh code bundle of its repository, whatever its priority or area, and takes no
-    # slot (`build.claim`, `build._bundle`, sd:10096): it joins the first chunk shown there and counts against
-    # no cap. A press of rides alone shows them as the bundle they wait to join.
+    # slot (`build.claim`, `build._bundle`, sd:10096): it joins the first chunk of the bundle the claim leads
+    # first there (`target`) and counts against no cap. A press of rides alone shows them as the bundle they wait to join.
     rides = [row for row in taken if _rides(connection, row)]
     groups: dict[tuple, list[dict]] = {}
     for row in taken:
@@ -158,22 +158,29 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
     for row in rides:
         if not any(repo == row["repo"] for repo, _ in groups):
             groups[(row["repo"], None)] = []
-    bundles, joined = [], set()
+    order = lambda row: (row["priority"] is None, row["priority"] or 0)  # noqa: E731 -- the claim's order
+    members = {}
     for (repo, slot), rows in groups.items():
         # The claim bundles the repository's queued fresh builds with these, best first (pack sd:9484): show them
         # where it puts them. ponytail: a queued retry claims alone and is not shown; a press queues after now.
-        queued = build.queued_fresh(connection, repo)
+        members[(repo, slot)] = sorted([*({**row, "queued": True} for row in build.queued_fresh(connection, repo)
+                                          if not _rides(connection, row) and _slot(row) == slot),
+                                        *({**row, "queued": False} for row in rows)], key=order)
+    # The rides join the bundle the claim leads first (`build.claim`, sd:10693): the first by priority among
+    # those with room, else the first by priority. A press of rides alone has one group, so it is that.
+    target = {}
+    for repo in dict.fromkeys(repo for repo, _ in members):
+        slots = sorted((slot for key, slot in members if key == repo),
+                       key=lambda slot: order(members[(repo, slot)][0]) if members[(repo, slot)] else (True, 0))
+        target[repo] = next((slot for slot in slots if build.room_for(room, repo, p1=slot is not None) > 0), slots[0])
+    bundles = []
+    for (repo, slot), rows in members.items():
         mine = [row for row in rides if row["repo"] == repo]
-        lane = (rows or mine)[0]["lane_host"]
-        aboard = [] if repo in joined else [
-            *({**row, "queued": True} for row in queued
+        lane = (groups[(repo, slot)] or mine)[0]["lane_host"]
+        aboard = [] if target[repo] != slot else [
+            *({**row, "queued": True} for row in build.queued_fresh(connection, repo)
               if _rides(connection, row) and build.design_waits(connection, row["id"]) is None),
             *({**row, "queued": False} for row in mine)]
-        joined.add(repo)
-        rows = sorted([*({**row, "queued": True} for row in queued
-                         if not _rides(connection, row) and _slot(row) == slot),
-                       *({**row, "queued": False} for row in rows)],
-                      key=lambda row: (row["priority"] is None, row["priority"] or 0))
         while rows or aboard:
             size = build.bundled(connection, [row["id"] for row in rows])
             chunk, rows, aboard = [*rows[:size], *aboard], rows[size:], []
