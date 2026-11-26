@@ -161,6 +161,10 @@ CORE_CONFIG = {
                     "description": "How many code-writing builders, drafts and interactive builders may run at once "
                                    "on this machine, 1 to 16. Unset reads 6 (sd:9891); the load guard still holds "
                                    "builds back below it. It grants nothing."},
+    "overload_fallback": {"pattern": "[01]",
+                          "description": "1: while a satellite's load is over its cap, this hub builds that lane's "
+                                         "fresh queued builds of a repository checked out here (sd:8991). Unset or "
+                                         "0: they wait for the satellite (sd:10823). It grants nothing."},
     "repo_cap": {"pattern": "[1-6]",
                  "description": "How many build bundles may build at once in one repository when this machine "
                                 "claims them, 1 to 6. Unset reads 1 (sd:8158). It grants nothing."},
@@ -479,6 +483,17 @@ def git_output(args: list[str], root: pathlib.Path) -> str | None:
     (timeout, no shell, failure-is-None). Most are reads; `delivered` fetches.
     """
     return _git(args, root)
+
+
+def git_show(root: pathlib.Path, spec: str) -> str | None:
+    """`git show <spec>` unstripped, or None: file bytes keep their last newline."""
+    try:
+        done = subprocess.run(["git", "-C", str(root), "show", spec], capture_output=True,  # nosec B603 B607
+                              text=True, timeout=GIT_TIMEOUT_SECONDS, check=False,
+                              env={**without_fsmonitor(os.environ), "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):  # a non-UTF-8 blob raises UnicodeDecodeError to the caller
+        return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def instance_files(instances: Any) -> list[str]:

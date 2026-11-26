@@ -1135,11 +1135,19 @@ class LineBudgetTests(unittest.TestCase):
         # The lead read a blocker with no repro and reran with `--json`;
         # the escape reuses `for_note`, so the three lines are a comment,
         # the loop and its write. Measured: `sd-review` is 3156 here.
+        #
+        # 5126 -> 5146 is sd:10380: `bin/sd-review` +20 for
+        # `unrecorded_reason`, so a pass that records no lane receipt
+        # names the one condition that failed, and a reader shortfall
+        # says so instead of nothing. One refusal covered five
+        # conditions, so a lane host's miss named no cause; the table is
+        # its own function to keep `record_lead_review` under the branch
+        # ceiling. Measured: `sd-review` is 3176 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5126,
+            5146,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
