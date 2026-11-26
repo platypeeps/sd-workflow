@@ -16,7 +16,7 @@ Read in parallel; write one repo at a time.
 ## 1. Collect, per repo
 
 - Activity: last commit on origin/main, open branches and worktrees, and unpushed commits.
-- Items: every planning, blocked, parked or ready item, its newest note, and any build or lane entry.
+- Items: every planning, ready, in_progress, blocked or parked item, its newest note, and any build or lane entry.
   Use `sd store items --parked --belongs-to <repo>` and `sd assignments list`.
 - Questions: open question notes and research rows in the Decisions list of `sd today --here`.
   Count review questions and scores for the report only: a review batch's questions are labelled on the dashboard's Review page, not answered with `--answers`.
@@ -68,7 +68,7 @@ Read in parallel; write one repo at a time.
 
 ## 5. Build
 
-- Run `sd assignments build N` for each ready item, including step-4 fixes. Respect the load limit.
+- Run `sd assignments build N` for each item this run set ready in step 3 or 4, in the reviewed repos only. Respect the load limit.
   Skip an item with an open question note or a Decisions row: step 6 asks first, then builds it.
   Filter on no list of builds first: the press refuses an item it cannot build, such as one already building, and writes nothing.
 - Note on each item touched what you did.
