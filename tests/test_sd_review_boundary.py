@@ -1154,11 +1154,16 @@ class LineBudgetTests(unittest.TestCase):
         # A failed reader's `open` verdict holds a blocker, and `followed`
         # moves each carried blocker through a rename so the next fix
         # review reads its source. Measured: `sd-review` is 3111 here.
+        #
+        # 5081 -> 5099 is round 3 of build/sd-2205: `bin/sd-review` +18.
+        # Degraded input holds a prior blocker: a malformed verdict reads
+        # as `open` (`held_verdicts`), and `followed` chains each commit's
+        # renames. Measured: `sd-review` is 3129 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5081,
+            5099,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

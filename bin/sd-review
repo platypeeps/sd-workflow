@@ -1293,6 +1293,16 @@ def _verdicts_error(rows: Any) -> str:
     return ""
 
 
+def held_verdicts(rows: Any) -> tuple[dict[str, Any], ...]:
+    """`verdicts` as `carried` reads them: a valid row as given, anything else as an `open`, for its id when it
+    has one. A malformed answer may hold a prior blocker and never releases one (round 3 of build/sd-2205: one
+    bad row dropped the valid `open` beside it)."""
+    def _unread(raw: Any) -> dict[str, Any]:
+        named = raw.get("id") if isinstance(raw, dict) else None
+        return {"id": named if isinstance(named, str) else "", "verdict": "open", "evidence": ""}
+    return tuple(raw if not _verdicts_error([raw]) else _unread(raw) for raw in (rows if isinstance(rows, list) else () if rows is None else [rows]))
+
+
 def evidence_limit(summary: str) -> dict[str, Any]:
     """An explicit blocker prevents omitted evidence becoming a clean fallback."""
     return {"path": "<review-response>", "line": None, "severity": "high",
@@ -1360,7 +1370,8 @@ def parse_findings(text: str, diagnostic: dict[str, Any] | None = None, *, allow
     if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
         diagnostic["validation_error"] = ("response: expected object" if not isinstance(value, dict) else
             "response.findings: missing required field" if "findings" not in value else "response.findings: expected array")
-        return None
+        held = held_verdicts(value.get("verdicts")) if isinstance(value, dict) else ()
+        return ParsedFindings((), diagnostic["validation_error"], held) if held else None
     rows = value["findings"]
     errors = []
     if len(rows) > MAX_FINDINGS:
@@ -1377,9 +1388,7 @@ def parse_findings(text: str, diagnostic: dict[str, Any] | None = None, *, allow
         kept = sorted(findings, key=lambda row: rank.get(row["severity"], 3))[:MAX_FINDINGS - 1]
         omitted = len(rows) - len(kept)
         findings = (*kept, evidence_limit(f"{omitted} finding row(s) omitted at the output limit; review remains incomplete"))
-    found = value.get("verdicts")
-    verdicts = tuple(found) if isinstance(found, list) and not _verdicts_error(found) else ()  # an `open` holds even beside bad findings
-    return ParsedFindings(findings, "; ".join(errors), verdicts)
+    return ParsedFindings(findings, "; ".join(errors), held_verdicts(value.get("verdicts")))  # an `open` holds even beside bad findings
 
 
 class Outcome(NamedTuple):
@@ -1837,7 +1846,8 @@ def prior_blockers(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
 def followed(root: pathlib.Path, previous: Mapping[str, Any], head: str) -> list[dict[str, Any]]:
     """`prior_blockers` in one spelling, each file followed through a rename to `head` from the row's own
     `prior_review.head`, else the report's head (review of build/sd-2205: a carried blocker kept a renamed
-    path, so the next fix review read no source for it). A rename git cannot read leaves the path as stored."""
+    path, so the next fix review read no source for it). Each commit's renames chain, so a later rewrite does
+    not hide one; a rename git cannot read leaves the path as stored, and the prompt marks its file absent."""
     spelled, cache = repo_spelling(root), {}
     def _renames(start: Any) -> dict[str, str]:
         if not isinstance(start, str) or not re.fullmatch(r"[0-9a-f]{40,64}", start):
@@ -1851,11 +1861,17 @@ def followed(root: pathlib.Path, previous: Mapping[str, Any], head: str) -> list
                     fields = fields[2:]
                 else:
                     fields = fields[1:]
+            names = [name for name in (sd_lib.git_output(  # a rewrite after the rename hides it from the diff of the two heads
+                ["log", "--reverse", "-M", "--diff-filter=R", "--name-status", "--format=", "-z", f"{start}..{head}"], root) or "").split("\0") if name]
+            chain: dict[str, str] = {}
+            for old, new in zip(names[1::3], names[2::3], strict=False):
+                chain[next((first for first, now in chain.items() if now == old), old)] = new
+            cache[start].update(chain)
         return cache[start]
     rows = []
     for row in (respelled(spelled, found) for found in prior_blockers(previous)):
         found = row["prior_review"].get("head") if isinstance(row.get("prior_review"), dict) else None
-        moved = _renames(found if isinstance(found, str) else previous["subject"].get("head"))
+        moved = _renames(found) or _renames(previous["subject"].get("head"))  # a row head git cannot read: the report's
         def _at(entry: Any, moved: dict[str, str] = moved) -> Any:
             place = instance_place(entry) if isinstance(entry, str) else None
             if place is None or place[0] not in moved:
@@ -1879,8 +1895,9 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome], reb
     its stored place, with its stored evidence and each `open` answer's. With no completed answer nothing is
     carried: the pass is incomplete and decides nothing."""
     answered = [row for row in outcomes if row.status in (CLEAN, FINDINGS)]
-    def _said(row: Outcome, name: str) -> list[dict[str, Any]]:
-        return [given for given in row.verdicts if given["id"].strip() == name]
+    names = {f"B{index + 1}" for index in range(len(prior))}
+    def _said(row: Outcome, name: str) -> list[dict[str, Any]]:  # an `open` naming no listed blocker holds every one
+        return [given for given in row.verdicts if (key := given["id"].strip().upper()) == name or key not in names and given["verdict"] == "open"]
     kept = []
     for index, old in enumerate(prior if answered else ()):
         name = f"B{index + 1}"
@@ -2260,7 +2277,8 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                    "against the fix and current code, including code outside changed hunks, and answer each by its id in "
                    "verdicts: fixed only when the defect is gone at every listed instance, with evidence naming the code "
                    "that now prevents it (path:line); open otherwise. An unrelated clean diff fixes nothing; a blocker you "
-                   "do not answer stays blocking; a row with no id needs no verdict. Report new defects in findings. Prior findings:\n" + evidence)
+                   "do not answer stays blocking; a row with no id needs no verdict. A blocker whose file is absent is fixed only when "
+                   "evidence names where its code went or shows the defect removed with it. Report new defects in findings. Prior findings:\n" + evidence)
         required = len(prompt.encode())
         for name in dict.fromkeys(map(repo_spelling(root), sd_lib.blocking_places([*blockers, *previous["findings"]]))):  # sd:9769; sd:9962 an old absolute path
             path = pathlib.Path(name)

@@ -652,6 +652,33 @@ class PriorVerdictTests(unittest.TestCase):
         bad_findings = sd_review.parse_findings(json.dumps({"findings": [{"path": "src.py"}], "verdicts": [verdict("open")]}))
         self.assertEqual(sd_review._answer("one", sd_review.Completed(0, "", ""), bad_findings).verdicts, (verdict("open"),))
 
+    def test_a_malformed_verdict_never_drops_what_holds_a_blocker(self) -> None:
+        """Round 3 of build/sd-2205 (bin/sd-review:1381), the class: degraded input must hold a blocker, never
+        release it. One bad verdict dropped the valid `open` beside it, and a fallback's `fixed` cleared B1."""
+        def failed(body: Any) -> Any:
+            return sd_review._answer("one", sd_review.Completed(0, "", ""), sd_review.parse_findings(json.dumps(body)))
+        for label, body in (
+                ("a bad verdict beside a valid open", {"findings": [], "verdicts": [verdict("maybe"), verdict("open")]}),
+                ("an open in an unknown spelling", {"findings": [], "verdicts": [verdict("OPEN")]}),
+                ("verdicts that are no array", {"findings": [], "verdicts": {"B1": "open"}}),
+                ("an open beside no findings array", {"verdicts": [verdict("open")]})):
+            with self.subTest(label):
+                outcome = failed(body)
+                self.assertNotIn(outcome.status, (sd_review.CLEAN, sd_review.FINDINGS))
+                self.assertEqual(verified(outcome, answer("two", verdicts=[verdict()]))["status"], "blocking")
+        self.assertIsNone(sd_review.parse_findings(json.dumps({"verdicts": []})))
+        self.assertIsNone(sd_review.parse_findings(json.dumps({"summary": "no review"})))
+
+    def test_an_open_verdict_holds_whatever_its_id_spelling(self) -> None:
+        """The same class in `carried`: an `open` for `b1` matched no blocker, so the `fixed` beside it cleared
+        B1. An id reads without case or space; an `open` naming no listed blocker holds every one."""
+        for label, verdicts, status in (
+                ("open in lower case", [verdict(), verdict("open", id="b1")], "blocking"),
+                ("open for an id never listed", [verdict(), verdict("open", id="B7")], "blocking"),
+                ("fixed in lower case", [verdict(id=" b1 ")], "clean")):
+            with self.subTest(label):
+                self.assertEqual(verified(answer("one", verdicts=verdicts))["status"], status)
+
     def test_no_completed_reader_carries_nothing(self) -> None:
         result = verified(answer("one", status=sd_review.UNAVAILABLE))
         self.assertEqual((result["status"], result["findings"]), (sd_review.UNAVAILABLE, []))
@@ -708,6 +735,52 @@ class PriorVerdictReviewTests(RepeatFixture):
                                   self.environment(), self.chatgpt_home())
         self.assertEqual([(row["path"], row["instances"]) for row in result["findings"] if row.get("prior_blocker")],
                          [("moved.py", ["moved.py:10"])])
+
+    def carried_after(self, row: dict[str, Any], *steps: Any) -> tuple[str, list[Any]]:
+        """The first prompt and the carried places for `row`, reported at the 20-line `src.py`, after `steps`."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 21)), encoding="utf-8")
+        prior_head = self.commit("add", "src.py") and self.commit("src")
+        report = self.tmp / "aggregate.json"
+        report.write_text(json.dumps({"scope": "branch", "subject": {"head": prior_head}, "findings": [row]}))
+        for step in steps:
+            step() if callable(step) else self.commit(*step)
+        prompts, _result, _stderr = self.prompts(scope="branch", resume_report=str(report))
+        runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", "")},
+                            default=sd_review.Completed(0, json.dumps({"findings": [], "verdicts": []}), ""))
+        result = sd_review.review(self.root, namespace(scope="branch", resume_report=str(report)), runner,
+                                  self.environment(), self.chatgpt_home())
+        return prompts[0], [(found["path"], found["instances"]) for found in result["findings"] if found.get("prior_blocker")]
+
+    def rewrite(self, name: str) -> None:
+        (self.root / name).write_text("".join(f"other{n}\n" for n in range(1, 21)), encoding="utf-8")
+
+    def test_a_carried_blocker_follows_a_rename_that_a_rewrite_hides(self) -> None:
+        """Round 3 of build/sd-2205 (bin/sd-review:1846): `git mv` in one commit and a rewrite in the next leave
+        no rename between the two heads, so the blocker kept the deleted `src.py`. Each commit's renames chain."""
+        prompt, places = self.carried_after(
+            dict(PRIOR[0], instances=["src.py:10"]), ("mv", "src.py", "moved.py"), ("rename",),
+            lambda: self.rewrite("moved.py"), ("add", "moved.py"), ("rewrite",), ("mv", "moved.py", "last.py"), ("again",))
+        self.assertEqual(places, [("last.py", ["last.py:10"])])
+        self.assertIn("Current source for prior finding last.py:\nother1\n", prompt)
+
+    def test_a_rename_is_read_from_the_report_head_when_the_rows_own_head_is_unusable(self) -> None:
+        """The same class: a row whose `prior_review.head` names no commit read no rename at all."""
+        for head in ("unknown", "0" * 40):
+            with self.subTest(head=head):
+                _prompt, places = self.carried_after(dict(PRIOR[0], instances=["src.py:10"], prior_review={"head": head}),
+                                                     ("mv", "src.py", "moved.py"), ("rename",))
+                self.commit("mv", "moved.py", "src.py") and self.commit("back")
+                self.assertEqual(places, [("moved.py", ["moved.py:10"])])
+
+    def test_a_blocker_whose_file_is_gone_asks_where_its_code_went(self) -> None:
+        """The same class: one commit deletes `src.py` and adds its rewrite, which git reads as no rename. The
+        blocker stays at its stored place and the reader is told a missing file alone fixes nothing."""
+        prompt, places = self.carried_after(
+            dict(PRIOR[0], instances=["src.py:10"]), ("rm", "--quiet", "src.py"), lambda: self.rewrite("new.py"),
+            ("add", "new.py"), ("replace",))
+        self.assertEqual(places, [("src.py", ["src.py:10"])])
+        self.assertIn("Current source for prior finding src.py:\n[file absent at current HEAD]", prompt)
+        self.assertIn("A blocker whose file is absent is fixed only when evidence names where its code went", prompt)
 
     def test_a_resumed_review_asks_each_blocker_by_id_and_holds_it_without_a_fixed_verdict(self) -> None:
         report = self.report()
