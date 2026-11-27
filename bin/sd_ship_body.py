@@ -142,8 +142,9 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
         spanned = bool(ticks)  # in an open code span the `plain` rules rest
-        rest, lazy = _continues(line, items, _runs_on(loose, commented, inline_at), plain, spanned)
-        if unclosed := _unclosed(inline_at, line, rest, (loose, len(items) < comment_depth), plain, spanned):
+        rest, lazy = _continues(line, items, _runs_on(loose, commented, inline_at), plain, spanned,
+                                inline_at is not None)
+        if unclosed := _unclosed(inline_at, line, rest, (loose, len(items) < comment_depth), lazy):
             return rows, unclosed  # its paragraph ended before its `-->`: its `<!--` is text
         commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
         _settle(rows, pending, None, ended=not commented)  # it ended with its list item, and no `-->`
@@ -153,8 +154,8 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
             rows.append((number, "fence", 0, len(items), rest, line, False, line))
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
-        kind, opened, text = ("text", 0, rest) if lazy else _kind(rest, items, loose, commented, len(items) != depth,
-                                                                    plain, spanned)
+        kind, opened, text = _wrapped(rest, commented) if lazy else _kind(
+            rest, items, loose, commented, len(items) != depth, plain, spanned)
         alone = _stands_alone(kind, text, line)
         if ticks and _ends_paragraph(kind, opened, alone, len(items) != depth):
             return rows, span_at  # the paragraph ended with the span open: its opener is text
@@ -172,7 +173,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
             text, shown, joins = _cut(line, text, lazy, cut, was, rows, pending)
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
-        rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line, spanned, shown))
+        rows.append((number, kind, opened, len(items), text, line, spanned, shown))
         _join(rows, joins, pending)
     _settle(rows, pending, None)
     return rows, (span_at if ticks else inline_at)  # an inline comment open at the end is text
@@ -198,20 +199,20 @@ def _inline_at(number: int, line: str, text: str, lazy: bool, cut: list[tuple[in
     return (number, cut[-1][0]) if cut[-1][0] > lead else None
 
 
-def _unclosed(inline_at: tuple[int, int] | None, line: str, rest: str, ended: tuple[bool, bool], plain: bool,
-              spanned: bool) -> tuple[int, int] | None:
+def _unclosed(inline_at: tuple[int, int] | None, line: str, rest: str, ended: tuple[bool, bool],
+              lazy: bool) -> tuple[int, int] | None:
     """`inline_at` when `line` ends the paragraph its inline comment sits in before any `-->`. `ended`
     says the row above stood alone, a heading, or the list item that held the comment ended."""
-    return inline_at if inline_at and _ends_comment_paragraph(line, rest, any(ended), plain, spanned) else None
+    return inline_at if inline_at and _ends_comment_paragraph(line, rest, any(ended), lazy) else None
 
 
-def _ends_comment_paragraph(line: str, rest: str, ended: bool, plain: bool, spanned: bool) -> bool:
+def _ends_comment_paragraph(line: str, rest: str, ended: bool, lazy: bool) -> bool:
     """Whether `line` ends the paragraph an inline comment open over it sits in: a blank, a block that
-    interrupts a paragraph, a setext underline, the end of its list item or of the heading it opened
-    on (`ended`), or, in the `plain` grammar, any list marker. CommonMark then reads its `<!--` as
-    text (pack sd:10090)."""
-    return ended or not line.strip() or _interrupts(rest) or bool(_SETEXT.match(rest)) \
-        or (plain and not spanned and bool(_ITEM_MARKER.match(rest)))
+    interrupts a paragraph, a setext underline on a line that is not `lazy`, the end of its list item
+    or of the heading it opened on (`ended`). CommonMark then reads its `<!--` as text. These are
+    CommonMark's rules in either grammar: the `plain` rules rest while the comment is open, as in an
+    open code span, so no read ends a comment a reader sees closed (pack sd:10090)."""
+    return ended or not line.strip() or _interrupts(rest) or (not lazy and bool(_SETEXT.match(rest)))
 
 
 #: What a comment between two word characters reads as: a word character no sha holds, so the two
@@ -222,16 +223,19 @@ _SEAM = "\u02bc"
 _OPEN = "\ue000"
 
 
-def _runs(line: str, cut: list[tuple[int, int]]) -> list[tuple[int, int, bool]]:
+def _runs(line: str, cut: list[tuple[int, int]], was: bool = False) -> list[tuple[int, int, bool]]:
     """The comments `cut` names on `line`, adjacent ones as one run: `(first, last, open)`, `open` when
-    no `-->` on the line closes the run."""
+    no `-->` on the line closes the run. A `-->` closes past its comment's `<!--`; one open from an
+    earlier line (`was`, the first of `cut`) has none here, so a `-->` anywhere closes it: a line
+    that is `-->` alone left it open, and the second read saw what it held (pack sd:10090)."""
     runs: list[list[int]] = []
-    for first, last in cut:
+    for index, (first, last) in enumerate(cut):
+        body = first if was and index == 0 else first + 4  # where the comment's own `-->` may start
         if runs and runs[-1][1] == first:
-            runs[-1][1] = last
+            runs[-1][1:] = [last, body]
         else:
-            runs.append([first, last])
-    return [(first, last, last >= len(line) and not line.endswith("-->", first + 4)) for first, last in runs]
+            runs.append([first, last, body])
+    return [(first, last, last >= len(line) and not line.endswith("-->", body)) for first, last, body in runs]
 
 
 def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool, rows: list,
@@ -239,7 +243,7 @@ def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool
     """`text` and the whole `line` with the comments `cut` names read (`_less`). A comment open from an
     earlier line (`was`) that closes here settles the `_OPEN` waiting on it; one open past this line's
     end leaves its own, for the row `_blocks_once` appends next."""
-    runs, joins = _runs(line, cut), None
+    runs, joins = _runs(line, cut, was), None
     if was and runs and runs[0][0] == 0 and not runs[0][2]:
         # A comment that opened after a row's text keeps one paragraph line: what follows its `-->` is
         # read on that row (`_join`), so a qualifier after the close stays on the heading it qualifies.
@@ -318,19 +322,24 @@ def _inline(line: str, number: int, commented: bool, ticks: str, span_at: tuple[
     return commented, ticks, (number, column) if ticks and column >= 0 else span_at
 
 
-def _continues(line: str, items: list[int], paragraph: bool, plain: bool, spanned: bool) -> tuple[str, bool]:
+def _continues(line: str, items: list[int], paragraph: bool, plain: bool, spanned: bool,
+               inline: bool = False) -> tuple[str, bool]:
     """`line` past its list column, popping each item it ends, and whether it is a lazy line.
 
     A line indented less than its list item continues the item's open
     `paragraph` (CommonMark's lazy continuation) unless a block starts on
     it: any list marker, or a block that interrupts a paragraph. In the
     `plain` grammar a line that ends with a colon is a heading, so it
-    ends the item too, unless it starts in an open code span.
+    ends the item too, unless it starts in an open code span. Over an
+    open `inline` comment only a block that interrupts a paragraph
+    starts: CommonMark's rule, which says where the comment's paragraph
+    ends (pack sd:10090).
     """
     ended = items.copy()
     rest = _item_text(line, ended, opens=False)
-    if paragraph and len(ended) < len(items) and not (_ITEM_MARKER.match(rest) or _interrupts(rest)) \
-            and not (plain and not spanned and _heading(rest).endswith(":")):
+    starts = _interrupts(rest) or (not inline and bool(
+        _ITEM_MARKER.match(rest) or (plain and not spanned and _heading(rest).endswith(":"))))
+    if paragraph and len(ended) < len(items) and not starts:
         return line.strip(), True
     items[:] = ended
     return rest, False
@@ -361,7 +370,14 @@ def _interrupts(text: str) -> bool:
 
 def _ends_paragraph(kind: str, opened: int, alone: bool, moved: bool) -> bool:
     """Whether a line ends the paragraph above it: no paragraph text, a list item, or a list item's end."""
-    return alone or kind != "text" or bool(opened) or moved
+    return alone or kind not in ("text", "wrapped") or bool(opened) or moved
+
+
+def _wrapped(rest: str, commented: bool) -> tuple[str, int, str]:
+    """The kind of a line that continues its item's paragraph (`_continues`): `wrapped`, or `comment`
+    when a comment is open at its start, so the read a comment's lines are left out of leaves it out
+    (pack sd:10090)."""
+    return "comment" if commented else "wrapped", 0, rest
 
 
 def _stands_alone(kind: str, text: str, line: str) -> bool:

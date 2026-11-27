@@ -984,6 +984,52 @@ class CitedIdTests(unittest.TestCase):
         commits = [("c" * 40, revert), (a + "0" * 33, "fix: work\n\nCloses: sd:2\n")]
         self.assertEqual(sd_ship_body.cited_ids("", commits), (2,))
 
+    def test_only_a_commonmark_block_ends_the_paragraph_of_a_comment(self) -> None:
+        """Last round, review of build/sd-1653 (pack sd:10090). The paragraph of an inline comment ended
+        by rules CommonMark does not have: the `plain` read's any-marker and colon-heading rules, a
+        marker that kept a line from being lazy, a setext underline on a lazy line. Its `<!--` then
+        read as text, so a numbered example a reader never sees, `2. <sha>` in a comment, undid a
+        retained commit. While an inline comment is open only CommonMark's rules end its paragraph,
+        as inside an open code span. Each expected value is what CommonMark shows."""
+        a, b, c = "a" * 7, "b" * 7, "c" * 7
+        listed = {
+            # 1. `plain`: any list marker ended the paragraph; `2.` and an empty `*` interrupt nothing.
+            f"Kept commits: see <!-- example:\nReverted commits:\n2. {a}\n-->\n- {b} retained\n": [],
+            f"Kept: <!-- example:\n*\nReverted commits:\n3. {a}\n-->\n- {b} retained\n": [],
+            f"Reverted commits: <!-- kept, as an example:\n2. {a}\n-->\n- {b} renew\n": [b],
+            f"Reverted commits:\n- {b} renew <!-- example\n  2. {a}\n  -->\n": [b],
+            f"Reverted commits:\n- {b} renew <!-- kept\n  *\n  3. {a}\n  -->\n": [b],
+            # 2. A marker kept a line indented less than its item from being lazy, so the item ended.
+            f"Reverted commits:\n- {b} renew <!-- example\n2. {a}\n-->\n": [b],
+            # 3. `plain`: a line that ends with a colon ended the item that held the comment.
+            f"Kept:\n- {b} retained <!-- example\nReverted commits:\n2. {a}\n-->\n": [],
+            f"Reverted commits:\n- {b} renew <!-- example\nKept:\n-->\n- {c} renew\n": [b, c],
+            # 4. A setext underline on a lazy line underlines nothing.
+            f"Reverted commits:\n- {b} renew <!-- example\n===\n2. {a} -->\n": [b],
+            # A block CommonMark has still ends it: a blank line, a bullet, an item numbered 1.
+            f"Kept.<!-- note\n\n--> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n1. x --> Reverted commits:\n- {a} renew\n": [],
+            f"Kept: <!-- example:\nReverted commits:\n- {a}\n-->\n": [a],
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+        # The property: lines that interrupt no paragraph, inside a comment, read as the comment gone.
+        inner = (f"2. {a}", "*", "Reverted commits:", "Kept:", "===", f"10) {a}", "-", f"  3. {a}", "text")
+        for head, indent, (one, two) in itertools.product(("Reverted commits:", "Kept:"), ("", "  "),
+                                                          itertools.product(inner, inner)):
+            if indent and {"-", "==="} & {one, two}:
+                continue  # at the item's indent `-` and `===` are setext underlines: CommonMark ends it there
+            gone = f"{head}\n- {b} renew\n- {c} renew\n"
+            message = f"{head}\n- {b} renew <!-- x\n{indent}{one}\n{indent}{two}\n{indent}-->\n- {c} renew\n"
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), sd_ship_body._listed_undone(gone))
+        # The review's case: a numbered example in a comment leaves the retained commit its closure.
+        revert = f"revert: undo\n\nKept commits: see <!-- example:\nReverted commits:\n2. {a}\n-->\n- {b}\n"
+        commits = [("d" * 40, revert), (a + "0" * 33, "fix: one\n\nCloses: sd:2\n"),
+                   (b + "0" * 33, "fix: two\n\nCloses: sd:3\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (2, 3))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")
