@@ -543,7 +543,9 @@ class CitedIdTests(unittest.TestCase):
         a, b, c = "a" * 7, "b" * 7, "c" * 7
         escaped = (f"Reverted commits:\n\n- {a} renew\n  \\` example <!-- `\n  - {b} retained\n"
                    f"- {c} renew\n")
-        self.assertEqual(sd_ship_body._listed_undone(escaped), [a, c])
+        # The nested item ends the paragraph before any `-->`, so CommonMark reads the `<!--` as text and
+        # shows `b` nested in a reverted item (pack sd:10090; it read hidden while a comment ran to its item's end).
+        self.assertEqual(sd_ship_body._listed_undone(escaped), [a, b, c])
         wrapped = f"A `span\n<!-- inside` end.\n\nReverted commits:\n\n- {a} renew\n"
         self.assertEqual(sd_ship_body._listed_undone(wrapped), [a])
         cases = {
@@ -949,6 +951,34 @@ class CitedIdTests(unittest.TestCase):
                 self.assertEqual(sd_ship_body._listed_undone(message), sd_ship_body._listed_undone(plain))
         # The review's case: the kept commit's closure survives the revert.
         revert = f"revert: undo\n\nReverted commits:<!-- note\n  --> pending verification\n- {a}\n"
+        commits = [("c" * 40, revert), (a + "0" * 33, "fix: work\n\nCloses: sd:2\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (2,))
+
+    def test_a_comment_no_paragraph_line_closes_is_text(self) -> None:
+        """Review of build/sd-1653 (pack sd:10090). An inline comment lives in its paragraph: a block
+        that ends the paragraph before the `-->` leaves the `<!--` text, as CommonMark reads it. The
+        read joined `Kept.<!-- note` across that block onto `--> Reverted commits:`, a heading that
+        said reverted, so the listed commit lost its `Closes:`."""
+        a = "a" * 7
+        listed = {
+            # Each block that ends a paragraph, between the comment's open and its close.
+            f"Kept.<!-- note\n\n--> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n- x --> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n> q --> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n```\n--> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n# h\n--> Reverted commits:\n- {a} renew\n": [],
+            f"Notes:\n- see.<!-- x\n\n  --> Reverted commits:\n  - {a}\n": [],
+            # A heading is one line: a comment it opens closes on it or not at all.
+            f"## Kept.<!-- note\n--> Reverted commits:\n- {a} renew\n": [],
+            # Lines the comment never held are read: the list under the heading after the blank.
+            f"Kept:\n- {'b' * 7} retained <!-- x\n\nReverted commits:\n- {a} -->\n": [a],
+            # An HTML block, a comment that leads its line, runs on past a blank line.
+            f"Kept:\n<!-- x\n\n- {a}\n--> Reverted commits:\n- {a} renew\n": [a],
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+        revert = f"revert: undo\n\nKept.<!-- note\n\n--> Reverted commits:\n- {a}\n"
         commits = [("c" * 40, revert), (a + "0" * 33, "fix: work\n\nCloses: sd:2\n")]
         self.assertEqual(sd_ship_body.cited_ids("", commits), (2,))
 

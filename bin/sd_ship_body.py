@@ -90,7 +90,7 @@ def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[in
             or (code and kind == "code")}
 
 
-def _blocks(body: str, comments: bool = True, plain: bool = False):
+def _blocks(body: str, comments: bool = True, plain: bool = False, paragraphs: bool = False):
     """Each line of `body` with the Markdown block it sits in, read once for every reader (pack sd:9666).
 
     Two grammars, and each read is whole in one of them: it finds its own
@@ -119,26 +119,32 @@ def _blocks(body: str, comments: bool = True, plain: bool = False):
     A code span may wrap onto the next lines of its paragraph. An opening
     backtick run that no line of the paragraph closes is text, so the read
     runs again with that run taken as text, until every span closes.
+    With `paragraphs`, the reads of a revert's list, a comment that opens
+    after text on its line is inline, as a code span is: one its paragraph
+    or heading ends before its `-->` is text, read again the same way.
     """
     literal: set[tuple[int, int]] = set()
     while True:
-        rows, unclosed = _blocks_once(body, comments, literal, plain)
+        rows, unclosed = _blocks_once(body, comments, literal, plain, paragraphs)
         if unclosed is None:
             return rows
         literal.add(unclosed)  # ponytail: a reread per unclosed run; a commit message has few
 
 
-def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain: bool):
+def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain: bool, paragraphs: bool):
     """`_blocks` once, each backtick run in `literal` taken as text; with the opener of a span left unclosed."""
     fence, fence_depth, commented, comment_depth, loose = "", 0, False, 0, True  # loose: no paragraph runs on
     depth, ticks, span_at = 0, "", (0, 0)
+    inline_at: tuple[int, int] | None = None  # where an open comment that follows text on its line opened
     rows: list[tuple] = []
     items: list[int] = []  # the text column of each open list item, outermost first
     pending: list[tuple[int, bool, str]] = []  # (row, word before, raw comment): an `_OPEN` waits on its close
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
         spanned = bool(ticks)  # in an open code span the `plain` rules rest
-        rest, lazy = _continues(line, items, not loose and not commented, plain, spanned)
+        rest, lazy = _continues(line, items, _runs_on(loose, commented, inline_at), plain, spanned)
+        if unclosed := _unclosed(inline_at, line, rest, (loose, len(items) < comment_depth), plain, spanned):
+            return rows, unclosed  # its paragraph ended before its `-->`: its `<!--` is text
         commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
         _settle(rows, pending, None, ended=not commented)  # it ended with its list item, and no `-->`
         if fence and len(items) >= fence_depth:
@@ -162,13 +168,50 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
             comment_depth = len(items) if commented and not was else comment_depth
             if ticks and alone:
                 return rows, span_at  # a heading is one line: a span it opens ends with it
+            inline_at = _inline_at(number, line, text, lazy, cut, (was, commented, paragraphs), inline_at)
             text, shown, joins = _cut(line, text, lazy, cut, was, rows, pending)
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
         rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line, spanned, shown))
         _join(rows, joins, pending)
     _settle(rows, pending, None)
-    return rows, (span_at if ticks else None)
+    return rows, (span_at if ticks else inline_at)  # an inline comment open at the end is text
+
+
+def _runs_on(loose: bool, commented: bool, inline_at: tuple[int, int] | None) -> bool:
+    """Whether a paragraph runs on to the next line: an inline comment open over it sits in one."""
+    return inline_at is not None or not (loose or commented)
+
+
+def _inline_at(number: int, line: str, text: str, lazy: bool, cut: list[tuple[int, int]],
+               state: tuple[bool, bool, bool], before: tuple[int, int] | None) -> tuple[int, int] | None:
+    """Where the comment open after line `number` opened, when it follows text on its line, so it is
+    inline and its paragraph bounds it; None for none open, an HTML block, or a read without
+    `paragraphs`. `state` is whether one was open before the line, is open after it, and the read's
+    `paragraphs`; `before` is the inline comment open before it."""
+    was, commented, paragraphs = state
+    if not (commented and paragraphs):
+        return None
+    if was and len(cut) == 1:
+        return before  # the comment open before the line runs on over it
+    lead = len(line) - len(line.lstrip() if lazy else text.lstrip())  # where the line's own text starts
+    return (number, cut[-1][0]) if cut[-1][0] > lead else None
+
+
+def _unclosed(inline_at: tuple[int, int] | None, line: str, rest: str, ended: tuple[bool, bool], plain: bool,
+              spanned: bool) -> tuple[int, int] | None:
+    """`inline_at` when `line` ends the paragraph its inline comment sits in before any `-->`. `ended`
+    says the row above stood alone, a heading, or the list item that held the comment ended."""
+    return inline_at if inline_at and _ends_comment_paragraph(line, rest, any(ended), plain, spanned) else None
+
+
+def _ends_comment_paragraph(line: str, rest: str, ended: bool, plain: bool, spanned: bool) -> bool:
+    """Whether `line` ends the paragraph an inline comment open over it sits in: a blank, a block that
+    interrupts a paragraph, a setext underline, the end of its list item or of the heading it opened
+    on (`ended`), or, in the `plain` grammar, any list marker. CommonMark then reads its `<!--` as
+    text (pack sd:10090)."""
+    return ended or not line.strip() or _interrupts(rest) or bool(_SETEXT.match(rest)) \
+        or (plain and not spanned and bool(_ITEM_MARKER.match(rest)))
 
 
 #: What a comment between two word characters reads as: a word character no sha holds, so the two
@@ -417,7 +460,8 @@ def _comment_open(line: str, commented: bool, ticks: str = "", literal=frozenset
         else:
             position = match.end()
             if match[0] == "<!--":
-                commented, opened = True, match.start()
+                if match.start() not in literal:  # one its paragraph never closes is text (`_blocks`)
+                    commented, opened = True, match.start()
             elif match[0][0] == "`" and match.start() not in literal:
                 ticks, column = match[0], match.start()
 
@@ -686,10 +730,10 @@ def _listed_undone(message: str) -> list[str]:
     a line, or after the `-->` a comment closes with, is prose at the
     line's indent, which heads as any line does and opens no item.
     """
-    shown = "\n".join(line for _, kind, *_, raw, spanned, line in _blocks(message)
+    shown = "\n".join(line for _, kind, *_, raw, spanned, line in _blocks(message, paragraphs=True)
                       if not spanned and (kind != "comment" or line.lstrip().startswith(_SEAM))
                       and (line or not raw.strip()))  # a row `_join` emptied is no blank line
-    found = _listed(_blocks(message, plain=True))
+    found = _listed(_blocks(message, plain=True, paragraphs=True))
     return found + [sha for sha in _listed(_blocks(shown, comments=False, plain=True)) if sha not in found]
 
 
