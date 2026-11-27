@@ -1911,6 +1911,20 @@ class Supervise(Case):
         self.assertFalse(again.rulings.exists())
         self.assertIsNone(again.ruled(head))
 
+    def test_applied_rulings_clear_no_later_round_at_the_same_head(self):
+        """Review of sd:10913: the applied mark named the commit alone, so a later blocking round at that same
+        head, whose ruling round wrote no file, read as applied and reviewed as usual. It names the round."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        self.assertTrue(again.rulings_applied())
+        head = again.round_head()
+        # A later blocking round at the same commit, as `blocked_round` records it.
+        record_state(self.db, "checkpoint", key=f"{build_run.ROUND_HEAD}{again.row['assignment']}", body=head)
+        self.assertEqual(again.round_head(), head)
+        self.assertFalse(again.rulings_applied(), "a later round's missing rulings read as applied")
+
     def test_a_reason_is_one_bounded_line(self):
         """sd:10286, long input: a reason is folded and cut before it is a note or a rebuttal."""
         self.ruling_round([{"blocker": 1, "ruling": "reject", "reason": "é" * 5000},

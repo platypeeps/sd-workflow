@@ -2381,21 +2381,23 @@ class Supervisor:
                 question=(f"Build run {self.ident} cannot rule on: {text}"[:build.FINDING_MAX - 80]
                           + "\nOption: Fix it in this build (Recommended)\nOption: Reject it and deliver"))
         # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
+        # Bound to the blocking round itself (its `ROUND_HEAD` record), not its commit: a later round at the
+        # same commit is another round, whose rulings are its own (review of sd:10913).
         self.once(f"rulings-applied:{head}", lambda: record_state(
-            self.db, "checkpoint", key=f"{RULINGS_APPLIED}{self.row['assignment']}", body=self.round_head()))
+            self.db, "checkpoint", key=f"{RULINGS_APPLIED}{self.row['assignment']}", body=self.round_mark()))
         self.rulings.unlink(missing_ok=True)
         return None
 
     def rulings_applied(self) -> bool:
-        """Whether `ruled` applied rulings for the blockers of the last blocking round (`round_head`), in this
-        run or one before it on the assignment; False when that head does not read (fail closed)."""
-        reviewed = self.round_head()
-        if reviewed is None:
+        """Whether `ruled` applied rulings for the blockers of the last blocking round (`round_mark`), in this
+        run or one before it on the assignment; False when that round does not read (fail closed)."""
+        mark = self.round_mark()
+        if mark is None:
             return False
         for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?",
                                        (f"{RULINGS_APPLIED}{self.row['assignment']}",)):
             try:
-                if json.loads(body) == reviewed:
+                if json.loads(body) == mark:
                     return True
             except (TypeError, ValueError):
                 continue
@@ -2431,6 +2433,14 @@ class Supervisor:
             elif self.calls_into(path, line, head, sources, words[1]):
                 found.append(f"a name {at} uses")
         return found
+
+    def round_mark(self) -> dict | None:
+        """The last blocking round as one record names it: its `ROUND_HEAD` row and head; None when it does not
+        read. Two rounds at one commit are two marks (review of sd:10913)."""
+        found = self.db.execute("SELECT id FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                "LIMIT 1", (f"{ROUND_HEAD}{self.row['assignment']}",)).fetchone()
+        head = self.round_head()
+        return None if found is None or head is None else {"round": found[0], "head": head}
 
     def round_head(self) -> str | None:
         """The head the last blocking round, whose blockers the ruling round ruled, read, as `blocked_round`
