@@ -2635,22 +2635,39 @@ roles:
 
     def test_a_vanished_request_does_not_hide_a_landed_recovery(self):
         """sd:10207 review: the first request vanished with no review, its
-        recovery landed and Copilot reviewed a later head. The vanished
-        receipt accounts for no review, so the recovery counts: the cap
-        holds at three requests, and no third request goes out."""
+        recovery landed and Copilot reviewed a later head. The recovery
+        claims that review, and the prepare at the reviewed head adds no
+        second receipt for it: the third request is permitted, the fourth
+        is not."""
         self.prepare("--copilot-review", "request")
         self.double.copilot_pending.clear()
         self.interrupt_copilot_request("--copilot-review", "request", lands=True)
         self.advance()
         self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
         self.double.copilot_pending.clear()
-        self.prepare("--copilot-review", "request")
-        self.assertEqual(len(self.operation().state["copilot_reviews"]), 3)
+        rerun = self.prepare("--copilot-review", "request")
+        self.assertEqual(rerun["copilot_review"]["decision"], "already_recorded")
+        self.assertEqual(len(self.operation().state["copilot_reviews"]), 2)
         (self.root / "src.py").write_text("value = 8\n")
         _git(self.root, "commit", "-qam", "again\n\nAuthored-with: human")
+        self.prepare("--copilot-review", "request")
+        self.assertEqual(len(self.double.copilot_requests), 3)
+        (self.root / "src.py").write_text("value = 9\n")
+        _git(self.root, "commit", "-qam", "once more\n\nAuthored-with: human")
+        self.double.copilot_pending.clear()
         with self.assertRaisesRegex(ship.Refusal, "limit"):
             self.prepare("--copilot-review", "request")
-        self.assertEqual(len(self.double.copilot_requests), 2)
+        self.assertEqual(len(self.double.copilot_requests), 3)
+
+    def test_a_refused_resend_spends_nothing(self):
+        """sd:10207 class pass. GitHub refused the resend outright (a 4xx),
+        so it bought nothing: the receipt keeps its earlier send count."""
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.double.lose_copilot_request = True
+        for _ in range(ship.COPILOT_REVIEW_LIMIT):
+            with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+                self.prepare("--copilot-review", "request")
+        self.assertEqual([entry["sends"] for entry in self.operation().state["copilot_reviews"]], [1])
 
     def test_selected_automatic_review_adopts_an_existing_remote_request(self):
         self.enable_automatic_copilot()

@@ -1155,9 +1155,11 @@ class Ship(SharedReview):
         took the request still owes the review at a merge. `resend` is the
         index of a `requesting` receipt to send again in place, at this head;
         its `sends` count grows by one, since the earlier send may have landed.
-        Only a first send GitHub refused outright (a 4xx) undoes its receipt.
-        Every other failure keeps it: an ambiguous answer may follow a request
-        GitHub took, and a refused resend says nothing of the earlier send.
+        A send GitHub refused outright (a 4xx) bought nothing and is undone:
+        a first send leaves no receipt, a resend leaves the receipt as it
+        was, since the refusal says nothing of the earlier send. Every other
+        failure keeps the new state: an ambiguous answer may follow a request
+        GitHub took.
         """
         kept = entries if resend is None else [*entries[:resend], *entries[resend + 1:]]
         sends = 1 if resend is None else entries[resend].get("sends", 1) + 1
@@ -1165,7 +1167,7 @@ class Ship(SharedReview):
         try:
             self.api.request_copilot_review(number)
         except Refusal as error:
-            if resend is None and error.workflow["blocker"]["code"] == COPILOT_REQUEST_REFUSED:
+            if error.workflow["blocker"]["code"] == COPILOT_REQUEST_REFUSED:
                 self.save(copilot_reviews=entries)
             raise
         result = {**result, "status": "requested"}
@@ -1241,6 +1243,12 @@ class Ship(SharedReview):
             self.clear_copilot_suppression()
             return result
 
+        claims = [entry.get("claimed", entry["head"]) for entry in pull_entries]
+        if status == "completed" and head not in self.unclaimed_copilot_reviews(reviews, claims):
+            # A receipt settled at another head claims this review: one review, one receipt.
+            claimer = next(entry for entry in reversed(pull_entries) if entry.get("claimed") == head)
+            self.clear_copilot_suppression()
+            return {**claimer, "decision": "already_recorded"}
         if status != "absent":
             result = self.record_copilot_request(entries, number, head, selection, status, "recorded")
             self.clear_copilot_suppression()
