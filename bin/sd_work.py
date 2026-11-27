@@ -814,11 +814,15 @@ def _change_status(workflow: Any, connection: Any, args: argparse.Namespace,
         raise WorkRefusal(
             f"item {args.item} is a report, and a report closes by acknowledgement: "
             f"`sd reports acknowledge {args.item} --resolve-followups` also resolves its open followups")
+    resolve = bool(getattr(args, "resolve_followups", False))
+    # sd:10430: a `--delivered-by` close is a delivery, so it keeps a person's followup open
+    # and owed (`kept_followups`), as `sd work deliver` does, instead of refusing until all go.
+    delivered = args.status == "done" and bool(getattr(args, "delivered_by", None)) and not resolve
     try:
         result = workflow.change_status(
             connection, args.item, args.status, who=who, session=_session(who),
             expected_revision=getattr(args, "if_revision", None), reason=reason,
-            resolve_followups=bool(getattr(args, "resolve_followups", False)))
+            followups=() if delivered else None, resolve_followups=resolve)
     except workflow.TransitionRefused as refused:
         if not str(refused).startswith(f"item {args.item} has open followups; "):
             raise
@@ -1862,7 +1866,8 @@ def register(groups: Any, store: Any) -> None:
                              "when it is not the item's own; the item keeps its checkout")
     status.add_argument("--resolve-followups", action="store_true",
                         help="with done: resolve every open followup too; without it, done refuses "
-                             "while a followup the machine did not write is open (sd:10407)")
+                             "while a followup the machine did not write is open (sd:10407), and "
+                             "--delivered-by keeps it open and owed (sd:10430)")
     _output(status, "status", revision=True)
 
     cancel = verbs.add_parser(
