@@ -457,6 +457,7 @@ The merge lane:
 - **`lane cancel <item>` clears a prepared entry merged by hand** (sd:5743), once a `merged` ship receipt of the item holds its head.
   It also clears the item's newest failed or skipped entries, back to its last merged or prepared one (pack sd:5838): their work landed in another bundle.
 - **Keep one `sd-ship lane watch --item A --item B ...` naming every item the lead has in that lane.**
+  It also waits on each item's queued or running build, and ends on one that blocks, naming its result (sd:10908): one watch covers a build and its lane entry.
   Restart it after each enqueue, after an sd outage and after any exit whose output lacks `ok: true`:
   a bare `lane watch` never exits, and a hub build mismatch ends a watch with `ok: false` (`hub_unavailable`).
 - **Stop an item's queued ship before its builder merges main.** Run `sd-ship lane cancel <item>`: the ship merges in the same worktree, and its abort can discard the builder's merge.
