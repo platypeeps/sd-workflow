@@ -2029,8 +2029,9 @@ def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], cited: str
     place = (row.get("path"), row.get("summary"), row.get("line"), row.get("instances"))
     worded, reworded = recorded_at(rebutted, *place), recorded_at(rebutted, *place, reworded=True)
     record = worded or (None if verdict else reworded)
-    if getattr(worded or reworded, "lead", None) is not None:
-        return lead_holds(worded or reworded, record, row, cited, verdict=verdict)
+    held = worded or reworded
+    if held is not None and getattr(held, "lead", None) is not None:
+        return lead_holds(held, record, row, cited, verdict=verdict)
     ruled = getattr(record, "ruled", None)
     if ruled is None:  # a rebuttal whose test passed holds a cited repeat in its words (sd:10918)
         tested = record is worded and bool(getattr(record, "test", "")) and not verdict
