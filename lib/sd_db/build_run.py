@@ -947,12 +947,12 @@ def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> l
     return [name for name, path in zip(UNFINISHED, paths, strict=True) if Path(work, path).exists()]
 
 
-def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None,
-               branch: str | None = None) -> dict | None:
+def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None) -> dict | None:
     """The newest lane entry of any of `items` by enqueue order, from `sd-ship lane list`; None when there is none.
 
-    Any member: the entry's item is the first member the branch delivers. With `branch`, only that branch's
-    entries: another branch's newer entry for a delivered item is not this run's (sd:10830).
+    Any member: the entry's item is the first member the branch delivers. By item alone, as the lane keys an
+    entry: it refuses a second one of an item whatever branch either names, so the watch and both delivery
+    reads must agree on that one key (review of build/sd-2260).
     """
     try:
         answer = json.loads(_read([*ship, "-C", str(cwd), "lane", "list"], env=env))
@@ -961,8 +961,7 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env:
     entries = answer.get("entries") if isinstance(answer, dict) and answer.get("ok") else None
     if not isinstance(entries, list):
         raise Unread("sd-ship lane list gave no entries")
-    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items
-            and (branch is None or row.get("branch") == branch)]
+    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
 
 
@@ -2790,7 +2789,7 @@ class Supervisor:
             return self.finish("blocked", "the branch delivers no item: no commit has a `Closes: sd:N` trailer "
                                           "for one of the run's items")
         if not unmanaged:
-            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env, branch=self.row["branch"])
+            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
         try:
@@ -2829,7 +2828,7 @@ class Supervisor:
             # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
             # that file queued or ended at this head; the shared queue says whether that entry is this head, read
             # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
-            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env, branch=self.row["branch"])
+            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"

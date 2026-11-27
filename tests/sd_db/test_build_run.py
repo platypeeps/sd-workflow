@@ -359,11 +359,8 @@ FAKE = textwrap.dedent('''
                and row["expected_head"] == argv[argv.index("--expected-head") + 1] for row in entries):
             print(json.dumps({"ok": False, "error": f"sd:{items[0]} at this head already ran in this lane"}))
             sys.exit(3)
-        # As the lane records it: the branch the enqueue ran on (sd:10830).
-        branch = subprocess.run(["git", "-C", argv[argv.index("-C") + 1], "branch", "--show-current"],
-                                capture_output=True, text=True).stdout.strip()
         entry = {"id": f"e{len(entries) + 1}", "item": items[0], "status": "pending", "enqueue_seq": len(entries) + 1,
-                 "expected_head": argv[argv.index("--expected-head") + 1], "branch": branch}
+                 "expected_head": argv[argv.index("--expected-head") + 1]}
         lane.write_text(json.dumps(entries + [entry]))
         print(json.dumps({"ok": True, **entry}))
     if role == "gh":  # pack sd:7868: an unmanaged repository's draft pull request, kept in `<plans>/pulls.json`
@@ -813,16 +810,6 @@ class Supervise(Case):
         found = build_run.lane_entry(self.tools.ship, self.repo, [5, 7], env=self.env)
         self.assertEqual(found and found["id"], "e1")
         self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [5], env=self.env))
-
-    def test_the_lane_entry_of_a_branch_is_that_branchs(self):
-        """sd:10830: another branch's newer entry for a delivered item is not this run's; reading it kept a
-        merged run at `enqueued`, unreleased, so the sweep kept its worktree."""
-        (self.plans / "lane.json").write_text(json.dumps([
-            {"id": "e1", "item": 7, "status": "merged", "branch": "build/sd-1", "enqueue_seq": 1},
-            {"id": "e2", "item": 7, "status": "pending", "branch": "build/sd-2", "enqueue_seq": 2}]))
-        found = build_run.lane_entry(self.tools.ship, self.repo, [7], env=self.env, branch="build/sd-1")
-        self.assertEqual(found and found["id"], "e1")
-        self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [7], env=self.env, branch="build/sd-3"))
 
     def test_an_unread_delivery_writes_nothing(self):
         """`cited` None (the commits were not read) is unknown: no enqueue, no outcome; the reap retries."""
@@ -4419,35 +4406,13 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "pending",
-                                                           "enqueue_seq": 1, "expected_head": head,
-                                                           "branch": self.bundle["branch"]}]))
+                                                           "enqueue_seq": 1, "expected_head": head}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
         self.assertEqual(len(json.loads((self.plans / "lane.json").read_text())), 1)
 
-    def test_enqueue_resume_adopts_no_entry_of_another_branch(self):
-        """sd:10830 review: delivery took the newest entry of its items at its head on any branch, and the watch,
-        which reads only the run's branch, never saw it: the run stayed `enqueued`. It enqueues its own."""
-        self.press()
-        self.write_pr()
-        work = Path(self.bundle["work_path"])
-        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(work), "origin/main")
-        (work / "work.txt").write_text("done\n")
-        support.git(work, "add", "work.txt")
-        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
-        head = support.git(work, "rev-parse", "HEAD")
-        (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "failed",
-                                                           "enqueue_seq": 1, "expected_head": head,
-                                                           "branch": "build/sd-0"}]))
-        build.write(self.db, self.bundle["id"], step="enqueuing")
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        self.assertEqual([call["argv"][call["argv"].index("lane") + 1] for call in self.calls("sd-ship")],
-                         ["list", "enqueue"])
-        self.assertEqual([row["branch"] for row in json.loads((self.plans / "lane.json").read_text())],
-                         ["build/sd-0", self.bundle["branch"]])
-
-    def legacy_resume(self, head_of=lambda head: head, status="pending"):
+    def legacy_resume(self, head_of=lambda head: head, status="pending", branch=None):
         """A run resumed at enqueuing whose item an earlier version's queue file holds pending, not imported:
         `lane list` shows only a cancelled entry, and the enqueue imports the file and then refuses the item."""
         self.press()
@@ -4459,11 +4424,10 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "cancelled",
-                                                           "enqueue_seq": 1, "expected_head": head,
-                                                           "branch": self.bundle["branch"]}]))
+                                                           "enqueue_seq": 1, "expected_head": head}]))
         (self.plans / "legacy.json").write_text(json.dumps([{"id": "import-1", "item": self.items[0],
                                                              "status": status, "expected_head": head_of(head),
-                                                             "branch": self.bundle["branch"]}]))
+                                                             **({"branch": branch} if branch else {})}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         return self.supervisor().run()
 
@@ -4481,6 +4445,21 @@ class Supervise(Case):
         self.assertEqual(self.legacy_resume(status="failed")["step"], "enqueued")
         self.assertEqual([(row["id"], row["status"]) for row in json.loads((self.plans / "lane.json").read_text())],
                          [("e1", "cancelled"), ("import-1", "failed")])
+
+    def test_an_imported_entry_on_another_branch_is_the_runs_and_the_watch_reads_it(self):
+        """Review of build/sd-2260, round 2: the lane keys an entry by its item, whatever branch it names, and
+        refuses a second one. A delivery read by branch missed the imported entry and blocked the run; a watch
+        read by branch would then never end it. Both read by item, as the lane does."""
+        self.assertEqual(self.legacy_resume(branch="build/sd-0")["step"], "enqueued")
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual([(row["id"], row["branch"]) for row in entries if row["id"] == "import-1"],
+                         [("import-1", "build/sd-0")])
+        (self.plans / "lane.json").write_text(json.dumps([{**row, "status": "merged"} for row in entries]))
+        row = build.run(self.db, self.bundle["id"])
+        delivered = [member["item"] for member in row["members"] if member["status"] == "done"]
+        with mock.patch.dict(os.environ, {"FAKE_PLANS": str(self.plans), "FAKE_BIN": str(BIN)}):
+            found = build_run.lane_entry(self.tools.ship, self.repo, delivered)
+        self.assertEqual(found and (found["id"], found["status"]), ("import-1", "merged"))
 
     def test_enqueue_resume_blocks_on_a_legacy_entry_at_another_head(self):
         """The imported entry holds another head, so the refusal stands and the run is blocked on it."""
