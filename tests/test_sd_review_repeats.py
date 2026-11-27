@@ -1131,6 +1131,32 @@ class RebuttalIdentityTests(unittest.TestCase):
         # Review of sd:9769: a new occurrence in a file the rebuttal named is still not adjudicated.
         self.assertEqual(gate([row(instances=["src.py:1", "src.py:60"])], body), ["blocking"])
 
+    def test_a_test_holds_a_cited_repeat_only_in_the_rebuttals_words(self) -> None:
+        """Review of build/sd-2233 (bin/sd-review:1945): the place match for a reworded repeat and the test's
+        hold of a cited one composed, so a different defect at the tested line, cited, posted as advice.
+        A test holds a cited repeat only in the words it was recorded with; a reworded one only uncited."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted")))
+        body["proposal"]["findings"][0]["test"] = ["python3", "t.py"]
+        tested = json.dumps(body)
+        self.assertEqual(gate([row(summary="another defect", evidence=REPRO)], tested), ["blocking"])
+        self.assertEqual(gate([row(summary="another defect")], tested), ["advisory"])
+        self.assertEqual(gate([row(evidence=REPRO)], tested), ["advisory"])
+
+    def test_a_test_clears_no_blocker_a_reader_holds_open(self) -> None:
+        """Review of build/sd-2233 (bin/sd-review:2031): `carried` decides a prior blocker by verdict
+        (pack sd:10087). A reader's `open` with evidence keeps it whatever test its rebuttal names, and a
+        prior blocker in other words at a rebutted line is no repeat: the adjudication recorded its words."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted")))
+        body["proposal"]["findings"][0]["test"] = ["python3", "t.py"]
+        seen = listed(json.dumps(body))
+        prior = [dict(row(evidence=REPRO), disposition="blocking")]
+        opened = sd_review.Outcome("codex", sd_review.FINDINGS, (), "", (), (), verdicts=(
+            {"id": "B1", "verdict": "open", "evidence": "python3 t.py --other: Traceback"},))
+        self.assertEqual([r["disposition"] for r in sd_review.carried(prior, [opened], seen)], ["blocking"])
+        self.assertEqual(sd_review.carried(prior, [], seen), [], "an unanswered rebutted blocker still holds")
+        other = [dict(row(summary="another defect", evidence=REPRO), disposition="blocking")]
+        self.assertEqual([r["disposition"] for r in sd_review.carried(other, [], seen)], ["blocking"])
+
     def test_a_line_follows_a_zero_context_diff_or_lapses(self) -> None:
         """sd:10918: `followed_line` moves a rebutted line past hunks outside `SHIFT_LINES` of it, and lapses
         it on a hunk inside, no diff, or a diff with no hunk (binary, mode change)."""
