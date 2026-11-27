@@ -11,9 +11,13 @@ from tests.test_sd_review import (
     FakeClient,
     FakeRunner,
     ReviewFixture,
+    chat_answer,
     namespace,
     sd_review,
 )
+
+#: An answer that clears the prior blocker B1, so the gate alone decides (pack sd:10087).
+FIXED = chat_answer(json.dumps({"findings": [], "verdicts": [{"id": "B1", "verdict": "fixed", "evidence": "prior.py:2 guards it"}]}))
 
 
 class URLContractTests(ReviewFixture):
@@ -59,7 +63,7 @@ class URLContractTests(ReviewFixture):
         material = sd_review.review_material(root, subject, prompt)
         prefix = f"{prompt}\nSchema: {json.dumps(sd_review.CODEX_OUTPUT_SCHEMA)}\n\nReview input:\n{material}"
         self.assertGreater(len(prefix.encode()), 150000)
-        self.assertIn(json.dumps(prior["findings"], sort_keys=True), prompt)
+        self.assertIn(json.dumps([{"id": "B1", **prior["findings"][0]}], sort_keys=True), prompt)
         self.assertIn((root / "prior.py").read_text(), prompt)
         self.assertIn("keep-the-complete-local-provenance", prompt)
         self.assertIn("+# first input marker", material)
@@ -72,7 +76,7 @@ class URLContractTests(ReviewFixture):
             self.assertLess(len(footer.encode()), 1600)
             self.assertIn("80 words", footer)
             self.assertIn("every distinct current defect", footer)
-            self.assertIn("every unresolved prior blocker", footer)
+            self.assertIn("findings and verdicts", footer)
             self.assertIn("Do not omit findings", footer)
             self.assertIn("no Markdown fences", footer)
             for key in sd_review.CODEX_OUTPUT_SCHEMA["properties"]["findings"]["items"]["required"]:
@@ -83,7 +87,7 @@ class URLContractTests(ReviewFixture):
     def test_selection_timing_and_checks_still_control_dispatch(self):
         root, args, _ = self.prepare()
         args.explain = True
-        client = FakeClient()
+        client = FakeClient(default=FIXED)
         planned = self.run_review(root, args, client)
         self.assertEqual(client.sent, [])
         args.explain = False

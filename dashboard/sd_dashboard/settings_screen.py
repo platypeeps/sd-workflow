@@ -130,10 +130,11 @@ def _scalars() -> dict:
     from .adversarial import SETTINGS as REVIEW
     from .hoa_attach import HOME_SETTINGS
     from .home_map import EXTENT_KEY
+    from .now_screen import ADVISORY_KEY, ADVISORY_TEXT
     from .realm_sweep import SETTINGS as SWEEP
 
     return {**{key: (text, None) for key, text in SWEEP.items()}, **{key: (text, PATTERNS[key]) for key, text in REVIEW.items()},
-            EXTENT_KEY: (EXTENT_TEXT, None), **HOME_SETTINGS, **AUTOMATION_SETTINGS,
+            EXTENT_KEY: (EXTENT_TEXT, None), ADVISORY_KEY: (ADVISORY_TEXT, "on"), **HOME_SETTINGS, **AUTOMATION_SETTINGS,
             **{key: (f"The deep review's {DEEP_NAMES.get(key.rsplit('.', 1)[1], key.rsplit('.', 1)[1])}: {wants}. Unset is {default}.", pattern)
                for key, (default, pattern, wants) in DEEP.items()}}
 
@@ -179,6 +180,7 @@ def rows(connection) -> dict:
     from .adversarial import SETTINGS as REVIEW
     from .hoa_attach import HOME_SETTINGS
     from .home_map import EXTENT_KEY
+    from .now_screen import ADVISORY_KEY, ADVISORY_TEXT
     from .realm_sweep import SETTINGS as SWEEP
 
     def scalar(key, text, held, pattern=None):
@@ -194,7 +196,7 @@ def rows(connection) -> dict:
     else:
         out.update(sweeps=[scalar(key, text, held) for key, text in SWEEP.items()], sweeps_reason="")
     try:
-        held = writes.read_settings(connection, [*REVIEW, *DEEP, EXTENT_KEY, *HOME_SETTINGS, *AUTOMATION_SETTINGS])
+        held = writes.read_settings(connection, [*REVIEW, *DEEP, EXTENT_KEY, ADVISORY_KEY, *HOME_SETTINGS, *AUTOMATION_SETTINGS])
         lists = []
         for key, (_, text) in setting_rows.LISTS.items():
             try:
@@ -209,7 +211,7 @@ def rows(connection) -> dict:
         out.update(dashboard=None, dashboard_reason=f"the workflow database did not answer: {failed}")
     else:
         known = _scalars()
-        out.update(dashboard=lists + [scalar(EXTENT_KEY, EXTENT_TEXT, held)]
+        out.update(dashboard=lists + [scalar(EXTENT_KEY, EXTENT_TEXT, held), scalar(ADVISORY_KEY, ADVISORY_TEXT, held)]
                    + [scalar(key, text, held) for key, (text, _) in HOME_SETTINGS.items()]
                    + [scalar(key, text, held) for key, (text, _) in AUTOMATION_SETTINGS.items()] + [scalar(key, text, held) for key, text in REVIEW.items()]
                    + [scalar(key, known[key][0], held, known[key][1]) for key in DEEP], dashboard_reason="")

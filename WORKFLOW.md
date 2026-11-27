@@ -433,7 +433,7 @@ Gates and reviews:
   each step, the state it moved, the failure, the recovery and the test.
   A parser, a journal, or event and protocol matching needs one too: a parser without one took nine rounds (sd:9584).
   A build refuses to start review on a branch whose `docs/work` design.md lacks one, in it or the body (sd:9770).
-- **A repeating finding starts a class pass.** The trigger is two findings of one class in different rounds, or three blocking rounds in a row.
+- **The first blocking round starts a class pass** (sd:10903): the fix of round 1 already covers every instance.
   Name the class, list every instance from the code rather than the findings, add each to the failure table,
   and fix each row that lacks a recovery or a test, fail-first. Record the trigger in `sd task note`. Split the pull request if the table shows it does too much.
   A class pass fixes the class within the change's own scope; a new reader, audit or entry kind becomes its own item:
@@ -454,9 +454,12 @@ The merge lane:
   A hand-run prepare-and-merge chain jumps the queue and leaves no log. Verbs: `enqueue|list|retry|cancel|move|hold|release|run|watch|prune`.
 - **`lane retry <item>` queues a failed, skipped or prepared entry again** at its head; a cancelled one needs `--expected-head`.
   It refuses `head_moved` for a branch that moved past the head, as enqueue does (pack sd:6057): enqueue the new head instead.
+- **Enqueue a parked build whose blockers a lead decision note rejected, each one, at the reviewed head**, not retry it:
+  a retry reruns review at the same head and pays a full round (sd:10892). A blocker a moved head left open still needs a fix.
 - **`lane cancel <item>` clears a prepared entry merged by hand** (sd:5743), once a `merged` ship receipt of the item holds its head.
   It also clears the item's newest failed or skipped entries, back to its last merged or prepared one (pack sd:5838): their work landed in another bundle.
 - **Keep one `sd-ship lane watch --item A --item B ...` naming every item the lead has in that lane.**
+  It also waits on each item's queued or running build, and ends on one that blocks, naming its result (sd:10908): one watch covers a build and its lane entry.
   Restart it after each enqueue, after an sd outage and after any exit whose output lacks `ok: true`:
   a bare `lane watch` never exits, and a hub build mismatch ends a watch with `ok: false` (`hub_unavailable`).
 - **Stop an item's queued ship before its builder merges main.** Run `sd-ship lane cancel <item>`: the ship merges in the same worktree, and its abort can discard the builder's merge.

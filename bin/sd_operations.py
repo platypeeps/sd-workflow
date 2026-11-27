@@ -453,10 +453,12 @@ def enqueue_refusals(worktree: Path, base: str, head: str, title: str, body: str
 
 
 def own_checks(worktree: Path) -> list[list[str]]:
-    """The checks an unmanaged repository's build runs, as `sd-check` detects and picks them (pack sd:7868).
+    """The checks a build runs where `sd-review` ran no gate, as `sd-check` picks them (pack sd:7868).
 
-    The aggregate `check` when the repository has one, else each of `test` and
-    `lint` it has; none is an empty list. A declaration that does not read is
+    The Makefile `precheck` first, as the gate runs it (sd:10286), then the
+    aggregate `check` when the repository has one, else each of `test` and
+    `lint` it has; none is an empty list. A managed repository runs its gate
+    instead (`Supervisor.own_checks`). A declaration that does not read is
     ValueError, a configuration fault that ends the run blocked; a `git` that
     gave no answer is `Unread`, which the reap retries. Neither is a fix
     round: the builder cannot fix either (review of b34af431e).
@@ -468,7 +470,8 @@ def own_checks(worktree: Path) -> list[list[str]]:
         raise build_modules()[2].Unread(f"git gave no answer reading the check entrypoints: {error}") from error
     except sd_lib.ConfigError as error:
         raise ValueError(str(error)) from error
-    return [list(found.commands[name]) for name in sd_lib._runs(found.commands)]
+    first = [list(found.precheck)] if found.precheck else []
+    return first + [list(found.commands[name]) for name in sd_lib._runs(found.commands)]
 
 
 def push_failures(connection: Any, environ: dict[str, str] | None = None) -> list[str]:

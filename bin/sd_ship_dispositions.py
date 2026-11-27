@@ -8,16 +8,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
+import re
 from datetime import datetime, timezone
 from typing import Any
 
+import sd_lib
 from sd_ship_bindings import adjudicator_binding
 from sd_ship_remote import Refusal, git
 
 MAX_PROPOSAL_BYTES = 2_000_000
 #: The only values that clear a blocker; the template names them (sd:9881).
 DISPOSITIONS = ("rebutted", "parked")
+#: sd:10893. How long one row's `test` may run, and the most argv bytes it may carry.
+TEST_TIMEOUT_SECONDS = 300  # ponytail: one focused test; a suite belongs to the gate
+#: A run that exits 0 yet never tried the finding: unittest's or pytest's skip or expected-failure count.
+UNTRIED = re.compile(r"skipped=[1-9]|expected failures=[1-9]|\b[1-9][0-9]* (?:skipped|xfailed)\b")
+#: A terminal colour sequence, which a runner told to force colour puts inside the count `UNTRIED` reads.
+COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+TEST_ARGV_BYTES = 4096
 
 
 def digest(value: Any) -> str:
@@ -67,6 +77,19 @@ def gate_waivable(check: Any) -> bool:
         return False
     code = check.get("exit_code")
     return (type(code) is int and code == 0) or (check.get("status") == GATE_NOT_RUN and code is None)
+
+
+#: The `context` entries a tool change moves; under `sd_lib.TOOL_CHANGES_KEEP_REVIEWS` a recorded
+#: rebuttal survives them (operator 2026-11-27). A policy change still re-reviews, so a new report
+#: (its digest and `passes_digest`) voids the rebuttal there.
+TOOL_BINDINGS = ("review_binding", "adjudicator_binding")
+
+
+def same_bindings(stored: object, current: dict) -> bool:
+    if sd_lib.TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict):
+        return digest({k: v for k, v in stored.items() if k not in TOOL_BINDINGS}) == digest(
+            {k: v for k, v in current.items() if k not in TOOL_BINDINGS})
+    return digest(stored) == digest(current)
 
 
 def context(operation: Any, head: str) -> tuple[dict, list[dict]]:
@@ -149,32 +172,149 @@ def text(value: Any, label: str) -> None:
         raise Refusal(f"disposition {label} needs nonempty bounded text")
 
 
-def validate(operation: Any, head: str, proposal: Any) -> str:
+def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool = False) -> str:
+    """`run_tests`: recording and prepare run each row's `test`; a read (merge, publication, `verify-review`) does not (sd:10893)."""
     bindings, expected = context(operation, head)
     if (not isinstance(proposal, dict) or set(proposal) != {"schema_version", "bindings", "findings"}
             or type(proposal["schema_version"]) is not int or proposal["schema_version"] != 1
-            or digest(proposal["bindings"]) != digest(bindings)):
+            or not same_bindings(proposal["bindings"], bindings)):
         raise Refusal("disposition proposal does not bind the current review, history, tools and head")
     rows = proposal["findings"]
     if not isinstance(rows, list) or len(rows) != len(expected):
         raise Refusal("every blocking finding needs one separate disposition")
     for row, identity in zip(rows, expected, strict=True):
-        if (not isinstance(row, dict) or set(row) != set(identity) | {"response_disposition", "reason"}
+        if (not isinstance(row, dict) or set(row) - {"test"} != set(identity) | {"response_disposition", "reason"}
                 or type(row.get("index")) is not int or digest({name: row.get(name) for name in identity}) != digest(identity)):
             raise Refusal("disposition finding indices, raw findings or digests changed")
         if row["response_disposition"] not in DISPOSITIONS:
             raise Refusal("only a rebuttal or a parked risk can clear a blocker: response_disposition "
                           f"is 'rebutted' or 'parked', not {row['response_disposition']!r}")
         text(row["reason"], "reason")
+    tests = [test_argv(row.get("test")) for row in rows]
+    if run_tests:
+        run_row_tests(operation, head, tests)
     return digest(proposal)
 
 
-def accepted(operation: Any, head: str) -> dict:
+def run_row_tests(operation: Any, head: str, tests: list[list[str]]) -> None:
+    """Each row's test at `head`. The clearance an earlier pass saved is voided before the first test runs,
+    so however a run ends short of a pass (a refusal, another error, a killed process) no read reuses it."""
+    if any(tests) and operation.state.get("review_clearance") is not None:
+        operation.save(review_clearance=None)
+    for index, argv in enumerate(tests, 1):
+        if argv:
+            reproduces(operation.root, head, index, argv)
+
+
+def test_argv(value: Any) -> list[str]:
+    """sd:10893. A row's `test`: the argv of the test the builder wrote for the finding; absent or [] is none."""
+    if value is None or value == []:
+        return []
+    if (not isinstance(value, list) or not all(isinstance(arg, str) and arg and "\0" not in arg for arg in value)
+            or len(json.dumps(value).encode()) > TEST_ARGV_BYTES):
+        raise Refusal("disposition test is a list of nonempty strings, the argv of one test, or []")
+    return value
+
+
+def names_root(root: pathlib.Path, value: str) -> bool:
+    """`value` mentions `root` in any spelling: as given or resolved, under `~`, `$HOME` or `${HOME}`, in any
+    letter case, anywhere in the text. A sibling whose name starts with `root`'s matches too: fail closed."""
+    home = os.path.expanduser("~").rstrip("/")
+    spellings = {str(root), str(root.resolve())}
+    for place in list(spellings):
+        if home and place.startswith(home + "/"):
+            spellings |= {prefix + place[len(home):] for prefix in ("~", "$HOME", "${HOME}")}
+    return any(spelling.casefold() in value.casefold() for spelling in spellings)
+
+
+def rebuttal_environment(root: pathlib.Path) -> dict[str, str]:
+    """The gate's environment (no `PATH` entry, venv or `PYTHONPATH` in `root`) as a plain checkout's tests see
+    it, without `SD_LOCAL_GATE` and every entry that names `root`: the test loads the head's code alone."""
+    import sd_gate_run  # noqa: PLC0415
+
+    env = sd_gate_run.gate_environment(root)
+    env.pop(sd_gate_run.GATE_VARIABLE, None)
+    kept = {key: os.pathsep.join(entry for entry in value.split(os.pathsep) if not names_root(root, entry))
+            for key, value in env.items()}
+    return {key: value for key, value in kept.items() if value or not env[key]}
+
+
+def untried(output: str, report: pathlib.Path) -> bool:
+    """The run skipped a test or expected its failure. pytest's flags reshape what it prints (`-qq` leaves
+    `s [100%]`, `-p no:terminal` nothing), so its count is read from the JUnit `report` it wrote, where a
+    skip and an xfail are both `skipped`; a report that cannot be read is no pass. Any other runner's
+    count is read from `output`, colour removed."""
+    import xml.etree.ElementTree as ET  # noqa: PLC0415  # nosec B405 - reads only the JUnit report this run wrote
+
+    if UNTRIED.search(COLOUR.sub("", output)):
+        return True
+    if not report.exists():
+        return False
+    try:
+        return any(int(suite.get("skipped") or 0) for suite in ET.parse(report).iter("testsuite"))  # nosec B314 - this run's own report
+    except (ET.ParseError, ValueError, OSError):
+        return True
+
+
+def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> None:
+    """sd:10893. A blocker stays open while its test exists and fails: run it at the exact `head`, no shell.
+
+    The test runs in a disposable detached worktree of `head`, as the gate's rerun does
+    (`sd_ship_review.rerun_tests`), so no test writes the live checkout, tracked or ignored; it runs as a
+    process group, so at the deadline no child outlives it. Exit 0 means the test does not reproduce the
+    finding, so the rebuttal stands. Any other exit, a test that is missing, cannot start or overruns,
+    refuses: fail closed. So does a test that moved its tree's head or left it dirty.
+    """
+    import tempfile  # noqa: PLC0415
+
+    import sd_gate_cache  # noqa: PLC0415
+    import sd_gate_run  # noqa: PLC0415
+    import sd_lib  # noqa: PLC0415
+    import sd_ship_review  # noqa: PLC0415 -- it imports this module
+
+    if any(names_root(root, arg) for arg in argv):
+        raise Refusal(f"finding {index}: its test names a path in the live checkout; name it relative "
+                      "to the checkout, so it runs the head's code")
+    with tempfile.TemporaryDirectory(**sd_gate_cache.worktree_place(root, head)) as parent:
+        tree = pathlib.Path(parent).resolve() / "tree"
+        try:
+            sd_gate_run.gate_git(root, "worktree", "add", "--detach", str(tree), head)
+        except sd_gate_run.GateError as error:
+            raise Refusal(f"finding {index}: no worktree of {head[:12]} for its test: {error}") from None
+        try:
+            env = {**rebuttal_environment(root), **sd_ship_review.runner_guards(tree)}  # Jev off, as the gate's rerun
+            report = tree.parent / "junit.xml"  # outside the tree, so it never dirties it
+            env["PYTEST_ADDOPTS"] = f"{env.get('PYTEST_ADDOPTS', '')} --junit-xml={report}".strip()
+            done = sd_lib.run_group(argv, cwd=tree, env=env, timeout=TEST_TIMEOUT_SECONDS)
+        except sd_lib.GroupTimeout:
+            raise Refusal(f"finding {index}: its test did not finish in {TEST_TIMEOUT_SECONDS} s; "
+                          "a blocker stays open until its test passes") from None
+        except OSError as error:
+            raise Refusal(f"finding {index}: its test could not start: {error.strerror or error}") from None
+        except ValueError:  # output that does not decode: no pass was read, so the finding stands
+            raise Refusal(f"finding {index}: its test wrote output that is not text, so it reproduces the "
+                          "finding: fix it, or name a test that passes") from None
+        else:
+            if git(tree, "status", "--porcelain", "--untracked-files=all") or git(tree, "rev-parse", "HEAD") != head:
+                raise Refusal(f"finding {index}: its test changed its checkout; the record binds the clean exact head")
+            skipped = untried(done.stdout + done.stderr, report)
+        finally:
+            sd_lib.git_output(["worktree", "remove", "--force", str(tree)], root)
+    if done.returncode != 0:
+        tail = " ".join((done.stdout + done.stderr).split())[-SUMMARY_CHARS:]
+        raise Refusal(f"finding {index}: its test fails (exit {done.returncode}), so it reproduces the finding: "
+                      f"fix it, or name a test that passes; {tail}")
+    if skipped:
+        raise Refusal(f"finding {index}: its test passed by skipping or expecting a failure, so it never tried "
+                      "the finding: name a test that runs it")
+
+
+def accepted(operation: Any, head: str, *, run_tests: bool = False) -> dict:
     revision, value = operation.store.read(operation.connection, key(operation))
     if not revision or value.get("decision") != "accepted":
         raise blocking_refusal(operation, head, operation.review_inputs(head),
                                "local review contains blocking findings without recorded dispositions")
-    proposal_digest = validate(operation, head, value.get("proposal"))
+    proposal_digest = validate(operation, head, value.get("proposal"), run_tests=run_tests)
     if value.get("proposal_digest") != proposal_digest:
         raise Refusal("recorded disposition receipt digest does not match")
     return {"kind": "adjudicated", "key": key(operation), "revision": revision, "digest": proposal_digest}
@@ -186,17 +326,17 @@ def adjudicate(operation: Any) -> dict:
     bindings, rows = context(operation, args.expected_head)
     if args.dispositions_file is None:
         proposal = {"schema_version": 1, "bindings": bindings,
-                    "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="") for row in rows]}
+                    "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="", test=[]) for row in rows]}
         # sd:9966: the dispositions this review already holds, which a filled template replaces whole.
         revision, value = operation.store.read(operation.connection, key(operation))
         held = (revision and value.get("decision") == "accepted"
-                and digest((value.get("proposal") or {}).get("bindings")) == digest(bindings))
+                and same_bindings((value.get("proposal") or {}).get("bindings"), bindings))
         return operation.result("disposition_template", proposal=proposal, recorded_revision=revision if held else None)
     try:
         proposal = json.loads(read_file(args.dispositions_file, MAX_PROPOSAL_BYTES), object_pairs_hook=unique_object)
     except (ValueError, RecursionError):
         raise Refusal("disposition proposal is not bounded valid JSON") from None
-    proposal_digest = validate(operation, args.expected_head, proposal)
+    proposal_digest = validate(operation, args.expected_head, proposal, run_tests=True)
     from sd_db.database import transaction
     with transaction(operation.connection):
         source_revision, source_state = operation.store.read(operation.connection, operation.key)

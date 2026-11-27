@@ -226,7 +226,7 @@ class Document(ScreenCase):
                                          "attention",
                                          "mail", "mail_more", "mail_unread", "mail_error", "problems", "problems_more",
                                          "problems_capped", "problems_error", "briefs", "briefs_more", "briefs_error", "briefs_skipped",
-                                         "needs", "lane", "track", "spend", "builders", "queues", "digest"})
+                                         "needs", "lane", "track", "spend", "builders", "queues", "advisories", "digest"})
         self.assertEqual(document["now"], NOW)
         self.assertEqual([(row["rank"], row["id"], row["band"]) for row in document["rows"]], [
             (2, "pr:example/project#14:2", "look"),
@@ -630,3 +630,28 @@ class FailedJobs(ScreenCase):
             (3, "ahead:pushy:1", "main · clean tree"),
         ])
         self.assertEqual(document["sources"]["jobs"], "LaunchAgents is unreadable")
+
+
+class Advisories(ScreenCase):
+    """sd:10915: the Queue view's advisory filter, from the item refs and the row `dashboard.queue_advisories`."""
+
+    def test_open_advisory_refs_are_listed_and_hidden_until_the_row_says_on(self):
+        sweep = self.item("Sweep finding", source="task-ref", external_id="advisory-sweep:2026-11-23:example")
+        filed = self.item("Hand-filed advisory", source="task-ref", external_id="advisory:example.test")
+        done = self.item("Fixed one", kind="task", source="task-ref", external_id="advisory:closed")
+        workflow.change_status(self.connection, done, "done", who="test", reason="test")
+        self.item("Look-alike", source="task-ref", external_id="advisoryish:x")
+        self.item("Inner match", source="task-ref", external_id="triage:advisory:x")
+        self.item("Other source", source="writing-piece", external_id="advisory:x")
+        found = now_screen.advisories(self.connection)
+        self.assertEqual(found, {"key": "dashboard.queue_advisories", "ids": [sweep, filed], "row": None,
+                                 "show": False, "error": ""})
+        writes.set_setting(self.connection, "dashboard.queue_advisories", "on")
+        self.assertTrue(now_screen.advisories(self.connection)["show"])
+        self.assertIn("advisories", now_screen.document(self.connection, now=NOW, fleet=lambda area: {},
+                                                        jobs=JobsBackend(self.tmp.name)))
+
+    def test_a_failed_read_hides_nothing_and_says_why(self):
+        with patch("sd_db.writes.read_settings", side_effect=sqlite3.OperationalError("database is locked")):
+            found = now_screen.advisories(self.connection)
+        self.assertEqual((found["ids"], found["show"], found["error"]), ([], True, "database is locked"))
