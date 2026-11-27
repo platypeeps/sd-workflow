@@ -65,6 +65,10 @@ class ThePhrases(ScreenCase):
             self.assertIn(f"Budget: {row['budget']}", reference.read_text(encoding="utf-8"), row)
         self.assertEqual(rows["open threads"]["does"], rows["collect followups"]["does"])
         self.assertIn("queues nothing", rows["check open PRs"]["mode"])
+        # sd:10917 lane review: only a run whose reference runs `sd assignments build` says it queues builds.
+        self.assertIn("queues builds", rows["triage"]["mode"])
+        for phrase in ("health check", "open threads"):
+            self.assertNotIn("queue", rows[phrase]["mode"], phrase)
 
     def test_a_new_run_in_the_skill_shows_without_a_page_edit(self):
         root = Path(self.tmp.name) / "pack"
@@ -73,7 +77,7 @@ class ThePhrases(ScreenCase):
         skill = root / "skills" / "sd-next" / "SKILL.md"
         skill.write_text('---\nname: x\n---\n\n## Operator runs\n\n- `references/sweep.md`: "sweep" (the new run).\n\n## Never\n')
         self.assertEqual(help_screen.phrases(skill, root), [{"phrase": "sweep", "does": "the new run", "budget": "about 5 minutes",
-                                                             "mode": "acts: fixes, files, rules, queues",
+                                                             "mode": "acts: fixes, files, rules",
                                                              "reference": "references/sweep.md"}])
 
     def test_a_reference_outside_the_pack_is_refused(self):

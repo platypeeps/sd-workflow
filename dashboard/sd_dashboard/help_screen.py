@@ -66,7 +66,10 @@ def phrases(skill: Path = SKILL, root: Path = ROOT) -> list[dict]:
         reference = run.group(1)
         text = _reference(reference, skill, root).read_text(encoding="utf-8")
         budget = re.search(r"^Budget: ([^.\n]+)", text, re.M)
-        mode = "reports and files; queues nothing" if "queues nothing" in text else "acts: fixes, files, rules, queues"
+        # sd:10917 lane review: a run queues builds only where its reference runs `sd assignments build`.
+        mode = ("reports and files; queues nothing" if "queues nothing" in text
+                else "acts: fixes, files, rules, queues builds" if "sd assignments build" in text
+                else "acts: fixes, files, rules")
         waiting = []
         for phrase, does in PHRASE.findall(run.group(2)):
             waiting.append(phrase)
