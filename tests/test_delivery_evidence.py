@@ -447,6 +447,29 @@ class TaskDeliveryCLITests(unittest.TestCase):
         self.assertEqual("done", done["item"]["status"])
         self.assertIn(f"delivered at {sha} on refs/heads/main", self.statuses(case, item)[-1])
 
+    def test_a_delivered_close_keeps_a_persons_followup_open(self) -> None:
+        """sd:10430: a `--delivered-by` close is a delivery: it keeps a person's followup open
+        and owed, as `sd work deliver` does, and `--resolve-followups` still resolves it."""
+        case = self.host()
+        root = self.repository(case)
+        items = []
+        for title in ("Keep the followup", "Resolve the followup"):
+            item = json.loads(case.call("task", "add", "--priority", "3", title, "--json",
+                                        cwd=root).stdout)["item"]["id"]
+            note = json.loads(case.call("task", "note", item, "Ask example.test", "--kind",
+                                        "followup", "--json", cwd=root).stdout)["note"]["id"]
+            sha = self.commit(root, f"fix: {title}\n\nDelivers: sd:{item}\n", title)
+            items.append((item, note, sha))
+        (kept, kept_note, kept_sha), (resolved, resolved_note, resolved_sha) = items
+        done = json.loads(case.call("task", "status", kept, "done", "--delivered-by", kept_sha,
+                                    "--json", cwd=root).stdout)
+        self.assertEqual("done", done["item"]["status"])
+        self.assertIsNone(next(n for n in done["notes"] if n["id"] == kept_note)["resolved_at"])
+        self.assertEqual([kept_note], json.loads(done["item"]["fields"])["kept_followups"])
+        done = json.loads(case.call("task", "status", resolved, "done", "--delivered-by",
+                                    resolved_sha, "--resolve-followups", "--json", cwd=root).stdout)
+        self.assertTrue(next(n for n in done["notes"] if n["id"] == resolved_note)["resolved_at"])
+
     def test_a_plain_close_records_no_commit_which_is_the_gap(self) -> None:
         """The control, and the state the flag exists to leave behind.
 

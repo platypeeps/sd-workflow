@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import hub, paths, reads
+from . import hub, paths, reads, remote
 from .database import served_by, transaction
 from .errors import SdDbError
 from .needs_sweep import standing_ruling
@@ -88,6 +88,10 @@ BESIDE_PRIORITY = 1
 #: A supervisor beats every 30 s; one silent this long, or unspawned this long after its claim, is lost.
 #: 600, not 180: a beat a held lock skips no longer ends a long build (pack sd:6741).
 STALE_SECONDS = 600
+#: How long the hub leaves the runs of a quiet satellite whose last beat named another `sd_db` build (sd:10934):
+#: a hub refresh refuses that satellite's every call until its follow job moves the pins, once past 10 minutes,
+#: while its builders still run. Past this, a follow that never came strands the runs as any quiet host's.
+MISMATCH_SECONDS = 3600
 #: The `heartbeat` state row each build-dispatch tick writes first: this key on the hub, `<key>@<host>` on a
 #: satellite (pack sd:7933).
 HEARTBEAT = "build-dispatch"
@@ -662,6 +666,19 @@ def _beat_moves(connection, host: str, now: str) -> bool:
     row = connection.execute("SELECT MAX(id) FROM state WHERE kind = 'heartbeat' AND key = ?",
                              (f"{HEARTBEAT}@{host}",)).fetchone()
     return mark is None or (row[0] is not None and row[0] > mark)
+
+
+def mismatched_build(body) -> str | None:
+    """The `sd_db` build a dispatcher beat's `body` names when it is not the one this process runs, else None.
+
+    A tick stamps the build it loaded on its beat (`build_run.dispatch`, sd:10934). A beat that names none, or
+    one that does not read, names no mismatch: the quiet host strands as before.
+    """
+    try:
+        named = json.loads(body).get("build") if body else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return named if isinstance(named, str) and named and named != remote.build_digest() else None
 
 
 def _beat(connection, host: str):
@@ -3337,6 +3354,14 @@ def _strand(connection, hosts: Collection[str | None], *, now: str) -> list[dict
         gone = dispatcher_gone(connection, host)
         if gone is None:
             continue
+        beat = _beat(connection, host)
+        other = mismatched_build(beat["body"]) if beat else None
+        if other is not None:
+            # sd:10934: a host on another build is refused until it follows the pins; its runs pause.
+            age = _lead_age(beat["timestamp"], now)
+            if age is not None and age < MISMATCH_SECONDS:
+                continue
+            gone = f"{gone}; its last beat ran sd_db build {other}, not this hub's, over {MISMATCH_SECONDS} s ago"
         if _ahead(connection, host) is not None:
             if _beat_moves(connection, host, now):
                 continue  # a beat too far ahead is skew: that host's ticks still reap its own runs

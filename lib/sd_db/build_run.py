@@ -1127,7 +1127,7 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
     why = why or build.unread(load, load_cap, interactive) or (
         build.RESTORING if build.restoration_pending(connection) else "") or build.rate_hold(connection)
     record_state(connection, "heartbeat", key=HEARTBEAT if hub else f"{HEARTBEAT}@{build.this_host()}",
-                 body={"pid": os.getpid(), "owner": owner, "why": why,
+                 body={"pid": os.getpid(), "owner": owner, "why": why, "build": remote.build_digest(),
                        "load": build.over_load(load, load_cap) if not build.unread(load, load_cap, []) else ""})
     reaped = build.reap(connection, probe=probe, kill=kill, hosts=hosts)
     if hub:
