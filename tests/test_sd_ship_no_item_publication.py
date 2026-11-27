@@ -261,6 +261,8 @@ class NoItemPublication(unittest.TestCase):
         self.assertIn("manual merge authority", result["error"])
         self.assertFalse([call for call in self.remote.calls if call.method == "PUT"])
 
+    # The strict reading (sd:10929): by default a tool change keeps the clearance (sd:10928).
+    @patch.object(fixture.ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)
     def test_cross_skill_receipt_policy_change_invalidates_accepted_clearance(self):
         reference = fixture.ROOT / "skills/sd-check/references/check-receipts.md"
         content = b"fixture receipt policy before acceptance"
