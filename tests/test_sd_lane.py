@@ -6500,6 +6500,149 @@ class Watch(Lane):
         self.assertEqual(lines, ["pack sd:3 merged at merged-3", "pack sd:4 none: no lane entry that is not cancelled",
                                  "pack sd:5 none: no lane entry that is not cancelled"])
 
+    def build(self, item: int, status: str, result: str | None = None, ended: str | None = None) -> int:
+        """A build assignment of `item`, as the build dispatcher writes one."""
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            with connection:
+                return connection.execute(
+                    "INSERT INTO assignment (item, role, status, scope, result, ended) "
+                    "VALUES (?, 'build', ?, 'build', ?, ?)", (item, status, result, ended)).lastrowid
+        finally:
+            connection.close()
+
+    def end_build(self, assignment: int, status: str, result: str) -> None:
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            with connection:
+                connection.execute("UPDATE assignment SET status = ?, result = ?, ended = ? WHERE id = ?",
+                                   (status, result, "2999-01-01T00:00:00+00:00", assignment))
+        finally:
+            connection.close()
+
+    def test_watch_item_waits_on_a_running_build_and_ends_on_its_block(self) -> None:
+        """sd:10908: a build that blocked after round 3 sat parked; no lane watch saw it."""
+        [item] = self.register_items(1)
+        assignment = self.build(item, "running")
+        pauses: list[int] = []
+
+        def pause() -> None:
+            pauses.append(len(pauses))
+            if len(pauses) == 2:
+                self.end_build(assignment, "blocked", "3 review rounds left blockers:\nround 3")
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, pauses), (1, [0, 1]))
+        self.assertEqual(lines, [f"pack sd:{item} build blocked: 3 review rounds left blockers: round 3"])
+
+    def test_watch_item_waits_on_a_build_then_on_the_entry_it_enqueued(self) -> None:
+        [item] = self.register_items(1)
+        assignment = self.build(item, "queued")
+
+        def pause() -> None:
+            self.end_build(assignment, "done", "build run r1 enqueued in the lane")
+            sd_lane.enqueue_entry(self.feature, item, "fix: one", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (0, [f"pack sd:{item} merged at merged-{item}"]))
+
+    def test_watch_item_follows_a_bundle_member_to_the_entry_that_closes_it(self) -> None:
+        """Review of sd:10908: a bundle's entry is keyed by its lead; a member rides in `closes`."""
+        lead, member = self.register_items(2)
+        builds = [self.build(lead, "running"), self.build(member, "running")]
+
+        def pause() -> None:
+            for assignment in builds:
+                self.end_build(assignment, "done", "build run r1 enqueued in the lane")
+            sd_lane.enqueue_entry(self.feature, lead, "fix: both", self.body, self.environ, manual=True,
+                                  claim="deliver", closes=(member,))
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, member)
+        self.assertEqual((code, lines), (0, [f"pack sd:{member} merged at merged-{lead}"]))
+
+    def test_watch_item_names_the_newer_of_a_blocked_build_and_an_ended_entry(self) -> None:
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            self.answers[(item, "prepare")] = {"ok": False, "phase": "review_blocked", "error": "a finding"}
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.build(one, "blocked", "a retried build blocked", "2999-01-01T00:00:00+00:00")
+        self.build(two, "blocked", "an older build blocked", "2000-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual(code, 1)
+        self.assertEqual(lines, [f"pack sd:{one} build blocked: a retried build blocked",
+                                 f"pack sd:{two} failed: a finding"])
+
+    def test_watch_items_exit_when_one_items_build_blocks(self) -> None:
+        """Review of sd:10908: a blocked build sat behind another item's running one."""
+        one, two = self.register_items(2)
+        assignment, _ = self.build(one, "running"), self.build(two, "running")
+        pauses: list[int] = []
+
+        def pause() -> None:
+            pauses.append(len(pauses))
+            if len(pauses) == 1:
+                self.end_build(assignment, "blocked", "round 3 left blockers")
+            if len(pauses) > 3:
+                raise AssertionError("waited on the other item")
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (1, [f"pack sd:{one} build blocked: round 3 left blockers"]))
+
+    def test_watch_item_names_a_blocked_build_over_a_pending_entry(self) -> None:
+        """Review of sd:10908: a pending entry hid the build that blocked after it."""
+        [item] = self.register_items(1)
+        sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                              claim="deliver")
+        self.build(item, "blocked", "a fix round blocked", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (1, [f"pack sd:{item} build blocked: a fix round blocked"]))
+
+    def test_watch_item_reports_a_merge_over_a_build_cancelled_after_it(self) -> None:
+        """Review of sd:10908: a build cancelled after the merge made a landed item exit 1."""
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+            self.build(item, "cancelled", "the item merged", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (0, [f"pack sd:{one} merged at merged-{one}",
+                                             f"pack sd:{two} merged at merged-{two}"]))
+
+    def test_watch_item_names_a_build_blocked_after_a_partial_merge(self) -> None:
+        """Review of sd:10908: an associate-only merge is an earlier pull request, not the item's end."""
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: part", self.body, self.environ, manual=True,
+                                  claim="associate-only")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.build(one, "blocked", "the last part blocked", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (1, [f"pack sd:{one} build blocked: the last part blocked",
+                                             f"pack sd:{two} merged at merged-{two}"]))
+
+    def test_watch_item_names_a_build_blocked_in_the_second_of_the_enqueue(self) -> None:
+        """Review of sd:10908: stamps hold whole seconds; a tie waited on the pending entry."""
+        [item] = self.register_items(1)
+        with mock.patch.object(sd_lane, "stamp_now", return_value="2030-01-01T00:00:00Z"):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+        self.build(item, "blocked", "blocked that second", "2030-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (1, [f"pack sd:{item} build blocked: blocked that second"]))
+
     def test_watch_item_reads_again_after_a_hub_fault(self) -> None:
         """A read the hub did not answer is unknown, not an end."""
         sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
