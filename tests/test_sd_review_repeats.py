@@ -790,6 +790,33 @@ class PriorVerdictReviewTests(RepeatFixture):
         self.assertIn("Current source for prior finding src.py:\n[file absent at current HEAD]", prompt)
         self.assertIn("A blocker whose file is absent is fixed only when evidence names where its code went", prompt)
 
+    def test_a_name_reused_after_a_delete_does_not_carry_the_blocker_to_unrelated_code(self) -> None:
+        """Round 4 of build/sd-2205 (bin/sd-review:1870): `src.py` moved to `a.py` and was deleted; unrelated
+        `x.py` then took the name `a.py` and moved to `b.py`. The chain sent the blocker to `b.py`, and a fix
+        review of unrelated code could clear it. A deleted file's blocker stays where it was, marked deleted."""
+        def other() -> None:
+            self.rewrite("x.py")
+        prompt, places = self.carried_after(
+            dict(PRIOR[0], instances=["src.py:10"]), ("mv", "src.py", "a.py"), ("rename",), ("rm", "--quiet", "a.py"),
+            ("drop",), other, ("add", "x.py"), ("unrelated",), ("mv", "x.py", "a.py"), ("reuse",),
+            ("mv", "a.py", "b.py"), ("move",))
+        self.assertEqual(places, [("src.py", ["src.py:10"])])
+        self.assertNotIn("Current source for prior finding b.py", prompt)
+        self.assertIn("Current source for prior finding src.py:\n[file absent at current HEAD]", prompt)
+
+    def test_a_file_deleted_and_added_again_is_not_read_as_the_blockers_source(self) -> None:
+        """Round 4 of build/sd-2205 (bin/sd-review:1880, :1881): `src.py` was deleted, then a new `src.py`
+        added. The prompt attached the new file as the blocker's source; it is now marked deleted, and the mark
+        stays on the carried row so the next pass does not read the new file as the old one either."""
+        def other() -> None:
+            self.rewrite("src.py")
+        prompt, places = self.carried_after(
+            dict(PRIOR[0], instances=["src.py:10"]), ("rm", "--quiet", "src.py"), ("drop",), other,
+            ("add", "src.py"), ("new",))
+        self.assertEqual(places, [("src.py", ["src.py:10"])])
+        self.assertNotIn("other1", prompt)
+        self.assertIn("Current source for prior finding src.py:\n[file deleted since the prior review", prompt)
+
     def test_a_resumed_review_asks_each_blocker_by_id_and_holds_it_without_a_fixed_verdict(self) -> None:
         report = self.report()
         prompts, _result, _stderr = self.prompts(scope="branch", resume_report=str(report))

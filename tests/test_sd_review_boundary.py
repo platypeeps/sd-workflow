@@ -1170,11 +1170,18 @@ class LineBudgetTests(unittest.TestCase):
         # A pass with no completed reader carries every prior blocker, so
         # an interrupted report, a resume's input, keeps it with each
         # `open` evidence. Measured: `sd-review` is 3133 here.
+        #
+        # 5103 -> 5122 is round 4 of build/sd-2205: `bin/sd-review` +19.
+        # `followed` walks each first-parent commit, so a file deleted on
+        # the way stays put, marked `deleted_since_review`, and a later
+        # file that takes its name is not read as its source; the marker
+        # is `prior_marker`, to keep `prepared_prompt` under the branch
+        # ceiling. Measured: `sd-review` is 3152 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5103,
+            5122,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

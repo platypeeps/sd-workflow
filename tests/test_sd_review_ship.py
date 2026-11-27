@@ -474,7 +474,8 @@ class FixReviewTests(ReviewFixture):
         prompt = next(call["stdin"] for call in codex_sessions(runner))
         self.assertIn("[file absent at current HEAD]", prompt)
         recovered, _ = json.JSONDecoder().raw_decode(prompt.split("Prior findings:\n", 1)[1])
-        self.assertEqual(recovered, [{"id": "B1", **findings[0]}])
+        # Round 4 of build/sd-2205: the deletion is marked, so a file added later at the name is not read as it.
+        self.assertEqual(recovered, [{"id": "B1", **findings[0], "deleted_since_review": ["src.py"]}])
         self.assertEqual(report.read_text(), original)
 
     def test_prior_blob_read_failure_refuses_before_check_or_provider(self):

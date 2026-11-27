@@ -1844,41 +1844,48 @@ def prior_blockers(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def followed(root: pathlib.Path, previous: Mapping[str, Any], head: str) -> list[dict[str, Any]]:
-    """`prior_blockers` in one spelling, each file followed through a rename to `head` from the row's own
-    `prior_review.head`, else the report's head (review of build/sd-2205: a carried blocker kept a renamed
-    path, so the next fix review read no source for it). Each commit's renames chain, so a later rewrite does
-    not hide one; a rename git cannot read leaves the path as stored, and the prompt marks its file absent."""
+    """`prior_blockers` in one spelling, each file followed to `head` from the row's own `prior_review.head`,
+    else the report's head, one first-parent commit at a time (review of build/sd-2205: a carried blocker kept a
+    renamed path, so the next fix review read no source for it). A file deleted on the way stays at its stored
+    path, named in `deleted_since_review`, and so does one whose name a later file took (round 4): code now at
+    that name is not the blocker's. A start git cannot read leaves the path as stored."""
     spelled, cache = repo_spelling(root), {}
-    def _renames(start: Any) -> dict[str, str]:
+    def _walk(start: Any) -> dict[str, str | None] | None:  # each path's name at `head`; None: deleted on the way
         if not isinstance(start, str) or not re.fullmatch(r"[0-9a-f]{40,64}", start):
-            return {}
+            return None
         if start not in cache:
-            fields, cache[start] = (sd_lib.git_output(["diff", "-M", "--name-status", "-z", start, head], root) or "").split("\0"), {}
-            while len(fields) > 2:  # `status\0path`, or `R<score>\0from\0to`: walked in order, a path is never a status
-                status, *fields = fields
-                if status[:1] in ("R", "C") and len(fields) > 1:
-                    cache[start].update({fields[0]: fields[1]} if status[:1] == "R" else {})
-                    fields = fields[2:]
-                else:
-                    fields = fields[1:]
-            names = [name for name in (sd_lib.git_output(  # a rewrite after the rename hides it from the diff of the two heads
-                ["log", "--reverse", "-M", "--diff-filter=R", "--name-status", "--format=", "-z", f"{start}..{head}"], root) or "").split("\0") if name]
-            chain: dict[str, str] = {}
-            for old, new in zip(names[1::3], names[2::3], strict=False):
-                chain[next((first for first, now in chain.items() if now == old), old)] = new
-            cache[start].update(chain)
+            commits = sd_lib.git_output(["rev-list", "--reverse", "--first-parent", f"{start}..{head}"], root)
+            where: dict[str, str | None] | None = {} if commits is not None else None
+            for commit in (commits or "").split():
+                listed = sd_lib.git_output(["diff", "-M", "--name-status", "-z", f"{commit}^", commit], root)
+                if listed is None or where is None:  # a commit git cannot diff: no walk, the path stays as stored
+                    where = None
+                    break
+                fields = listed.split("\0")
+                moves: dict[str, str | None] = {}
+                while len(fields) > 1:  # `status\0path`, or `R<score>\0from\0to`: walked in order, a path is never a status
+                    status, *fields = fields
+                    two = status[:1] in ("R", "C") and len(fields) > 1
+                    moves.update({fields[0]: fields[1] if two else None} if status[:1] in ("R", "D") else {})
+                    fields = fields[2:] if two else fields[1:]
+                where = {old: moves.get(now, now) if now else None for old, now in {**{name: name for name in moves}, **where}.items()}
+            cache[start] = where
         return cache[start]
     rows = []
     for row in (respelled(spelled, found) for found in prior_blockers(previous)):
         found = row["prior_review"].get("head") if isinstance(row.get("prior_review"), dict) else None
-        moved = _renames(found) or _renames(previous["subject"].get("head"))  # a row head git cannot read: the report's
-        def _at(entry: Any, moved: dict[str, str] = moved) -> Any:
+        moved = _walk(found)
+        moved = _walk(previous["subject"].get("head")) if moved is None else moved  # a row head git cannot read
+        gone = {str(name) for name in row.get("deleted_since_review") or () if isinstance(name, str)}
+        def _to(path: Any, moved: dict[str, str | None] = moved or {}, gone: set[str] = gone) -> Any:
+            if path in moved and moved[path] is None:
+                gone.add(path)
+            return path if path not in moved or moved[path] is None else moved[path]
+        def _at(entry: Any) -> Any:
             place = instance_place(entry) if isinstance(entry, str) else None
-            if place is None or place[0] not in moved:
-                return entry
-            return moved[place[0]] if place[1] is None else f"{moved[place[0]]}:{place[1]}"
-        rows.append(dict(row, path=moved.get(row["path"], row["path"]),
-                         **({"instances": [_at(entry) for entry in row["instances"]]} if isinstance(row.get("instances"), list) else {})))
+            return entry if place is None else _to(place[0]) if place[1] is None else f"{_to(place[0])}:{place[1]}"
+        row = dict(row, path=_to(row["path"]), **({"instances": [_at(entry) for entry in row["instances"]]} if isinstance(row.get("instances"), list) else {}))
+        rows.append(dict(row, deleted_since_review=sorted(gone)) if gone else row)
     return rows
 
 
@@ -2280,6 +2287,7 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                    "do not answer stays blocking; a row with no id needs no verdict. A blocker whose file is absent is fixed only when "
                    "evidence names where its code went or shows the defect removed with it. Report new defects in findings. Prior findings:\n" + evidence)
         required = len(prompt.encode())
+        deleted = {name for row in blockers for name in row.get("deleted_since_review", ())}  # round 4 of build/sd-2205
         for name in dict.fromkeys(map(repo_spelling(root), sd_lib.blocking_places([*blockers, *previous["findings"]]))):  # sd:9769; sd:9962 an old absolute path
             path = pathlib.Path(name)
             if path.is_absolute() or ".." in path.parts or not (root / path).resolve().is_relative_to(root.resolve()):
@@ -2287,22 +2295,22 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
             entry = sd_lib.git_output(["ls-tree", "-z", "-l", subject.head, "--", f":(literal){name}"], root)
             if entry is None:
                 raise UsageError("cannot inspect prior finding source at current HEAD")
-            current = "[file absent at current HEAD]"
+            current = prior_marker(root, path, entry, name in deleted)
             prefix = f"\nCurrent source for prior finding {name}:\n"
-            size = len(current.encode())
-            if entry:
+            if current is None:
                 fields = entry.split("\t", 1)[0].split()
                 if len(fields) != 4 or fields[0] not in ("100644", "100755") or fields[1] != "blob":
                     raise UsageError("prior finding source must be a tracked regular file")
                 size = int(fields[3])
+                current = "[file absent at current HEAD]"
                 if required + len(prefix.encode()) + size + 1 <= MAX_OUTPUT_BYTES:
                     blob = subprocess_runner(["git", "cat-file", "blob", fields[2]], env, root, sd_lib.GIT_TIMEOUT_SECONDS)
                     if blob.exit_code:
                         raise UsageError("cannot read prior finding source at current HEAD")
                     current = blob.stdout
                     size = len(current.encode())
-            elif (root / path).exists() or (root / path).is_symlink():
-                raise UsageError("prior finding source must be a tracked regular file")
+            else:
+                size = len(current.encode())
             size += len(prefix.encode()) + 1
             required += size
             included = required <= MAX_OUTPUT_BYTES
@@ -2310,6 +2318,17 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                 prompt += prefix + current + "\n"
             context.append({"path": name, "bytes": size, "included_bytes": size if included else 0, "boundary": "prior-finding-source"})
     return prompt, bool(conventions), context
+
+
+def prior_marker(root: pathlib.Path, path: pathlib.Path, entry: str, deleted: bool) -> str | None:
+    """What the prompt shows for a prior finding's file in place of its source, or None to attach the blob
+    `entry` names. A file deleted since the prior review shows no new code at its name (round 4 of
+    build/sd-2205); an untracked file at the path is refused."""
+    if entry:
+        return "[file deleted since the prior review; code now at this path is new]" if deleted else None
+    if (root / path).exists() or (root / path).is_symlink():
+        raise UsageError("prior finding source must be a tracked regular file")
+    return "[file absent at current HEAD]"
 
 
 def changed_review_input(root: pathlib.Path, args: argparse.Namespace, previous: dict[str, Any] | None,
