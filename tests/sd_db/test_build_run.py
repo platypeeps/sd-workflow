@@ -814,6 +814,21 @@ class Supervise(Case):
         self.assertEqual(found and found["id"], "e1")
         self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [5], env=self.env))
 
+    def test_the_lane_entry_is_read_on_the_runs_branch_alone(self):
+        """Review of build/sd-1808: a rebuild shares items, and can share a head, with the failed branch's entry;
+        the newest entry of the items was taken whatever its branch. A row with no branch, an earlier version's
+        import, still counts."""
+        (self.plans / "lane.json").write_text(json.dumps([
+            {"id": "e1", "item": 7, "status": "failed", "enqueue_seq": 1, "branch": "build/sd-2"},
+            {"id": "e2", "item": 7, "status": "failed", "enqueue_seq": 2, "branch": "build/sd-1"}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-2", env=self.env)
+        self.assertEqual(found and found["id"], "e1")
+        self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env))
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e3", "item": 7, "status": "merged",
+                                                           "enqueue_seq": 1}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env)
+        self.assertEqual(found and found["id"], "e3")
+
     def test_an_unread_delivery_writes_nothing(self):
         """`cited` None (the commits were not read) is unknown: no enqueue, no outcome; the reap retries."""
         self.press()
@@ -5563,6 +5578,19 @@ class Tick(Case):
         entries = json.loads((self.plans / "lane.json").read_text())
         self.assertEqual([(row["status"], row["expected_head"]) for row in entries],
                          [("failed", head), ("pending", head)])
+
+    def test_a_refused_rebuild_enqueue_never_adopts_the_failed_branchs_entry(self):
+        """Review of build/sd-1808: the enqueue refused, and its recovery took the newest entry at this head as the
+        run's own, the failed branch's included. Only an entry of this run's branch is its own: the run blocks."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "pending", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("already queued in this lane", ended["blocked"])
 
     def test_a_rebuilt_failed_bundle_with_an_unrelated_item_beside_it_starts_from_the_failed_head(self):
         """Lane review of build/sd-1808: an item never built, bundled in with the whole failed bundle, sent the
