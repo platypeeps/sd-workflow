@@ -103,7 +103,13 @@ def get_assignments(args: argparse.Namespace) -> int:
         time.sleep(min(POLL_SECONDS, left))
     for state in states:
         print(json.dumps(state, ensure_ascii=False) if args.json else json.dumps(state, ensure_ascii=False, indent=2))
-    return 0 if not args.wait or (ended and (not merged or set(lanes) == {"merged"})) else 1
+    return 0 if not args.wait or (ended and (not merged or lanes_delivered(states))) else 1
+
+
+def lanes_delivered(states: list[dict]) -> bool:
+    """Whether each build's lane entry merged with no delivery pending: `--until merged`'s success (pack sd:9923)."""
+    lanes = [state.get("lane") or {} for state in states]
+    return all(lane.get("status") == "merged" and not lane.get("delivery_pending") for lane in lanes)
 
 
 def run(args: argparse.Namespace) -> int:
