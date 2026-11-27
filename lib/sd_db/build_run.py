@@ -1774,6 +1774,13 @@ class Supervisor:
         refused = self.prechecked(head)
         if refused:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused], head)
+        # A check the last round failed runs again first: one that still fails spends no review (sd:10914).
+        # ponytail: the whole check, not only its failing tests; a narrower rerun if the gate's cost bites.
+        rerun = self.own_checks(head) if self.known_failure() else None
+        if isinstance(rerun, dict):
+            return rerun
+        if rerun:
+            return self.blocked_round(rerun, head)
         answer: dict | None = None
         argv, prior = self.review_plan(head)
         unknown = waits = 0
@@ -1804,7 +1811,9 @@ class Supervisor:
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
-        unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
+        # A rerun that passed at `head` is this round's check: it runs once (sd:10914).
+        unmanaged = build.unmanaged(self.db, self.row["repo"])
+        checked: list[dict] | dict | None = rerun
         # `sd-review` runs no gate on a blocking report: a pass made from one here runs the checks (sd:10286).
         ungated = unmanaged or answer["status"] == "blocking"
         # Read before `file_new_findings` rebuilds the answer: only a whole report may settle to a pass. A
@@ -1813,7 +1822,7 @@ class Supervisor:
         # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
         if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
             new, blockers = self.deferred(answer, prior, head)
-            if ungated and not blockers:  # before any rebuttal: a failed check means a fix round follows
+            if ungated and not blockers and checked is None:  # before any rebuttal: a failed check, a fix round
                 checked = self.own_checks(head)
             answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
             if isinstance(checked, dict):
@@ -2689,6 +2698,12 @@ class Supervisor:
     def late_brief(rounds: int) -> str:
         """The fix brief for a round at or past the bound: the class pass, then the ruling round (sd:10286)."""
         return CLASS_PASS if rounds == REVIEW_ROUNDS else RULING
+
+    def known_failure(self) -> bool:
+        """Whether the last blocking round, after which a fix ran, failed a check: a blocker with no line
+        that is no enqueue check, from this run's checks or the review's gate (sd:10914)."""
+        return bool(self.fresh()["review_round"]) and any(
+            row.get("line") == "-" and row.get("path") != "enqueue check" for row in self.round_blockers())
 
     def round_blockers(self) -> list[dict]:
         """The last blocking round's findings as `blocked_round` kept them; [] for none or an unreadable file."""

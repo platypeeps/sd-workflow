@@ -1373,6 +1373,47 @@ class Supervise(Case):
         self.assertEqual(ended.get("outcome"), "blocked", ended)
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
 
+    def known_failure(self, code):
+        """A managed run whose first review cleared and whose gate failed; its own check exits `code` after."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", f"exit({code})"])
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["gate_failed", "clean"])
+        return self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+
+    def test_a_known_failure_still_failing_spends_no_review(self):
+        """sd:10914: after a fix round for a failed gate, the check runs again before the review. One that
+        still fails starts no reviewer and goes back to the builder."""
+        ended = self.known_failure(3)
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(len(self.calls("sd-review")), 1, "a review ran on a head whose known failure stands")
+        self.assertGreater(len(self.calls("gate")), 1, "the check was not run again after each fix")
+        self.assertIn("exit 3", self.latest()["detail"])
+
+    def test_a_known_failure_that_passes_reviews_once_and_checks_once(self):
+        """sd:10914: a rerun that passes permits the usual review, and its pass is the round's check."""
+        ended = self.known_failure(0)
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual((len(self.calls("sd-review")), len(self.calls("gate"))), (2, 1))
+
+    def test_a_healthy_build_runs_no_extra_check(self):
+        """sd:10914: no known failure, no rerun: a clean managed review runs no check of its own."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(0)"])
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
+        ended = self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+        self.assertEqual(ended.get("step"), "enqueued")
+        self.assertEqual(self.calls("gate"), [])
+
     def test_a_ruled_repeat_in_an_incomplete_review_is_no_pass(self):
         """Review of sd:10286: clearing a ruled blocker turns no short or uncovered review into a pass. A
         report one reviewer missed, or one that covers no delta, proves nothing else clean."""
@@ -2224,7 +2265,9 @@ class Supervise(Case):
         self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
         self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()  # bare entrypoints pass
         self.assertGreaterEqual(len(self.calls("gate")), 1, "the deferral's pass ran no gate")
-        self.assertEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        self.assertGreaterEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        # sd:10914: the check still fails after the fix, so it runs again and no third review is spent.
+        self.assertEqual(len(self.calls("sd-review")), 2)
 
     def test_a_gate_that_refused_to_run_is_no_fix_round(self):
         """Class pass on sd:10286: `sd gate check` that refuses (exit 1, no result) ran no check: unknown,
