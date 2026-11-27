@@ -414,6 +414,25 @@ def _why(row) -> str | None:
     return why if isinstance(why, str) and why else None
 
 
+def overloaded(connection, host: str) -> bool:
+    """Whether the satellite `host`'s fresh beat says its five-minute load is over its cap: the hub's claim then
+    builds that lane's fresh queued rows itself when `overload_fallback` is on, and the satellite's lane still lands
+    them (sd:8991, sd:10823)."""
+    if dispatcher_gone(connection, host):
+        return False
+    row = _beat(connection, host)
+    try:
+        load = json.loads(row["body"]).get("load") if row else None
+    except (TypeError, ValueError, AttributeError):
+        load = None
+    return isinstance(load, str) and bool(load)
+
+
+def _checked_out(repo: str) -> bool:
+    """Whether `repo` has a checkout on this machine's disk, which a build's worktree comes from (sd:8991)."""
+    return (paths.expand(repo) / ".git").exists()
+
+
 def _lead(row) -> int | None:
     """The lead assignment of `row`'s bundle once it ran, or None for a fresh row that never ran."""
     return row["parent"] or (row["id"] if row["run_count"] else None)
@@ -1824,6 +1843,12 @@ def machine_cap(environ: dict[str, str] | None = None) -> int:
     return _machine_setting("machine_cap", "[1-9]|1[0-6]", MACHINE_CAP, environ)
 
 
+def overload_fallback(environ: dict[str, str] | None = None) -> bool:
+    """Whether this machine's `sd.overload_fallback` reads 1: the hub then builds an overloaded satellite's fresh
+    rows itself (sd:8991). Unset or 0, they wait for the satellite (sd:10823)."""
+    return _machine_setting("overload_fallback", "[01]", 0, environ) == 1
+
+
 def repo_cap(environ: dict[str, str] | None = None) -> int:
     """This machine's `sd.repo_cap`, bundles building per repository, 1 to 6; `REPO_CAP` when unset (sd:9172)."""
     return _machine_setting("repo_cap", "[1-6]", REPO_CAP, environ)
@@ -1938,9 +1963,14 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             "WHERE assignment.status = 'queued' AND assignment.scope = ? AND item.repo IS NOT NULL "
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
         lanes = {row["id"]: _route(connection, row["lane_host"], _lead(row)) for row in queued}
-        # A satellite over its load cap claims nothing, and its fresh rows wait for it: a hub build of a
-        # satellite's lane left the work in a hub worktree that lane's lead cannot read (sd:10397, reversing
-        # sd:8991). A bundle the hub built before still routes back to the hub (`_route`), where its commits are.
+        if None in hosts and overload_fallback():
+            # A satellite over its load cap claims nothing: with `sd.overload_fallback` set to 1, the hub builds its
+            # fresh rows of a repository checked out here, under the hub's caps (sd:8991); unset, they wait for the
+            # satellite (sd:10823). A retry stays on its lane: its work is in that lane's worktree.
+            over = {host for host in set(lanes.values()) - set(hosts) if host and overloaded(connection, host)}
+            lanes = {row["id"]: None if (lanes[row["id"]] in over and _lead(row) is None
+                                         and _checked_out(row["repo"])) else lanes[row["id"]]
+                     for row in queued}
         if None in hosts:
             # The hub blocks another host's row once that host's dispatcher went quiet: a lane moved after the
             # press, or a dispatcher that died after it, would leave the item locked with no word. A fresh beat

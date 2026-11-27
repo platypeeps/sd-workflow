@@ -110,6 +110,19 @@ def lead_review_key(repository: str, branch: str) -> str:
     return f"review:v1:{repository}:{branch}"
 
 
+#: Operator 2026-11-27: while the pack and system tools change daily, a change to the
+#: review tools alone keeps a review and its rebuttals; a policy change still re-reviews.
+#: False restores the strict reading (any tool change re-reviews).
+TOOL_CHANGES_KEEP_REVIEWS = True
+
+
+def same_review_binding(stored: object, current: object) -> bool:
+    """Two lead-review bindings agree; the `tools` entry counts only under the strict reading."""
+    if TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict) and isinstance(current, dict):
+        return {k: v for k, v in stored.items() if k != "tools"} == {k: v for k, v in current.items() if k != "tools"}
+    return stored == current
+
+
 def lead_review_binding(root: pathlib.Path) -> dict | None:
     """What a recorded lead review is bound to, or None when a part does not read (sd:5988).
 
@@ -161,6 +174,10 @@ CORE_CONFIG = {
                     "description": "How many code-writing builders, drafts and interactive builders may run at once "
                                    "on this machine, 1 to 16. Unset reads 6 (sd:9891); the load guard still holds "
                                    "builds back below it. It grants nothing."},
+    "overload_fallback": {"pattern": "[01]",
+                          "description": "1: while a satellite's load is over its cap, this hub builds that lane's "
+                                         "fresh queued builds of a repository checked out here (sd:8991). Unset or "
+                                         "0: they wait for the satellite (sd:10823). It grants nothing."},
     "repo_cap": {"pattern": "[1-6]",
                  "description": "How many build bundles may build at once in one repository when this machine "
                                 "claims them, 1 to 6. Unset reads 1 (sd:8158). It grants nothing."},
@@ -479,6 +496,17 @@ def git_output(args: list[str], root: pathlib.Path) -> str | None:
     (timeout, no shell, failure-is-None). Most are reads; `delivered` fetches.
     """
     return _git(args, root)
+
+
+def git_show(root: pathlib.Path, spec: str) -> str | None:
+    """`git show <spec>` unstripped, or None: file bytes keep their last newline."""
+    try:
+        done = subprocess.run(["git", "-C", str(root), "show", spec], capture_output=True,  # nosec B603 B607
+                              text=True, timeout=GIT_TIMEOUT_SECONDS, check=False,
+                              env={**without_fsmonitor(os.environ), "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):  # a non-UTF-8 blob raises UnicodeDecodeError to the caller
+        return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def instance_files(instances: Any) -> list[str]:
@@ -4344,6 +4372,12 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
     return [answers[index] for index in sorted(answers)]
 
 
+def finding_key(finding: Mapping[str, Any]) -> str:
+    """What makes two readers' findings copies of one for `distinct_findings`."""
+    return json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
+                      sort_keys=True, default=str)
+
+
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
@@ -4356,8 +4390,7 @@ def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, A
     seen: dict[str, dict[str, Any]] = {}
     cited: dict[str, list[str]] = {}
     for finding in findings:
-        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
-                         sort_keys=True, default=str)
+        key = finding_key(finding)
         kept = seen.setdefault(key, dict(finding))
         evidence, parts = finding.get("evidence"), cited.setdefault(key, [])
         if isinstance(evidence, str) and evidence.strip() and evidence not in parts:
