@@ -1456,6 +1456,13 @@ def _checks_environ(env: dict) -> dict:
     return {**env, "GITHUB_TOKEN": env["GITHUB_PERSONAL_ACCESS_TOKEN"]}
 
 
+def target_kib(target: Path) -> int:
+    """`du -sk` of `target`, bounded: the supervisor beats no heartbeat while it runs."""
+    out = subprocess.run(["du", "-sk", str(target)], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                         timeout=build.STALE_SECONDS // 2, check=True).stdout
+    return int(out.split()[0])
+
+
 class Supervisor:
     """One run's supervisor: `run()` walks its steps and returns how it ended."""
 
@@ -1740,11 +1747,31 @@ class Supervisor:
 
     def finish(self, outcome: str, detail: str, *, question: str | None = None) -> dict:
         self.ending = (outcome, detail, question)  # kept: a hub fault here must not lose how the run ended
+        if outcome in ("blocked", "done"):
+            self.note_target()
         ended = build.end(self.db, self.ident, outcome, detail, question=question)
         return ended or {"run": self.ident, "outcome": None, "why": "the run ended or moved before its last write"}
 
     def fresh(self) -> dict:
         return build.run(self.db, self.ident)
+
+    def note_target(self) -> None:
+        """A note on the lead naming the size of the kept worktree's Rust `target/` (sd:10384: one held 106 GiB).
+
+        It deletes nothing (ruling #91707 on #89515): no file test tells a capture under `target/debug/` from
+        cargo's output, and the lane may still hold the worktree. One note per run: a replayed end adds none.
+        """
+        manifest, target = self.work / "Cargo.toml", self.work / "target"
+        if not manifest.is_file() or target.is_symlink() or not target.is_dir():
+            return
+        try:
+            size = f"{target_kib(target) / 2**20:.1f} GiB"
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError) as fault:
+            size = f"size unread ({type(fault).__name__})"
+        body = (f"Build run {self.ident}: its kept worktree {self.work} holds a Rust target/ of {size}, "
+                f"not cleaned: cargo clean deletes every file in it, a capture saved there too, "
+                f"so move out any file you keep first")
+        self.once("target-size", lambda: add_note(self.db, self.lead, "comment", body))
 
     def enter(self, step: str, **fields) -> None:
         if self.fresh()["cancel_requested"] and step in build.CANCELLABLE:
