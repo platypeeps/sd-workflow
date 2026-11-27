@@ -757,6 +757,31 @@ class PriorVerdictTests(unittest.TestCase):
         [row] = verified(failed, answer("two", verdicts=[verdict()]), rebutted=plain)["findings"]
         self.assertIn(fresh, row["evidence"])
 
+    def test_an_open_citing_the_ruled_repro_clears_no_blocker_saved_with_another(self) -> None:
+        """Last round of build/sd-2205 (bin/sd-review:1968), the class: a hold decided on one piece of
+        evidence while another stands. A citation of the ruled repro skipped the saved-evidence test, so it
+        cleared a blocker saved with a repro the ruling never judged. Every evidence must be the judged one:
+        the stored one, each saved beside it and each `open` citation."""
+        body = json.loads(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
+        body["proposal"]["findings"][0].update(ruled=True)
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        ruled, fresh = listed(json.dumps(body)), "python3 t.py --empty: IndexError"
+        beside = dict(finding(fresh, line=11, summary="A short list crashes"), disposition="blocking")
+        def held(prior: list[dict[str, Any]], *verdicts: dict[str, Any]) -> list[str]:
+            result = sd_review.finish_review({"severity_floor": "high", "requested_reviews": 1},
+                                             [answer("one", verdicts=verdicts)], ["one"], ruled, repro=True, prior=prior)
+            return [row["prior_blocker"] for row in result["findings"]]
+        other = [dict(PRIOR[0], evidence=fresh)]
+        for label, prior, verdicts, kept in (
+                ("saved with another repro, open cites the ruled one", other, [verdict("open", REPRO)], ["B1"]),
+                ("saved with another repro, an unlisted open cites the ruled one", other, [verdict("open", REPRO, id="B7")], ["B1"]),
+                ("saved with another repro, a blank open beside the citation", other,
+                 [verdict("open", ""), verdict("open", REPRO)], ["B1"]),
+                ("another blocker saved beside it", [*PRIOR, beside], [verdict("open", REPRO)], ["B1", "B2"]),
+                ("saved with the ruled repro, open cites it", PRIOR, [verdict("open", REPRO)], [])):
+            with self.subTest(label):
+                self.assertEqual(held(prior, *verdicts), kept)
+
     def test_the_carried_row_keeps_its_place_and_adds_the_open_evidence(self) -> None:
         [row] = verified(answer("one", verdicts=[verdict("open", "python3 t.py: still 2")]))["findings"]
         self.assertEqual({key: row[key] for key in ("path", "line", "summary", "disposition", "evidence")},

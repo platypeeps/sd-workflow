@@ -1958,13 +1958,14 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome], reb
     what a failed reader found open): silence, a paraphrase, a nearby repeat or an `open` keeps it blocking, at
     its stored place, with its stored evidence and each `open` answer's. With no completed answer nothing
     clears: every blocker is carried, so an interrupted pass's report, a resume's input, keeps it (build/sd-2205).
-    An `open` with evidence is a citation: a rebuttal holds it only as `dispose` holds a cited repeat."""
+    An `open` with evidence is a citation: a rebuttal holds it only as `dispose` holds a cited repeat, and
+    only beside saved evidence it judged: a citation of the ruled repro clears no other (last round)."""
     answered = [row for row in outcomes if row.status in (CLEAN, FINDINGS)]
     names = {f"B{index + 1}" for index in range(len(prior))}
     def _said(row: Outcome, name: str) -> list[dict[str, Any]]:  # an `open` naming no listed blocker holds every one
         return [given for given in row.verdicts if (key := given["id"].strip().upper()) == name or key not in names and given["verdict"] == "open"]
-    def _rebuts(old: Mapping[str, Any], opened: Sequence[Any]) -> bool:  # each `open` evidence read as a citation
-        cites = [text.strip() for text in opened if isinstance(text, str) and text.strip()] or [None]
+    def _rebuts(old: Mapping[str, Any], opened: Sequence[Any]) -> bool:  # the saved evidence, and each `open` one as a citation
+        cites = [None, *(text.strip() for text in opened if isinstance(text, str) and text.strip())]
         return all(is_rebutted(rebutted, old, text, prior) for text in cites)
     kept = []
     for index, old in enumerate(prior):

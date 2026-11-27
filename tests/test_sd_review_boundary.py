@@ -1203,11 +1203,15 @@ class LineBudgetTests(unittest.TestCase):
         # a reader's `open` evidence is a citation a rebuttal holds only
         # as `dispose` holds a cited repeat (`_rebuts`, kept out of `carried`
         # for its complexity ceiling). Measured: `sd-review` is 3230.
+        #
+        # 5200 -> 5201 is the last round of build/sd-2205: `bin/sd-review`
+        # +1, a docstring line: `_rebuts` tests the saved evidence beside
+        # every `open` citation. Measured: `sd-review` is 3231.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5200,
+            5201,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
