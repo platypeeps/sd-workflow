@@ -5643,6 +5643,96 @@ def sd_quote(argv):
     return shlex.join(argv)
 
 
+class TargetSize(Case):
+    """sd:10384: a run that ends blocked or done notes the size of the Rust `target/` its kept worktree holds.
+
+    Ruling #91707 on #89515 dropped the automatic `cargo clean`: no file test tells a capture under
+    `target/debug/` from cargo's output, and the lane may still hold the worktree, so the run deletes nothing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.press()
+        self.work = Path(self.bundle["work_path"])
+
+    def rust(self):
+        """The run's worktree, holding a `Cargo.toml`, cargo's output and a capture under `target/debug/`."""
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        exclude(self.work, "target/\n")
+        (self.work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
+        (self.work / "target" / "debug" / "deps").mkdir(parents=True)
+        (self.work / "target" / "debug" / "deps" / "big.rlib").write_bytes(b"x" * 4096)
+        (self.work / "target" / "debug" / "repro.log").write_text("capture")
+        (self.work / "target" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+
+    def notes(self):
+        return [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+
+    def sized(self):
+        return [body for body in self.notes() if "Rust target/" in body]
+
+    def test_the_note_warns_that_a_clean_deletes_what_target_holds(self):
+        """Review of build/sd-1798: the note advised `cargo clean`, which deletes a capture saved under
+        `target/` too; on both paths, measured and unread, it says so and asks to move such files first."""
+        self.rust()
+        self.supervisor().note_target()
+        with mock.patch.object(build_run, "target_kib", side_effect=OSError("du")):
+            supervisor = self.supervisor()
+            supervisor.marks.clear()
+            supervisor.note_target()
+        self.assertEqual(len(self.sized()), 2, self.notes())
+        for body in self.sized():
+            self.assertNotIn("run cargo clean there", body)
+            self.assertIn("deletes every file in it", body)
+            self.assertIn("move out any file you keep first", body)
+
+    def capture_survives(self, outcome):
+        """Ruling #83955: target/debug/repro.log stays; the lead gets a note naming the size and the cleanup."""
+        self.rust()
+        self.assertEqual(self.supervisor().finish(outcome, "fixture end")["outcome"], outcome)
+        self.assertEqual((self.work / "target" / "debug" / "repro.log").read_text(), "capture")
+        self.assertTrue((self.work / "target" / "debug" / "deps" / "big.rlib").is_file())
+        sized = self.sized()
+        self.assertTrue(sized and all("GiB" in body and str(self.work) in body for body in sized), self.notes())
+
+    def test_a_capture_survives_a_blocked_run_and_the_size_is_noted(self):
+        self.capture_survives("blocked")
+
+    def test_a_capture_survives_a_done_run_and_the_size_is_noted(self):
+        self.capture_survives("done")
+
+    def test_a_replayed_end_notes_once(self):
+        self.rust()
+        supervisor = self.supervisor()
+        supervisor.note_target()
+        supervisor.note_target()
+        self.assertEqual(len(self.sized()), 1, self.notes())
+
+    def test_cancelled_and_timed_out_note_nothing(self):
+        self.rust()
+        for outcome in ("cancelled", "timed_out"):
+            self.supervisor().finish(outcome, "fixture end")
+        self.assertEqual(self.sized(), [])
+
+    def test_no_rust_no_target_a_linked_target_or_no_worktree_notes_nothing(self):
+        self.supervisor().note_target()  # no worktree
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        self.supervisor().note_target()  # no Cargo.toml
+        (self.work / "Cargo.toml").write_text("")
+        self.supervisor().note_target()  # no target/
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.work / "target").symlink_to(elsewhere)
+        self.supervisor().note_target()  # a linked target/ is someone else's
+        self.assertEqual(self.sized(), [])
+
+    def test_an_unread_size_still_notes_and_the_run_ends(self):
+        self.rust()
+        with mock.patch.object(build_run, "target_kib", side_effect=subprocess.TimeoutExpired(["du"], 300)):
+            self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
+        self.assertTrue(any("size unread" in body for body in self.sized()), self.notes())
+
+
 class Tick(Case):
     def setUp(self):
         super().setUp()
