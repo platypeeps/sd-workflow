@@ -1233,7 +1233,7 @@ roles:
         # The receipt reads back through the same coverage walk that merge uses.
         self.assertEqual(self.merge()["phase"], "merged")
 
-    @unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)  # the strict reading
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
     def test_a_re_review_records_what_moved_and_stores_a_fresh_manifest(self):
         """sd:1834, sd:1246. The pass a moved binding spends says which file spent it."""
         self.assertEqual(self.prepare()["phase"], "ready_to_send")
@@ -1255,7 +1255,7 @@ roles:
                 self.assertEqual(state["passes"][-1]["review_binding_change"]["changed"], changed)
                 self.assertEqual(state["binding_manifest"], ship.binding_manifest(self.root))
 
-    @unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)  # the strict reading
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
     def test_a_landing_that_leaves_the_request_unchanged_keeps_the_receipt(self):
         """sd:1397, option E. A verdict file moved, but `sd-review --explain` replayed for the
         stored pass asks the reviewers the same thing, so the receipt stands and no pass is spent."""
@@ -1278,7 +1278,7 @@ roles:
         land()
         self.assertEqual(self.merge()["phase"], "merged")
 
-    @unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)  # the strict reading
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
     def test_a_landing_that_moves_finding_parsing_re_reviews_though_the_request_is_unchanged(self):
         """sd:1397, operator ruling (option A). `sd-review` parses and disposes findings, so a
         landing that moves it re-reviews even when `--explain` would ask the reviewers the same."""
@@ -5223,7 +5223,7 @@ roles:
     def test_a_lead_review_under_other_review_tools_gets_a_full_review_when_strict(self):
         calls = self.lead_reviewed_branch()
         self.rewrite_lead_record(binding={**self.lead_record()["binding"], "tools": "0" * 40})
-        with unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False):
+        with unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False):
             self.assert_full_review(calls, "the review tools or policy changed since")
 
     def test_a_lead_review_that_wanted_copilot_gets_the_lane_review(self):

@@ -646,7 +646,7 @@ reviewer chain before vendor, transport, availability and spending gates run.
 
 Core settings use `sd config get|set|unset|list` and the existing atomic machine configuration writer.
 The file is `~/.config/sd-ai-command-pack/config.json`, honoring `XDG_CONFIG_HOME`.
-These keys serve every machine and live in the workflow database as `setting` rows: `sd.fleet_owners`, `sd.copilot_review` (sd:3989), `sd.hub_name` (sd:4044), `sd.status_companions` (sd:5098) and the `sd.notion_*` publish ids (sd:5141).
+These keys serve every machine and live in the workflow database as `setting` rows: `sd.fleet_owners`, `sd.copilot_review` (sd:3989), `sd.review_tool_changes` (sd:10929), `sd.hub_name` (sd:4044), `sd.status_companions` (sd:5098) and the `sd.notion_*` publish ids (sd:5141).
 Every plugin key (`hoa.*`, `sdw.*`, `songs.*`) is a `setting` row too (sd:5109).
 `sd config set` and `unset` write the row; with a database the row alone answers, the file's line for that key is not read, and `get` names it on stderr.
 A machine with no database and no `hub.json` keeps them in the file. A database that cannot be read is an error, never the file's value.
@@ -663,6 +663,9 @@ The reserved `sd` namespace declares these settings:
 - `sd.external_reviews`: `configured` permits private code and scoped review context to eligible configured providers.
   It includes future registry entries; registry configuration chooses capability, while this explicit operator grant authorizes transmission.
   `deny` vetoes all local allowances. Absence supplies no standing grant.
+- `sd.review_tool_changes`: `keep`, the default, keeps a review and its rebuttals across a change to the
+  review tools alone; a policy change still re-reviews. `strict`, or a value that does not read,
+  re-reviews on any tool change and voids rebuttals. Settings → Fleet sets it.
 - `sd.copilot_review`: when `sd-ship` requests a Copilot review by itself. `deep` requests one on deep-tier changes only,
   `always` on every reviewing tier, `never` on none. Absence reads `deep`, so a repository with no
   review declaration gets Copilot on deep changes and on nothing else.

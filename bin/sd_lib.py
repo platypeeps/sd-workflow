@@ -115,15 +115,19 @@ def lead_review_key(repository: str, branch: str) -> str:
 LEAD_REVIEW_SOURCE = "lead-review"
 
 
-#: Operator 2026-11-27: while the pack and system tools change daily, a change to the
-#: review tools alone keeps a review and its rebuttals; a policy change still re-reviews.
-#: False restores the strict reading (any tool change re-reviews).
-TOOL_CHANGES_KEEP_REVIEWS = True
+def tool_changes_keep_reviews(environ: Mapping[str, str] | None = None) -> bool:
+    """`sd.review_tool_changes` (sd:10929): `keep`, the default (operator 2026-11-27), keeps a review and
+    its rebuttals across a change to the review tools alone; a policy change still re-reviews. `strict`
+    re-reviews on any tool change, as does a value or a database that does not read: the safe reading."""
+    try:
+        return core_setting("review_tool_changes", environ) != "strict"
+    except ConfigError:
+        return False
 
 
 def same_review_binding(stored: object, current: object) -> bool:
     """Two lead-review bindings agree; the `tools` entry counts only under the strict reading."""
-    if TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict) and isinstance(current, dict):
+    if isinstance(stored, dict) and isinstance(current, dict) and tool_changes_keep_reviews():
         return {k: v for k, v in stored.items() if k != "tools"} == {k: v for k, v in current.items() if k != "tools"}
     return stored == current
 
@@ -151,6 +155,11 @@ NOTION_DATA_SOURCE = rf"(?:collection://)?{NOTION_ID}"
 CORE_CONFIG = {
     "external_reviews": {"pattern": "configured|deny",
                          "description": "Standing private-code/context review authorization; unset uses local consent."},
+    "review_tool_changes": {"pattern": "keep|strict",
+                            "description": "What a change to the review tools alone does to a recorded review and "
+                                           "its rebuttals. keep (the default): both stand, and a policy change "
+                                           "still re-reviews; strict: any tool change re-reviews and voids "
+                                           "rebuttals (sd:10929)."},
     "copilot_review": {"pattern": "|".join(COPILOT_REVIEW_POLICIES),
                        "description": "When a merge asks GitHub for a Copilot review on its own. deep (the default): only "
                                       "changes that get a deep review; always: every reviewed change; never: none. "
@@ -768,7 +777,7 @@ def review_slot(result: dict[str, Any], environ: Mapping[str, str], root: pathli
 #: workflow database, not `config.json` (sd:3989). `external_reviews` stays per
 #: machine until each machine's value is known to match: it is the consent to
 #: send private code out, and the work satellite holds the work repositories.
-FLEET_KEYS = ("fleet_owners", "copilot_review", "hub_name", "status_companions",
+FLEET_KEYS = ("fleet_owners", "copilot_review", "review_tool_changes", "hub_name", "status_companions",
               "notion_private_folder", "notion_team_folder", "notion_experiments", "notion_experiment_tasks")
 
 
