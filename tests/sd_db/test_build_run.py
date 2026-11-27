@@ -6026,6 +6026,45 @@ class Drafts(Case):
         [again] = build.queue_again(self.db, [second], who="operator")
         self.assertEqual((again["item"], again["status"]), (second, "queued"))
 
+    def test_the_dashboard_press_builds_an_answered_item_its_bundle_left_blocked(self):
+        """Review of build/sd-1867: only `queue_again` lifted a build's own block. The dashboard's dialog
+        check (`_item`) and its press (`queue`) refused the item as blocked, answered or not."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        for check in (lambda: build._item(self.db, second), lambda: build.queue(self.db, [second], who="dashboard")):
+            with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+                check()
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        build._item(self.db, second)
+        [again] = build.queue(self.db, [second], who="dashboard")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "ready")
+
+    def test_the_dashboard_press_leaves_a_retryable_bundles_block(self):
+        """Class pass of build/sd-1867: a member whose bundle Retry still takes keeps its block on a
+        press: a fresh build would leave the bundle's branch behind."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        self.db.execute("UPDATE assignment SET status = 'blocked', result = ? WHERE id = ? OR parent = ?",
+                        (f"build run {bundle['id']} ended", lead, lead))
+        for item in (first, second):
+            writes.transition(self.db, item, "blocked", who="build", reason=f"build run {bundle['id']} ended")
+        with self.assertRaisesRegex(build.BuildRefused, "is blocked"):
+            build.queue(self.db, [second], who="dashboard")
+
     def test_build_keeps_an_operator_block_newer_than_its_run(self):
         """Review of build/sd-1867: Build lifted any blocked item whose newest build ended blocked, so an
         operator's later block went too. Only the build's own block, still the item's latest, lifts."""

@@ -493,7 +493,9 @@ def _item(connection, item: int, *, lead: int | None = None, riding: Collection[
     if row["kind"] not in RUNNABLE_KINDS:  # named before the status, as a press of a chore reads it
         raise BuildRefused(_press_refusal(connection, row))
     if row["status"] != "ready" and not (row["status"] == "blocked" and split_held(connection, item)):
-        raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+        if row["status"] != "blocked" or (since := _rebuild_since(connection, item)) is None:
+            raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+        _answered(connection, item, since)
     refused = _press_refusal(connection, row, lead=lead, riding=riding)
     if refused:
         raise BuildRefused(refused)
@@ -679,8 +681,10 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                 raise BuildRefused(f"item {item} was parked after auto-pickup read it")
         created = []
         for item in items:
-            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # a split-held bundle's item
-                transition(connection, item, "ready", who=who, reason="its bundle's branch is held after a split")
+            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # `_item` took it blocked
+                transition(connection, item, "ready", who=who,
+                           reason="its bundle's branch is held after a split" if split_held(connection, item)
+                           else "Build after its bundle ended")
             if work_kind(connection, item) == DESIGN_KIND and draft_design(connection, item) is None:
                 # A design item with no design yet runs a design run first, beside the code (sd:10096).
                 from . import draft  # noqa: PLC0415 -- draft imports this module
@@ -1313,9 +1317,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     # A member its run blocked, whose bundle cannot retry (its lead done: the code shipped
                     # without it), builds fresh once its builder's question is answered (pack sd:10294): one
                     # that run raised, as delivery read it (`asked_since`), not an older unrelated one.
-                    if asked := open_question(connection, [item], since, pending=True):
-                        raise BuildRefused(f"item {item} waits on question note #{asked['id']}; "
-                                           f"answer it, then Build it")
+                    _answered(connection, item, since)
                     transition(connection, item, "ready", who=who, reason="Build after its bundle ended")
         fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])
@@ -1339,6 +1341,27 @@ def _build_blocked(connection, item: int) -> str | None:
     number = _blocking_run(connection, lead, row["result"])
     # A block that names no run of its bundle reads every question: no time stands in for the run.
     return asked_since(connection, lead, number) if number is not None else ""
+
+
+def _rebuild_since(connection, item: int) -> str | None:
+    """`_build_blocked` for an item a fresh press may take blocked: its bundle Retry no longer takes, as
+    its lead ended otherwise or its lead's item is done (the code shipped without it, pack sd:10294).
+    The dashboard's press and dialog read it through `_item`, as Build by item does (review of sd-1867)."""
+    since = _build_blocked(connection, item)
+    if since is None:
+        return None
+    row = connection.execute("SELECT id, parent FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    state = queue_state(connection, row["parent"] or row["id"])
+    if state["status"] == "blocked" and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"]):
+        return None  # Retry of the bundle resumes its branch
+    return since
+
+
+def _answered(connection, item: int, since: str) -> None:
+    """Refuse while a question the blocking run raised on `item` still waits on the operator."""
+    if asked := open_question(connection, [item], since, pending=True):
+        raise BuildRefused(f"item {item} waits on question note #{asked['id']}; answer it, then Build it")
 
 
 def _blocking_run(connection, lead: int, reason: str) -> int | None:
