@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -200,6 +201,22 @@ def test_argv(value: Any) -> list[str]:
     return value
 
 
+def names_root(root: pathlib.Path, value: str) -> bool:
+    """`value` names `root` or a path under it, as given or resolved: exactly, not `root` as a prefix of a sibling."""
+    return any(re.search(re.escape(str(place)) + r"(?:/|$|" + re.escape(os.pathsep) + ")", value)
+               for place in {root, root.resolve()})
+
+
+def rebuttal_environment(root: pathlib.Path) -> dict[str, str]:
+    """The gate's environment (no `PATH` entry, venv or `PYTHONPATH` in `root`) as a plain checkout's tests see
+    it, without `SD_LOCAL_GATE` and any variable naming `root`: the test loads the head's code alone."""
+    import sd_gate_run  # noqa: PLC0415
+
+    env = sd_gate_run.gate_environment(root)
+    env.pop(sd_gate_run.GATE_VARIABLE, None)
+    return {key: value for key, value in env.items() if not names_root(root, value)}
+
+
 def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> None:
     """sd:10893. A blocker stays open while its test exists and fails: run it at the exact `head`, no shell.
 
@@ -215,6 +232,9 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
     import sd_gate_run  # noqa: PLC0415
     import sd_lib  # noqa: PLC0415
 
+    if any(names_root(root, arg) for arg in argv):
+        raise Refusal(f"finding {index}: its test names a path in the live checkout; name it relative "
+                      "to the checkout, so it runs the head's code")
     with tempfile.TemporaryDirectory(**sd_gate_cache.worktree_place(root, head)) as parent:
         tree = pathlib.Path(parent).resolve() / "tree"
         try:
@@ -222,7 +242,7 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
         except sd_gate_run.GateError as error:
             raise Refusal(f"finding {index}: no worktree of {head[:12]} for its test: {error}") from None
         try:
-            done = sd_lib.run_group(argv, cwd=tree, env=sd_lib.without_fsmonitor(os.environ), timeout=TEST_TIMEOUT_SECONDS)
+            done = sd_lib.run_group(argv, cwd=tree, env=rebuttal_environment(root), timeout=TEST_TIMEOUT_SECONDS)
         except sd_lib.GroupTimeout:
             raise Refusal(f"finding {index}: its test did not finish in {TEST_TIMEOUT_SECONDS} s; "
                           "a blocker stays open until its test passes") from None

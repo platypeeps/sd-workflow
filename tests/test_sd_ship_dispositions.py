@@ -283,6 +283,22 @@ class DispositionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ship.Refusal, "prepare again"):
                     self.operation().check_review(self.head)
 
+    def test_a_test_reaches_no_code_in_the_live_checkout(self):
+        """sd:10893 class pass: the test runs the head's code alone. An environment entry or an argv path
+        naming the live checkout would load its uncommitted files and clear the finding against them."""
+        root = self.root.resolve()
+        with (root / ".git/info/exclude").open("a") as stream:
+            stream.write("example_probe.py\n")
+        (root / "example_probe.py").write_text("")
+        head = fixture._git(root, "rev-parse", "HEAD")
+        environments = {"PYTHONPATH": str(root), "EXAMPLE_SOURCE": str(root)}
+        script = "import os, sys; sys.path[:0] = [os.environ['EXAMPLE_SOURCE']]; import example_probe"
+        for argv in ([sys.executable, "-c", "import example_probe"], [sys.executable, "-c", script],
+                     [sys.executable, str(root / "example_probe.py")]):
+            with self.subTest(argv=argv), patch.dict("os.environ", environments):
+                with self.assertRaises(ship.Refusal):
+                    sd_ship_dispositions.reproduces(root, head, 1, argv)
+
     def test_only_recording_and_prepare_run_the_test_never_a_read(self):
         """sd:10893 review: merge, publication and `verify-review` read the record and run nothing; a test
         is code, so a read-only command executing it in the live checkout is not read-only."""
