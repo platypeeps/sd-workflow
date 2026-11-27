@@ -2092,6 +2092,38 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         kept = self.run_view("R.repos = repos();", search="?show=suggested")
         self.assertIn("beta:false", kept["R"]["repos"])
 
+    def test_advisory_items_are_hidden_until_the_advisories_toggle_is_on(self):
+        # sd:10915: #61 is an advisory item; off (the row unset) its suggested row is gone, on it shows.
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [61], "row": None, "show": False, "error": ""}
+        out = self.run_view("open('system'); R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;",
+                            search="?show=suggested")
+        self.assertNotIn("#61 Ready 61", out["R"]["html"])
+        self.assertIn("#60 Ready 60", out["R"]["html"])
+        self.assertIn('data-f="qshow" data-v="advisory" aria-pressed="false"', out["R"]["filters"])
+        self.doc["advisories"].update(row="on", show=True)
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=suggested")
+        self.assertIn("#61 Ready 61", out["R"]["html"])
+
+    def test_the_advisories_toggle_posts_its_row_and_reads_today_again(self):
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [61], "row": None, "show": False, "error": ""}
+        answers = {"/api/settings/row": [200, {"key": "dashboard.queue_advisories", "value": "on", "was": None}]}
+        out = self.run_view("R.before = OUT.gets.length; press('advisory'); await flush(); await flush(); await flush();"
+                            " R.after = OUT.gets.slice(R.before); R.said = ELS['queue-said'].textContent;", answers=answers)
+        self.assertEqual([p[:2] for p in out["posts"]],
+                         [["/api/settings/row", {"key": "dashboard.queue_advisories", "value": "on", "before": None}]])
+        self.assertIn("/api/now", out["R"]["after"])
+        self.assertEqual(out["R"]["said"], "Advisory items show.")
+        self.assertEqual(out["urls"], [], "the toggle is the setting row, not a ?show= key")
+
+    def test_an_advisories_read_that_failed_hides_nothing_and_says_so(self):
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [], "row": None, "show": True,
+                                  "error": "database is locked"}
+        out = self.run_view("open('system'); R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;"
+                            " R.note = ELS['queue-note'].textContent;", search="?show=suggested")
+        self.assertIn("#61 Ready 61", out["R"]["html"])
+        self.assertNotIn('data-v="advisory"', out["R"]["filters"])
+        self.assertIn("Advisory items not read: database is locked", out["R"]["note"])
+
     def test_suggested_is_on_with_no_show_key_and_turned_off_stays_off_on_a_reload(self):
         # pack sd:7314 (operator request): no `show` key starts Suggested on. Turning every filter off writes `show=` empty,
         # so a reload keeps them off; a key naming other filters keeps Suggested off, as before.
@@ -2486,6 +2518,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         none = self.run_view("R.tally = ELS['queue-tally'].html;")
         self.assertNotIn("parked", none["R"]["tally"], "no parked task, no tile")
 
+    def test_an_advisory_filed_after_the_now_read_stays_hidden_on_a_tasks_refresh(self):
+        """sd:10915 lane review: the hidden set came from /api/now's ids alone, so an advisory item a refresh of
+        /api/tasks brought in showed while the filter was off. The task row's own `advisory` flag hides it too."""
+        from sd_dashboard import tasks_screen
+        for title in ("Parked plain", "Parked advisory"):
+            made = self.item(title, kind="task", priority=4, repo=str(self.checkout))
+            self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
+            if title.endswith("advisory"):
+                self.connection.execute("UPDATE item SET source = 'task-ref', external_id = ? WHERE id = ?",
+                                        (f"advisory:sd:{made}", made))
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [], "row": None, "show": False, "error": ""}
+        answers = {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]}
+        out = self.run_view("R.tally = ELS['queue-tally'].html;", answers=answers)
+        self.assertIn(">1 parked</a>", out["R"]["tally"])
+
     def test_each_repo_row_has_a_parked_box_last_that_shows_its_parked_tasks(self):
         """sd:9247 (operator 2026-11-17): "add a per repo tile for the respective parked items like the other tiles
         ... as last one, and have it do the same filtering". The box counts the repo's parked tasks the tally counts
@@ -2585,6 +2632,26 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             return out["R"]["tiled"].split(f'data-type="parked" data-item="{item}"')[1].split("</tr>")[0]
         self.assertIn("blocked build · assignment 90 · build run ended", row(built))
         self.assertIn("lane failed at prepare · gate failed", row(made))
+
+    def test_a_hidden_advisory_parked_item_moves_none_of_its_rows_back_into_blocked(self):
+        """sd:10915 review: hiding advisories dropped a parked item from the parked set too, so its blocked build and
+        failed lane entry were Blocked rows again. Hidden, the item is no row at all and Blocked counts neither."""
+        built, _ = self.parked_answers(self.checkout)
+        made, answers = self.parked_answers(self.checkout)
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        asg = {"id": 90, "lead": 90, "item": built, "title": "Set aside", "repo": str(self.checkout),
+               "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
+               "cancel": {"allowed": True, "reason": ""}}
+        answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [built, made], "row": None,
+                                  "show": False, "error": ""}
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", answers=answers)
+        _, attrs, _ = self.repo_detail(out["R"]["html"], "system")
+        self.assertIn(" 2 blocked,", attrs, "the fixture's two blocked rows, not the hidden parked item's")
+        self.assertIn(" 0 parked", attrs)
+        self.assertNotIn('data-asg-row="90"', out["R"]["html"])
+        self.assertNotIn(f'data-id="entry:{self.checkout}:{made}"', out["R"]["html"])
 
     def test_a_parked_items_blocked_rows_keep_their_controls_on_its_parked_row(self):
         """Re-review of pack sd:9425: the Parked row took the blocked rows' reasons and dropped their controls, so a
