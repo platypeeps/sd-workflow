@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import glob
 import hashlib
 import json
 import os
@@ -58,11 +59,20 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from . import build, contributions, draft, paths, remote, runner_journal, sessions
+from . import (
+    build,
+    contributions,
+    draft,
+    paths,
+    remote,
+    repos,
+    runner_journal,
+    sessions,
+)
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
-from .errors import SchemaTooNew
+from .errors import SchemaTooNew, SdDbError
 from .ship import this_host
 from .workflow import WorkflowError
 from .writes import add_note, create_item, now, record_cost, record_state
@@ -789,11 +799,15 @@ def implicit(lines: list[str], start: int, *, named: Collection[str] = ()) -> bo
     return False
 
 
-def unwalked(work: Path, paths: Collection[str]) -> list[str]:
+def unwalked(work: Path, paths: Collection[str], *, data: Collection[str] = ()) -> list[str]:
     """Each of `paths` the name walk does not read: anything but Python source, a `.py` file or a regular file
-    under `work` whose first line is a Python shebang (class pass 7 on sd:10286). Code reads such a file as
-    data, by no name, so a round's change there reaches a blocker no edge finds. A closed test, not a list of
-    configuration kinds: a symlink, a missing file or one that does not read is none, fail closed."""
+    under `work` whose first line is a Python shebang (class pass 7 on sd:10286), and any path a `data` glob
+    matches, the repository's declared runtime data (policy `runtime_data`, sd:10906), Python or not. Code
+    reads such a file as data, by no name, so a round's change there reaches a blocker no edge finds. A closed
+    test, not a list of configuration kinds: a symlink, a missing file or one that does not read is none, fail
+    closed. Globs read as `check_scope`'s do: `*` within one segment, `**` across them."""
+    declared = [re.compile(glob.translate(pattern, recursive=True, include_hidden=True)) for pattern in data]
+
     def python(path: str) -> bool:
         if not path or (work / path).is_symlink():
             return False
@@ -805,7 +819,9 @@ def unwalked(work: Path, paths: Collection[str]) -> list[str]:
         except OSError:
             return False
         return first.startswith(b"#!") and b"python" in first
-    return [f"{path} (no Python source)" for path in sorted(paths) if not python(path)]
+    return [f"{path} (declared runtime data)" if any(pattern.match(path) for pattern in declared)
+            else f"{path} (no Python source)" for path in sorted(paths)
+            if any(pattern.match(path) for pattern in declared) or not python(path)]
 
 
 def round_words(git: Collection[str], work: str, base: str, head: str, *,
@@ -2332,9 +2348,12 @@ class Supervisor:
         # function, or that names nothing the round changed and is reached all the same (`reaches`).
         words = (round_words(self.tools.git, str(self.work), reviewed, head, env=self.env)
                  if reviewed and moved is not None else None)
+        data = self.runtime_data() if found else []
+        if data is None:  # a declaration that does not read: every path the round changed may be one (fail closed)
+            data = ["**"]
         for number, (ruling, reason) in sorted(found.items()):
             row = blockers[number - 1]
-            reached = (self.reaches(row, words, head) + unwalked(self.work, moved or {})
+            reached = (self.reaches(row, words, head) + unwalked(self.work, moved or {}, data=data)
                        if ruling in ("reject", "file") and ruleable(row) and words is not None else [])
             self.once(f"ruling:{head}:{number}", functools.partial(
                 self.rule, number, row, ruling, reason, head, repository, changed,
@@ -2368,6 +2387,19 @@ class Supervisor:
             except (TypeError, ValueError):
                 continue
         return False
+
+    def runtime_data(self) -> list[str] | None:
+        """The repository's declared runtime-data globs (policy `runtime_data`, sd:10906); [] for none, None
+        for a declaration that does not read or a value that is no list of globs."""
+        try:
+            held = repos.declarations(self.db, self.row["repo"])
+        except (SdDbError, sqlite3.Error):
+            return None
+        policy = (held or {}).get("policy") or {}
+        globs = policy.get("runtime_data", []) if isinstance(policy, dict) else None
+        if not isinstance(globs, list) or not all(isinstance(text, str) and text.strip() for text in globs):
+            return None
+        return globs
 
     def reaches(self, row: dict, words: tuple[set[str], set[str]] | None, head: str) -> list[str]:
         """How a ruling round's own changes (`round_words`) reach a blocker that names none of them, at each

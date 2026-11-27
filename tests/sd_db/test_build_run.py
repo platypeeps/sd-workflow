@@ -41,6 +41,7 @@ from sd_db import (
     operations,
     paths,
     remote,
+    repos,
     runner,
     sessions,
     writes,
@@ -1438,6 +1439,23 @@ class Supervise(Case):
                 self.assertEqual(ended.get("outcome"), "blocked", ended)
                 self.assertEqual(self.rebuttals(), [])
                 self.assertIn(f"not applied: the round changed {name} (no Python source)", self.decisions()[1])
+
+    def test_a_ruling_lapses_when_its_round_changes_declared_runtime_data(self):
+        """sd:10906: code reads a `.py` file as data, by no name, and the round changed it. The name walk read
+        it as source, so the reject applied. A path the policy's `runtime_data` declares lapses it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.rebuttals(), [])
+        self.assertIn("not applied: the round changed apart.py (declared runtime data)", self.decisions()[1])
+
+    def test_declared_runtime_data_is_matched_by_glob(self):
+        """sd:10906: `runtime_data` globs as `check_scope` reads them: `*` in one segment, `**` across them."""
+        self.assertEqual(build_run.unwalked(self.root, ["a/b.py", "data/x/t.py", "top.py", "c.py"],
+                                            data=["data/**", "c.py"]),
+                         ["c.py (declared runtime data)", "data/x/t.py (declared runtime data)"])
 
     def test_only_python_source_is_a_file_the_name_walk_reads(self):
         """Class pass 7: a `.py` file, or a regular file whose first line is a Python shebang; a symlink, a
