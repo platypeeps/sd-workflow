@@ -780,6 +780,14 @@ class ToolChangesKeepReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(ship.Refusal, "review_declaration \\(policy\\)$"):
             self.operation.review_inputs(self.head)
 
+    def test_a_normalizer_move_does_not_hide_a_policy_change(self):
+        stored = self.operation.state["binding_manifest"]
+        self.operation.state["binding_manifest"] = dict(stored, normalizer="py-old")
+        seed_declaration(self.home, self.root, "review", {})
+        with self.assertRaises(ship.Refusal):
+            self.operation.review_inputs(self.head)
+        self.assertNotIn("review_binding_kept", self.operation.state)
+
     def test_a_lead_review_binding_ignores_only_the_tools_entry(self):
         stored = {"tools": "old", "local": "L", "review_declaration": {"x": 1}}
         self.assertTrue(sd_lib.same_review_binding(stored, dict(stored, tools="new")))

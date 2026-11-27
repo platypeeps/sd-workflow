@@ -846,11 +846,15 @@ class SharedReview:
         if (not sd_lib.TOOL_CHANGES_KEEP_REVIEWS or manifest is None or not changed
                 or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
             return False
+        # A normalizer move reports alone and hides the policy entries, so policy is compared here too.
+        current = manifest(self.root)
+        if (self.state.get("binding_manifest") or {}).get("policy") != current["policy"]:
+            return False
         passes = self.history.native(self.state)
         kept = {"head": passes[-1].get("head") if passes else None, "recorded_at": self.runtime.clock(),
                 "superseded_binding": self.state.get("binding"), "changed": [list(row) for row in changed],
                 "tools_only": True}
-        rebound = {"binding": self.runtime.binding(self.root), "binding_manifest": manifest(self.root),
+        rebound = {"binding": self.runtime.binding(self.root), "binding_manifest": current,
                    "review_binding_kept": [*(self.state.get("review_binding_kept") or []), kept]}
         if self.read_only():
             self.state.update(rebound)  # pack sd:7576: a read verb rebinds in memory only
