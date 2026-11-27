@@ -620,10 +620,12 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
     return done.stdout
 
 
-def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
+def kept_files(git: Collection[str], work: str, *, env: dict | None = None, build_output: bool = False) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder, or a `BUILD_OUTPUT`
-    folder beside its manifest (sd:10830); "" when it may go."""
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go.
+
+    With `build_output`, the sweep's read alone (sd:10830): also less a `BUILD_OUTPUT` folder beside its
+    manifest. Every other caller keeps the plain read, where such a folder is still a file the run holds."""
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
 
@@ -632,7 +634,7 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
             return False
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         parts = line[3:].strip('"').split("/")[:-1]
-        return any(part in DISPOSABLE or (part in BUILD_OUTPUT
+        return any(part in DISPOSABLE or (build_output and part in BUILD_OUTPUT
                                           and Path(work, *parts[:at], BUILD_OUTPUT[part]).is_file())
                    for at, part in enumerate(parts))
     return "\n".join(line for line in lines.splitlines() if line.strip() and not rebuilt(line))
@@ -1031,7 +1033,7 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
     may land the same items; the lane squash-merges, so the branch reads
     unpushed forever (pack sd:6909). Kept: an unreleased run on the path, an
     item of any run on it not done, a dirty or unread worktree, one holding an
-    ignored or untracked file outside a `DISPOSABLE` cache, a locked one, a
+    ignored or untracked file outside a `DISPOSABLE` cache or `BUILD_OUTPUT` beside its manifest, a locked one, a
     live session other than a builder's. The paths removed.
 
     An item marked done is no proof its commits landed: a squash merge leaves
@@ -1066,7 +1068,7 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
         if entry["keep"] or not Path(work).is_dir():
             continue
         try:
-            if kept_files(git, work):
+            if kept_files(git, work, build_output=True):
                 continue
         except Unread:
             continue

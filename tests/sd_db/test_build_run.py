@@ -5912,17 +5912,21 @@ class Sweep(Case):
             (work / folder).mkdir(parents=True)
             (work / folder / "index.js").write_text("x")
         self.assertEqual(build_run.sweep(self.db), [], "no manifest: nothing rebuilds them")
-        self.assertEqual(sorted(build_run.kept_files(["git"], str(work)).splitlines()),
-                         ["!! node_modules/left-pad/index.js", "!! target/debug/index.js",
-                          "!! web/node_modules/x/index.js"])
+        every = ["!! node_modules/left-pad/index.js", "!! target/debug/index.js", "!! web/node_modules/x/index.js"]
+        self.assertEqual(sorted(build_run.kept_files(["git"], str(work), build_output=True).splitlines()), every)
         for manifest in ("package.json", "Cargo.toml"):
             (work / manifest).write_text("{}")
-        self.assertEqual([line for line in build_run.kept_files(["git"], str(work)).splitlines()
+        self.assertEqual([line for line in build_run.kept_files(["git"], str(work), build_output=True).splitlines()
                           if line.startswith("!!")], ["!! web/node_modules/x/index.js"],
                          "web/ has no package.json of its own")
         (work / "web" / "package.json").write_text("{}")
         support.git(work, "add", "package.json", "Cargo.toml", "web/package.json")
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "chore: manifests")
+        # Review of build/sd-2260, round 2: only the sweep, whose items are all done and whose head is kept,
+        # reads build output as rebuildable. The cleaning step and the split check call `kept_files` plain:
+        # there an ignored folder is still work a builder would inherit, or a file the run must not lose.
+        self.assertEqual(sorted(build_run.kept_files(["git"], str(work)).splitlines()), every)
+        self.assertEqual(build_run.kept_files(["git"], str(work), build_output=True), "")
         self.assertEqual(build_run.sweep(self.db), [str(work)])
         self.assertFalse(work.exists())
 
