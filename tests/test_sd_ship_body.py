@@ -967,6 +967,8 @@ class CitedIdTests(unittest.TestCase):
             f"Kept.<!-- note\n> q --> Reverted commits:\n- {a} renew\n": [],
             f"Kept.<!-- note\n```\n--> Reverted commits:\n- {a} renew\n": [],
             f"Kept.<!-- note\n# h\n--> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n===\n--> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n---\n--> Reverted commits:\n- {a} renew\n": [],
             f"Notes:\n- see.<!-- x\n\n  --> Reverted commits:\n  - {a}\n": [],
             # A heading is one line: a comment it opens closes on it or not at all.
             f"## Kept.<!-- note\n--> Reverted commits:\n- {a} renew\n": [],
