@@ -1864,6 +1864,7 @@ class Supervisor:
             return None
         last, mine = self.review_files()
         kept = self.out("prior")
+        carried: list[dict] = []
         for path in (last, mine):
             try:
                 text = path.read_text(encoding="utf-8")
@@ -1882,8 +1883,14 @@ class Supervisor:
                     return None
                 continue
             reviewed = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
-            if reviewed == head:  # a fix with no commit: an older report would omit this round's blockers
-                return None
+            if reviewed == head:
+                # A fix with no commit (a rebuttal): the older kept report verifies the same delta, with this
+                # round's blockers carried in, so none is omitted (sd:10902). Anything else reviews in full.
+                if path != last or not isinstance(answer, dict) or not isinstance(answer.get("findings"), list):
+                    return None
+                carried = [row for row in answer["findings"]
+                           if isinstance(row, dict) and row.get("disposition") == "blocking"]
+                continue
             # `sd-review` verifies only these statuses: a `skipped` round has no prior to verify (sd:2721).
             if (not isinstance(reviewed, str) or answer.get("scope") != "branch"
                     or answer.get("status") not in ("clean", "advisory", "blocking", "gate_failed")
@@ -1904,6 +1911,12 @@ class Supervisor:
                 if path == last:
                     return None
                 continue
+            if carried:
+                seen = {(row.get("path"), row.get("line"), row.get("summary"))
+                        for row in answer["findings"] if isinstance(row, dict)}
+                answer["findings"] += [row for row in carried
+                                       if (row.get("path"), row.get("line"), row.get("summary")) not in seen]
+                answer["status"] = "blocking"
             for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
                 if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
                     row["path"] = self.locations({"path": row["path"]})[0][0]

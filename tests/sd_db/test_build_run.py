@@ -2152,6 +2152,25 @@ class Supervise(Case):
         fix = [call["argv"] for call in self.calls("claude")][1]
         self.assertIn("instances: src.py:1", fix[fix.index("-p") + 1], "the fix brief lacks the instance list")
 
+    def test_a_fix_with_no_commit_verifies_every_earlier_blocker_not_the_branch(self):
+        """sd:10902: a fix round that commits nothing (a rebuttal) leaves the last report at the head. The
+        next review verifies the older kept report over the same delta, with the last round's blockers
+        carried in, instead of reviewing the whole branch again."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "asked"], sd_review=["blocking", "blocking2", "clean"])
+        self.supervisor().run()
+        argvs = [call["argv"] for call in self.calls("sd-review")]
+        self.assertEqual(len(argvs), 3, self.latest()["detail"])
+        first, second, third = argvs
+        self.assertIn("--verify-report", third, "a fix with no commit reviewed the whole branch")
+        self.assertEqual(third[third.index("--base") + 1], second[second.index("--base") + 1],
+                         "the same delta was not verified")
+        prior = json.loads(Path(third[third.index("--verify-report") + 1]).read_text(encoding="utf-8"))
+        self.assertIn(("work.txt", 2), [(row["path"], row["line"]) for row in prior["findings"]],
+                      "the last round's blocker was not carried into the verified report")
+        self.assertEqual(len(prior["findings"]), 2, "a blocker both rounds found was carried twice")
+
     def test_a_new_round_two_finding_on_unchanged_code_files_a_follow_up(self):
         """Pack sd:9769: a later round's finding off the delta and off the earlier findings is filed, not a block."""
         self.press()
