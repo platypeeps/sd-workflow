@@ -290,6 +290,8 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
         return None, f"it reviewed from {str(record.get('base'))[:12]}, not the fork from origin/{base}"
     if reviewed == head:
         return record, f"the {record['status']} pass of {head[:12]} covers it"
+    if record.get("head_only"):  # a build's settled pass: its rulings judged that tree alone (sd:10919)
+        return None, f"the pass of {reviewed[:12]} settled on rulings, which cover that head alone"
     try:
         carried = carry_forward(root, reviewed, head, f"refs/remotes/origin/{base}")
     except Refusal:

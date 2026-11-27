@@ -1358,6 +1358,21 @@ class Supervise(Case):
         record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], head, "main",
                                        {"fixture": "binding"})
         self.assertIsNotNone(record, why)
+        # A clean merge of main far from the branch carries a plain pass; a ruling judged the tree at H, and
+        # main may add the caller it said was missing, so this pass covers H alone (review of sd:10919).
+        support.git(work, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        (work / "far").mkdir()
+        (work / "far" / "caller.txt").write_text("a new caller\n", encoding="utf-8")
+        support.git(work, "add", "far")
+        support.git(work, "commit", "-q", "-m", "feat: a new caller")
+        support.git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
+        support.git(work, "checkout", "-q", self.bundle["branch"])
+        support.git(work, "merge", "-q", "--no-edit", "refs/remotes/origin/main")
+        merged = support.git(work, "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(lane.carry_forward(work, head, merged, "refs/remotes/origin/main"))
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], merged, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
         support.git(work, "commit", "-q", "--allow-empty", "-m", "fix: later")
         moved = support.git(work, "rev-parse", "HEAD").strip()
         record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], moved, "main",

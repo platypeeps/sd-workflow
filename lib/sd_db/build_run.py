@@ -2746,7 +2746,8 @@ class Supervisor:
         """Record the review at `head` this run settled to a pass (every blocker ruled or deferred) as the lead
         pass lane prepare reuses at the same head (sd:10919, pack sd:5988), in the record `sd-review` writes
         for a pass of its own (`sd_lib.lead_review_key`, `record_lead_review`). The lane checks the binding,
-        the fork and the head itself, so a report that lacks one records nothing: the lane reviews in full."""
+        the fork and the head itself, so a report that lacks one records nothing: the lane reviews in full. The record
+        covers `head` alone: the lane carries no ruled pass across a merge (review of sd:10919)."""
         try:
             report = json.loads(self.out("review").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -2763,7 +2764,9 @@ class Supervisor:
         record_state(self.db, "checkpoint", key=f"review:v1:{repository}:{self.row['branch']}", body={
             "repository": repository, "branch": self.row["branch"], "head": head, "base": base, "status": status,
             "binding": binding, "reviewed_by": report.get("reviewed_by", []), "challenge": False,
-            "copilot_automatic": copilot.get("automatic"), "settled_by": f"build run {self.ident}"})
+            "copilot_automatic": copilot.get("automatic"), "settled_by": f"build run {self.ident}",
+            # Its rulings judged the tree at `head`: a catch-up merge may add the caller one said was missing.
+            "head_only": True})
 
     def known_failure(self) -> bool:
         """Whether the last blocking round, after which a fix ran, failed a check: a blocker with no line
