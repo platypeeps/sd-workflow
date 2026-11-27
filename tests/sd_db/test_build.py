@@ -790,10 +790,11 @@ class DesignRulings(Case):
             "SELECT result FROM assignment WHERE scope = ? AND item IN (?, ?) ORDER BY id", (build.SCOPE, code, item))]
         self.assertTrue(all(f"waits on design question note #{asked}" in (result or "") for result in results),
                         results)
-        # sd:10819: a Retry leaves the design out, parked, while its reopened question waits.
-        queued = build.retry(self.db, bundle["assignment"], who="operator")["queued"]
-        self.assertEqual([row["item"] for row in queued], [code])
-        self.assertIsNotNone(item_state(self.db, item)["item"]["parked_at"])
+        # Review of sd:10819: the reopened question predates the build, so it leaves no member out; the
+        # design's own ruling check refuses the whole Retry, as before.
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE id = ?", (asked,))
+        with self.assertRaisesRegex(build.BuildRefused, "waits on design question"):
+            build.retry(self.db, bundle["assignment"], who="operator")
 
     def test_a_p1_design_rides_an_ordinary_code_bundle(self):
         """Review of sd:10096: a P1 row joined only a P1 lead of its area, and a ride never leads, so a P1
@@ -2181,6 +2182,45 @@ class Park(Case):
                 self.assertEqual(runner.queue_state(self.db, child)["status"], "queued" if answered else "cancelled")
                 self.assertEqual((self.statuses(self.items), self.parked()),
                                  (["ready", "ready"], [False, not answered]))
+
+    def backdate(self, note):
+        """Move question `note` to before the run's claim: asked before the build, still unanswered."""
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE id = ?", (note,))
+
+    def test_a_question_from_before_the_build_leaves_no_member_out(self):
+        """Review of sd:10819 (build.py:1477, :920, :931, :1465): Retry read every unanswered question, whenever
+        asked, so one that predates the build dropped a member the run built. Only the run's own count."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.backdate(add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B"))
+        lead, child = (m["id"] for m in build.run(self.db, self.bundle["id"])["members"])
+        self.assertEqual([row["item"] for row in build.retry(self.db, lead, who="operator")["queued"]], self.items)
+        self.assertEqual(self.parked(), [False, False])
+
+    def test_an_old_question_ahead_of_the_lead_still_builds_fresh(self):
+        """The same class on the `ahead` path (build.py:920): a member the lead waits on, with a question
+        from before the build, leaves to build fresh, unparked."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        workflow.edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        self.backdate(add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B"))
+        lead = build.run(self.db, self.bundle["id"])["members"][0]["id"]
+        self.assertEqual([row["item"] for row in build.retry(self.db, lead, who="operator")["queued"]],
+                         [self.items[1]])
+        self.assertEqual(self.parked()[1], False)
+
+    def test_build_by_item_press_checks_a_member_with_an_old_question(self):
+        """The same class in `_retry_takes` (build.py:1465): an old question skipped the member's press check,
+        so Build by item chose a Retry that refuses. It is checked; a question the run raised is not."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        outside = self.item(status="planning")
+        workflow.edit_item(self.db, self.items[1], {"blocked_by": [outside]}, who="operator")
+        asked = add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
+        lead = build.run(self.db, self.bundle["id"])["members"][0]["id"]
+        self.assertTrue(build._retry_takes(self.db, lead, "blocked"), "the run's own question: left out")
+        self.backdate(asked)
+        self.assertFalse(build._retry_takes(self.db, lead, "blocked"), "an old question: press-checked")
 
     def test_a_retry_parks_a_member_its_lead_waits_on_while_its_question_waits(self):
         """sd:10819, the `ahead` path: a member the lead waits on leaves to build fresh, but not while its
