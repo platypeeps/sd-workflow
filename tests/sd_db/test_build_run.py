@@ -1206,7 +1206,8 @@ class Supervise(Case):
         block the items; each fix resumes."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
         self.assertIn(f"{R + 2} review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
@@ -1222,6 +1223,11 @@ class Supervise(Case):
         self.assertIn("rule each numbered blocker", prompts[-1], "sd:10286: the last round rules")
         self.assertIn("1. work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
+
+    def fixed_ruling(self):
+        """The ruling round's child that rules its one blocker FIX, as each ruling round writes a file (sd:10913)."""
+        (self.plans / "rulings.txt").write_text(json.dumps([{"blocker": 1, "ruling": "fix", "reason": "a failing input"}]))
+        return "rule_apart"
 
     def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2", rule="rule_apart",
                      **options):
@@ -1786,11 +1792,33 @@ class Supervise(Case):
                 self.setUp()
                 ended = self.ruling_round(text, after=("blocking2",))
                 self.assertEqual(ended["outcome"], "blocked", ended)
-                self.assertIn(f"{build_run.REVIEW_ROUNDS + 2} review rounds left blockers", self.latest()["detail"])
+                # sd:10913: no file at all ends the run before the review; one that does not read parks after it.
+                self.assertIn("the ruling round wrote no rulings file" if name == "no file" else
+                              f"{build_run.REVIEW_ROUNDS + 2} review rounds left blockers", self.latest()["detail"])
                 self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
                 said = [body for (body,) in self.db.execute(
-                    "SELECT body FROM note WHERE item = ? AND body LIKE '%ruling round%rulings%'", (self.items[0],))]
+                    "SELECT body FROM note WHERE item = ? AND body LIKE '%ruling round''s rulings at%'", (self.items[0],))]
                 self.assertEqual(len(said), 0 if name == "no file" else 1, said)
+
+    def test_a_ruling_round_that_writes_no_rulings_file_delivers_nothing(self):
+        """sd:10913: the ruling round wrote no rulings file and the review after it omitted the blockers. The
+        run delivered; it now ends blocked before that review, and no review is spent."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round(None, after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the missing rulings")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_applied_rulings_walked_again_review_as_usual(self):
+        """sd:10913: a later walk at the same count, the applied rulings file gone, is no missing file."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertFalse(again.rulings.exists())
+        self.assertIsNone(again.ruled(head))
 
     def test_a_reason_is_one_bounded_line(self):
         """sd:10286, long input: a reason is folded and cut before it is a note or a rebuttal."""
@@ -1800,14 +1828,15 @@ class Supervise(Case):
 
     def test_a_rulings_file_from_before_the_round_is_not_this_rounds(self):
         """sd:10286, a stale value: a rulings file an earlier round left is gone before the ruling child
-        starts, so a builder that writes none rejects nothing."""
+        starts, so a builder that writes none rejects nothing, and delivers nothing (sd:10913)."""
         self.press()
         self.supervisor().logs.mkdir(parents=True, exist_ok=True)
         self.rulings_file().write_text(json.dumps([{"blocker": 1, "ruling": "reject", "reason": "stale"}]))
         R = build_run.REVIEW_ROUNDS
         self.write_pr()
         self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=[*["blocking"] * (R + 1), "clean"])
-        self.assertEqual(self.supervisor().run().get("step"), "enqueued")
+        self.assertEqual(self.supervisor().run().get("outcome"), "blocked")
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
         self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
 
     def test_rulings_walked_twice_are_written_once(self):
@@ -1839,7 +1868,8 @@ class Supervise(Case):
         model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
         self.assertEqual(len(self.calls("sd-review")), R + 2, "the park moved")
@@ -2029,7 +2059,8 @@ class Supervise(Case):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
         R = build_run.REVIEW_ROUNDS
         self.press(2)
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         add_note(self.db, self.items[1], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
@@ -4036,7 +4067,7 @@ class Supervise(Case):
             again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
                                 root=self.root / "worktrees")
         assert again is not None
-        self.plan(claude=["fixr"], sd_review=["clean"])
+        self.plan(claude=[self.fixed_ruling()], sd_review=["clean"])
         self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
         fix = [call["argv"] for call in self.calls("claude")][-1]
         self.assertIn("rule each numbered blocker", fix[fix.index("-p") + 1])

@@ -287,6 +287,8 @@ HELD_NOTES = ("[downgraded: repeats a rebutted finding, no evidence cited]",
               "[downgraded: repeats a blocker a build ruling rejected]")
 #: The checkpoint key prefix of the head a blocking round found its blockers at, by assignment.
 ROUND_HEAD = "build-round-head:"
+#: The checkpoint key prefix of the round head whose rulings `ruled` applied, by assignment (sd:10913).
+RULINGS_APPLIED = "build-rulings-applied:"
 #: The rulings `RULING` asks for, and the longest reason kept.
 RULINGS = ("fix", "reject", "file", "ask")
 REASON_MAX = 500
@@ -2308,7 +2310,13 @@ class Supervisor:
         A blocker that is no review finding (an enqueue check, a failed gate: line "-") takes no rebuttal: no
         review reads one for it."""
         if not self.rulings.exists():
-            return None  # no ruling round wrote one for this head (a retry that kept the count): review as usual
+            # Applied at this round head already (a later walk, a retry that kept the count): review as usual.
+            # Else the ruling round wrote none: its blockers stand unruled, and a review that omits them must
+            # not deliver around them (sd:10913).
+            if self.rulings_applied():
+                return None
+            return self.finish("blocked", f"the ruling round wrote no rulings file at {head[:12]}, so its "
+                                          f"blockers stand unruled: {' '.join(self.summary(self.round_blockers()).split())}")
         blockers = self.round_blockers()
         found, unread = self.read_rulings(len(blockers))
         if unread:
@@ -2341,8 +2349,25 @@ class Supervisor:
                 question=(f"Build run {self.ident} cannot rule on: {text}"[:build.FINDING_MAX - 80]
                           + "\nOption: Fix it in this build (Recommended)\nOption: Reject it and deliver"))
         # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
+        self.once(f"rulings-applied:{head}", lambda: record_state(
+            self.db, "checkpoint", key=f"{RULINGS_APPLIED}{self.row['assignment']}", body=self.round_head()))
         self.rulings.unlink(missing_ok=True)
         return None
+
+    def rulings_applied(self) -> bool:
+        """Whether `ruled` applied rulings for the blockers of the last blocking round (`round_head`), in this
+        run or one before it on the assignment; False when that head does not read (fail closed)."""
+        reviewed = self.round_head()
+        if reviewed is None:
+            return False
+        for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?",
+                                       (f"{RULINGS_APPLIED}{self.row['assignment']}",)):
+            try:
+                if json.loads(body) == reviewed:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def reaches(self, row: dict, words: tuple[set[str], set[str]] | None, head: str) -> list[str]:
         """How a ruling round's own changes (`round_words`) reach a blocker that names none of them, at each
