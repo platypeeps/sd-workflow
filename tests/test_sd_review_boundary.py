@@ -1207,11 +1207,22 @@ class LineBudgetTests(unittest.TestCase):
         # 5200 -> 5201 is the last round of build/sd-2205: `bin/sd-review`
         # +1, a docstring line: `_rebuts` tests the saved evidence beside
         # every `open` citation. Measured: `sd-review` is 3231.
+        #
+        # 5201 -> 5263 is sd:10918: a rebuttal follows its line through a
+        # `-U0` diff (`followed_line`, `lines_now`) instead of lapsing on any
+        # edit to its file, matches a reworded repeat at its exact line,
+        # and holds a cited repeat when its test passed. Measured:
+        # `sd-review` is 3293.
+        #
+        # 5263 -> 5268 is the build/sd-2233 review: `is_rebutted` takes a
+        # `verdict` mode, so a test holds a cited repeat only in its
+        # recorded words and never outweighs a reader's `open`. Measured:
+        # `sd-review` is 3298.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5201,
+            5268,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
