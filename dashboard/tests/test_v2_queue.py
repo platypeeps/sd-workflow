@@ -2089,6 +2089,38 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         kept = self.run_view("R.repos = repos();", search="?show=suggested")
         self.assertIn("beta:false", kept["R"]["repos"])
 
+    def test_advisory_items_are_hidden_until_the_advisories_toggle_is_on(self):
+        # sd:10915: #61 is an advisory item; off (the row unset) its suggested row is gone, on it shows.
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [61], "row": None, "show": False, "error": ""}
+        out = self.run_view("open('system'); R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;",
+                            search="?show=suggested")
+        self.assertNotIn("#61 Ready 61", out["R"]["html"])
+        self.assertIn("#60 Ready 60", out["R"]["html"])
+        self.assertIn('data-f="qshow" data-v="advisory" aria-pressed="false"', out["R"]["filters"])
+        self.doc["advisories"].update(row="on", show=True)
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=suggested")
+        self.assertIn("#61 Ready 61", out["R"]["html"])
+
+    def test_the_advisories_toggle_posts_its_row_and_reads_today_again(self):
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [61], "row": None, "show": False, "error": ""}
+        answers = {"/api/settings/row": [200, {"key": "dashboard.queue_advisories", "value": "on", "was": None}]}
+        out = self.run_view("R.before = OUT.gets.length; press('advisory'); await flush(); await flush(); await flush();"
+                            " R.after = OUT.gets.slice(R.before); R.said = ELS['queue-said'].textContent;", answers=answers)
+        self.assertEqual([p[:2] for p in out["posts"]],
+                         [["/api/settings/row", {"key": "dashboard.queue_advisories", "value": "on", "before": None}]])
+        self.assertIn("/api/now", out["R"]["after"])
+        self.assertEqual(out["R"]["said"], "Advisory items show.")
+        self.assertEqual(out["urls"], [], "the toggle is the setting row, not a ?show= key")
+
+    def test_an_advisories_read_that_failed_hides_nothing_and_says_so(self):
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [], "row": None, "show": True,
+                                  "error": "database is locked"}
+        out = self.run_view("open('system'); R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;"
+                            " R.note = ELS['queue-note'].textContent;", search="?show=suggested")
+        self.assertIn("#61 Ready 61", out["R"]["html"])
+        self.assertNotIn('data-v="advisory"', out["R"]["filters"])
+        self.assertIn("Advisory items not read: database is locked", out["R"]["note"])
+
     def test_suggested_is_on_with_no_show_key_and_turned_off_stays_off_on_a_reload(self):
         # pack sd:7314 (operator request): no `show` key starts Suggested on. Turning every filter off writes `show=` empty,
         # so a reload keeps them off; a key naming other filters keeps Suggested off, as before.
