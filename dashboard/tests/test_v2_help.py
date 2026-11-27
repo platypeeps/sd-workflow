@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +19,10 @@ from sd_dashboard import help_screen, v2
 from sd_db import create_item
 from support import NOW, ScreenCase
 from test_v2_registry import GROUPS, Registers
+from test_v2_tasks import SHELL, STAND_IN
+from test_v2_today import OSASCRIPT
+
+V2 = Path(v2.__file__).resolve().parent
 
 
 def text(document) -> str:
@@ -136,6 +141,35 @@ class TheLiveValues(ScreenCase):
         found = help_screen.sections("## Ü <b>\n\n- one <i>é</i>\n  two `a<b`\n", lambda token, name: {})
         self.assertEqual(found, [{"title": "Ü <b>", "blocks": [
             {"kind": "li", "parts": [{"text": "one <i>é</i> two "}, {"code": "a<b"}]}]}])
+
+
+DOC = {"phrases": [{"phrase": "triage", "does": "d", "budget": "b", "mode": "acts"}],
+       "sections": [{"title": "Load and capacity", "blocks": [{"kind": "p", "parts": [{"text": "words"}]}]}],
+       "problems": [], "read": "2026-11-26T00:00:00Z"}
+
+
+class TheScript(unittest.TestCase):
+    """help.js under JavaScriptCore against the tasks stand-in, the shell's nav already drawn."""
+
+    def test_help_draws_into_the_page_body_and_keeps_the_nav(self):
+        # Lane review: help.js drew into #sections, the id of the shell's nav, so opening Help replaced the nav.
+        script = (STAND_IN + (V2 / "static" / "markup.js").read_text(encoding="utf-8") + "\nconst mk = window.markup.html;\n"
+                  + SHELL + f"\nANSWER = () => [200, {json.dumps(DOC)}];\n"
+                  + "ELS.sections = El('sections'); ELS.sections.html = 'NAV';\n"
+                  + (V2 / "static" / "help.js").read_text(encoding="utf-8")
+                  + "\n(async () => { try { (DOC_LISTENERS.DOMContentLoaded || []).forEach(f => f()); await flush(); }"
+                  + " catch (e) { OUT.error = String(e); } })();\n"
+                  + "function run() { OUT.html = Object.fromEntries(Object.entries(ELS).map(([k, e]) => [k, e.html]));"
+                  + " return JSON.stringify(OUT); }\n")
+        result = subprocess.run([OSASCRIPT, "-l", "JavaScript", "-e", script], capture_output=True, text=True,
+                                timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertIsNone(out["error"])
+        self.assertEqual(out["html"]["sections"], "NAV", out)
+        drawn = [key for key, value in out["html"].items() if value and "Load and capacity" in value]
+        self.assertEqual(len(drawn), 1, drawn)
+        self.assertIn(f'id="{drawn[0]}"', (V2 / "help.html").read_text(encoding="utf-8"))
 
 
 class TheRail(unittest.TestCase):
