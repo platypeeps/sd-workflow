@@ -5146,12 +5146,14 @@ def item_end(queue: Queue, item: int, entry: dict[str, Any] | None, build: dict[
     require_sd_db()
     from sd_db.repos import item_ref  # noqa: PLC0415 - sd_db is required above
     status, ref = (entry.get("status") if entry else "none"), item_ref(item, queue.repository)
-    if status in ("pending", "running") or (build and build["status"] in BUILDING):
+    if build and build["status"] in BUILDING:
         return None
-    if build is not None and build_ended_last(build, entry):
+    if build is not None and build_ended_last(build, entry):  # before a pending entry: review of sd:10908
         reason = " ".join(str(build["result"] or "no reason recorded").split())
         write(f"{ref} build {build['status']}: {reason}")
         return False
+    if status in ("pending", "running"):
+        return None
     if entry is None:
         write(f"{ref} none: no lane entry that is not cancelled")
     elif status == "merged":
@@ -5170,8 +5172,8 @@ def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = pr
     remove the worktree it started in. One line per item as it ends. An item
     whose newest build assignment is queued or running waits on it, entry or
     none (sd:10908); one whose build blocked or was cancelled after its
-    newest entry, or with none, ends naming the build's result; one with
-    neither ends at once. A read the hub did not answer is no end: it reads
+    newest entry, pending or not, or with none, names the build's result
+    and ends the whole watch at once; one with neither ends at once. A read the hub did not answer is no end: it reads
     again after the pause, and a hub that refuses this build stops it.
     """
     require_sd_db()
@@ -5190,11 +5192,15 @@ def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = pr
                 raise
             write(f"hub unavailable: {error}; reading again")
             newest = {}
+        blocked = False
         for item, (entry, build) in newest.items():
             ended = item_end(queue, item, entry, build, write)
+            blocked = blocked or (ended is False and build_ended_last(build, entry))
             if ended is not None:
                 left.remove(item)
                 merged = merged and ended
+        if blocked:
+            return 1  # a blocked build needs the operator now, not after the others (review of sd:10908)
         if not left:
             return 0 if merged else 1
         watch_pause()

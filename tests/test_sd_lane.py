@@ -6580,6 +6580,32 @@ class Watch(Lane):
         self.assertEqual(lines, [f"pack sd:{one} build blocked: a retried build blocked",
                                  f"pack sd:{two} failed: a finding"])
 
+    def test_watch_items_exit_when_one_items_build_blocks(self) -> None:
+        """Review of sd:10908: a blocked build sat behind another item's running one."""
+        one, two = self.register_items(2)
+        assignment, _ = self.build(one, "running"), self.build(two, "running")
+        pauses: list[int] = []
+
+        def pause() -> None:
+            pauses.append(len(pauses))
+            if len(pauses) == 1:
+                self.end_build(assignment, "blocked", "round 3 left blockers")
+            if len(pauses) > 3:
+                raise AssertionError("waited on the other item")
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (1, [f"pack sd:{one} build blocked: round 3 left blockers"]))
+
+    def test_watch_item_names_a_blocked_build_over_a_pending_entry(self) -> None:
+        """Review of sd:10908: a pending entry hid the build that blocked after it."""
+        [item] = self.register_items(1)
+        sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                              claim="deliver")
+        self.build(item, "blocked", "a fix round blocked", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (1, [f"pack sd:{item} build blocked: a fix round blocked"]))
+
     def test_watch_item_reads_again_after_a_hub_fault(self) -> None:
         """A read the hub did not answer is unknown, not an end."""
         sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
