@@ -273,12 +273,32 @@ class DispositionTests(unittest.TestCase):
         self.operation().check_review(self.head, refresh_adjudication=True)
         self.assertEqual(runs.read_text(), "xx")
 
+    def test_a_rebuttal_test_runs_in_a_disposable_worktree_at_the_head(self):
+        """sd:10893 class fix: the test runs in a throwaway worktree of the exact head, as the gate's rerun
+        does, so no test writes the live checkout, tracked or ignored, and git cannot restore an ignored file."""
+        self.blocked()
+        with (self.root / ".git/info/exclude").open("a") as stream:
+            stream.write("example-ignored.txt\n")
+        ignored = self.root / "example-ignored.txt"
+        ignored.write_text("operator data")
+        tracked = fixture._git(self.root, "ls-files").split()[0]
+        before = (self.root / tracked).read_bytes()
+        script = ("import os, subprocess; open('example-ignored.txt', 'w').write('clobbered'); "
+                  f"open({tracked!r}, 'w').write('clobbered'); subprocess.run(['git', 'checkout', '--', '.']); "
+                  f"assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == {self.head!r}")
+        self.accepted(self.with_test([sys.executable, "-c", script]))
+        self.assertEqual(ignored.read_text(), "operator data")
+        self.assertEqual((self.root / tracked).read_bytes(), before)
+        self.assertEqual(fixture._git(self.root, "status", "--porcelain"), "")
+        listed = fixture._git(self.root, "worktree", "list", "--porcelain")
+        self.assertEqual(listed.count("worktree "), 1, listed)
+
     def test_a_test_that_dirties_the_checkout_or_is_malformed_refuses(self):
         """sd:10893. The record binds the clean exact head; `test` is an argv list, not a shell string."""
         self.blocked()
         dirty = [sys.executable, "-c", "open('example-left-behind.txt', 'w').close()"]
         self.rejected_proposal(self.with_test(dirty))
-        (self.root / "example-left-behind.txt").unlink()
+        self.assertFalse((self.root / "example-left-behind.txt").exists())
         for value in ("python3 -c pass", [""], [1], {"argv": []}, ["a\0b"]):
             with self.subTest(value=value):
                 self.rejected_proposal(self.with_test(value))
