@@ -1826,18 +1826,31 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     return found
 
 
-def rendered_heading_lines(lines: list[str]) -> list[tuple[int, str]]:
-    """`note_heading_lines`, trusting only a fence whose line starts at column 0.
+def fenced_headings_only(lines: list[str]) -> bool:
+    """Whether every `## ` line of section text is code wherever the note renders (sd:10784).
 
-    An indented fence line may sit in a list item, and CommonMark ends that
-    fence when the item ends: a column-0 `## ` after it renders as a heading
-    the reader takes for code (review of sd:10784). An indented fence line is
-    read as text here, so such a `## ` line counts; a top-level fence with an
-    indented closer then reads as open, which only refuses more.
+    A line scan is not the renderer, so the text passes only where the two
+    cannot disagree (last-round class pass); anything else refuses:
+
+    - an indented fence line, anywhere: it may sit in a list item, whose end
+      closes its fence, or close a fence the scan would hold open;
+    - outside a fence, a line starting `<`, `$$` or `%%`: an HTML block, a
+      math block or an Obsidian comment takes the fence lines below it as
+      its own text, and what follows them renders as a heading;
+    - a `## ` line outside a fence, or a fence the text leaves open, which
+      would hide the note's later headings.
+
+    A column-0 fence line outside those blocks opens or closes a top-level
+    fence for the renderer as for `note_heading_lines`: a list item or a
+    quote continues only by indentation or `>`. The risky lines are read
+    as headings and one sentinel heading follows the text, so the text
+    passes only when the sentinel is the one heading found.
     """
 
-    return note_heading_lines(
-        [f"x{line}" if line[:1] == " " and CODE_FENCE.match(line) else line for line in lines], 0)
+    if any(line[:1] == " " and CODE_FENCE.match(line) for line in lines):
+        return False
+    marked = ["## risky" if line.lstrip().startswith(("<", "$$", "%%")) else line for line in lines]
+    return note_heading_lines([*marked, "## end"], 0) == [(len(lines), "end")]
 
 
 def section_span(lines: list[str], headings: list[tuple[int, str]],
@@ -2110,13 +2123,11 @@ def parse_sections(pairs: list[str]) -> dict[str, str]:
         # `^ {0,3}## `, not `startswith`. CommonMark renders a heading
         # indented by up to three spaces, so `   ## Score` reaches Obsidian
         # as a heading while `body_headings` -- which reads column 0 -- does
-        # not see it. A `## ` line inside a column-0 fence the text closes is
-        # code, as the note renders and is read back (sd:10784): a sentinel
-        # heading after the text is the only heading found then; an unclosed
-        # fence hides the sentinel, and would hide the note's later headings.
+        # not see it. A `## ` line is text only where `fenced_headings_only`
+        # can tell it renders as code (sd:10784).
         lines = text.splitlines()
         if any(SMUGGLED_HEADING.match(line) for line in lines):
-            if rendered_heading_lines([*lines, "## end"]) != [(len(lines), "end")]:
+            if not fenced_headings_only(lines):
                 raise Refusal(
                     f"section {name!r} carries its own `## ` heading;"
                     " section text is the body under a heading, not more headings")
@@ -2238,14 +2249,17 @@ def rendered_body(kind: dict[str, object], root: pathlib.Path, args: argparse.Na
     template = sections.get("template")
     if template is None:
         raise Refusal("the kind declares no `sections.template`, so there is nothing to render")
+    titled = fill_placeholders(read_template(root, str(template)), args.title)
     body = fill_sections(
-        fill_placeholders(read_template(root, str(template)), args.title),
+        titled,
         parse_sections(
             resolve_pair_files(args.section or [], "--section-file", sequences=False)))
 
     order = declared_sections(kind)
-    # Fence-aware as the note renders: section text may hold a fenced `## ` line (sd:10784).
-    rendered = [heading for _, heading in rendered_heading_lines(body.splitlines())]
+    # The template's own headings, read before the fill and with no fence model: section text may hold
+    # a fenced `## ` line, which `parse_sections` has vetted, and a `## ` line of the template counts
+    # fenced or not, as it did before sd:10784.
+    rendered = body_headings(titled)
     if order and rendered != order:
         # The first thing in this rollout that gives `sections.order` a
         # consequence. `validate_sections` never opens the template, so until

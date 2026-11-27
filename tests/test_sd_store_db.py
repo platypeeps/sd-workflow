@@ -199,8 +199,16 @@ class TheWrites(DbStoreFixture):
         self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Tip").stdout, code + "\n")
         self.ok("store", "set-section", "pp.tip", "First tip", "--section", f"Notes={code}")
         self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout, code + "\n")
+        inside = "```html\n<div>\n$$\n## a comment\n```"  # a risky start inside the fence is code too
+        self.ok("store", "set-section", "pp.tip", "First tip", "--section", f"Notes={inside}")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout, inside + "\n")
         for text in ("x\n## Notes", "```\n## Notes", "```\n```\n## Notes", "~~~\n## Notes\n```",
-                     "- item\n  ```\n## Notes\n  ```", " ```\n## Notes\n ```"):
+                     "- item\n  ```\n## Notes\n  ```", " ```\n## Notes\n ```",
+                     # Last-round class pass: each a place a line scan and the renderer disagree on a fence.
+                     "```\n ```\n## Notes\n```", "````\n ```\n````\n```\n   ```\n## Notes\n```",
+                     "<!--\n```\n-->\n## Notes\n```", "<div>\n```\n\n## Notes\n```",
+                     "  <pre>\n```\n</pre>\n## Notes\n```", "$$\n```\n$$\n## Notes\n```",
+                     "%%\n```\n%%\n## Notes\n```"):
             with self.subTest(text=text):
                 self.refused("store", "set-section", "pp.tip", "First tip", "--section", f"Tip={text}",
                              says="its own `## ` heading")

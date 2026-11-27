@@ -373,6 +373,15 @@ class AddRefusalTests(StoreFixture):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("but the template renders ['Tip', 'Extra', 'Score']", done.stderr)
 
+    def test_a_heading_after_an_indented_closer_counts_in_the_order_check(self) -> None:
+        """Last-round class pass on sd:10784: ` ``` ` closes a fence, so `## Extra` below it renders as a
+        heading; with indented fence lines read as text the order check took it for code."""
+
+        self.build(template="\n# {{title}}\n\n## Tip\n\n```\n ```\n## Extra\n```\n\n## Score\n")
+        done = self.run_sd("store", "add", "pp.tip", "T", "--field", "score=9")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("but the template renders ['Tip', 'Extra', 'Score']", done.stderr)
+
     def test_a_misspelled_placeholder_is_refused_rather_than_shipped(self) -> None:
         """Left in place it would reach every note written from that template
         as literal text, and be noticed by a reader rather than an author."""
