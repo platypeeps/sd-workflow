@@ -275,6 +275,23 @@ class ThroughAProxy(unittest.TestCase):
             with self.subTest(host=host, entries=entries):
                 self.assertEqual(remote._bypassed(host, entries), expected)
 
+    def test_a_proxy_on_another_machine_is_left_alone(self):
+        # The hub admits a tailnet session by its peer: a proxy elsewhere
+        # would become that peer and read the session, so only one on
+        # this machine (the sandbox's own) carries it.
+        for value in ("socks5://192.0.2.1:1080", "socks5h://proxy.example.test:1080",
+                      "socks5h://[2001:db8::1]:1080"):
+            with self.subTest(value=value):
+                os.environ["ALL_PROXY"] = value
+                self.assertIsNone(remote.socks_proxy(HUB))
+                self.assertEqual(self.read_one(), 1)
+
+    def test_a_proxy_named_localhost_or_ipv6_loopback_is_used(self):
+        os.environ["ALL_PROXY"] = "socks5h://localhost:1080"
+        self.assertEqual(remote.socks_proxy(HUB), ("localhost", 1080, True))
+        os.environ["ALL_PROXY"] = "socks5://[::1]:1080"
+        self.assertEqual(remote.socks_proxy(HUB), ("::1", 1080, False))
+
     def test_an_http_all_proxy_is_left_alone(self):
         os.environ["ALL_PROXY"] = f"http://127.0.0.1:{socket_closed_port()}"
         self.assertEqual(self.read_one(), 1)

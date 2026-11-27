@@ -636,8 +636,9 @@ def socks_proxy(host: str) -> tuple[str, int, bool] | None:
     a `NO_PROXY` entry naming the hub leaves the direct dial. A loopback
     hub is always dialled directly, as `calls.loopback_url` reads it: the
     socket stays on this machine, and the local wire suite runs inside a
-    sandbox that sets `ALL_PROXY`. A SOCKS value that does not parse is
-    refused: a direct dial would hide it.
+    sandbox that sets `ALL_PROXY`. A proxy that is not on this machine is
+    ignored: the hub would admit it as the peer. A SOCKS value that does
+    not parse is refused: a direct dial would hide it.
     """
     if _loopback(host):
         return None
@@ -656,6 +657,12 @@ def socks_proxy(host: str) -> tuple[str, int, bool] | None:
     if parsed is None or not parsed.hostname or port is None or parsed.username is not None:
         # The value is not echoed: a user's password may be in it.
         raise ProxyRefused(f"ALL_PROXY is not {scheme}://<host>:<port> with no user name or password")
+    if not _loopback(parsed.hostname):
+        # The hub admits a tailnet session by its TCP peer, and the session
+        # is plain inside the tunnel: a proxy on another machine would be
+        # that peer and read the session. Only this machine's own proxy
+        # (the sandbox's) carries it; any other is ignored, as before.
+        return None
     return parsed.hostname, port, scheme == "socks5h"
 
 
