@@ -54,6 +54,14 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // its Details are read, so its status commands are on from the start (pack sd:7334).
   // PARKI is the parked tasks the Parked box shows (sd:9247), adopted as OPENI's are so their rows act.
   let SUGG = new Map(), OPENI = new Map(), PARKI = new Map(), TASKS = new Map(), TD = null;
+  // sd:10915: ADV is the advisory items the Queue view hides: /api/now's `advisories.ids` while its toggle (the setting row
+  // dashboard.queue_advisories) is off. A read that failed hides none. Suggested, All items and Parked leave them out.
+  let ADV = new Set();
+  const advHidden = doc => { const a = (doc || {}).advisories; return a && !a.error && !a.show ? new Set((a.ids || []).map(Number)) : new Set(); };
+  // A task row's own `advisory` flag hides it too while the filter is off: a refresh of /api/tasks can bring one filed
+  // after /api/now's ids were read (sd:10915 lane review).
+  const advOff = () => { const a = (DOC || {}).advisories; return !!a && !a.error && !a.show; };
+  const advTask = t => ADV.has(Number(t.id)) || (!!t.advisory && advOff());
   const SROW = new Map();
   const listedTask = k => OPENI.get(k) || PARKI.get(k) || (SUGG.has(k) ? TASKS.get(k) : undefined);
   const isItem = id => SUGG.has(id) || OPENI.has(id) || PARKI.has(id), taskOf = k => SROW.get(k) || listedTask(k);
@@ -531,7 +539,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // no row (pack sd:7731): Suggested draws no Unassociated group; Tasks still lists it.
   function suggested(doc) {
     const live = new Set(((doc.active || {}).rows || []).map(r => r.item)), found = new Map();
-    ((doc.queues || {}).suggested || []).filter(r => r.repo && !live.has(r.id)).forEach(r => {
+    ((doc.queues || {}).suggested || []).filter(r => r.repo && !live.has(r.id) && !ADV.has(Number(r.id))).forEach(r => {
       found.set(String(r.id), r); });
     return found;
   }
@@ -548,10 +556,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     TASKS = new Map((QV.tasks ? QV.tasks.rows.map(TD.shape) : []).map(t => [t.key, t]));
     const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
     return new Map([...TASKS].filter(([k, t]) => (all || qShow.has('open')) && t.status !== 'done' && !t.parked && t.repo_path && !ideas.has(t.kind)
-      && !(qShow.has('suggested') && SUGG.has(k))));
+      && !advTask(t) && !(qShow.has('suggested') && SUGG.has(k))));
   }
-  const parkedTasks = () => { const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
+  // sd:10915: parkedAll is every parked task, hidden advisories too: it is the set whose blocked rows fold into Parked, so
+  // a hidden one stays parked and its blocked rows stay out of Blocked. parkedTasks is the ones drawn and counted.
+  const parkedAll = () => { const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
     return QV.tasks ? QV.tasks.rows.filter(t => t.parked && !ideas.has(t.kind)).map(TD.shape) : []; };
+  const parkedTasks = () => parkedAll().filter(t => !advTask(t));
   // sd:9258: a parked task with no repo is no row (pack sd:7731), so no row object; the tally still counts it.
   const parkedItems = () => new Map(parkedTasks().filter(t => t.repo_path).map(t => [t.key, t]));
   // A task's read row (SROW) holds while it is still an item row at the revision its /api/tasks row has (pack sd:7251): a
@@ -592,7 +603,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
     // pack sd:9425: a parked item is its Parked row alone: a blocked build or lane entry of it is no row and counts in no
     // box; the Parked row says why it waits instead. A parked task with no repo is no row, so its blocked rows stay.
-    const parked = new Set(parkedTasks().filter(t => t.repo_path).map(t => Number(t.id))), why = new Map();
+    const parked = new Set(parkedAll().filter(t => t.repo_path).map(t => Number(t.id))), why = new Map();
     // Each blocked row's reason and its controls move to the Parked row, so the item can still be retried or cancelled.
     const aside = (item, text, ctl) => parked.has(Number(item)) && !!why.set(Number(item), [...(why.get(Number(item)) || []), { text, ctl }]);
     ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))
@@ -681,8 +692,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const waits = new Set((((QV.lanes || {}).prs || {}).rows || []).map(p => Number(p.item))), laned = lanedItems();
     const opens = QV.tasks ? [...openItems(true).values()].filter(t => !waits.has(Number(t.id)) && !laned.has(Number(t.id))).length : null;
     const n = v => v !== 'open' ? every.filter(c => c.type === v).length : opens;
-    put($('queue-filters'), shell.list.fseg('qshow', 'Show', [['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
-      ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
+    // sd:10915: Advisories is the setting row's toggle, not a ?show= key; its count is the open advisory items.
+    const adv = DOC.advisories;
+    if (adv && adv.error) unread.push(`Advisory items not read: ${adv.error}`);
+    const advSeg = adv && !adv.error ? [{ v: 'advisory', pressed: !!adv.show, title: adv.show ? 'Advisory items show; press to hide them' : 'Advisory items are hidden; press to show them',
+      label: html`Advisories <span class="n">${String((adv.ids || []).length)}</span>` }] : [];
+    put($('queue-filters'), shell.list.fseg('qshow', 'Show', [...[['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
+      ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` })), ...advSeg]));
     const prs = prTally(every);
     // sd:8953: the parked tasks Tasks reads (parked_at, not a status), less the idea kinds; it opens Tasks' Parked chip.
     const parked = parkedTasks().length;
@@ -1073,7 +1089,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     DOC = doc; NEEDS = doc.needs || []; SNOOZED = doc.snoozed; ACTIVE = doc.active || null;
     ALL = new Map(); NEEDS.forEach(r => { ALL.set(r.id, r); (r.members || []).forEach(m => ALL.set(m.id, m)); });
     OTHER = others(doc);
-    SUGG = suggested(doc); OPENI = openItems(); PARKI = parkedItems();
+    ADV = advHidden(doc); SUGG = suggested(doc); OPENI = openItems(); PARKI = parkedItems();
     freshRows();
     document.body.dataset.observed = doc.now;
     const items = [...[...SUGG].map(([id, r]) => SROW.has(id) ? TD.objectOf(SROW.get(id)) : { id, type: 'item', label: `#${r.id} ${r.title}`, item: r.id }),
@@ -1082,7 +1098,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
                        { id: 'needs', type: 'needs list', label: 'Needs you' }],
              state: doc.snooze_error ? window.snooze.unread(doc.snooze_error, '/api/now') : null };
   }
-  function clear(err) { DOC = null; NEEDS = []; ALL = new Map(); OTHER = new Map(); SUGG = new Map(); OPENI = new Map(); PARKI = new Map(); TASKS = new Map(); SROW.clear(); SNOOZED = []; ACTIVE = null; failed = err.message; delete document.body.dataset.observed; }
+  function clear(err) { DOC = null; NEEDS = []; ALL = new Map(); OTHER = new Map(); SUGG = new Map(); OPENI = new Map(); PARKI = new Map(); ADV = new Set(); TASKS = new Map(); SROW.clear(); SNOOZED = []; ACTIVE = null; failed = err.message; delete document.body.dataset.observed; }
   function draw() {
     if (DOC) return render();
     // Nothing from the last read stays on screen: rows, counts, lamps, the observed time, the selection and the badge.
@@ -1347,6 +1363,21 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       const p = e.target.closest('tr.repo'); if (p && !e.target.closest('a, [data-copy]')) { qOpen = qOpen === p.dataset.repo ? null : p.dataset.repo; return queueView(); }
       pickRow('tr[data-id]')(e);
     });
+    // sd:10915: Advisories posts its setting row with the value this read saw, so a change made elsewhere since is a 409;
+    // either way the page reads Today again, and the line above the table says what happened.
+    async function advToggle() {
+      const a = DOC && DOC.advisories; if (!a || a.error || QV.busy) return;
+      QV.busy = true; queueView();
+      try {
+        await shell.post('/api/settings/row', { key: a.key, value: a.show ? '' : 'on', before: a.row ?? null });
+        qSaid = { ok: true, text: a.show ? 'Advisory items are hidden.' : 'Advisory items show.' };
+      } catch (err) {
+        qSaid = { ok: false, text: `Advisory items not ${a.show ? 'hidden' : 'shown'}: ${err.message}` };
+      }
+      QV.busy = false;
+      await Promise.resolve(reading.reread()).catch(() => {});
+      queueView();
+    }
     $('queue-pickup').addEventListener('click', async e => {
       const b = e.target.closest('button[data-pickup]'); if (!b || b.disabled || !QV.built) return;
       const on = b.dataset.pickup === 'on';
@@ -1362,6 +1393,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     });
     $('queue-filters').addEventListener('click', e => {
       const b = e.target.closest('button[data-f="qshow"]'); if (!b) return;
+      if (b.dataset.v === 'advisory') { advToggle(); return; }
       if (!qShow.delete(b.dataset.v)) qShow.add(b.dataset.v);
       // An empty show= is every filter off (pack sd:7314): no key would turn Suggested back on at the next load.
       shell.url({ show: QSHOW.filter(v => qShow.has(v)).join(',') });
