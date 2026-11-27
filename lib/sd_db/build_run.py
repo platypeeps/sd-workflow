@@ -2790,7 +2790,7 @@ class Supervisor:
             return self.finish("blocked", "the branch delivers no item: no commit has a `Closes: sd:N` trailer "
                                           "for one of the run's items")
         if not unmanaged:
-            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env, branch=self.row["branch"])
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
         try:
@@ -2829,7 +2829,7 @@ class Supervisor:
             # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
             # that file queued or ended at this head; the shared queue says whether that entry is this head, read
             # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
-            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env, branch=self.row["branch"])
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"

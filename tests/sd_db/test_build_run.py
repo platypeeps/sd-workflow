@@ -359,8 +359,11 @@ FAKE = textwrap.dedent('''
                and row["expected_head"] == argv[argv.index("--expected-head") + 1] for row in entries):
             print(json.dumps({"ok": False, "error": f"sd:{items[0]} at this head already ran in this lane"}))
             sys.exit(3)
+        # As the lane records it: the branch the enqueue ran on (sd:10830).
+        branch = subprocess.run(["git", "-C", argv[argv.index("-C") + 1], "branch", "--show-current"],
+                                capture_output=True, text=True).stdout.strip()
         entry = {"id": f"e{len(entries) + 1}", "item": items[0], "status": "pending", "enqueue_seq": len(entries) + 1,
-                 "expected_head": argv[argv.index("--expected-head") + 1]}
+                 "expected_head": argv[argv.index("--expected-head") + 1], "branch": branch}
         lane.write_text(json.dumps(entries + [entry]))
         print(json.dumps({"ok": True, **entry}))
     if role == "gh":  # pack sd:7868: an unmanaged repository's draft pull request, kept in `<plans>/pulls.json`
@@ -4416,11 +4419,33 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "pending",
-                                                           "enqueue_seq": 1, "expected_head": head}]))
+                                                           "enqueue_seq": 1, "expected_head": head,
+                                                           "branch": self.bundle["branch"]}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
         self.assertEqual(len(json.loads((self.plans / "lane.json").read_text())), 1)
+
+    def test_enqueue_resume_adopts_no_entry_of_another_branch(self):
+        """sd:10830 review: delivery took the newest entry of its items at its head on any branch, and the watch,
+        which reads only the run's branch, never saw it: the run stayed `enqueued`. It enqueues its own."""
+        self.press()
+        self.write_pr()
+        work = Path(self.bundle["work_path"])
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(work), "origin/main")
+        (work / "work.txt").write_text("done\n")
+        support.git(work, "add", "work.txt")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
+        head = support.git(work, "rev-parse", "HEAD")
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "failed",
+                                                           "enqueue_seq": 1, "expected_head": head,
+                                                           "branch": "build/sd-0"}]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        self.assertEqual([call["argv"][call["argv"].index("lane") + 1] for call in self.calls("sd-ship")],
+                         ["list", "enqueue"])
+        self.assertEqual([row["branch"] for row in json.loads((self.plans / "lane.json").read_text())],
+                         ["build/sd-0", self.bundle["branch"]])
 
     def legacy_resume(self, head_of=lambda head: head, status="pending"):
         """A run resumed at enqueuing whose item an earlier version's queue file holds pending, not imported:
@@ -4434,9 +4459,11 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "cancelled",
-                                                           "enqueue_seq": 1, "expected_head": head}]))
+                                                           "enqueue_seq": 1, "expected_head": head,
+                                                           "branch": self.bundle["branch"]}]))
         (self.plans / "legacy.json").write_text(json.dumps([{"id": "import-1", "item": self.items[0],
-                                                             "status": status, "expected_head": head_of(head)}]))
+                                                             "status": status, "expected_head": head_of(head),
+                                                             "branch": self.bundle["branch"]}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         return self.supervisor().run()
 
