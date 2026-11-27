@@ -5330,8 +5330,12 @@ roles:
             review.record_lead_review(self.root, args, {**result, "binding": {"review_declaration": "older"}},
                                       dict(os.environ))
         self.assertIsNone(self.lead_record(), "a pass under another binding was stamped with the current one")
-        review.record_lead_review(self.root, args, {**result, "status": "blocking"}, dict(os.environ))
-        self.assertIsNone(self.lead_record(), "a blocking pass was recorded")
+        blocker = {"path": "src.py", "line": 1, "summary": "defect", "disposition": "blocking"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, {**result, "status": "blocking", "findings": [
+                blocker, dict(blocker, disposition="advisory")]}, dict(os.environ))
+        self.assertEqual((self.lead_record()["status"], self.lead_record()["findings"]), ("blocking", [blocker]),
+                         "a blocking pass keeps its blockers for adjudicate (sd:10926)")
         with contextlib.redirect_stderr(io.StringIO()):
             review.record_lead_review(self.root, args, result, dict(os.environ))
         self.assertEqual(self.lead_record()["status"], "advisory", "an advisory pass was not recorded (sd:9767)")
