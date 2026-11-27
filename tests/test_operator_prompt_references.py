@@ -35,6 +35,9 @@ PROMPTS = {
     "sd-status": {
         "deep.md": ("/sd-status deep",),
     },
+    "sd-ship": {
+        "open-prs.md": ("check open PRs",),
+    },
 }
 
 
@@ -92,14 +95,89 @@ def reference(skill: str, name: str) -> str:
     return (ROOT / "skills" / skill / "references" / name).read_text(encoding="utf-8")
 
 
-class OpenPrSweepMovedOut(unittest.TestCase):
-    def test_no_skill_carries_or_routes_the_open_pr_sweep(self):
-        """The open-PR sweep moved to sd:10803 (ruling on sd:10795)."""
-        self.assertFalse((ROOT / "skills" / "sd-ship" / "references" / "open-prs.md").exists())
-        for skill in ("sd-next", "sd-ship"):
-            with self.subTest(skill=skill):
-                self.assertNotIn("open-prs", skill_text(skill))
-                self.assertNotIn("check open PRs", skill_text(skill))
+class OpenPrSweep(unittest.TestCase):
+    """The open-PR sweep (sd:10803), split from sd:10795 after review rounds.
+
+    Class pass (sd:10803), identity by proxy: nothing durable names a PR's items. A lane entry holds a
+    branch and no PR number; a note can quote any PR's URL; a build's run id leaves the assignment list
+    when the run is released, and its bundle rows list members the PR leaves open. Each proxy the sweep
+    tried sent a note, a retry or a delivery to another item. So it writes to no item and queues nothing.
+    """
+
+    def text(self) -> str:
+        return reference("sd-ship", "open-prs.md")
+
+    def kinds(self) -> set[str]:
+        return {" ".join(parse(command)[1]) for command in prescribed_commands(self.text())}
+
+    def test_sd_next_routes_the_plain_ask(self):
+        self.assertIn("check open PRs", description("sd-next"))
+        self.assertIn("skills/sd-ship/references/open-prs.md`", skill_text("sd-next"))
+
+    def test_a_fork_pr_is_reported_before_any_match(self):
+        """A fork's head branch can share a name with one in the base repo."""
+        text = self.text()
+        fork = text.index("head.repo.full_name")
+        self.assertLess(fork, text.index("lane list"))
+        self.assertIn("is a fork PR: report it and act on nothing", text)
+
+    def test_sweep_prescribes_no_item_keyed_command(self):
+        """Every instance of the class: the two notes, the enqueue, the
+        retry, the finding send and the two item lookups."""
+        keyed = [command for command in prescribed_commands(self.text())
+                 if re.search(r"(build|retry|note|show) N\b|--item\b", command)]
+        self.assertEqual(keyed, [])
+        self.assertEqual(self.kinds(), {"lane list"})
+
+    def test_sweep_derives_no_item_from_a_proxy(self):
+        text = self.text()
+        self.assertIn("It writes to no item of a PR and queues nothing in the lane", text)
+        for proxy in ("build_run", "assignments list", "whose note names", "the lead"):
+            with self.subTest(proxy=proxy):
+                self.assertNotIn(proxy, text)
+
+    def test_sweep_names_no_item_keyed_action_for_the_operator(self):
+        """Fix and Retry act on an item's newest build or entry."""
+        text = self.text()
+        self.assertNotIn("the operator's Fix", text)
+        self.assertNotIn("the operator's Retry", text)
+
+    def test_the_report_names_no_item_of_its_own(self):
+        """The table's item column was the proxy's guess."""
+        table = self.text().split("End with a table:")[1]
+        self.assertNotRegex(table.split(";")[0], r"\bitem\b")
+
+    def test_entries_on_the_branch_are_reported_with_their_own_fields(self):
+        """A catch-up push moves the head past a failed entry's; an older
+        PR's entry can sit on the branch. The operator reads which."""
+        text = self.text()
+        self.assertIn("whose `branch` equals the PR's head branch exactly, at any `expected_head` and in any `status`", text)
+        self.assertIn("`item`, `status` and `expected_head`", text)
+
+    def test_a_stacked_pr_is_reported(self):
+        """A squash merge of a parent strands each PR whose base is its branch."""
+        text = self.text()
+        self.assertIn("`base.ref`", text)
+        self.assertIn("another open PR's base is this PR's head branch", text)
+        self.assertIn("its base is not the repo's default branch", text)
+
+    def test_each_finding_is_filed_under_the_runs_ref(self):
+        """A filed item needs no PR-to-item match, and a rerun's add refuses."""
+        text = self.text()
+        self.assertIn("--ref open-prs:<date>:<slug>", text)
+        self.assertIn("a blocking one at priority 1", text)
+        self.assertIn("the PR's URL in its body", text)
+
+    # Shell expansion: a PR title, URL or review finding is text others wrote. In double quotes the
+    # shell expands `$(...)`, backticks and `$NAME` in it before the CLI reads it.
+
+    def test_no_external_value_sits_in_double_quotes(self):
+        for command in prescribed_commands(self.text()):
+            with self.subTest(command=command):
+                self.assertNotRegex(command, r'"[^"]*<[^>]+>[^"]*"')
+
+    def test_the_quoting_rule_is_stated(self):
+        self.assertIn("written as `'\\''`", self.text())
 
 
 class ReviewRoundFixes(unittest.TestCase):
@@ -423,7 +501,7 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
             for command in prescribed_commands(text):
                 if "--kind decision" in command:
                     with self.subTest(path=path, command=command):
-                        self.assertRegex(command, r'note N "<[^>]+>" --kind decision')
+                        self.assertRegex(command, r'note N (["\'])<[^>]+>\1 --kind decision')
 
     def test_no_reference_looks_a_ref_up_by_wildcard(self):
         """`sd store items --ref` matches one exact reference; `--grep` reads the body."""
