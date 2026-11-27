@@ -2266,7 +2266,8 @@ def wait_for_pid(path: pathlib.Path) -> int:
     return int(path.read_text())
 
 
-def gone(pid: int, seconds: float = 3) -> bool:
+def gone(pid: int, seconds: float = 30) -> bool:
+    """Whether `pid` ends within `seconds`; a killed one lasts until reaped, which load delays (sd:10759)."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         try:
@@ -2285,6 +2286,14 @@ def end_session(pid: int) -> None:
 class KillReachTests(unittest.TestCase):
     """pack sd:9392: a SIGKILL of a group reaches each session below it, which a SIGTERM's unwind would have ended."""
 
+    def setUp(self) -> None:
+        # sd:10759: these tests are about reach, not `ps` speed. Under a gate's load a read can pass
+        # the product's 3 s bound; it is then unknown and kills nothing below, which the unread-table
+        # tests here cover, and the reach test failed once with load5 at 26 to 28.
+        patcher = unittest.mock.patch.object(sd_lib, "PS_SECONDS", 30)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def start(self, scratch: str) -> tuple[subprocess.Popen, int]:
         mark = pathlib.Path(scratch) / "below.pid"
         leader = sd_lib.spawn_group([sys.executable, "-c", SESSION_LEADER, str(mark)])
@@ -2299,6 +2308,20 @@ class KillReachTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             leader, below = self.start(scratch)
             sd_lib.end_group(leader)
+            self.assertTrue(gone(below), "the session below the leader outlived end_group's SIGKILL")
+
+    def test_a_ps_slower_than_the_product_bound_still_reaches_the_session_below(self) -> None:
+        """sd:10759: a `ps` that took over 3 s under load read as unknown, and the session below ran on."""
+        real = subprocess.run
+
+        def slow_ps(argv, *args, **kwargs):  # a `ps` that takes 5 s: any shorter bound times it out
+            if list(argv[:1]) == ["ps"] and kwargs.get("timeout", 0) < 5:
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return real(argv, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as scratch:
+            leader, below = self.start(scratch)
+            with unittest.mock.patch.object(sd_lib.subprocess, "run", slow_ps):
+                sd_lib.end_group(leader)
             self.assertTrue(gone(below), "the session below the leader outlived end_group's SIGKILL")
 
     def test_thread_groups_kill_ends_the_sessions_below(self) -> None:
