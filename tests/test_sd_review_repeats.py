@@ -1075,6 +1075,152 @@ class RebuttalIdentityTests(unittest.TestCase):
         body["proposal"]["findings"][0]["test"] = ["python3", "t.py"]
         self.assertIn("Test: python3 t.py", sd_review.rebuttal_section(listed(json.dumps(body))))
 
+    def test_a_lead_rejection_holds_a_cited_repeat_in_other_words(self) -> None:
+        """sd:10926: the lead rejected a blocker at :1898; the lane raised it again reworded, with evidence,
+        and blocked. A rebuttal of the lead's review holds it at its line until a change reaches the line."""
+        plain = adjudicated(("src.py", "A no-commit fix turns a filed follow-up into a blocker", "rebutted"), line=40)
+        body = json.loads(plain)
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        lead = json.dumps(body)
+        repeat = row(summary="A no-commit fix turns an already-filed follow-up into a merge blocker", line=40,
+                     evidence=REPRO)
+        self.assertEqual(gate([repeat], lead), ["advisory"])
+        self.assertEqual(gate([repeat], plain), ["blocking"], "a plain rebuttal holds no cited reworded repeat")
+        self.assertEqual(gate([dict(repeat, line=44)], lead), ["blocking"], "another line is another finding")
+        self.assertEqual(gate([dict(repeat, path="other.py")], lead), ["blocking"])
+        changed = sd_review.rebuttals([(lead,)], {ON_BRANCH}.__contains__, lambda _head, _path: False)
+        self.assertEqual([record["disposition"] for record in sd_review.dispose([repeat], "high", changed)],
+                         ["blocking"], "a change to the cited line lapses it")
+        body["proposal"]["bindings"]["source"] = "lead"
+        self.assertEqual(gate([repeat], json.dumps(body)), ["blocking"], "only the exact source holds")
+        self.assertIn("lead's review", sd_review.rebuttal_section(listed(lead)))
+        self.assertNotIn("blocks nothing.", sd_review.rebuttal_section(listed(lead)), "fresh evidence still blocks")
+
+    def test_a_lead_rejection_never_holds_fresh_evidence(self) -> None:
+        """sd:10926 review: a lead rebuttal held a different defect citing fresh evidence at its line. It holds
+        a cited repeat only of the evidence the lead rejected, in any words; other evidence blocks."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted"), line=40))
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        lead = json.dumps(body)
+        for summary in ("defect", "another defect"):
+            with self.subTest(summary=summary):
+                self.assertEqual(gate([row(summary=summary, line=40, evidence="python3 u.py: Traceback")], lead),
+                                 ["blocking"])
+        del body["proposal"]["findings"][0]["raw_finding"]["evidence"]
+        self.assertEqual(gate([row(line=40, evidence=REPRO)], json.dumps(body)), ["blocking"],
+                         "a lead finding with no evidence holds no cited repeat")
+        self.assertEqual(gate([row(summary="other words", line=40)], json.dumps(body)), ["advisory"])
+
+    def test_a_lead_rejection_holds_no_cited_repeat_once_the_tree_changed(self) -> None:
+        """sd:10926 ruling round: the lead rejected a crash no caller reached; a later commit in another file
+        added the caller, and the same citation was held. As a build's ruling, the hold of a cited repeat
+        judged the tree at its head: any change since ends it. An uncited repeat still follows its line."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted"), line=40))
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        moved = sd_review.rebuttals([(json.dumps(body),)], {ON_BRANCH}.__contains__,
+                                    lambda _head, path: path is not None)  # another file changed
+        def held(**extra: Any) -> list[str]:
+            return [record["disposition"] for record in sd_review.dispose([row(line=40, **extra)], "high", moved)]
+        self.assertEqual(held(evidence=REPRO), ["blocking"])
+        self.assertEqual(held(), ["advisory"])
+        self.assertEqual(gate([row(line=40, evidence=REPRO)], json.dumps(body)), ["advisory"], "an unchanged tree")
+
+    def lead_body(self, **finding: Any) -> dict[str, Any]:
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted"), line=40))
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        body["proposal"]["findings"][0].update(finding)
+        return body
+
+    def test_a_tested_lead_rejection_never_holds_fresh_evidence(self) -> None:
+        """sd:10926 class pass (bin/sd-review:2026): a lead rebuttal holds a cited repeat only of the evidence
+        it rejected. Its passing test held any citation in its words, so fresh evidence posted as advice."""
+        tested = json.dumps(self.lead_body(test=["python3", "t.py"]))
+        self.assertEqual(gate([row(line=40, evidence="python3 u.py: Traceback")], tested), ["blocking"])
+        self.assertEqual(gate([row(line=40, evidence=REPRO)], tested), ["advisory"])
+        self.assertEqual(gate([row(line=40)], tested), ["advisory"])
+
+    def test_a_lane_retry_holds_a_lead_rejection_of_the_same_evidence(self) -> None:
+        """sd:10926 class pass (bin/sd-review:2025, :2112): `carried` asks with `verdict`, which turned the lead's
+        hold off, so a retry whose reader cited the exact rejected evidence kept the blocker. It holds that
+        evidence in any words and outer whitespace; fresh evidence still keeps it."""
+        seen = listed(json.dumps(self.lead_body()))
+        def kept(summary: str, evidence: str) -> list[str]:
+            prior = [dict(row(summary=summary, line=40, evidence=REPRO), disposition="blocking")]
+            opened = sd_review.Outcome("codex", sd_review.FINDINGS, (), "", (), (), verdicts=(
+                {"id": "B1", "verdict": "open", "evidence": evidence},))
+            return [r["disposition"] for r in sd_review.carried(prior, [opened], seen)]
+        for summary in ("defect", "the same defect reworded"):
+            with self.subTest(summary=summary):
+                self.assertEqual(kept(summary, REPRO), [])
+                self.assertEqual(kept(summary, REPRO + "\n"), [])
+                self.assertEqual(kept(summary, "python3 u.py: Traceback"), ["blocking"])
+        fresh = [dict(row(line=40, evidence="python3 u.py: Traceback"), disposition="blocking")]
+        self.assertEqual([r["disposition"] for r in sd_review.carried(fresh, [], seen)], ["blocking"],
+                         "a prior blocker's own fresh evidence is a new claim")
+        self.assertEqual(sd_review.carried([dict(row(line=40), disposition="blocking")], [], seen), [],
+                         "an uncited prior blocker in the rejection's words still holds")
+
+    def lead_kept(self, stored: str, opened: str, saved: str | None = None) -> list[str]:
+        """What `carried` keeps of one prior blocker, `opened` a reader's `open`, against a lead rejection of `stored`."""
+        body = self.lead_body()
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = stored
+        prior = [dict(row(line=40, evidence=stored if saved is None else saved), disposition="blocking")]
+        answer = sd_review.Outcome("codex", sd_review.FINDINGS, (), "", (), (), verdicts=(
+            {"id": "B1", "verdict": "open", "evidence": opened},))
+        return [r["disposition"] for r in sd_review.carried(prior, [answer], listed(json.dumps(body)))]
+
+    def test_a_lead_rejection_of_two_reproductions_holds_a_repeat_of_one(self) -> None:
+        """sd:10926 last class pass (bin/sd-review:2009): two readers' evidence is stored one per line
+        (`distinct_findings`), so a retry citing one of them matched no whole string and blocked. Each cited
+        line must be one the lead rejected; a line it never saw is fresh and blocks."""
+        one, two = "pytest tests/a.py: 1 failed", "pytest tests/b.py: 1 failed"
+        body = self.lead_body()
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = f"{one}\n{two}"
+        lead = json.dumps(body)
+        for cited in (one, two, f"{one}\n\n {two}", f" {one} \n\n"):
+            with self.subTest(cited=cited):
+                self.assertEqual(gate([row(line=40, evidence=cited)], lead), ["advisory"])
+                self.assertEqual(self.lead_kept(f"{one}\n{two}", cited), [])
+        for cited in ("pytest tests/c.py: 1 failed", f"{one}\npytest tests/c.py: 1 failed", "pytest tests/a.py"):
+            with self.subTest(cited=cited):
+                self.assertEqual(gate([row(line=40, evidence=cited)], lead), ["blocking"])
+                self.assertEqual(self.lead_kept(f"{one}\n{two}", cited), ["blocking"])
+        self.assertEqual(self.lead_kept(one, one, saved=f"{one}\n{two}"), ["blocking"], "a saved line it never saw")
+
+    def test_a_lead_rejection_holds_no_repro_whose_lines_run_in_another_order(self) -> None:
+        """sd:10926 ruling round (bin/sd-review:2013): the cited lines were compared as a set, so a repro
+        running the rejected commands in another order, a new claim, was held. The cited lines must run
+        together and in order in the rejected evidence."""
+        stored = "pytest -q\nexport FEATURE=1"
+        body = self.lead_body()
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = stored
+        lead = json.dumps(body)
+        swapped = "export FEATURE=1\npytest -q"
+        self.assertEqual(gate([row(line=40, evidence=swapped)], lead), ["blocking"])
+        self.assertEqual(self.lead_kept(stored, swapped), ["blocking"])
+        self.assertEqual(self.lead_kept("a\nb\nc", "a\nc"), ["blocking"], "a line left out between")
+        self.assertEqual(gate([row(line=40, evidence=stored)], lead), ["advisory"])
+        self.assertEqual(self.lead_kept("a\nb\nc", "b\nc"), [])
+
+    def test_a_lead_rejection_holds_an_uncut_repeat_of_evidence_stored_cut(self) -> None:
+        """sd:10926 last class pass (bin/sd-review:2025, :2120): a finding's evidence is stored cut with the
+        digest of the whole (`_evidence`), an `open` verdict's is not, so a reader repeating a long traceback
+        whole kept the blocker. The citation is cut the same way first; another long text has another digest."""
+        whole = "python3 t.py: " + "x" * 1500
+        stored = sd_review._evidence(whole)
+        self.assertNotEqual(stored, whole)
+        self.assertEqual(self.lead_kept(stored, whole), [])
+        self.assertEqual(self.lead_kept(stored, f"  {whole}\n"), [])
+        self.assertEqual(self.lead_kept(stored, whole + "y"), ["blocking"])
+        self.assertEqual(self.lead_kept(f"{REPRO}\n{stored}", whole), [], "one of two, stored cut")
+        # Ruling round (:2012): a reader may quote the cut form the prior report showed; cutting it again lost it.
+        self.assertEqual(self.lead_kept(stored, stored), [], "the stored form quoted as shown")
+        self.assertEqual(self.lead_kept(stored, f" {stored}\n"), [])
+
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
         for summary in ("value is wrong", " VALUE is\nwrong ", f"Value is wrong {sd_review.REPEAT_NOTE}"):
