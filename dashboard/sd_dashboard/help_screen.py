@@ -176,6 +176,10 @@ def _inline(text: str, value) -> list[dict]:
         elif label is not None:
             if not LINK.fullmatch(href):
                 raise ValueError(f"help.md links {href!r}: a link opens a dashboard view, a path that starts with /")
+            from . import v2
+
+            if re.split(r"[?#]", href)[0] not in v2.PAGES:
+                raise ValueError(f"help.md links {href!r}: no dashboard page is at that path")
             parts.append({"text": label, "href": href})
         else:
             parts.append(value(token, name))

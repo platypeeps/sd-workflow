@@ -30,7 +30,7 @@
 - Builder cap (`sd.machine_cap`, `sd.repo_cap`): {live:machine_cap}.
 - No new builder starts above this load: {live:load_cap}. The load now: {live:load5}.
 - Gate slots (`sd gate status`): {live:gate_slots}.
-- The usual heavy hitters: gates, builds, and the Docker VM (an end-to-end test database). See [Health](/health).
+- The usual heavy hitters: gates, builds, and the Docker VM (an end-to-end test database). See [Health](/fleet-health).
 
 ## Hub and satellites
 

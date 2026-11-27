@@ -143,6 +143,19 @@ class TheLiveValues(ScreenCase):
             {"kind": "li", "parts": [{"text": "one <i>é</i> two "}, {"code": "a<b"}]}]}])
 
 
+class TheLinks(unittest.TestCase):
+    def test_each_help_md_link_opens_a_registered_page(self):
+        # Lane review: [Health](/health) opened the server's probe, not the Health page.
+        body = help_screen.HELP.read_text(encoding="utf-8")
+        links = re.findall(r"\]\((/[^)\s]*)\)", body)
+        self.assertIn("/fleet-health", links)
+        self.assertEqual([link for link in links if re.split(r"[?#]", link)[0] not in v2.PAGES], [])
+
+    def test_a_link_to_a_route_no_page_serves_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "no dashboard page"):
+            help_screen.sections("## A\n\n[Health](/health)\n", lambda token, name: {})
+
+
 DOC = {"phrases": [{"phrase": "triage", "does": "d", "budget": "b", "mode": "acts"}],
        "sections": [{"title": "Load and capacity", "blocks": [{"kind": "p", "parts": [{"text": "words"}]}]}],
        "problems": [], "read": "2026-11-26T00:00:00Z"}
