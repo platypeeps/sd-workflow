@@ -2169,7 +2169,54 @@ class Supervise(Case):
         prior = json.loads(Path(third[third.index("--verify-report") + 1]).read_text(encoding="utf-8"))
         self.assertIn(("work.txt", 2), [(row["path"], row["line"]) for row in prior["findings"]],
                       "the last round's blocker was not carried into the verified report")
-        self.assertEqual(len(prior["findings"]), 2, "a blocker both rounds found was carried twice")
+        self.assertEqual([(row["path"], row["line"]) for row in prior["findings"]].count(("work.txt", 2)), 1,
+                         "the last round's blocker was carried twice")
+
+    def test_a_carried_blocker_keeps_its_own_identity_in_the_older_report(self):
+        """Class pass on sd:10902: a blocker carried from the last report at the head into the older kept
+        report keeps what makes it that blocker. An older row with the same place and words does not
+        match it away; the older report's pass numbers do not read it as resolved; and its path is read
+        at the head it was found at, not walked from the older head (a rename and a reused name)."""
+        import importlib.machinery
+        import types
+        bin_dir = str(Path(build_run.__file__).resolve().parents[2] / "bin")
+        sys.path.insert(0, bin_dir)
+        try:
+            loader = importlib.machinery.SourceFileLoader("sd_review_carry", os.path.join(bin_dir, "sd-review"))
+            review = types.ModuleType(loader.name)
+            review.__file__ = loader.path
+            loader.exec_module(review)
+        finally:
+            sys.path.remove(bin_dir)
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        head, older = "a" * 40, "b" * 40
+        row = {"path": "src.py", "line": 1, "summary": "a blocker", "severity": "high"}
+        report = {"scope": "branch", "requested_reviews": 1, "completed_reviews": 1, "covers_from": "c" * 40}
+        cases = {
+            "same place and words": ({**row, "disposition": "blocking"}, [{**row, "disposition": "advisory"}], None),
+            "older pass numbers": ({**row, "disposition": "blocking", "prior_review": {"pass": 1, "head": head}},
+                                   [], [{"pass": 1, "head": older, "completed": True},
+                                        {"pass": 2, "head": older, "completed": True}]),
+            "path at its head": ({**row, "disposition": "blocking"}, [], None),
+        }
+        for name, (carried, kept_rows, history) in cases.items():
+            supervisor.out("review").write_text(json.dumps(
+                {**report, "status": "blocking", "subject": {"head": head}, "findings": [carried]}), encoding="utf-8")
+            supervisor.out("prior").write_text(json.dumps(
+                {**report, "status": "blocking", "subject": {"head": older}, "findings": kept_rows,
+                 **({"history": history} if history else {})}), encoding="utf-8")
+            with self.subTest(name), mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+                prior = supervisor.prior_review(head)
+                self.assertIsNotNone(prior, "a fix with no commit dropped the chain")
+                blockers = review.prior_blockers(prior)
+                self.assertEqual(len(blockers), 1, "the carried blocker was matched away or read as resolved")
+                self.assertEqual((blockers[0].get("prior_review") or {}).get("head"), head,
+                                 "the carried path would be walked from the older report's head")
+                again = supervisor.prior_review(head)  # a replay reads the kept report it rewrote
+                self.assertEqual(len(review.prior_blockers(again)), 1, "a replay carried the blocker again")
 
     def test_a_new_round_two_finding_on_unchanged_code_files_a_follow_up(self):
         """Pack sd:9769: a later round's finding off the delta and off the earlier findings is filed, not a block."""

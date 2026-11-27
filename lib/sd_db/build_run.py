@@ -1888,7 +1888,9 @@ class Supervisor:
                 # round's blockers carried in, so none is omitted (sd:10902). Anything else reviews in full.
                 if path != last or not isinstance(answer, dict) or not isinstance(answer.get("findings"), list):
                     return None
-                carried = [row for row in answer["findings"]
+                # Each read at this head, with no pass number: `sd-review` walks a row's path from its own
+                # `prior_review.head`, and reads a pass number against the older report's history.
+                carried = [dict(row, prior_review={"head": head}) for row in answer["findings"]
                            if isinstance(row, dict) and row.get("disposition") == "blocking"]
                 continue
             # `sd-review` verifies only these statuses: a `skipped` round has no prior to verify (sd:2721).
@@ -1912,10 +1914,9 @@ class Supervisor:
                     return None
                 continue
             if carried:
-                seen = {(row.get("path"), row.get("line"), row.get("summary"))
-                        for row in answer["findings"] if isinstance(row, dict)}
-                answer["findings"] += [row for row in carried
-                                       if (row.get("path"), row.get("line"), row.get("summary")) not in seen]
+                # Only a whole equal row is the same: an older row at the same place and words may be
+                # advisory, or read at another head (sd:10902). A replay finds its own rows equal.
+                answer["findings"] += [row for row in carried if row not in answer["findings"]]
                 answer["status"] = "blocking"
             for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
                 if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
