@@ -1246,11 +1246,16 @@ class LineBudgetTests(unittest.TestCase):
         # 5331 -> 5335 is sd:10892 round 5: `bin/sd-review` +4 so `base_check`
         # counts a mode, type or presence change as touching the whole file.
         # Measured: `sd-review` is 3365.
+        #
+        # 5335 -> 5350 is sd:10926: `bin/sd-review` +15 so a blocking lead
+        # review keeps its blockers for `sd-ship adjudicate` and a rebuttal
+        # of the lead's review holds a cited or reworded repeat at its line.
+        # Measured: `sd-review` is 3380.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5335,
+            5350,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

@@ -110,6 +110,11 @@ def lead_review_key(repository: str, branch: str) -> str:
     return f"review:v1:{repository}:{branch}"
 
 
+#: The `bindings.source` of a rebuttal `sd-ship adjudicate` recorded from that branch review, not a ship one:
+#: the lead's ruling, which holds a reworded or cited repeat at its line until the line changes (sd:10926).
+LEAD_REVIEW_SOURCE = "lead-review"
+
+
 def lead_review_binding(root: pathlib.Path) -> dict | None:
     """What a recorded lead review is bound to, or None when a part does not read (sd:5988).
 

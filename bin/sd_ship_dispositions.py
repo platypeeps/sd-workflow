@@ -78,9 +78,44 @@ def gate_waivable(check: Any) -> bool:
     return (type(code) is int and code == 0) or (check.get("status") == GATE_NOT_RUN and code is None)
 
 
+def lead_context(operation: Any, head: str) -> tuple[dict, list[dict]] | None:
+    """sd:10926. The lead's blocking `sd-review --scope branch` of `head` as `context` gives a ship review, when
+    the ship receipt holds no pass of `head`: a lead's rejection is a rebuttal in the store `sd-review` reads.
+    None, and the ship review decides, for a record of another subject, head or status, or one that does not read."""
+    import sd_lib  # noqa: PLC0415
+
+    passes = operation.history.native(operation.state)
+    if passes and (passes[-1].get("head") == head or operation.state.get("reviewed_head") == head):
+        return None
+    found = operation.connection.execute(
+        "SELECT body FROM state WHERE id = (SELECT MAX(id) FROM state WHERE kind = 'checkpoint' AND key = ?)",
+        (sd_lib.lead_review_key(operation.repository, operation.branch),)).fetchone()
+    try:
+        record = json.loads(found[0]) if found else None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(record, dict) or [record.get(name) for name in ("repository", "branch", "head", "status")] != [
+            operation.repository, operation.branch, head, "blocking"] or not isinstance(record.get("findings"), list):
+        return None
+    rows = [{"index": index, "finding_digest": digest(row), "raw_finding": row} for index, row in enumerate(
+        (row for row in record["findings"] if isinstance(row, dict) and row.get("disposition") == "blocking"), 1)]
+    return ({"repository": operation.repository, "branch": operation.branch, "head": head,
+             "source": sd_lib.LEAD_REVIEW_SOURCE, "lead_review_digest": digest(record)}, rows) if rows else None
+
+
+def recorded_key(operation: Any, bindings: dict) -> str:
+    """Where a proposal records: a lead review's apart from the ship review's, which prepare reads (sd:10926)."""
+    import sd_lib  # noqa: PLC0415
+
+    where = key(operation)
+    return "ship-adjudication:lead:" + where.split(":", 1)[1] if bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE else where
+
+
 def context(operation: Any, head: str) -> tuple[dict, list[dict]]:
     if git(operation.root, "status", "--porcelain", "--untracked-files=all") or git(operation.root, "rev-parse", "HEAD") != head:
         raise Refusal("adjudication requires the clean exact reviewed head")
+    if lead := lead_context(operation, head):
+        return lead
     report = operation.review_inputs(head)
     if report["status"] != "blocking":
         raise Refusal("adjudication requires a complete blocking report")
@@ -314,7 +349,7 @@ def adjudicate(operation: Any) -> dict:
         proposal = {"schema_version": 1, "bindings": bindings,
                     "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="", test=[]) for row in rows]}
         # sd:9966: the dispositions this review already holds, which a filled template replaces whole.
-        revision, value = operation.store.read(operation.connection, key(operation))
+        revision, value = operation.store.read(operation.connection, recorded_key(operation, bindings))
         held = (revision and value.get("decision") == "accepted"
                 and digest((value.get("proposal") or {}).get("bindings")) == digest(bindings))
         return operation.result("disposition_template", proposal=proposal, recorded_revision=revision if held else None)
@@ -328,8 +363,9 @@ def adjudicate(operation: Any) -> dict:
         source_revision, source_state = operation.store.read(operation.connection, operation.key)
         if source_revision != operation.revision or source_state != operation.state:
             raise Refusal("ship receipt changed before the dispositions were recorded")
-        previous, prior = operation.store.read(operation.connection, key(operation))
-        revision = operation.store.save(operation.connection, key(operation), previous, {
+        where = recorded_key(operation, proposal["bindings"])
+        previous, prior = operation.store.read(operation.connection, where)
+        revision = operation.store.save(operation.connection, where, previous, {
             "decision": "accepted", "proposal": proposal, "proposal_digest": proposal_digest,
             "source_checkpoint": source_revision, "previous_adjudication_digest": digest(prior),
             "accepted_at": datetime.now(timezone.utc).isoformat()})

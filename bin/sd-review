@@ -828,6 +828,7 @@ def blocker_checklist(root: pathlib.Path, subject: Subject, database: Any, env: 
 #: moved blocks again, so a stale rebuttal never clears another finding.
 REBUTTED_LINES, REBUTTED_SUMMARY_CHARS, REBUTTED_REASON_CHARS = 10, 200, 200
 REBUTTED_HEADER = "Findings already rebutted on this branch"
+LEAD_LINE = " A rebuttal of the lead's review: a repeat at this line blocks nothing (sd:10926)."
 REBUTTED_ROWS = 200
 #: The rows only: a body is ASCII JSON, while a field `json_extract` decodes may not be UTF-8 and failed the whole read.
 REBUTTED_QUERY = (
@@ -845,11 +846,12 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str | None, str]]]:
-    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, ruled, test) per accepted
-    finding; malformed: none. `ruled`: the evidence a build's ruling round judged, as recorded, "" for none, when
-    that round wrote the row (sd:10286); None from `sd-ship adjudicate`, which cannot mark one. Never folded: the
-    build clears only the exact evidence, and `-k ABC` is another repro than `-k abc` (night triage, sd:10286)."""
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str | None, str, bool]]]:
+    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, ruled, test, lead) per
+    accepted finding; malformed: none. `lead`: it answers the lead's review (sd:10926). `ruled`: the evidence a
+    build's ruling round judged, as recorded, "" for none, when that round wrote the row (sd:10286); None from
+    `sd-ship adjudicate`, which cannot mark one. Never folded: the build clears only the exact evidence, and
+    `-k ABC` is another repro than `-k abc` (night triage, sd:10286)."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -861,7 +863,7 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
          tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()),
          (raw["evidence"] if isinstance(raw.get("evidence"), str) else "") if row.get("ruled") is True else None,
-         _test_text(row.get("test")))
+         _test_text(row.get("test")), isinstance(bindings, dict) and bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE)
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -894,6 +896,7 @@ class Rebuttal(NamedTuple):
     instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
     ruled: str | None = None  # the evidence a build's ruling judged: a repeat citing it, or none, holds (sd:10286)
     test: str = ""  # the test `sd-ship adjudicate` ran passing (sd:10893): it holds a cited repeat too (sd:10918)
+    lead: bool = False  # a rebuttal of the lead's review: it holds any repeat at its line (sd:10926)
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
@@ -1007,10 +1010,10 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     records = [lines_now(Rebuttal(head, path, summary_key(summary), line if type(line) is int else None,
                                   disposition == "rebutted", _bounded(path or "?", 120),
                                   _bounded(summary, REBUTTED_SUMMARY_CHARS), _bounded(reason, REBUTTED_REASON_CHARS),
-                                  instances, ruled, _bounded(test, REBUTTED_REASON_CHARS)), unchanged, line_now)
+                                  instances, ruled, _bounded(test, REBUTTED_REASON_CHARS), lead), unchanged, line_now)
                for body, *_rest in rows for head, found in [_adjudicated(body)]
                if isinstance(head, str) and on_branch(head)
-               for path, summary, line, disposition, reason, instances, ruled, test in found
+               for path, summary, line, disposition, reason, instances, ruled, test, lead in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
     shown = 0
     for index, record in enumerate(records):
@@ -1042,7 +1045,8 @@ def lines_now(record: Rebuttal, unchanged: Callable[[str, Any], bool],
 def rebuttal_section(seen: Sequence[Rebuttal]) -> str:
     """The prompt section for `rebuttals`; a static reader cites the lines it read."""
     lines = "".join(f"\n- {entry.place}{'' if entry.line is None else f':{entry.line}'}: {entry.text} Rebuttal: "
-                    f"{entry.reason}{f' Test: {entry.test}' if entry.test else ''}" for entry in seen if entry.listed)
+                    f"{entry.reason}{f' Test: {entry.test}' if entry.test else ''}{LEAD_LINE if entry.lead else ''}"
+                    for entry in seen if entry.listed)
     return (f"\n\n{REBUTTED_HEADER}, newest first, from its recorded adjudications. Raise one again only with new "
             "evidence that contradicts the rebuttal, given in the finding's evidence field: a check you ran and its "
             "output, or, when you cannot run commands, path:line and a quote of the current code showing the rebuttal "
@@ -2009,7 +2013,10 @@ def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], cited: str
     ruled = getattr(record, "ruled", None)
     if ruled is None:  # a rebuttal whose test passed holds a cited repeat in its words (sd:10918)
         tested = record is worded and bool(getattr(record, "test", "")) and not verdict
-        return (cited is None or tested) and getattr(record, "listed", False)
+        # sd:10926: a lead's rejection holds any repeat at its exact line until a change reaches it (`lines_now`).
+        # ponytail: another defect at that exact line is held too; it still posts, as advisory.
+        bound = getattr(record, "lead", False) and not verdict
+        return (cited is None or tested or bound) and getattr(record, "listed", False)
     def _judged(old: Mapping[str, Any]) -> bool:
         kept = old.get("evidence") if isinstance(old.get("evidence"), str) and old["evidence"].strip() else None
         return kept == ruled if kept is not None else summary_key(old.get("summary")) == summary_key(row.get("summary"))
@@ -3314,16 +3321,23 @@ def unrecorded_reason(result: dict[str, Any], head: str, current: str, branch: s
     return None
 
 
+def _blockers(result: dict[str, Any]) -> dict[str, Any]:
+    """A blocking review's blockers, which `sd-ship adjudicate` answers (sd:10926); nothing for another status."""
+    rows = [row for row in result.get("findings") or () if isinstance(row, dict) and row.get("disposition") == "blocking"]
+    return {"findings": rows} if result.get("status") == "blocking" else {}
+
+
 def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dict[str, Any],
                        env: Mapping[str, str]) -> None:
-    """Record a passing plain `--scope branch` review of HEAD, so lane prepare can skip its own (sd:5988).
+    """Record a plain `--scope branch` review of HEAD, so lane prepare can skip its own (sd:5988).
 
-    Clean or advisory only (sd:9767), every reviewer its policy asked for, HEAD still its head: lane prepare runs the gate alone.
+    Clean or advisory (sd:9767), every reviewer its policy asked for, HEAD still its head: lane prepare runs the gate alone.
+    A blocking one keeps its blockers, which lane prepare never reuses: `sd-ship adjudicate` rebuts them (sd:10926).
     A record that cannot be written is said on stderr; the exit code stands.
     """
     status = result.get("status")
     verified = bool(getattr(args, "verify_report", None) and getattr(args, "base", None))
-    if (args.scope != "branch" or status not in ("clean", "advisory") or any(
+    if (args.scope != "branch" or status not in ("clean", "advisory", "blocking") or any(
             getattr(args, name, None) for name in UNRECORDED_OPTIONS if not (verified and name in ("base", "verify_report")))):
         return
     try:
@@ -3340,12 +3354,13 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
             library.record_state(connection, "checkpoint", key=sd_lib.lead_review_key(f"{owner}/{name}", branch), body={
                 "repository": f"{owner}/{name}", "branch": branch, "head": head, "base": base,
                 "status": status, "binding": binding, "reviewed_by": result.get("reviewed_by", []),
-                "challenge": bool(args.challenge), "copilot_automatic": copilot.get("automatic")})
+                "challenge": bool(args.challenge), "copilot_automatic": copilot.get("automatic"), **_blockers(result)})
     except Exception as error:  # any failure: the review stands, and the lane reviews in full
         print(f"sd-review: the {status} pass was not recorded for lane prepare: {type(error).__name__}: {error}",
               file=sys.stderr)
         return
-    print(f"sd-review: recorded the {status} pass of {head[:12]} on {branch} for lane prepare (sd:5988)", file=sys.stderr)
+    print(f"sd-review: recorded the {status} pass of {head[:12]} on {branch} for "
+          f"{'sd-ship adjudicate' if status == 'blocking' else 'lane prepare (sd:5988)'}", file=sys.stderr)
 
 
 def _validate_copilot_policy(policy: dict[str, Any], source: str) -> dict[str, Any]:

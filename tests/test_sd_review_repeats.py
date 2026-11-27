@@ -1075,6 +1075,26 @@ class RebuttalIdentityTests(unittest.TestCase):
         body["proposal"]["findings"][0]["test"] = ["python3", "t.py"]
         self.assertIn("Test: python3 t.py", sd_review.rebuttal_section(listed(json.dumps(body))))
 
+    def test_a_lead_rejection_holds_a_cited_repeat_in_other_words(self) -> None:
+        """sd:10926: the lead rejected a blocker at :1898; the lane raised it again reworded, with evidence,
+        and blocked. A rebuttal of the lead's review holds it at its line until a change reaches the line."""
+        plain = adjudicated(("src.py", "A no-commit fix turns a filed follow-up into a blocker", "rebutted"), line=40)
+        body = json.loads(plain)
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        lead = json.dumps(body)
+        repeat = row(summary="A no-commit fix turns an already-filed follow-up into a merge blocker", line=40,
+                     evidence=REPRO)
+        self.assertEqual(gate([repeat], lead), ["advisory"])
+        self.assertEqual(gate([repeat], plain), ["blocking"], "a plain rebuttal holds no cited reworded repeat")
+        self.assertEqual(gate([dict(repeat, line=44)], lead), ["blocking"], "another line is another finding")
+        self.assertEqual(gate([dict(repeat, path="other.py")], lead), ["blocking"])
+        changed = sd_review.rebuttals([(lead,)], {ON_BRANCH}.__contains__, lambda _head, _path: False)
+        self.assertEqual([record["disposition"] for record in sd_review.dispose([repeat], "high", changed)],
+                         ["blocking"], "a change to the cited line lapses it")
+        body["proposal"]["bindings"]["source"] = "lead"
+        self.assertEqual(gate([repeat], json.dumps(body)), ["blocking"], "only the exact source holds")
+        self.assertIn("lead's review", sd_review.rebuttal_section(listed(lead)))
+
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
         for summary in ("value is wrong", " VALUE is\nwrong ", f"Value is wrong {sd_review.REPEAT_NOTE}"):
