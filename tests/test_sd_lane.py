@@ -3941,6 +3941,33 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [b])
 
+    def test_a_listed_merge_revert_whose_side_deletion_the_branch_repeats_keeps_it(self) -> None:
+        """Ruling round, review of build/sd-1654 (sd_lane.py:1092): the side fix deletes an obsolete file,
+        the listed merge revert puts the file back, and a later commit deletes it again. The restore check
+        matched added lines only, a deletion adds none, and the citation dropped. A later commit that puts
+        the side's patch back whole, or takes out a line it took out, restores it too."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-deletes")
+        (tree / "obsolete.txt").write_text("old\nolder\n", encoding="utf-8")
+        git(tree, "add", "obsolete.txt")
+        git(tree, "commit", "-q", "-m", "chore: an obsolete file")
+        git(tree, "switch", "-q", "-c", "topic-deletes-side")
+        git(tree, "rm", "-q", "obsolete.txt")
+        git(tree, "commit", "-q", "-m", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-deletes")
+        (tree / "a.txt").write_text("guard\n", encoding="utf-8")
+        git(tree, "add", "a.txt")
+        git(tree, "commit", "-q", "-m", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-deletes-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        git(tree, "rm", "-q", "obsolete.txt")
+        git(tree, "commit", "-q", "-m", "fix: delete it again")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(sorted(entry["closes"]), sorted([b, c]))
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open

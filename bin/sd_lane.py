@@ -1046,10 +1046,10 @@ def _patch(worktree: pathlib.Path, commit: str, names: Iterable[str] = ()) -> by
     return diff.stdout if diff.returncode == 0 else None
 
 
-def _added(patch: bytes) -> set[bytes]:
-    """The lines `patch` adds, stripped, less blank ones and file headers."""
+def _lines(patch: bytes, sign: bytes) -> set[bytes]:
+    """The lines `patch` adds (`sign` "+") or takes out ("-"), stripped, less blank ones and file headers."""
     return {line[1:].strip() for line in patch.splitlines()
-            if line.startswith(b"+") and not line.startswith(b"+++ ") and line[1:].strip()}
+            if line.startswith(sign) and not line.startswith(sign * 3 + b" ") and line[1:].strip()}
 
 
 def _present(worktree: pathlib.Path, patch: bytes, commit: str) -> bool | None:
@@ -1075,9 +1075,10 @@ def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[st
             line: Collection[str]) -> bool | None:
     """Whether side commit `sha`'s own change is gone at the head. Gone needs proof: the listing revert at
     `since` took its patch out whole (there before, absent after), and no commit of the head's first-parent
-    `line` since added one of its lines back to one of its files. So a file the side shared, an unrelated
-    edit in the revert, and a fix put back, changed or not, and then moved, each keep it (class passes,
-    review of build/sd-1654). A commit off that line, a branch an `ours` merge discarded, restores nothing.
+    `line` since put it back: the whole patch, or one of its lines in one of its files, added or taken out
+    again. So a file the side shared, an unrelated edit in the revert, and a fix put back, changed or not,
+    and then moved, each keep it (class passes, review of build/sd-1654). A commit off that line, a branch
+    an `ours` merge discarded, restores nothing.
     None when nothing is proved: no patch (a merge, an empty commit), or it reads neither way at the revert.
     ponytail: a restore is matched by line, so a fix rewritten in every line reads as new work, which cites
     its own item; one common line added to the file reads as a restore, and the item closes as on the base."""
@@ -1087,9 +1088,15 @@ def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[st
     revert = commits[since][0]
     if _present(worktree, patch, f"{revert}^") is not True or _present(worktree, patch, revert) is not False:
         return None
-    names, lines = _changed(worktree, sha), _added(patch)
+    names = _changed(worktree, sha)
     for commit, _ in commits[:since]:
-        if commit in line and lines & _added(_patch(worktree, commit, names) or b""):
+        later = _patch(worktree, commit, names) if commit in line else None
+        if not later:
+            continue
+        # A line of it back, added or taken out again, or the whole patch back: a deletion adds no line, and
+        # a binary or mode-only change has none to match (ruling round, review of build/sd-1654).
+        if (_lines(patch, b"+") & _lines(later, b"+") or _lines(patch, b"-") & _lines(later, b"-")
+                or (_present(worktree, patch, f"{commit}^") is False and _present(worktree, patch, commit))):
             return False
     return True
 
