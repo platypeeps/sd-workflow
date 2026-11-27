@@ -2843,6 +2843,15 @@ class Supervise(Case):
         prompt = self.calls("claude")[-1]["argv"]
         self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
+    def test_a_question_holds_no_build_of_a_held_split(self):
+        """Lane review of build/sd-1867: Build of a held split's items read their questions too, so a
+        pending one held a fresh Build that worked before; the press takes a held split as it stands."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        self.release_all()
+        add_note(self.db, self.items[0], "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        queued = build.queue_again(self.db, self.items[:2], who="operator")
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(self.items[:2]))
+
     def test_the_build_press_takes_a_held_bundles_items_fresh(self):
         """Row 12: the held bundle's refusal says Build; the dashboard's Build dialog checks each item (`_item`) and
         its press calls `queue`, not `queue_again`, so both take the blocked items and build them on a new branch."""

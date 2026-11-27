@@ -1209,6 +1209,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     finding = finding.strip()
     with transaction(connection):
         leads, fixes, fresh = [], [], []
+        held: set[int] = set()
         named: dict[int, set[int]] = {}
         # Each lane-failed run this press split, and every member of its bundle: the split settled each, so a
         # later one of them is done, whatever the order (review of build/sd-1306).
@@ -1266,6 +1267,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
             if split_held(connection, item):  # its branch may hold a left item's work: a fresh press, new branch
                 fresh.append(item)
+                held.add(item)  # `queue` takes it blocked as it stands: no question holds it (lane review)
                 continue
             # A drop's kept lead never ran, and its Retry resumes the split branch (`retry`, review of build/sd-1306).
             if (state and state["status"] in AGAIN and row["status"] == state["status"] and not alone
@@ -1306,7 +1308,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
-                elif state["item"]["status"] == "blocked" and (since := _build_blocked(connection, item)) is not None:
+                elif (state["item"]["status"] == "blocked" and item not in held
+                      and (since := _build_blocked(connection, item)) is not None):
                     # A member its run blocked, whose bundle cannot retry (its lead done: the code shipped
                     # without it), builds fresh once its builder's question is answered (pack sd:10294): one
                     # that run raised, as delivery read it (`asked_since`), not an older unrelated one.
