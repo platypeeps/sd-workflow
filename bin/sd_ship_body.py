@@ -71,6 +71,8 @@ _BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 _SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 #: A list item's marker and the spaces after it; their width is where the item's text starts.
 _ITEM_MARKER = re.compile(r"^( {0,3}(?:[-*+]|[0-9]{1,9}[.)]))( +|$)")
+#: A block quote marker: `>`, at most three spaces in.
+_QUOTE = re.compile(r"^ {0,3}>")
 
 
 def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[int]:
@@ -374,9 +376,10 @@ _HTML_START = re.compile(
 
 def _interrupts(text: str) -> bool:
     """Whether `text` starts a block that ends an open paragraph: a heading, fence, break, quote, HTML
-    block, or a list item with text that is a bullet or numbered 1."""
+    block, or a list item with text that is a bullet or numbered 1. Each starts at most three spaces
+    in; four or more make a lazy line (pack sd:10090)."""
     fence = _FENCE_RE.match(text)
-    if _ATX.match(text) or _BREAK.match(text) or _HTML_START.match(text) or text.lstrip(" ")[:1] == ">" \
+    if _ATX.match(text) or _BREAK.match(text) or _HTML_START.match(text) or _QUOTE.match(text) \
             or (fence and not (fence["fence"][0] == "`" and "`" in fence["info"])):
         return True
     marker = _ITEM_MARKER.match(text)

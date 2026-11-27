@@ -984,6 +984,30 @@ class CitedIdTests(unittest.TestCase):
         commits = [("c" * 40, revert), (a + "0" * 33, "fix: work\n\nCloses: sd:2\n")]
         self.assertEqual(sd_ship_body.cited_ids("", commits), (2,))
 
+    def test_a_block_indented_four_spaces_ends_no_comment_paragraph(self) -> None:
+        """Review of build/sd-1653, `bin/sd_ship_body.py:217` and `:356` (pack sd:10090). A block
+        that interrupts a paragraph starts at most three spaces in; four or more make a lazy
+        line. Every start `_interrupts` reads had that bound but the quote, which matched `>` at
+        any indent, so `    > q` in a comment ended its paragraph, its `<!--` read as text, and
+        the list it hid undid commits. Each expected value is what CommonMark shows."""
+        a, b, c = "a" * 7, "b" * 7, "c" * 7
+        starts = ("> q", ">", "# h", "***", "<div>", "- x", "1. x")
+        for start in starts:
+            for indent, found in ((4, []), (8, []), (3, [a, b])):
+                message = f"Kept: see <!-- example:\n{' ' * indent}{start}\nReverted commits:\n2. {a}\n-->\n- {b} retained\n"
+                with self.subTest(message=message):
+                    self.assertEqual(sd_ship_body._listed_undone(message), found)
+        for start in ("> q", ">", "# h"):  # inside a list item, four past its text column
+            message = f"Reverted commits:\n- {b} renew <!-- x\n      {start}\n  Kept:\n  -->\n  - {c} renew\n"
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), [b, c])
+        for indent in range(0, 9):
+            with self.subTest(indent=indent):
+                self.assertEqual(sd_ship_body._interrupts(" " * indent + "> q"), indent <= 3)
+        hidden = f"revert: undo\n\nKept: see <!-- example:\n    > q\nReverted commits:\n2. {a}\n-->\n- {b}\n"
+        commits = [("f" * 40, hidden), (b + "0" * 33, "fix: work\n\nCloses: sd:3\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (3,))
+
     def test_only_a_commonmark_block_ends_the_paragraph_of_a_comment(self) -> None:
         """Last round, review of build/sd-1653 (pack sd:10090). The paragraph of an inline comment ended
         by rules CommonMark does not have: the `plain` read's any-marker and colon-heading rules, a
