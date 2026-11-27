@@ -7153,7 +7153,7 @@ class Sweep(Case):
         self.done()
         aside = Path(str(work) + build_run.ASIDE)
         support.git(self.repo, "worktree", "move", str(work), str(aside))
-        tracked = support.git(aside, "ls-files").splitlines()[0]
+        tracked = support.git(aside, "ls-files", "--deduplicate").splitlines()[0]
         (aside / tracked).unlink()
         self.assertEqual(build_run.sweep(self.db), [])
         self.assertTrue(registered(self.repo, work))

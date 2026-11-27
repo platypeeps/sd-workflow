@@ -238,6 +238,7 @@ A waiting gate names who holds each slot and since when.
 `sd.lane_train` is load control too: how many queued entries of one repository one lane run gates at once as a stack and lands as one train pull request (unset: 3, 1 to 9).
 `sd.machine_cap`, `sd.repo_cap` and `sd.bundle_max` are load control too: how many builders run at once on this machine (unset: 6), how many bundles build at once in one repository (unset: 1), and how many items one build bundle takes when this machine claims it (unset: 3); the claim gives a build child 120 minutes per 3 slots it took, never less.
 `sd.overload_fallback` set to `1` lets the hub build an overloaded satellite's fresh queued builds (unset: they wait for the satellite).
+`sd.review_tool_changes` decides what a change to the review tools alone does to a lead review and its rebuttals: `keep` (unset) keeps them; `strict` re-reviews (sd:10929).
 `sd.build_model` names the model every build bundle this machine claims runs its builder on (unset: opus, and sonnet for an all-mechanical bundle).
 `sd gate post --head SHA` runs the merge gate at SHA and posts `sd/local-gate`, for a merge path that is not `sd-ship merge`.
 `sd gate check` runs the same check at `HEAD` and records a pass that `sd-ship prepare` and the merge gate reuse at that head; it posts nothing.
