@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 from datetime import datetime, timezone
 from typing import Any
@@ -171,10 +172,22 @@ def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool = Fals
                           f"is 'rebutted' or 'parked', not {row['response_disposition']!r}")
         text(row["reason"], "reason")
     tests = [test_argv(row.get("test")) for row in rows]
-    for index, argv in enumerate(tests, 1):
-        if argv and run_tests:
-            reproduces(operation.root, head, index, argv)
+    if run_tests:
+        run_row_tests(operation, head, tests)
     return digest(proposal)
+
+
+def run_row_tests(operation: Any, head: str, tests: list[list[str]]) -> None:
+    """Each row's test at `head`; one that fails voids the clearance an earlier pass saved, so no read reuses it."""
+    for index, argv in enumerate(tests, 1):
+        if not argv:
+            continue
+        try:
+            reproduces(operation.root, head, index, argv)
+        except Refusal:
+            if operation.state.get("review_clearance") is not None:
+                operation.save(review_clearance=None)
+            raise
 
 
 def test_argv(value: Any) -> list[str]:
@@ -196,7 +209,6 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
     finding, so the rebuttal stands. Any other exit, a test that is missing, cannot start or overruns,
     refuses: fail closed. So does a test that moved its tree's head or left it dirty.
     """
-    import os  # noqa: PLC0415
     import tempfile  # noqa: PLC0415
 
     import sd_gate_cache  # noqa: PLC0415
@@ -210,8 +222,7 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
         except sd_gate_run.GateError as error:
             raise Refusal(f"finding {index}: no worktree of {head[:12]} for its test: {error}") from None
         try:
-            done = sd_lib.run_group(argv, cwd=tree, env=sd_lib.without_fsmonitor(os.environ),
-                                    timeout=TEST_TIMEOUT_SECONDS)
+            done = sd_lib.run_group(argv, cwd=tree, env=sd_lib.without_fsmonitor(os.environ), timeout=TEST_TIMEOUT_SECONDS)
         except sd_lib.GroupTimeout:
             raise Refusal(f"finding {index}: its test did not finish in {TEST_TIMEOUT_SECONDS} s; "
                           "a blocker stays open until its test passes") from None

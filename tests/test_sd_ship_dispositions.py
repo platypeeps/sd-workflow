@@ -259,6 +259,30 @@ class DispositionTests(unittest.TestCase):
         with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
             self.prepare()
 
+    def test_a_test_that_fails_on_a_rerun_revokes_the_recorded_clearance(self):
+        """sd:10893 class pass: a rerun that runs the test and fails, at prepare or at a new recording, drops
+        the clearance a passing prepare saved, so a later read (merge, `verify-review`) cannot reuse it."""
+        self.blocked()
+        flag = self.directory / "reproduced"
+        script = f"import pathlib, sys; sys.exit(pathlib.Path({str(flag)!r}).exists())"
+        for rerun in ("prepare", "recording"):
+            with self.subTest(rerun=rerun):
+                flag.unlink(missing_ok=True)
+                self.accepted(self.with_test([sys.executable, "-c", script]))
+                self.prepare()
+                self.operation().check_review(self.head)
+                flag.write_text("x")
+                if rerun == "prepare":
+                    with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
+                        self.prepare()
+                else:
+                    self.proposal_file.write_text(json.dumps(self.with_test([sys.executable, "-c", script])))
+                    result = self.command("--dispositions-file", str(self.proposal_file))
+                    self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertIsNone(self.operation().state.get("review_clearance"))
+                with self.assertRaisesRegex(ship.Refusal, "prepare again"):
+                    self.operation().check_review(self.head)
+
     def test_only_recording_and_prepare_run_the_test_never_a_read(self):
         """sd:10893 review: merge, publication and `verify-review` read the record and run nothing; a test
         is code, so a read-only command executing it in the live checkout is not read-only."""
