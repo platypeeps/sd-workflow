@@ -1150,6 +1150,40 @@ class LineBudgetTests(unittest.TestCase):
         # ASCII stdout before the status line. Measured: `sd-review` is
         # 3179 here.
         #
+        # 5149 -> 5048 is pack sd:10087: `bin/sd-review` -101. A prior
+        # blocker clears only on each completed reader's `fixed` verdict
+        # for its id (`carried`), so the prose matcher (`prior_evidence`),
+        # the line map (`prior_at`, `moved_line`, `diff_lines`) and
+        # `instance_rows` are deleted. Measured: `sd-review` is 3078 here.
+        #
+        # 5048 -> 5084 is the review of build/sd-2205: `bin/sd-review` +36.
+        # A failed reader's `open` verdict holds a blocker, and `followed`
+        # moves each carried blocker through a rename so the next fix
+        # review reads its source. Measured: `sd-review` is 3114 here.
+        #
+        # 5084 -> 5102 is round 3 of build/sd-2205: `bin/sd-review` +18.
+        # Degraded input holds a prior blocker: a malformed verdict reads
+        # as `open` (`held_verdicts`), and `followed` chains each commit's
+        # renames. Measured: `sd-review` is 3132 here.
+        #
+        # 5102 -> 5103 is round 4 of build/sd-2205: `bin/sd-review` +1.
+        # A pass with no completed reader carries every prior blocker, so
+        # an interrupted report, a resume's input, keeps it with each
+        # `open` evidence. Measured: `sd-review` is 3133 here.
+        #
+        # 5103 -> 5122 is round 4 of build/sd-2205: `bin/sd-review` +19.
+        # `followed` walks each first-parent commit, so a file deleted on
+        # the way stays put, marked `deleted_since_review`, and a later
+        # file that takes its name is not read as its source; the marker
+        # is `prior_marker`, to keep `prepared_prompt` under the branch
+        # ceiling. Measured: `sd-review` is 3152 here.
+        #
+        # 5122 -> 5139 is round 5 of build/sd-2205: `bin/sd-review` +17.
+        # `shared` gives each evidence note a share of the cap, so stored
+        # evidence does not push out a reader's new `open` evidence, and
+        # `replaced` hides a deleted file's new source only when no other
+        # blocker lives at the path. Measured: `sd-review` is 3169 here.
+        #
         # 5149 -> 5183 is sd:10286: `bin/sd-review` +34 so a build's
         # ruling holds back only the repeat it judged: a citation of
         # other evidence, a lapsed ruling or a cut text's literal
@@ -1159,11 +1193,25 @@ class LineBudgetTests(unittest.TestCase):
         # so a ruling holds an uncited repeat only when each blocker
         # the prior review saved beside it is the claim it judged, a
         # closed test in `dispose`. Measured: `sd-review` is 3227 here.
+        #
+        # 5139 -> 5196 is the merge of sd:10286 into build/sd-2205: its
+        # ruling check moves to `is_rebutted`, which `dispose` and
+        # `carried` share, so a ruling clears a carried blocker only when
+        # it judged that blocker's repro. Measured: `sd-review` is 3226.
+        #
+        # 5196 -> 5200 is round 6 of build/sd-2205: `bin/sd-review` +4 so
+        # a reader's `open` evidence is a citation a rebuttal holds only
+        # as `dispose` holds a cited repeat (`_rebuts`, kept out of `carried`
+        # for its complexity ceiling). Measured: `sd-review` is 3230.
+        #
+        # 5200 -> 5201 is the last round of build/sd-2205: `bin/sd-review`
+        # +1, a docstring line: `_rebuts` tests the saved evidence beside
+        # every `open` citation. Measured: `sd-review` is 3231.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5197,
+            5201,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
