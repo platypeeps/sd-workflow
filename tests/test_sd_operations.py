@@ -116,16 +116,20 @@ class OperationsCLI(unittest.TestCase):
         with patch.dict(sys.modules, {"sd_db.build": builds}), patch.object(sd_db, "build", builds, create=True):
             code, output = self.call("assignments", "build", "sd:7", "9")
             self.call("assignments", "build", "7", "--finding", "check the parser")
-            self.assertEqual(queue.call_args.kwargs, {"who": "operator", "finding": "check the parser"})
+            self.assertEqual(queue.call_args.kwargs, {"who": "operator", "finding": "check the parser",
+                                                      "expected_branch": None})
+            # sd:10897: the branch the caller read reaches the press, which refuses another.
+            self.call("assignments", "build", "7", "--finding", "x", "--expected-branch", "build/sd-7")
+            self.assertEqual(queue.call_args.kwargs["expected_branch"], "build/sd-7")
             with self.assertRaises(cli.WorkRefusal):
                 queue.side_effect = sd_db.SdDbError("item 9 is planning; a build takes a ready item")
                 self.call("assignments", "build", "9")
         self.assertEqual(code, 0)
         self.assertEqual(output.splitlines(), ["#31  queued  build  sd:7", "#32  queued  build  sd:9"])
         self.assertEqual(queue.call_args_list[0].args[1:], ([7, 9],))
-        self.assertEqual(queue.call_args_list[0].kwargs, {"who": "operator", "finding": ""})
+        self.assertEqual(queue.call_args_list[0].kwargs, {"who": "operator", "finding": "", "expected_branch": None})
         self.connect.assert_called_with(sd_db, write=True)
-        self.assertEqual(self.connection.close.call_count, 3)
+        self.assertEqual(self.connection.close.call_count, 4)
 
     def test_assignments_get_wait_blocks_until_each_build_ends(self):
         """pack sd:8793: `get N... --wait` polls on a fake clock until every assignment leaves queued, claimed or

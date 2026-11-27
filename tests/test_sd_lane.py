@@ -313,6 +313,20 @@ class QueueOutlivesTheProcess(Lane):
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertEqual(json.loads(done.stdout)["expected_head"], head)
 
+    def test_retry_expected_branch_refuses_another_branch(self) -> None:
+        """sd:10897. The open-PR sweep reads a PR's branch, then retries an item; an entry on another branch,
+        such as one a second writer queued between the read and the write, is refused with `stale_head`."""
+        sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        branch = self.entries()[0]["branch"]
+        done = self.sd_ship(self.repo, "retry", "7", "--expected-branch", "build/sd-0")
+        answer = json.loads(done.stdout)
+        self.assertEqual((done.returncode, answer["ok"], answer["code"]), (3, False, sd_lane.STALE_HEAD), done.stdout)
+        self.assertIn(branch, answer["error"])
+        self.assertEqual([row["status"] for row in self.entries()], ["prepared"])
+        done = self.sd_ship(self.repo, "retry", "7", "--manual", "--expected-branch", branch)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
     def test_retry_takes_a_cancelled_entry_and_its_help_says_so(self) -> None:
         """sd:3389. The system Queue page re-queues a cancelled row; it reads `cancelled` in the help to offer it."""
         sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")

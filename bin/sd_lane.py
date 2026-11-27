@@ -1731,7 +1731,7 @@ def worktree_unmoved(last: dict[str, Any]) -> None:
 
 
 def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: bool = False,
-          expected_head: str | None = None) -> dict[str, Any]:
+          expected_head: str | None = None, expected_branch: str | None = None) -> dict[str, Any]:
     """Queue `item`'s last entry again when it stopped short of a merge (sd:3254).
 
     A new entry with the old one's branch, title, claim, texts and worktree
@@ -1749,6 +1749,8 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
     is made again: another head refuses `STALE_HEAD`, a newer entry
     `SUPERSEDED` (`check_successor`). An entry Fix handed back to its
     builder (`HANDED_BACK`, pack sd:8584) is refused at both reads.
+    `expected_branch` is the branch the caller read: a last entry on
+    another refuses `STALE_HEAD` at both reads too (sd:10897).
 
     What enqueue refuses as a moved head (sd:5989), retry refuses too, before
     the publish (sd:6057): a worktree here that moved past the head
@@ -1767,6 +1769,9 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
         if expected_head is not None and latest.get("expected_head") != expected_head:
             raise LaneError(f"sd:{item}'s last entry is at {latest.get('expected_head')}, not the expected head "
                             f"{expected_head}; read it again with `sd-ship lane list`", code=STALE_HEAD)
+        if expected_branch is not None and latest.get("branch") != expected_branch:
+            raise LaneError(f"sd:{item}'s last entry is on {latest.get('branch')}, not the expected branch "
+                            f"{expected_branch}; read it again with `sd-ship lane list`", code=STALE_HEAD)
         if latest.get("handed_back"):
             handed = latest["handed_back"] if isinstance(latest["handed_back"], dict) else {}
             raise LaneError(f"sd:{item}'s last entry was handed back to its builder (build run "
@@ -5335,6 +5340,8 @@ def add_lane_verbs(commands: Any) -> None:
                                                  f"and {SUPERSEDED} after a newer entry; a cancelled entry needs it, "
                                                  f"and refuses {HEAD_MOVED} when its branch moved and "
                                                  f"{ALREADY_MERGED} at a merged head (sd:3389)")
+    retrier.add_argument("--expected-branch", help=f"refuse with {STALE_HEAD} unless the item's newest entry is on "
+                                                   "this branch, checked in the write's transaction (sd:10897)")
     canceller = verbs.add_parser("cancel", help="mark a pending entry cancelled, release a stuck running one, "
                                                     "clear a prepared one a ship receipt shows merged, or clear "
                                                     "the newest failed or skipped ones")
@@ -5408,7 +5415,8 @@ def lane_main(args: Any) -> int:
                       **({"legacy": said} if (said := legacy_waiting(
                           queue_path(root, environ), {str(row.get("id")) for row in entries})) else {})}
         elif args.lane_command == "retry":
-            result = retry(root, args.item, environ, manual=args.manual, expected_head=args.expected_head)
+            result = retry(root, args.item, environ, manual=args.manual, expected_head=args.expected_head,
+                           expected_branch=args.expected_branch)
         elif args.lane_command == "cancel":
             result = cancel(root, args.item, environ, expected_revision=args.expected_revision,
                             expected_claim=args.expected_claim)

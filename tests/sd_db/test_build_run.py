@@ -5421,6 +5421,17 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
+    def test_fix_bound_to_another_branch_is_refused(self):
+        """sd:10897: a Fix bound to a branch read before another writer moved the bundle refuses, writing nothing."""
+        run = self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.assertRaisesRegex(build.BuildRefused, "not the expected branch build/sd-0"):
+            build.queue_again(self.db, self.items, who="operator", finding="x", expected_branch="build/sd-0")
+        self.assertFalse(self.stored("e1").get("handed_back"))
+        build.queue_again(self.db, self.items, who="operator", finding="x", expected_branch=run["branch"])
+        self.assertTrue(self.stored("e1").get("handed_back"))
+
     def reopened_dependency(self):
         """The bundle's lead waits on an item reopened since its build: the dependency is open again."""
         first = create_item(self.db, kind="task", title="Prerequisite", repo=str(self.repo), status="ready")

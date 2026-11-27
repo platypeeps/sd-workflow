@@ -1526,6 +1526,23 @@ class Reap(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
         self.assertIn(build.FINDING + "check the parser", notes)
 
+    def test_build_with_a_stale_expected_branch_is_refused(self):
+        """sd:10897: the open-PR sweep reads a branch, then presses an item; a press bound to a branch the item's
+        bundle no longer builds on refuses and writes nothing."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        with self.assertRaisesRegex(build.BuildRefused, "expected branch build/sd-0"):
+            build.queue_again(self.db, [self.items[0]], who="operator", finding="check the parser",
+                              expected_branch="build/sd-0")
+        self.assertEqual(self.statuses(self.items), ["blocked", "blocked"], "one refusal writes nothing")
+        fresh = self.item()
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{fresh} .*no build branch"):
+            build.queue_again(self.db, [fresh], who="operator", expected_branch=row["branch"])
+        queued = build.queue_again(self.db, [self.items[0]], who="operator", finding="check the parser",
+                                   expected_branch=row["branch"])
+        self.assertEqual({entry["status"] for entry in queued}, {"queued"})
+
     def test_a_plain_retry_of_a_review_parked_run_sends_its_blockers(self):
         """pack sd:9498: Retry of a run parked after REVIEW_ROUNDS dropped the last round's blockers, which only
         Send to builder's prefill carried; the retry's finding note now names them, with the class pass."""
