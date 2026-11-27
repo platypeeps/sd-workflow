@@ -2000,6 +2000,15 @@ def _place(path: Any) -> str:
     return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
 
 
+def lead_holds(lead: Rebuttal, record: Rebuttal | None, row: Mapping[str, Any], cited: str | None, *, verdict: bool) -> bool:
+    """sd:10926 class pass: a lead's rejection holds only the evidence it rejected, a prior blocker's saved one too, in any
+    words until a change reaches its line (`lines_now`), whatever test it names; an uncited repeat holds as `record`."""
+    saved = row.get("evidence") if verdict and isinstance(row.get("evidence"), str) and row["evidence"].strip() else None
+    said = cited if cited is not None else saved
+    return getattr(record, "listed", False) if said is None else bool(
+        (lead.lead or "").strip()) and said.strip() == str(lead.lead).strip() and lead.listed
+
+
 def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], cited: str | None = None,
                 saved: Sequence[Mapping[str, Any]] = (), *, verdict: bool = False) -> bool:
     """The newest record at every place `row` names is a listed rebuttal, `row` citing no evidence. Or a
@@ -2015,15 +2024,14 @@ def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], cited: str
     # and no test outweighs a reader's `open` (pack sd:10087).
     # ponytail: another defect raised uncited at that exact line is held too; it still posts, as advisory.
     place = (row.get("path"), row.get("summary"), row.get("line"), row.get("instances"))
-    worded = recorded_at(rebutted, *place)
-    record = worded or (None if verdict else recorded_at(rebutted, *place, reworded=True))
+    worded, reworded = recorded_at(rebutted, *place), recorded_at(rebutted, *place, reworded=True)
+    record = worded or (None if verdict else reworded)
+    if getattr(worded or reworded, "lead", None) is not None:
+        return lead_holds(worded or reworded, record, row, cited, verdict=verdict)
     ruled = getattr(record, "ruled", None)
     if ruled is None:  # a rebuttal whose test passed holds a cited repeat in its words (sd:10918)
         tested = record is worded and bool(getattr(record, "test", "")) and not verdict
-        # sd:10926: a lead's rejection holds a repeat of the evidence it rejected, in any words, at its line
-        # until a change reaches it (`lines_now`); fresh evidence is a new claim and blocks.
-        bound = bool(cited) and cited == getattr(record, "lead", None) and not verdict
-        return (cited is None or tested or bound) and getattr(record, "listed", False)
+        return (cited is None or tested) and getattr(record, "listed", False)
     def _judged(old: Mapping[str, Any]) -> bool:
         kept = old.get("evidence") if isinstance(old.get("evidence"), str) and old["evidence"].strip() else None
         return kept == ruled if kept is not None else summary_key(old.get("summary")) == summary_key(row.get("summary"))

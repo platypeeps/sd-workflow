@@ -1128,6 +1128,42 @@ class RebuttalIdentityTests(unittest.TestCase):
         self.assertEqual(held(), ["advisory"])
         self.assertEqual(gate([row(line=40, evidence=REPRO)], json.dumps(body)), ["advisory"], "an unchanged tree")
 
+    def lead_body(self, **finding: Any) -> dict[str, Any]:
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted"), line=40))
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        body["proposal"]["findings"][0].update(finding)
+        return body
+
+    def test_a_tested_lead_rejection_never_holds_fresh_evidence(self) -> None:
+        """sd:10926 class pass (bin/sd-review:2026): a lead rebuttal holds a cited repeat only of the evidence
+        it rejected. Its passing test held any citation in its words, so fresh evidence posted as advice."""
+        tested = json.dumps(self.lead_body(test=["python3", "t.py"]))
+        self.assertEqual(gate([row(line=40, evidence="python3 u.py: Traceback")], tested), ["blocking"])
+        self.assertEqual(gate([row(line=40, evidence=REPRO)], tested), ["advisory"])
+        self.assertEqual(gate([row(line=40)], tested), ["advisory"])
+
+    def test_a_lane_retry_holds_a_lead_rejection_of_the_same_evidence(self) -> None:
+        """sd:10926 class pass (bin/sd-review:2025, :2112): `carried` asks with `verdict`, which turned the lead's
+        hold off, so a retry whose reader cited the exact rejected evidence kept the blocker. It holds that
+        evidence in any words and outer whitespace; fresh evidence still keeps it."""
+        seen = listed(json.dumps(self.lead_body()))
+        def kept(summary: str, evidence: str) -> list[str]:
+            prior = [dict(row(summary=summary, line=40, evidence=REPRO), disposition="blocking")]
+            opened = sd_review.Outcome("codex", sd_review.FINDINGS, (), "", (), (), verdicts=(
+                {"id": "B1", "verdict": "open", "evidence": evidence},))
+            return [r["disposition"] for r in sd_review.carried(prior, [opened], seen)]
+        for summary in ("defect", "the same defect reworded"):
+            with self.subTest(summary=summary):
+                self.assertEqual(kept(summary, REPRO), [])
+                self.assertEqual(kept(summary, REPRO + "\n"), [])
+                self.assertEqual(kept(summary, "python3 u.py: Traceback"), ["blocking"])
+        fresh = [dict(row(line=40, evidence="python3 u.py: Traceback"), disposition="blocking")]
+        self.assertEqual([r["disposition"] for r in sd_review.carried(fresh, [], seen)], ["blocking"],
+                         "a prior blocker's own fresh evidence is a new claim")
+        self.assertEqual(sd_review.carried([dict(row(line=40), disposition="blocking")], [], seen), [],
+                         "an uncited prior blocker in the rejection's words still holds")
+
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
         for summary in ("value is wrong", " VALUE is\nwrong ", f"Value is wrong {sd_review.REPEAT_NOTE}"):
