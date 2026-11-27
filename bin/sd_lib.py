@@ -110,6 +110,19 @@ def lead_review_key(repository: str, branch: str) -> str:
     return f"review:v1:{repository}:{branch}"
 
 
+#: Operator 2026-11-27: while the pack and system tools change daily, a change to the
+#: review tools alone keeps a review and its rebuttals; a policy change still re-reviews.
+#: False restores the strict reading (any tool change re-reviews).
+TOOL_CHANGES_KEEP_REVIEWS = True
+
+
+def same_review_binding(stored: object, current: object) -> bool:
+    """Two lead-review bindings agree; the `tools` entry counts only under the strict reading."""
+    if TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict) and isinstance(current, dict):
+        return {k: v for k, v in stored.items() if k != "tools"} == {k: v for k, v in current.items() if k != "tools"}
+    return stored == current
+
+
 def lead_review_binding(root: pathlib.Path) -> dict | None:
     """What a recorded lead review is bound to, or None when a part does not read (sd:5988).
 
@@ -4359,6 +4372,12 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
     return [answers[index] for index in sorted(answers)]
 
 
+def finding_key(finding: Mapping[str, Any]) -> str:
+    """What makes two readers' findings copies of one for `distinct_findings`."""
+    return json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
+                      sort_keys=True, default=str)
+
+
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
@@ -4371,8 +4390,7 @@ def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, A
     seen: dict[str, dict[str, Any]] = {}
     cited: dict[str, list[str]] = {}
     for finding in findings:
-        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
-                         sort_keys=True, default=str)
+        key = finding_key(finding)
         kept = seen.setdefault(key, dict(finding))
         evidence, parts = finding.get("evidence"), cited.setdefault(key, [])
         if isinstance(evidence, str) and evidence.strip() and evidence not in parts:

@@ -3859,6 +3859,39 @@ class Hosts(Case):
         self.assertIsNotNone(build.run(self.db, run["id"])["released_at"], "work's own probe releases it")
         self.assertFalse(self.lease_held(run))
 
+    def test_the_hub_pauses_the_runs_of_a_satellite_on_another_build(self):
+        """sd:10934: a hub refresh refuses a satellite's every call until it follows the pins, so its dispatcher
+        and runs go quiet while its builders still run. A quiet host whose last beat named another sd_db build
+        is paused for `MISMATCH_SECONDS`, its runs left open; past that it strands as any quiet host's."""
+        from sd_db import remote
+
+        run = self.satellite_run()
+        now = later(run["created_at"], build.STALE_SECONDS + 1)
+        other = "0" * 16 if remote.build_digest() != "0" * 16 else "1" * 16
+        quiet = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=quiet,
+                     body={"pid": 1, "why": "", "build": other})
+        self.assertIsNotNone(build.dispatcher_gone(self.db, "work"))
+        self.assertEqual(self.strand(run), [], "a mismatch pauses the run")
+        self.assertIsNone(build.run(self.db, run["id"])["outcome"])
+        lapsed = (datetime.fromisoformat(now) - timedelta(seconds=build.MISMATCH_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=lapsed,
+                     body={"pid": 1, "why": "", "build": other})
+        [settled] = self.strand(run)
+        self.assertEqual((settled["run"], settled["outcome"]), (run["id"], "blocked"))
+        self.assertIn(f"its last beat ran sd_db build {other}", build.run(self.db, run["id"])["detail"])
+        self.assertTrue(self.lease_held(run))
+
+    def test_the_hub_strands_a_quiet_run_whose_beat_names_this_build_or_none(self):
+        """sd:10934: only another build pauses; a beat on the hub's own build, or an unreadable one, does not."""
+        from sd_db import remote
+
+        for body in ({"build": remote.build_digest()}, {"build": ["0" * 16]}, {"build": ""}):
+            with self.subTest(body=body):
+                self.assertFalse(build.mismatched_build(json.dumps(body)))
+        self.assertFalse(build.mismatched_build("not json"))
+        self.assertFalse(build.mismatched_build(None))
+
     def test_the_hub_strands_a_run_whose_beat_leads_past_stale_seconds(self):
         """Pack sd:7970: a run beat is stamped on its satellite's clock, so it takes the dispatcher beat's lead
         rule. A lead up to `STALE_SECONDS` is skew and reads as age 0; one further has no age to trust, so a

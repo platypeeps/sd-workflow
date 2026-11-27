@@ -1218,11 +1218,39 @@ class LineBudgetTests(unittest.TestCase):
         # `verdict` mode, so a test holds a cited repeat only in its
         # recorded words and never outweighs a reader's `open`. Measured:
         # `sd-review` is 3298.
+        #
+        # 5268 -> 5285 is sd:10892: `bin/sd-review` +17 for the `base`
+        # finding key, its prompt ask, the `dispose` leg that posts a
+        # defect the merge base already has as advisory, and `_bad_enum`,
+        # which keeps `_finding_error` under the complexity ceiling.
+        # Measured: `sd-review` is 3315.
+        #
+        # 5285 -> 5300 is the sd:10892 class pass: `bin/sd-review` +15 so
+        # the `base` question names the default branch's merge base by
+        # commit (`Subject.main_base`, `base_ask`), never the diff's own
+        # base, and only a review that asked it downgrades a `has`.
+        # Measured: `sd-review` is 3330.
+        #
+        # 5300 -> 5323 is the sd:10892 last round: `bin/sd-review` +23 for
+        # `base_check`, so a reader's `base: has` downgrades only from a
+        # reader of the checkout and only where git shows every named
+        # place untouched since the main merge base. Measured:
+        # `sd-review` is 3353.
+        #
+        # 5323 -> 5331 is sd:10892 round 4: `bin/sd-review` +8 so a merged
+        # finding downgrades only when every reader's copy holds, and only
+        # a diff from the main merge base is asked or judged (`_judged`).
+        # Measured: `sd-review` is 3361,
+        # after the merge of origin/main (sd:10918, build/sd-2233).
+        #
+        # 5331 -> 5335 is sd:10892 round 5: `bin/sd-review` +4 so `base_check`
+        # counts a mode, type or presence change as touching the whole file.
+        # Measured: `sd-review` is 3365.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5268,
+            5335,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

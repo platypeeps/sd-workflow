@@ -44,6 +44,9 @@ TEST_FIELDS = ("setup", "env", "teardown")
 RELEASE_FIELDS = ("deploy_repo", "file", "key", "verify")
 RELEASE_DEPLOY = ("deploy_repo", "file", "key")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
+#: `runtime_data`: globs of the files code reads as data, by no name, whatever their kind (sd:10906): a build's
+#: ruling round that changes one applies no reject or file ruling (`build_run.unwalked`).
+RUNTIME_DATA = "runtime_data"
 #: Slice 2's keys (design § Slices): accepted as objects now, so a preset written for both slices declares once.
 LATER = ("ci", "release", "test", "links")
 
@@ -176,7 +179,8 @@ def problems(value: Any) -> list[str]:
     where = "the policy declaration"
     if not isinstance(value, dict):
         return [f"{where} is a JSON object, not {type(value).__name__}"]
-    known = {"mode", *ACTS, MERGE, "merge_method", "issues", "issues_scope", "review", "commit_convention", *LATER}
+    known = {"mode", *ACTS, MERGE, "merge_method", "issues", "issues_scope", "review", "commit_convention",
+             RUNTIME_DATA, *LATER}
     extra = sorted(set(value) - known)
     found = [f"{where}: unknown key(s) {', '.join(extra)}"] if extra else []
     found += _choice(value, "mode", MODES, where)
@@ -201,6 +205,8 @@ def problems(value: Any) -> list[str]:
         found += _test_problems(value["test"], f"{where}: test")
     if "release" in value:
         found += _release_problems(value["release"], f"{where}: release")
+    if RUNTIME_DATA in value and not _words(value[RUNTIME_DATA]):
+        found.append(f"{where}: {RUNTIME_DATA} is a list of path globs")
     if "links" in value and not _words(value["links"]):
         found.append(f"{where}: links is a list of registered paths")
     return found

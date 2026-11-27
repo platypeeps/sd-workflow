@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import hub, paths, reads
+from . import hub, paths, reads, remote
 from .database import served_by, transaction
 from .errors import SdDbError
 from .needs_sweep import standing_ruling
@@ -88,6 +88,10 @@ BESIDE_PRIORITY = 1
 #: A supervisor beats every 30 s; one silent this long, or unspawned this long after its claim, is lost.
 #: 600, not 180: a beat a held lock skips no longer ends a long build (pack sd:6741).
 STALE_SECONDS = 600
+#: How long the hub leaves the runs of a quiet satellite whose last beat named another `sd_db` build (sd:10934):
+#: a hub refresh refuses that satellite's every call until its follow job moves the pins, once past 10 minutes,
+#: while its builders still run. Past this, a follow that never came strands the runs as any quiet host's.
+MISMATCH_SECONDS = 3600
 #: The `heartbeat` state row each build-dispatch tick writes first: this key on the hub, `<key>@<host>` on a
 #: satellite (pack sd:7933).
 HEARTBEAT = "build-dispatch"
@@ -512,7 +516,9 @@ def _item(connection, item: int, *, lead: int | None = None, riding: Collection[
     if row["kind"] not in RUNNABLE_KINDS:  # named before the status, as a press of a chore reads it
         raise BuildRefused(_press_refusal(connection, row))
     if row["status"] != "ready" and not (row["status"] == "blocked" and split_held(connection, item)):
-        raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+        if row["status"] != "blocked" or (since := _rebuild_since(connection, item)) is None:
+            raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+        _answered(connection, item, since)
     refused = _press_refusal(connection, row, lead=lead, riding=riding)
     if refused:
         raise BuildRefused(refused)
@@ -664,6 +670,19 @@ def _beat_moves(connection, host: str, now: str) -> bool:
     return mark is None or (row[0] is not None and row[0] > mark)
 
 
+def mismatched_build(body) -> str | None:
+    """The `sd_db` build a dispatcher beat's `body` names when it is not the one this process runs, else None.
+
+    A tick stamps the build it loaded on its beat (`build_run.dispatch`, sd:10934). A beat that names none, or
+    one that does not read, names no mismatch: the quiet host strands as before.
+    """
+    try:
+        named = json.loads(body).get("build") if body else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return named if isinstance(named, str) and named and named != remote.build_digest() else None
+
+
 def _beat(connection, host: str):
     return connection.execute("SELECT timestamp, body FROM state WHERE kind = 'heartbeat' AND key = ? "
                               "ORDER BY id DESC LIMIT 1", (f"{HEARTBEAT}@{host}",)).fetchone()
@@ -698,8 +717,10 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                 raise BuildRefused(f"item {item} was parked after auto-pickup read it")
         created = []
         for item in items:
-            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # a split-held bundle's item
-                transition(connection, item, "ready", who=who, reason="its bundle's branch is held after a split")
+            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # `_item` took it blocked
+                transition(connection, item, "ready", who=who,
+                           reason="its bundle's branch is held after a split" if split_held(connection, item)
+                           else "Build after its bundle ended")
             if work_kind(connection, item) == DESIGN_KIND and draft_design(connection, item) is None:
                 # A design item with no design yet runs a design run first, beside the code (sd:10096).
                 from . import draft  # noqa: PLC0415 -- draft imports this module
@@ -1249,6 +1270,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     finding = finding.strip()
     with transaction(connection):
         leads, fixes, fresh = [], [], []
+        held: set[int] = set()
         # Each lane-failed run this press split, and every member of its bundle: the split settled each, so a
         # later one of them is done, whatever the order (review of build/sd-1306).
         freed: dict[str, set[int]] = {}
@@ -1306,6 +1328,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # Its branch may hold a left item's work: a fresh press, new branch.
             if split_held(connection, item, items):
                 fresh.append(item)
+                held.add(item)  # `queue` takes it blocked as it stands: no question holds it (lane review)
                 continue
             # A drop's kept lead never ran, and its Retry resumes the split branch (`retry`, review of build/sd-1306).
             if (state and state["status"] in AGAIN and row["status"] == state["status"] and not alone
@@ -1367,8 +1390,67 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+                elif (state["item"]["status"] == "blocked" and item not in held
+                      and (since := _build_blocked(connection, item)) is not None):
+                    # A member its run blocked, whose bundle cannot retry (its lead done: the code shipped
+                    # without it), builds fresh once its builder's question is answered (pack sd:10294): one
+                    # that run raised, as delivery read it (`asked_since`), not an older unrelated one.
+                    _answered(connection, item, since)
+                    transition(connection, item, "ready", who=who, reason="Build after its bundle ended")
         fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])
+
+
+def _build_blocked(connection, item: int) -> str | None:
+    """When the build run that blocked `item` reads questions from (`asked_since`), if `item`'s block
+    is that build's, which a Build lifts; else None. The block is the build's while that assignment ended
+    blocked and the item's latest status change is the build's move to blocked with that assignment's
+    reason. A block someone wrote after it, an operator's hold, is not the build's (review of build/sd-1867)."""
+    row = connection.execute("SELECT id, parent, status, result FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    if row is None or row["status"] != "blocked" or not row["result"]:
+        return None
+    moved = connection.execute("SELECT body FROM note WHERE item = ? AND kind = 'status_change' "
+                               "ORDER BY id DESC LIMIT 1", (item,)).fetchone()
+    if moved is None or re.fullmatch(r"\w+ -> blocked by build: " + re.escape(row["result"]),
+                                     moved["body"] or "", re.DOTALL) is None:
+        return None
+    lead = row["parent"] or row["id"]
+    number = _blocking_run(connection, lead, row["result"])
+    # A block that names no run of its bundle reads every question: no time stands in for the run.
+    return asked_since(connection, lead, number) if number is not None else ""
+
+
+def _rebuild_since(connection, item: int) -> str | None:
+    """`_build_blocked` for an item a fresh press may take blocked: its bundle Retry no longer takes, as
+    its lead ended otherwise or its lead's item is done (the code shipped without it, pack sd:10294).
+    The dashboard's press and dialog read it through `_item`, as Build by item does (review of sd-1867)."""
+    since = _build_blocked(connection, item)
+    if since is None:
+        return None
+    row = connection.execute("SELECT id, parent FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    state = queue_state(connection, row["parent"] or row["id"])
+    if state["status"] == "blocked" and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"]):
+        return None  # Retry of the bundle resumes its branch
+    return since
+
+
+def _answered(connection, item: int, since: str) -> None:
+    """Refuse while a question the blocking run raised on `item` still waits on the operator."""
+    if asked := open_question(connection, [item], since, pending=True):
+        raise BuildRefused(f"item {item} waits on question note #{asked['id']}; answer it, then Build it")
+
+
+def _blocking_run(connection, lead: int, reason: str) -> int | None:
+    """The number of the run of `lead` that a build block's `reason` names, or None. Every block a run writes
+    (`_block`) begins `build run <id> `, so the run is read by its id, never by time or as the newest: a
+    lane Fix runs the bundle again after it, even in the block's own second, and did not build the blocked
+    item, so its start would hide the question the item waits on (class pass of build/sd-1867)."""
+    named = re.match(r"build run ([0-9a-f]{32}) ", reason)
+    row = named and connection.execute("SELECT run FROM runner_run WHERE id = ? AND assignment = ?",
+                                       (named.group(1), lead)).fetchone()
+    return row["run"] if row else None
 
 
 def _part(connection, lead: int, status: str, selected: Collection[int]) -> set[int] | None:
@@ -2984,6 +3066,60 @@ def branch_run(connection, branch: str) -> dict | None:
     return dict(found) if found else None
 
 
+def _last_builds(connection, ids: Collection[int], items: Collection[int]) -> dict[int, dict]:
+    """Each of `items`' newest build run outside the assignments `ids`, by the bundle it rode in, keyed by item: an
+    assignment that never ran (a press cancelled before its claim) hides no earlier build (lane review of
+    build/sd-1808), nor does a run that ended before its builder ran (`step` still `claimed` or `worktree`): it
+    built nothing, so the earlier run holds the item's newest work (lane review at 992ef580). A run from before
+    `step` was kept (NULL) counts as built."""
+    marks = ", ".join("?" for _ in ids)
+    found = {item: connection.execute(
+        f"SELECT runner_run.id, runner_run.outcome FROM runner_run JOIN assignment "
+        f"ON assignment.id = runner_run.assignment OR assignment.parent = runner_run.assignment "
+        f"WHERE assignment.item = ? AND assignment.scope = ? AND assignment.id NOT IN ({marks}) "
+        f"AND COALESCE(runner_run.step, '') NOT IN ('claimed', 'worktree') "
+        f"ORDER BY runner_run.created_at DESC, runner_run.run DESC, runner_run.rowid DESC LIMIT 1",
+        (item, SCOPE, *ids)).fetchone() for item in items}
+    return {item: dict(row) for item, row in found.items() if row}
+
+
+def lane_failed_start(connection, lead: int) -> dict | None:
+    """Where a new bundle under assignment `lead` starts when its items were last built in a bundle whose lane entry
+    failed: that run's `branch` and its `detail` (sd:10379). An item
+    moved back to ready and built again is a fresh press with a new branch, which from origin/main dropped the
+    failed bundle's commits. None, so main, unless exactly one lane-failed run that some item last rode in had
+    every item it built in this bundle: its commits cite them, and a missing one would not deliver. An item never
+    built, or last built elsewhere, rides along: it cites nothing on that branch (lane review of build/sd-1808).
+    That run must be the last build of each item it built, too: an item built again since has newer work on
+    another branch, and the failed branch holds only its older commits (lane review at 992ef580)."""
+    # A member cancelled out of this bundle (`ALONE`) is not selected: it neither builds nor delivers here.
+    bundle = connection.execute(f"SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+                                f"AND {_in_group()}", (lead, lead, SCOPE)).fetchall()
+    ids, items = {row["id"] for row in bundle}, {row["item"] for row in bundle}
+    last = _last_builds(connection, ids, items)
+    runs = {row["id"] for row in last.values() if row["outcome"] == "lane_failed"}
+    whole = [failed for failed in (run(connection, ident) for ident in sorted(runs))
+             if all(member["item"] in items and last.get(member["item"], {}).get("id") == failed["id"]
+                    for member in failed["members"])]
+    if len(whole) != 1:
+        return None
+    failed = whole[0]
+    return {"run": failed["id"], "branch": failed["branch"], "detail": failed["detail"] or "", "items": items}
+
+
+def outside_rebuild(connection, lead: int, cited: Collection[int]) -> list[int]:
+    """Of `cited`, the items outside the bundle under `lead` when it builds again an item whose last bundle failed
+    in the lane; [] for any other bundle. Its branch may start at that bundle's head (`lane_failed_start`) and so
+    hold its trailers, and the lane's merge closes every open item one cites. Read from history alone, each row of
+    the bundle counted, so a member that leaves mid-run turns no check off (class pass of build/sd-1808)."""
+    bundle = connection.execute("SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
+                                (lead, lead, SCOPE)).fetchall()
+    ids, items = [row["id"] for row in bundle], {row["item"] for row in bundle}
+    if any(last["outcome"] == "lane_failed" for last in _last_builds(connection, ids, items).values()):
+        return sorted(set(cited) - items)
+    return []
+
+
 def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
     """Whether Fix on a failed lane entry (pack sd:8584) takes build run `run`: its bundle's members to send back, and
     the lane entry's key and body to hand back. Fix's state on the page and its press both read this one check.
@@ -3040,6 +3176,28 @@ def _hand_back(connection, key: str, entry: dict, run: str, *, who: str, by: str
                         f"{entry.get('reason') or 'no reason kept'}"[:2000])
     connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
                        (key, stamp, json.dumps(entry, sort_keys=True)))
+
+
+def take_over(connection, failed: dict, run: str) -> str:
+    """Build run `run` starts its branch at the failed bundle `failed`'s tip (`lane_failed_start`), so it owns that
+    work now: the failed lane entry is handed back (`_hand_back`), as Fix does. Its head may stay unchanged, and the
+    lane refuses a head an imported entry ended (`sd_lane.refuse_ran`) but not a cancelled one; nor does a Retry
+    of the old entry deliver the same commits beside the rebuild (lead review of build/sd-1808). Only the entry the
+    failed run recorded is handed back, as the conflict rebuild checks: a newer one on that branch (a lane Retry)
+    is an attempt this build never read. Answers "" once handed back, or why not: one already handed back by an
+    earlier try of this start, another entry, or a lane not read, writes nothing, and the enqueue then names
+    any refusal."""
+    named = LANE_ENTRY.match(failed["detail"] or "")
+    ident = named.group(1) if named else None
+    with transaction(connection):
+        try:
+            key, entry = _lane_entry(connection, failed["branch"], ident, actor="the rebuild")
+            if ident is not None and entry.get("id") != ident:
+                raise BuildRefused(f"branch {failed['branch']}'s newest lane entry is {entry.get('id')}, not {ident}")
+        except BuildRefused as refused:
+            return str(refused)
+        _hand_back(connection, key, entry, run, who="build", by="a rebuild", stamp=clock())
+    return ""
 
 
 def _lane_entry(connection, branch: str, ident: str | None = None, *, actor: str = "Fix") -> tuple[str, dict]:
@@ -3346,6 +3504,14 @@ def _strand(connection, hosts: Collection[str | None], *, now: str) -> list[dict
         gone = dispatcher_gone(connection, host)
         if gone is None:
             continue
+        beat = _beat(connection, host)
+        other = mismatched_build(beat["body"]) if beat else None
+        if other is not None:
+            # sd:10934: a host on another build is refused until it follows the pins; its runs pause.
+            age = _lead_age(beat["timestamp"], now)
+            if age is not None and age < MISMATCH_SECONDS:
+                continue
+            gone = f"{gone}; its last beat ran sd_db build {other}, not this hub's, over {MISMATCH_SECONDS} s ago"
         if _ahead(connection, host) is not None:
             if _beat_moves(connection, host, now):
                 continue  # a beat too far ahead is skew: that host's ticks still reap its own runs

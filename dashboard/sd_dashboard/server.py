@@ -24,6 +24,7 @@ a writer only after the request and finite action vocabulary are validated.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import hmac
 import json
@@ -322,6 +323,32 @@ def capture_followup(connection, *, followup_of=None, who, **values):
             workflow.add_item_note(connection, followup_of, kind="comment", who=who,
                                    body=f"Followup item #{item} filed: {state['item']['title']}")
         return workflow.item_state(connection, item)
+
+
+def _shown_followups(values):
+    """The followup note ids Done, resolve all names (sd:10429): the ones its confirm showed; None when not asked."""
+    if "resolve_followups" not in values:
+        return None
+    named = values["resolve_followups"]
+    if (values["status"] != "done" or not isinstance(named, list) or not named
+            or any(type(note) is not int or not 1 <= note <= 9223372036854775807 for note in named)):
+        raise ValueError("resolve_followups is the list of followup note ids the confirm showed, with done only.")
+    return named
+
+
+def _refuse_unseen(connection, item, revision, named):
+    """Refuse a close while a person's followup its confirm did not show is open; nothing is resolved (sd:10429).
+
+    One the list names that is resolved already is left as it is. The machine's followups go with any
+    done, as `workflow.change_status` decides. The caller's transaction holds this read and the close.
+    """
+    state = workflow._checked_state(connection, item, revision)
+    unseen = [note["id"] for note in state["notes"] if note["kind"] == "followup" and not note["resolved_at"]
+              and not workflow.machine_followup(note) and note["id"] not in named]
+    if unseen:
+        raise workflow.WorkflowError(
+            "the confirm did not show " + ", ".join(f"followup {note}" for note in unseen)
+            + "; nothing was resolved: read the item again and confirm Done, resolve all once more")
 
 
 def _acknowledge_report(connection, item, *, expected_revision):
@@ -693,10 +720,19 @@ def action_route(path, payload, *, principal, operations_backend=None, services_
                                    if _base_kind(connection, number) else
                                    workflow.edit_item(connection, number, values, **options))
     if entity == "items" and suffix == "/status":
-        if set(values) - {"status", "reason"} or "status" not in values:
+        if set(values) - {"status", "reason", "resolve_followups"} or "status" not in values:
             raise ValueError("A status and optional reason are required.")
-        return lambda connection: workflow.change_status(connection, number,
-            values["status"], reason=values.get("reason") or None, **options)
+        named = _shown_followups(values)
+
+        def move(connection):
+            # One route writes a status (criterion 7.17). Done, resolve all names the followups its confirm
+            # showed; one transaction holds the check for an unseen one and the close.
+            with workflow.transaction(connection) if named is not None else contextlib.nullcontext():
+                if named is not None:
+                    _refuse_unseen(connection, number, revision, named)
+                return workflow.change_status(connection, number, values["status"],
+                                              reason=values.get("reason") or None, followups=named, **options)
+        return move
     if entity == "items" and suffix == "/notes":
         if set(values) - {"body", "kind"} or "body" not in values:
             raise ValueError("A note body and optional kind are required.")

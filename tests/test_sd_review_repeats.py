@@ -392,6 +392,77 @@ class ReproRuleTests(unittest.TestCase):
                                  "trigger: invalid enum value")
         self.assertEqual(sd_review._finding_error(finding(REPRO, trigger="untrusted", instances=["src.py:1"])), "")
 
+    def test_a_defect_the_merge_base_already_has_is_advisory(self) -> None:
+        """sd:10892: a finding blocks only when the merge base lacks the same defect; one main already
+        has posts as advisory, filed for the repo, and says why."""
+        parsed = sd_review._finding(finding(REPRO, base="has"))
+        assert parsed is not None
+        [record] = sd_review.dispose([parsed], "high", repro=True, on_base=lambda _row: True)
+        self.assertEqual((record["disposition"], record["summary"]),
+                         ("advisory", f"defect {sd_review.ON_BASE_NOTE}"))
+
+    def test_a_has_answer_no_prompt_asked_for_still_blocks(self) -> None:
+        """sd:10892 review: with no main merge base named in the prompt, a reader's `has` was judged
+        against no stated baseline, so it downgrades nothing."""
+        parsed = sd_review._finding(finding(REPRO, base="has"))
+        assert parsed is not None
+        for on_base in (None, lambda _row: False):
+            [record] = sd_review.dispose([parsed], "high", repro=True, on_base=on_base)
+            self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_the_review_passes_whether_it_asked_to_dispose(self) -> None:
+        result = {"severity_floor": "high", "requested_reviews": 1}
+        answer = sd_review.Outcome("fake", sd_review.FINDINGS, (finding(REPRO, base="has", instances=["src.py:1"]),),
+                                   "", (), ())
+        sd_review.finish_review(dict(result), [answer], ["fake"], repro=True)
+        asked = dict(result)
+        sd_review.finish_review(asked, [answer], ["fake"], repro=True, on_base=lambda _row: True)
+        self.assertEqual(asked["status"], "advisory")
+
+    def test_a_has_downgrades_only_when_every_merged_copy_holds(self) -> None:
+        """sd:10892 round 4: `distinct_findings` merges one finding two readers report and keeps the
+        first reader's `backend`. A patch-only reader's copy, or a `lacks` copy, keeps it blocking."""
+        result = {"severity_floor": "high", "requested_reviews": 2}
+        def answer(backend: str, base: str) -> Any:
+            return sd_review.Outcome(backend, sd_review.FINDINGS,
+                                     (finding(REPRO, base=base, instances=["src.py:1"]),), "", (), ())
+        reads = lambda row: row.get("backend") == "local"  # noqa: E731
+        for label, outcomes, status in (
+                ("both read the checkout", [answer("local", "has"), answer("local", "has")], "advisory"),
+                ("a patch-only copy", [answer("local", "has"), answer("remote", "has")], "blocking"),
+                ("a patch-only copy first", [answer("remote", "has"), answer("local", "has")], "blocking"),
+                ("a lacks copy", [answer("local", "has"), answer("local", "lacks")], "blocking")):
+            with self.subTest(label):
+                done = sd_review.finish_review(dict(result), outcomes, [o.backend for o in outcomes],
+                                               repro=True, on_base=reads)
+                self.assertEqual(done["status"], status)
+
+    def test_a_defect_the_change_causes_still_blocks(self) -> None:
+        """sd:10892: `lacks`, an older answer without `base`, or a value not exactly `has` still blocks."""
+        for base in ("lacks", None, "Has", " has", 3, []):
+            with self.subTest(base=base):
+                parsed = sd_review._finding(finding(REPRO) if base is None else finding(REPRO, base=base))
+                assert parsed is not None
+                [record] = sd_review.dispose([parsed], "high", repro=True, on_base=lambda _row: True)
+                self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_the_prompt_asks_whether_the_merge_base_has_it(self) -> None:
+        self.assertIn("base", sd_review.FINDING_PROPERTIES)
+        self.assertIn('"base": "lacks"', sd_review.URL_OUTPUT_CONTRACT)
+
+    def test_has_means_the_same_failure_at_the_merge_base_not_a_defect_made_reachable(self) -> None:
+        """sd:10892 ruling round: a branch caller that starts sending empty input to an unchanged parser
+        is this change's failure, so the prompt says that is `lacks`, never `has`."""
+        self.assertIn("same failure already happens there, by the same route", sd_review.BASES["has"])
+        self.assertIn("makes an old defect reachable", sd_review.BASES["lacks"])
+
+    def test_an_unknown_base_is_a_schema_error(self) -> None:
+        for value in ("maybe", [], None, "Has"):
+            with self.subTest(value=value):
+                self.assertEqual(sd_review._finding_error(finding(REPRO, base=value, instances=["src.py:1"])),
+                                 "base: invalid enum value")
+        self.assertEqual(sd_review._finding_error(finding(REPRO, base="lacks", instances=["src.py:1"])), "")
+
     def test_the_lanes_own_blockers_need_no_repro(self) -> None:
         parsed = sd_review.oversized_findings()
         assert parsed is not None
