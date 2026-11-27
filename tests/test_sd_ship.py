@@ -2553,17 +2553,42 @@ roles:
         self.assertEqual(self.prepare()["copilot_review"]["decision"], "request_failed")
         self.assert_receipt_still_owed()
 
-    def test_a_resend_reuses_the_receipt_and_spends_no_capacity(self):
-        """sd:10207 class pass. Each rerun that finds no sign of the request
-        sends it again on the one receipt: the cap counts it once."""
-        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
-        for _ in range(ship.COPILOT_REVIEW_LIMIT + 1):
+    def test_each_resend_spends_one_unit_of_the_cap(self):
+        """sd:10207 lane review. A send killed at the POST may have landed,
+        so each resend on the one receipt may buy a review: every send
+        counts against the cap, and the send past it is refused."""
+        for _ in range(ship.COPILOT_REVIEW_LIMIT):
             self.interrupt_copilot_request("--copilot-review", "request", lands=False)
-        self.assertEqual(len(self.operation().state["copilot_reviews"]), 1)
+        [entry] = self.operation().state["copilot_reviews"]
+        self.assertEqual(entry["sends"], ship.COPILOT_REVIEW_LIMIT)
+        with self.assertRaisesRegex(ship.Refusal, "limit"):
+            self.prepare("--copilot-review", "request")
+        self.assertEqual(self.operation().state["copilot_reviews"][0]["sends"], ship.COPILOT_REVIEW_LIMIT)
+
+    def test_a_resend_keeps_one_receipt(self):
+        """sd:10207 class pass. A rerun that finds no sign of the request
+        sends it again on the one receipt."""
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
         rerun = self.prepare("--copilot-review", "request")
         self.assertEqual(rerun["copilot_review"]["status"], "requested")
         self.assertEqual(len(self.double.copilot_requests), 1)
         self.assertEqual(len(self.operation().state["copilot_reviews"]), 1)
+
+    def test_one_unclaimed_review_confirms_one_receipt_only(self):
+        """sd:10207 lane review. A review at a head no receipt names
+        confirms one unsent receipt; a later unsent receipt stays owed."""
+        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
+        self.advance()
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.prepare("--copilot-review", "skip")
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]],
+                         ["requested"])
+        (self.root / "src.py").write_text("value = 8\n")
+        _git(self.root, "commit", "-qam", "again\n\nAuthored-with: human")
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.prepare("--copilot-review", "skip")
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]],
+                         ["requested", "requesting"])
 
     def test_a_recovery_request_interrupted_after_it_landed_keeps_its_receipt(self):
         """sd:10207. The recovery of a disappeared request records before it

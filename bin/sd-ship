@@ -873,6 +873,8 @@ class Ship(SharedReview):
                        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(entry.get("head") or ""))
                        or entry.get("selection") not in ("automatic", "explicit")
                        or entry.get("status") not in ("requesting", "requested", "pending", "completed")
+                       or type(entry.get("sends", 1)) is not int or entry.get("sends", 1) < 1
+                       or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(entry.get("claimed", entry["head"])))
                        for entry in entries)):
             raise Refusal("Copilot review receipt is malformed")
         return [dict(entry) for entry in entries]
@@ -1111,7 +1113,8 @@ class Ship(SharedReview):
 
     @staticmethod
     def require_copilot_capacity(entries: list[dict]) -> None:
-        if len(entries) >= COPILOT_REVIEW_LIMIT:
+        # Each send may have bought a review, a resend on one receipt too (sd:10207).
+        if sum(entry.get("sends", 1) for entry in entries) >= COPILOT_REVIEW_LIMIT:
             raise Refusal(
                 f"Copilot review limit of {COPILOT_REVIEW_LIMIT} requests per pull request is reached",
                 code="copilot_review_limit", boundary="review", state="operator_decision",
@@ -1119,13 +1122,14 @@ class Ship(SharedReview):
             )
 
     def record_copilot_request(self, entries: list[dict], number: int, head: str,
-                               selection: str, status: str, decision: str) -> dict:
+                               selection: str, status: str, decision: str, sends: int = 1) -> dict:
         entry = {
             "pull": number,
             "head": head,
             "selection": "explicit" if selection == "request" else "automatic",
             "status": status,
             "requested_at": moment(),
+            "sends": sends,
         }
         self.save(copilot_reviews=[*entries, entry])
         return {**entry, "decision": decision}
@@ -1149,13 +1153,15 @@ class Ship(SharedReview):
 
         The receipt goes first, as `requesting`: a prepare killed after GitHub
         took the request still owes the review at a merge. `resend` is the
-        index of a `requesting` receipt to send again in place, at this head.
+        index of a `requesting` receipt to send again in place, at this head;
+        its `sends` count grows by one, since the earlier send may have landed.
         Only a first send GitHub refused outright (a 4xx) undoes its receipt.
         Every other failure keeps it: an ambiguous answer may follow a request
         GitHub took, and a refused resend says nothing of the earlier send.
         """
         kept = entries if resend is None else [*entries[:resend], *entries[resend + 1:]]
-        result = self.record_copilot_request(kept, number, head, selection, "requesting", decision)
+        sends = 1 if resend is None else entries[resend].get("sends", 1) + 1
+        result = self.record_copilot_request(kept, number, head, selection, "requesting", decision, sends)
         try:
             self.api.request_copilot_review(number)
         except Refusal as error:
@@ -1185,22 +1191,28 @@ class Ship(SharedReview):
         reviews = self.api.pages(f"{self.api.prefix}/pulls/{number}/reviews")
         statuses = {index: self.api.copilot_review_status(pull, reviews, entries[index]["head"]) for index in waiting}
         left = self.unclaimed_copilot_reviews(reviews, [
-            entry["head"] for index, entry in enumerate(entries)
+            entry.get("claimed", entry["head"]) for index, entry in enumerate(entries)
             if entry["pull"] == number and statuses.get(index, entry["status"]) != "absent"])
         for index in waiting:
-            status = statuses[index]
-            if status == "absent" and left > 0:
-                status, left = "requested", left - 1
+            status, claim = statuses[index], {}
+            if status == "absent" and left:
+                # The receipt claims that review, so no later receipt counts it again.
+                status, claim = "requested", {"claimed": left.pop(0)}
             if status != "absent":
-                entries[index] = {**entries[index], "status": status}
+                entries[index] = {**entries[index], "status": status, **claim}
         self.save(copilot_reviews=entries)
 
-    def unclaimed_copilot_reviews(self, reviews: list[dict], heads: list[str]) -> int:
-        """How many completed Copilot reviews no receipt at the review's own head claims."""
+    def unclaimed_copilot_reviews(self, reviews: list[dict], claims: list[str]) -> list[str]:
+        """The heads of completed Copilot reviews no receipt claims.
+
+        A receipt claims the review at its own head, or the one it was
+        confirmed by (`claimed`).
+        """
         completed = collections.Counter(
             str(review.get("commit_id") or "") for review in self.api.copilot_reviews(reviews)
-            if bool(review.get("submitted_at")) and str(review.get("state") or "").upper() not in ("", "PENDING"))
-        return sum((completed - collections.Counter(heads)).values())
+            if bool(review.get("submitted_at")) and str(review.get("state") or "").upper() not in ("", "PENDING")
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(review.get("commit_id") or "")))
+        return sorted((completed - collections.Counter(claims)).elements())
 
     def prepare_copilot_review(self, number: int, pull: dict, head: str, mode: str) -> dict:
         self.settle_copilot_requests(number, pull)
@@ -1214,6 +1226,7 @@ class Ship(SharedReview):
         unconfirmed = next((index for index in reversed(range(len(entries)))
                             if entries[index]["pull"] == number and entries[index]["status"] == "requesting"), None)
         if unconfirmed is not None:
+            self.require_copilot_capacity(pull_entries)
             return self.dispatch_copilot_request(entries, number, head, selection, automatic, unconfirmed)
         if automatic and pull_entries:
             return {**pull_entries[-1], "decision": "not_repeated"}
