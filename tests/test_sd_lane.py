@@ -4119,6 +4119,48 @@ class CitedCloses(SharedQueue):
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), expected)
 
+    def test_a_revert_that_disables_a_delivered_executable_undoes_it(self) -> None:
+        """sd:10214 review, class pass 22: the work is the entry the fix left, its mode with its text. A
+        revert that clears the executable bit of a fixed script keeps its text but not its work: the script
+        no longer runs. At its own name, after a move, and at a stale mapping's new name, alike."""
+        import sd_operations
+        a, *_ = self.open
+        original = "#!/bin/sh\n" + "".join(f"echo step {n}\n" for n in range(20))
+        fixed = original.replace("echo step 7\n", "echo step 7 fixed\n")
+        for case, closes in (("in-place", set()), ("moved", set()), ("stale", set()),
+                             ("stale-kept", {a}), ("moved-kept", {a})):
+            with self.subTest(case=case):
+                tree, _ = self.committed(f"topic-disabled-executable-{case}")
+                git(tree, "fetch", "-q", "origin")
+                git(tree, "reset", "-q", "--hard", "origin/main")
+                if not (tree / "run.sh").exists():  # the second case builds on the first's main
+                    self.on_main(tree, {"run.sh": original})
+                    (tree / "run.sh").chmod(0o755)
+                    git(tree, "add", "run.sh")
+                    git(tree, "commit", "-q", "-m", "chore: run.sh runs")
+                    git(tree, "push", "-q", "origin", "HEAD:main")
+                    git(tree, "fetch", "-q", "origin")
+                (tree / "run.sh").write_text(fixed, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", f"fix: step 7\n\nCloses: sd:{a}")
+                name = "run.sh"
+                if case != "in-place":
+                    git(tree, "mv", "run.sh", "tool.sh")
+                    git(tree, "commit", "-q", "-m", "refactor: rename run to tool")
+                    name = "tool.sh"
+                if case.startswith("stale"):  # the old name comes back as before, the new one stays
+                    (tree / "run.sh").write_text(original, encoding="utf-8")
+                    (tree / "run.sh").chmod(0o755)
+                    git(tree, "add", "run.sh")
+                if not case.endswith("kept"):
+                    (tree / name).chmod(0o644)
+                    git(tree, "add", name)
+                else:
+                    (tree / "other.txt").write_text("other\n", encoding="utf-8")
+                    git(tree, "add", "other.txt")
+                git(tree, "commit", "-q", "-m", "revert: the step 7 fix")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
+
     def test_a_reverted_script_kept_only_in_documentation_closes_nothing(self) -> None:
         """sd:10214 class pass 11: a file of another kind than the cited one cannot hold its work. A revert
         that moves a cited script into a document, whether git pairs the move as a rename or the text lands

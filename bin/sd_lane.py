@@ -1052,6 +1052,28 @@ def holds_fix(old: list[bytes], fixed: list[bytes], text: list[bytes]) -> bool:
     return True
 
 
+# What kind of entry a path is decides what it can hold (class pass 10). A plain or an executable file
+# holds text; a submodule link and a symlink hold none.
+TEXT_MODES = ("100644", "100755")
+
+
+def mode_holds(cited: str, holder: str, cited_path: str, holder_path: str) -> bool:
+    """Whether an entry of mode `holder` at `holder_path` can hold the work of one of mode `cited` at
+    `cited_path`: the same kind, or an executable file for a plain one, with the same file suffix. A
+    plain-text copy of an executable does not run, nor does a script kept in a document (class pass 11)."""
+    # ponytail: the suffix stands for the file's kind; a move that renames `tool` to `tool.py` loses its
+    # close (fixed by hand), never a false close. Read the language if that matters.
+    return (holder == cited or (cited, holder) == TEXT_MODES) and \
+        pathlib.PurePosixPath(cited_path).suffix == pathlib.PurePosixPath(holder_path).suffix
+
+
+def runs_as(entry: str | None, fix: str | None, at: str, name: str) -> bool:
+    """Whether `entry` at `at` is a kind that can hold the work the cited commit's `fix` left at `name`:
+    the work is the entry, its mode with its text, so a script whose executable bit a revert cleared
+    holds none (class pass 22). True when either side is absent: the content read decides there."""
+    return not entry or not fix or mode_holds(fix.split()[0], entry.split()[0], name, at)
+
+
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
                base: str = "") -> list[tuple[str, str]]:
     """`commits` (newest first), each cited one a later hand-written revert undid with its message emptied (sd:8373).
@@ -1113,19 +1135,6 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         return None if listed is None else {path: entry for entry, _, path in
                                             (line.partition("\t") for line in listed if line)}
 
-    # What kind of entry a path is decides what it can hold (class pass 10). A plain or an executable file
-    # holds text; a submodule link and a symlink hold none.
-    text_modes = ("100644", "100755")
-
-    def mode_holds(cited: str, holder: str, cited_path: str, holder_path: str) -> bool:
-        """Whether an entry of mode `holder` at `holder_path` can hold the work of one of mode `cited` at
-        `cited_path`: the same kind, or an executable file for a plain one, with the same file suffix. A
-        plain-text copy of an executable does not run, nor does a script kept in a document (class pass 11)."""
-        # ponytail: the suffix stands for the file's kind; a move that renames `tool` to `tool.py` loses its
-        # close (fixed by hand), never a false close. Read the language if that matters.
-        return (holder == cited or (cited, holder) == text_modes) and \
-            pathlib.PurePosixPath(cited_path).suffix == pathlib.PurePosixPath(holder_path).suffix
-
     def renames_since(sha: str, rev: str) -> dict[str, str] | None:
         """Where `rev` holds each file of `sha` that a commit between them renamed. A pair whose new mode
         cannot hold the old one's work (`mode_holds`) is no rename (sd:10214 review)."""
@@ -1154,10 +1163,12 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             return None
         return done.stdout.split(b"\n") if done.returncode == 0 and b"\0" not in done.stdout else None
 
-    def keeps_fix(entry: str | None, fix: str | None, before: str | None) -> bool:
-        """Whether `entry` holds what the cited commit's `fix` changed in `before` (`holds_fix`)."""
+    def keeps_fix(entry: str | None, fix: str | None, before: str | None, at: str, name: str) -> bool:
+        """Whether `entry` holds what the cited commit's `fix` changed in `before` (`holds_fix`), in a mode
+        that runs as the fix left it (`runs_as`)."""
         text, fixed, old = lines(entry), lines(fix), lines(before)
-        return text is not None and fixed is not None and old is not None and holds_fix(old, fixed, text)
+        return text is not None and fixed is not None and old is not None and \
+            runs_as(entry, fix, at, name) and holds_fix(old, fixed, text)
 
     def reads_before(where: dict[str, str], rev: str, names: list[str], before: str,
                      home: dict[str, str] | None = None, cited: str = "") -> bool | None:
@@ -1193,9 +1204,11 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 found = [now.get(at), now.get(name)]
                 if (fix.get(name) is not None and fix[name] in found) or want.get(name) not in found:
                     return False
+                other = name if found[0] == want.get(name) else at
                 found.remove(want.get(name))
-                return not keeps_fix(found[0], fix.get(name), want.get(name))
-            return now.get(at) == want.get(name)
+                return not keeps_fix(found[0], fix.get(name), want.get(name), other, name)
+            # A place the cited commit's work cannot run in holds none of it (class pass 22).
+            return now.get(at) == want.get(name) or not runs_as(now.get(at), fix.get(name), at, name)
         return all(one(at, name) for at, name in zip(held, names, strict=True))
 
     def places_in(later: str, held: list[str], revert: bool, names: list[str],
