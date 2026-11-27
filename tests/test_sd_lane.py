@@ -3822,6 +3822,54 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [b])
 
+    def test_a_listed_merge_revert_whose_side_the_branch_restores_and_moves_keeps_it(self) -> None:
+        """Class pass, review of build/sd-1654 (sd_lane.py:1023, 1086): a revert listing the merge undid
+        the side, a later commit put the side's fix back and another moved it. Its file read as before the
+        side commit at the head, so the citation dropped though the fix survives. A side commit is read by
+        what each later commit did to its own patch: a revert takes it out, any commit puts it back."""
+        b, c, *_ = self.open
+        tree, merge = self._side_merge("topic-restored", b, c)
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        (tree / "side.txt").write_text("side\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", "fix: put the side back")
+        self._move(tree, "side.txt", "other.txt")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(sorted(entry["closes"]), sorted([b, c]))
+
+    def test_a_listed_merge_revert_with_an_unrelated_edit_keeps_a_mainline_fix_in_a_shared_file(self) -> None:
+        """Class pass, review of build/sd-1654 (sd_lane.py:1038, 1086): as the shared-file case, but the
+        revert also adds an unrelated file, so its patch matches neither side exactly. Both sides were then
+        read by the revert's files, and the kept mainline fix, moved later, lost its citation."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-shared-extra")
+        shared = tree / "shared.txt"
+        shared.write_text("".join(f"line {n}\n" for n in range(20)), encoding="utf-8")
+        git(tree, "add", "shared.txt")
+        git(tree, "commit", "-q", "-m", "chore: the shared file")
+        before = shared.read_text(encoding="utf-8")
+        git(tree, "switch", "-q", "-c", "topic-shared-extra-side")
+        shared.write_text(before + "side function\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-shared-extra")
+        shared.write_text("mainline function\n" + before, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-shared-extra-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        (tree / "extra.txt").write_text("extra\n", encoding="utf-8")
+        git(tree, "add", "extra.txt")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        shared.write_text(before, encoding="utf-8")
+        (tree / "moved.txt").write_text("mainline function\n", encoding="utf-8")
+        git(tree, "add", "-A")
+        git(tree, "commit", "-q", "-m", "refactor: keep the guard in moved.txt")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open

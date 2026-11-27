@@ -1011,16 +1011,15 @@ def _changed(worktree: pathlib.Path, sha: str) -> list[str]:
     return [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
 
 
-def listed_sides(worktree: pathlib.Path, commits: list[tuple[str, str]]) -> dict[str, set[str]]:
+def listed_sides(worktree: pathlib.Path, commits: list[tuple[str, str]]) -> dict[str, tuple[int, set[str]]]:
     """Each commit a merge listed by a hand-written revert in `commits` brought in, on either side since the
-    merge base, with the files those reverts changed (pack sd:10108). The list names no mainline, and no one
-    read of the merge picks it: both sides read whole dropped a commit the revert kept, and the side picked
-    by the revert's whole patch read none once the revert changed one more file (reviews of build/sd-1654).
-    So `unreverted` reads each side commit by itself, only when the revert changed every file it changed.
-    A listed commit that is no merge, an ambiguous prefix (git refuses one) or a failed read reads nothing."""
+    merge base (pack sd:10108): the index in `commits` of the oldest revert listing it, and the files those
+    reverts changed. Which side a revert undid is read per commit (`_undone`), not from the whole merge: a
+    revert that also edits another file matches neither side (reviews of build/sd-1654). A listed commit
+    that is no merge, an ambiguous prefix (git refuses one) or a failed read reads nothing."""
     import sd_ship_body  # noqa: PLC0415
-    sides: dict[str, set[str]] = {}
-    for revert, message in commits:
+    sides: dict[str, tuple[int, set[str]]] = {}
+    for index, (revert, message) in enumerate(commits):
         if not sd_ship_body.REVERT_SUBJECT.match(message):
             continue
         for prefix in sd_ship_body._listed_undone(message):  # noqa: SLF001
@@ -1029,33 +1028,64 @@ def listed_sides(worktree: pathlib.Path, commits: list[tuple[str, str]]) -> dict
             # their citations. Read `^@` against the octopus merge base if one ever lists such a merge.
             if len(named) != 1:
                 continue
-            # A revert whose patch undoes one side exactly kept the other: that side alone is read, or a kept
-            # commit that shares a file with the undone side loses its citation once its fix moves (ruling
-            # round, review of build/sd-1654). Any other revert reads both, each commit by the revert's files.
-            undid = _patch_id(worktree, f"{revert}^", revert)
-            kept = next((parent for parent in (1, 2)
-                         if undid and _patch_id(worktree, named[0], f"{named[0]}^{parent}") == undid), None)
-            span = (f"{named[0]}^{3 - kept}", f"^{named[0]}^{kept}") if kept else (f"{named[0]}^1...{named[0]}^2",)
-            listed = publish_git(worktree, "rev-list", *span)
+            listed = publish_git(worktree, "rev-list", f"{named[0]}^1...{named[0]}^2")
             for sha in listed.stdout.split() if listed and listed.returncode == 0 else ():
-                sides.setdefault(sha, set()).update(_changed(worktree, revert))
+                # Newest first, so the last revert to list it is the oldest.
+                sides[sha] = (index, sides.get(sha, (index, set()))[1] | set(_changed(worktree, revert)))
     return sides
 
 
-def _patch_id(worktree: pathlib.Path, old: str, new: str) -> str:
-    """The stable patch id of `git diff old new`, or "" for an empty diff or a failed read. Bytes, not text: a
-    file that is not UTF-8 must not fail the read."""
-    env = sd_lib.without_fsmonitor(os.environ)
+def _present(worktree: pathlib.Path, patch: bytes, commit: str) -> bool | None:
+    """Whether `commit`'s tree holds `patch`'s change: True when it applies in reverse there, False when it
+    applies forward, None when neither does or a read fails. A scratch index, so no checkout moves."""
     try:
-        diff = subprocess.run(["git", "diff", "--no-ext-diff", "--no-color", old, new], cwd=worktree,
-                              capture_output=True, timeout=PUBLISH_SECONDS, check=False, env=env)
-        if diff.returncode != 0 or not diff.stdout:
-            return ""
-        found = subprocess.run(["git", "patch-id", "--stable"], cwd=worktree, input=diff.stdout,
-                               capture_output=True, timeout=PUBLISH_SECONDS, check=False, env=env)
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {**sd_lib.without_fsmonitor(os.environ), "GIT_INDEX_FILE": str(pathlib.Path(scratch) / "index")}
+            if subprocess.run(["git", "read-tree", commit], cwd=worktree, capture_output=True,
+                              timeout=PUBLISH_SECONDS, check=False, env=env).returncode != 0:
+                return None
+            for flags, answer in ((["-R"], True), ([], False)):
+                if subprocess.run(["git", "apply", "--cached", "--check", *flags], cwd=worktree, input=patch,
+                                  capture_output=True, timeout=PUBLISH_SECONDS, check=False,
+                                  env=env).returncode == 0:
+                    return answer
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return found.stdout.split(b" ", 1)[0].decode("ascii", "replace") if found.returncode == 0 else ""
+        return None
+    return None
+
+
+def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[str, str]]) -> bool | None:
+    """Whether side commit `sha`'s own change is gone at the head, read from what each commit from the
+    listing revert at `since` on did to it: a revert that takes it out undoes it, and any commit that puts
+    it back restores it, so a later move keeps it; a file the side shared, or one the revert edited besides,
+    does not decide it (class pass, review of build/sd-1654). None when the listing revert's effect is
+    unread: no patch (a merge, an empty commit), or neither direction applies on either side of it."""
+    import sd_ship_body  # noqa: PLC0415
+    try:
+        diff = subprocess.run(["git", "diff", "--binary", "--no-ext-diff", "--no-color", f"{sha}^", sha],
+                              cwd=worktree, capture_output=True, timeout=PUBLISH_SECONDS, check=False,
+                              env=sd_lib.without_fsmonitor(os.environ))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if diff.returncode != 0 or not diff.stdout or len(publish_parents(worktree, sha)) != 1:
+        return None
+    gone = False
+    for index in range(since, -1, -1):  # oldest first
+        commit, message = commits[index]
+        before, after = _present(worktree, diff.stdout, f"{commit}^"), _present(worktree, diff.stdout, commit)
+        if index == since and (before is None or after is None):
+            return None
+        if before and after is False and sd_ship_body.REVERT_SUBJECT.match(message):
+            gone = True
+        elif before is False and after:
+            gone = False
+    return gone
+
+
+def publish_parents(worktree: pathlib.Path, sha: str) -> list[str]:
+    """The parents of `sha`; none for a failed read."""
+    read = publish_git(worktree, "rev-list", "--parents", "-n", "1", sha)
+    return read.stdout.split()[1:] if read and read.returncode == 0 else []
 
 
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -1065,9 +1095,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     system sd:8242 closed though the branch undid its commit and fixes. A
     commit with a `Closes:` line counts as undone when a later commit's
     subject is a revert and the files it changed read at `head` as before
-    it. So does a commit a merge a revert lists brought in, which cites
-    its item only by a `Lane review fix` line, when that revert changed
-    every file it changed (`listed_sides`, pack sd:10108). A review fix
+    it. A cited commit a merge a revert lists brought in (`listed_sides`,
+    pack sd:10108) is read by its own patch instead (`_undone`): out by a
+    revert and not put back since; its files decide only when that patch
+    reads neither way at the listing revert. A review fix
     line on any other commit is not read so: a later revert that keeps
     the fix in another file left its item open (review of build/sd-1654).
     A read that fails keeps the commit, as before this check.
@@ -1077,12 +1108,18 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     kept = []
     for index, (sha, message) in enumerate(commits):
         names: list[str] = []
+        side = sides.get(sha) if sd_ship_body.cited_ids("", [(sha, message)]) else None
+        undone = _undone(worktree, sha, side[0], commits) if side else None
+        if undone is not None:
+            if not undone:
+                kept.append((sha, message))
+            continue
         if any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             if "Closes:" in message:
                 names = _changed(worktree, sha)
-            elif sha in sides and sd_ship_body.cited_ids("", [(sha, message)]):
+            elif side:  # the listing revert's effect is unread: its files at the head decide, as before
                 names = _changed(worktree, sha)
-                names = [] if set(names) - sides[sha] else names  # the revert left one of its files alone
+                names = [] if set(names) - side[1] else names  # the revert left one of its files alone
         same = names and publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", f"{sha}^", head, "--", *names)
         if same and same.returncode == 0:
             continue
