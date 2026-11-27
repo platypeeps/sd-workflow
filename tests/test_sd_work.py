@@ -82,6 +82,26 @@ class TaskCLI(unittest.TestCase):
         self.call("task", "add", "An idea", "--kind", "work-idea")
         self.call("task", "add", "Ranked", "--priority", 3)
 
+    def test_task_show_prints_the_items_review_rounds_and_cost(self):
+        """sd:10401: `sd task show` gives the item's review rounds, clean ones too, and their cost; JSON is unchanged."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Built", "--json").stdout)["item"]["id"]
+        self.assertNotIn("reviews:", self.call("task", "show", item).stdout, "no run, no line")
+        with database(home=self.home) as connection:
+            lead = sd_db.create_assignment(connection, item=item, role="author", status="done", lane="parallel")
+            connection.execute("UPDATE assignment SET scope = 'build' WHERE id = ?", (lead,))
+            sd_db.upsert_repo(connection, "/example/repo", remote="https://github.com/example/repo.git", managed=1)
+            connection.execute(
+                "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, step, "
+                "review_round, created_at, updated_at) VALUES ('r1', ?, 1, '/example/repo', 'build/sd-1', 'fixture', "
+                "'/w', '/w', 'enqueued', 2, '2026-11-24T00:00:00Z', '2026-11-24T00:00:00Z')", (lead,))
+            connection.execute("INSERT INTO cost (timestamp, role, assignment, pass, tokens_in, tokens_out, usd, "
+                               "source) VALUES ('2026-11-24T00:00:00Z', 'author', ?, 'r1', 1200, 30, 3.5, 'run')",
+                               (lead,))
+        shown = self.call("task", "show", item).stdout
+        self.assertIn("reviews: 3 rounds (2 blocking, 1 clean build, 0 lane) over 1 build runs", shown)
+        self.assertIn("tokens 1,200 in, 30 out · $3.50", shown)
+        self.assertNotIn("reviews", json.loads(self.call("task", "show", item, "--json").stdout))
+
     def test_experiment_designates_and_refuses_a_bad_parent(self):
         """sd:3982: `--experiment` writes the designation; a task of itself or of an undesignated item refuses."""
         first = json.loads(self.call("task", "add", "--priority", "3", "An experiment", "--json").stdout)["item"]["id"]
@@ -707,6 +727,20 @@ class TaskCLI(unittest.TestCase):
         self.assertEqual((state["note"]["kind"], state["note"]["body"]),
                          ("decision", f"Ruling on note #{asked}: Confirm destructive taps only"))
         self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+
+    def test_an_ordinary_question_on_a_review_batch_takes_the_linked_decision_path(self):
+        """sd:10505: a question asked on a batch after its header's count is no batch question;
+        it was sent to `review.rule`, which refused it with and without --option."""
+        item, _ = self.batch_question()
+        asked = self.question(item)
+        state = json.loads(self.call("task", "note", item, "Database rows", "--kind", "decision",
+                                     "--answers", asked, "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Database rows")
+        self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+        picked = self.question(item)
+        state = json.loads(self.call("task", "note", item, "Pack store", "--kind", "decision",
+                                     "--answers", picked, "--option", "pack store", "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{picked}: Pack store")
 
     def test_all_public_note_kinds_parse_and_persist_without_internal_kinds(self):
         self.assertEqual(set(NOTE_KINDS), {"comment", "followup", "question", "decision", "proposal"})

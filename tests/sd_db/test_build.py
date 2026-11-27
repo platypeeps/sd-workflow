@@ -2879,6 +2879,33 @@ class Hosts(Case):
 
     OVER = {"load": "the five-minute load is 30, above the cap of 24"}
 
+    def overloaded(self, *, fallback: bool):
+        """The satellite `work` beats over its load cap; this hub's `sd.overload_fallback` reads 1 or is unset."""
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        config = {"config": {"sd": {"overload_fallback": "1"}}} if fallback else {}
+        (folder / "config.json").write_text(json.dumps(config))
+
+    def test_the_hub_leaves_an_overloaded_satellites_fresh_row_queued_unless_the_fallback_is_on(self):
+        """sd:10823: the hub built an overloaded satellite's fresh rows whenever it had the repository checked
+        out (sd:8991); the operator ruled it waits for the satellite unless `sd.overload_fallback` reads 1."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        self.overloaded(fallback=False)
+        self.assertIsNone(self.claim(hosts=HUB), "unset: the satellite's fresh row waits for its lane")
+        self.assertEqual(self.count("SELECT status FROM assignment"), "queued", "skipped, not blocked")
+        self.overloaded(fallback=True)
+        self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture", "set to 1: the hub builds it, as before")
+
+    def test_the_overload_fallback_setting_reads_only_0_or_1(self):
+        """sd:10823: anything but "1" reads off, the default."""
+        self.assertFalse(build.overload_fallback())
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        for value, on in (("1", True), ("0", False), ("2", False), ("yes", False), (1, False), ("1\n", False)):
+            (folder / "config.json").write_text(json.dumps({"config": {"sd": {"overload_fallback": value}}}))
+            self.assertIs(build.overload_fallback(), on, f"{value!r}")
+
     def test_the_hub_takes_no_overloaded_satellite_row_whose_repository_it_has_not_checked_out(self):
         """sd:8991 review: the hub claimed a satellite's row for a repository with no checkout on its disk, and the
         run blocked at the worktree step, once per queued row while the satellite stayed busy."""
@@ -2921,7 +2948,7 @@ class Hosts(Case):
         """sd:8991 review round 2: the quiet-dispatcher refusal ran before `_ran_on` routed the later rows, so the
         retry of the hub's fallback build, queued behind another row, blocked once its satellite went quiet."""
         build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.overloaded(fallback=True)
         fallback = self.claim(hosts=HUB)
         self.retried(fallback)
         build.queue(self.db, [self.item(priority=1)], who="operator")
@@ -2950,7 +2977,7 @@ class Hosts(Case):
         """sd:8991 review: the retry of a bundle the hub built for a busy satellite moved back to the satellite,
         whose disk holds none of its work."""
         build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.overloaded(fallback=True)
         fallback = self.claim(hosts=HUB)
         self.assertEqual(fallback["owner"], "fixture", "a fresh row of a checked-out repository moves")
         self.retried(fallback)
@@ -2989,7 +3016,7 @@ class Hosts(Case):
     def fallback_retried(self):
         """A bundle the hub built for the busy satellite's lane, ended blocked and released; its run."""
         build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.overloaded(fallback=True)
         fallback = self.claim(hosts=HUB)
         self.retried(fallback)
         self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (fallback["assignment"],))
@@ -3669,6 +3696,39 @@ class Hosts(Case):
                    hosts=WORK)
         self.assertIsNotNone(build.run(self.db, run["id"])["released_at"], "work's own probe releases it")
         self.assertFalse(self.lease_held(run))
+
+    def test_the_hub_pauses_the_runs_of_a_satellite_on_another_build(self):
+        """sd:10934: a hub refresh refuses a satellite's every call until it follows the pins, so its dispatcher
+        and runs go quiet while its builders still run. A quiet host whose last beat named another sd_db build
+        is paused for `MISMATCH_SECONDS`, its runs left open; past that it strands as any quiet host's."""
+        from sd_db import remote
+
+        run = self.satellite_run()
+        now = later(run["created_at"], build.STALE_SECONDS + 1)
+        other = "0" * 16 if remote.build_digest() != "0" * 16 else "1" * 16
+        quiet = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=quiet,
+                     body={"pid": 1, "why": "", "build": other})
+        self.assertIsNotNone(build.dispatcher_gone(self.db, "work"))
+        self.assertEqual(self.strand(run), [], "a mismatch pauses the run")
+        self.assertIsNone(build.run(self.db, run["id"])["outcome"])
+        lapsed = (datetime.fromisoformat(now) - timedelta(seconds=build.MISMATCH_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=lapsed,
+                     body={"pid": 1, "why": "", "build": other})
+        [settled] = self.strand(run)
+        self.assertEqual((settled["run"], settled["outcome"]), (run["id"], "blocked"))
+        self.assertIn(f"its last beat ran sd_db build {other}", build.run(self.db, run["id"])["detail"])
+        self.assertTrue(self.lease_held(run))
+
+    def test_the_hub_strands_a_quiet_run_whose_beat_names_this_build_or_none(self):
+        """sd:10934: only another build pauses; a beat on the hub's own build, or an unreadable one, does not."""
+        from sd_db import remote
+
+        for body in ({"build": remote.build_digest()}, {"build": ["0" * 16]}, {"build": ""}):
+            with self.subTest(body=body):
+                self.assertFalse(build.mismatched_build(json.dumps(body)))
+        self.assertFalse(build.mismatched_build("not json"))
+        self.assertFalse(build.mismatched_build(None))
 
     def test_the_hub_strands_a_run_whose_beat_leads_past_stale_seconds(self):
         """Pack sd:7970: a run beat is stamped on its satellite's clock, so it takes the dispatcher beat's lead

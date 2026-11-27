@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ from sd_db import (
     operations,
     paths,
     remote,
+    repos,
     runner,
     sessions,
     writes,
@@ -69,7 +71,9 @@ FAKE = textwrap.dedent('''
     role, plans = Path(sys.argv[0]).stem, Path(os.environ["FAKE_PLANS"])
     with open(plans / "calls.jsonl", "a") as log:
         log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd(),
-                             "run": os.environ.get("SD_BUILD_RUN")}) + "\\n")
+                             "run": os.environ.get("SD_BUILD_RUN"),
+                             "jobs": os.environ.get("CARGO_BUILD_JOBS"),
+                             "xdist": os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS")}) + "\\n")
     plan = plans / f"{role}.json"
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
@@ -159,8 +163,18 @@ FAKE = textwrap.dedent('''
             db.commit()
         # A function per round: a change outside any function holds every later blocker (sd:9769).
         added = f"def {mode}(): pass\\n"
-        Path("work.txt").write_text(Path("work.txt").read_text() + added if Path("work.txt").exists() else added)
-        git("add", "work.txt")
+        # `rule_apart`: a ruling round whose fix commits to a file no blocker names (sd:10286)
+        # `rule_caller`: one whose fix adds, in another file, a caller of the function at work.txt:2
+        if mode == "rule_caller":
+            added = "def rule_caller(): fix1()\\n"
+        if mode == "rule_apart":  # no `pass`: the first round's function has that name, and a call is a caller
+            added = "def rule_apart(): return 0\\n"
+        # `rule_config`: one whose fix changes a settings file only, as a config the code reads
+        # `rule_data`: the same under a name no list of configuration kinds holds
+        target = Path({"rule_apart": "apart.py", "rule_caller": "apart.py", "rule_config": "settings.json",
+                       "rule_data": "limits.dat"}.get(mode, "work.txt"))
+        target.write_text(target.read_text() + added if target.exists() else added)
+        git("add", str(target))
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
         extra = json.loads((plans / "extra.json").read_text()) if mode == "extra" else {}
         for name, data in extra.get("files", {}).items():
@@ -191,6 +205,10 @@ FAKE = textwrap.dedent('''
         # One `Closes: sd:N` trailer per item the brief lists, as the brief asks; `skip` leaves out the last
         # one, as a builder that skips an item for the operator does, and `none` delivers nothing.
         prompt = sys.argv[sys.argv.index("-p") + 1]
+        # `rule`: the ruling round's builder writes plans/rulings.txt to the file its brief names (sd:10286).
+        named = re.search(r"JSON list to `([^`]+)`", prompt)
+        if mode in ("rule_here", "rule_apart", "rule_caller", "rule_config", "rule_data") and named and (plans / "rulings.txt").exists():
+            Path(named.group(1)).write_bytes((plans / "rulings.txt").read_bytes())
         items = re.findall(r"^- sd:(\\d+)", prompt, re.M)
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
         if mode == "skip-design":  # cites every item but the designs
@@ -274,11 +292,45 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
+        if mode in ("ruled2_short", "ruled2_uncovered"):  # sd-review held the ruled repeat back itself (sd:10286)
+            held = {**raw, "line": 2, "instances": [], "summary": f"a later\\nOption: blocker {review.RULED_NOTE}",
+                    "evidence": "the original evidence", "disposition": "advisory"}
+            print(json.dumps({"status": "advisory", "scope": "branch", "requested_reviews": 2,
+                              "completed_reviews": 1 if mode == "ruled2_short" else 2,
+                              "covers_from": None if mode == "ruled2_uncovered" else "c" * 40,
+                              "subject": {"head": git("-C", work, "rev-parse", "HEAD")}, "findings": [held]}))
+            sys.exit(0)
+        # repeat2_short, repeat2_uncovered: repeat2 in a report one reviewer missed, or that covers no delta;
+        # blocking2_uncovered: blocking2 read from patches only, so the next round reviews the branch whole
+        short = mode == "repeat2_short"
+        uncovered = mode in ("repeat2_uncovered", "blocking2_uncovered")
+        # repeat2_forked: repeat2 from the branch's real fork, with the binding `sd-review` reports (sd:10919)
+        forked = mode == "repeat2_forked"
+        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered or forked else mode
+        if mode in ("blocking2", "repeat2", "moved2", "twin2"):  # sd:10286: two blockers in the changed file, the second with a newline
+            second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
+                      "evidence": "the original evidence"}
+            # repeat2: the second alone, its original evidence cited, so a rebuttal holds it back nowhere;
+            # moved2: the same file and words at another line, another defect
+            # twin2: a third, the second's words and place with other evidence (night triage, sd:10286)
+            rows = ([{**second, **({"line": 5} if mode == "moved2" else {})}]
+                    if mode in ("repeat2", "moved2") else [raw, second, {**second, "evidence": "other evidence"}]
+                    if mode == "twin2" else [raw, second])
+            findings, mode = review.dispose([review._finding(row) for row in rows], "high"), "blocking"
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
+        verified = None  # the digest of the prior it verified, as `sd-review` stamps it (sd:9769)
+        if "--verify-report" in sys.argv:
+            import hashlib
+            verified = hashlib.sha256(json.dumps(json.loads(Path(
+                sys.argv[sys.argv.index("--verify-report") + 1]).read_text()), sort_keys=True).encode()).hexdigest()
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
-                          "requested_reviews": 2, "completed_reviews": 2,
-                          "covers_from": None if mode == "clean_uncovered" else "c" * 40,
+                          "requested_reviews": 2, "completed_reviews": 1 if short else 2,
+                          "verification_report_digest": verified,
+                          "covers_from": None if mode == "clean_uncovered" or uncovered else
+                          git("-C", work, "merge-base", "HEAD", "refs/remotes/origin/main") if forked else "c" * 40,
+                          **({"binding": {"fixture": "binding"}, "reviewed_by": ["fixture-reader"],
+                              "remote_reviews": {"copilot": {"automatic": False}}} if forked else {}),
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -304,6 +356,29 @@ FAKE = textwrap.dedent('''
             sys.exit(3)
         argv = sys.argv
         items = [int(argv[n + 1]) for n, arg in enumerate(argv) if arg == "--item"]
+        legacy = plans / "legacy.json"  # an earlier version's queue file: a writing verb imports it first
+        if legacy.exists():
+            entries += [{**row, "enqueue_seq": len(entries) + n} for n, row in enumerate(json.loads(legacy.read_text()), 1)]
+            lane.write_text(json.dumps(entries))
+            legacy.unlink()
+        if any(row["item"] == items[0] and row["status"] in ("pending", "running") for row in entries):
+            print(json.dumps({"ok": False, "error": f"sd:{items[0]} is already queued in this lane"}))
+            sys.exit(3)
+        if any(row["item"] == items[0] and row.get("id", "").startswith("import-") and row["status"] != "cancelled"
+               and row["expected_head"] == argv[argv.index("--expected-head") + 1] for row in entries):
+            print(json.dumps({"ok": False, "error": f"sd:{items[0]} at this head already ran in this lane"}))
+            sys.exit(3)
+        import sqlite3  # the lane's own guard, over each entry as the shared queue stores it now (a hand-back)
+        stored = sqlite3.connect(os.environ["FAKE_DB"])
+        def now(row):
+            newest = stored.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                    "LIMIT 1", (f"lane:v1:example/repo:{row.get('id')}",)).fetchone()
+            return {**row, "status": json.loads(newest[0]).get("status")} if newest else row
+        try:
+            sd_lane.refuse_ran([now(row) for row in entries], items[0], argv[argv.index("--expected-head") + 1])
+        except sd_lane.LaneError as error:
+            print(json.dumps({"ok": False, "error": str(error)}))
+            sys.exit(3)
         entry = {"id": f"e{len(entries) + 1}", "item": items[0], "status": "pending", "enqueue_seq": len(entries) + 1,
                  "expected_head": argv[argv.index("--expected-head") + 1]}
         lane.write_text(json.dumps(entries + [entry]))
@@ -424,6 +499,20 @@ def fake_grep(files: dict[str, str], head: str, argv: list[str]) -> str:
         tests = [re.compile(rf"\b{re.escape(pattern)}\b") for pattern in patterns]
     return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
                    for number, text in enumerate(body.splitlines(), 1) if any(test.search(text) for test in tests))
+
+
+#: A `CACHEDIR.TAG` as cargo writes it into `target/`.
+CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n"
+
+
+def cargo(work: Path, *folders: str) -> None:
+    """Commit a `Cargo.toml` in each of `folders` of `work` ("" for its top), as a real crate has beside
+    its `target/`."""
+    for folder in folders or ("",):
+        (work / folder).mkdir(parents=True, exist_ok=True)
+        (work / folder / "Cargo.toml").write_text("[package]\nname = \"example\"\n")
+        support.git(work, "add", "-f", str(Path(folder, "Cargo.toml")))
+    support.git(work, "commit", "-q", "-m", "add a manifest")
 
 
 def exclude(work: Path, patterns: str) -> None:
@@ -756,6 +845,21 @@ class Supervise(Case):
         self.assertEqual(found and found["id"], "e1")
         self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [5], env=self.env))
 
+    def test_the_lane_entry_is_read_on_the_runs_branch_alone(self):
+        """Review of build/sd-1808: a rebuild shares items, and can share a head, with the failed branch's entry;
+        the newest entry of the items was taken whatever its branch. A row with no branch, an earlier version's
+        import, still counts."""
+        (self.plans / "lane.json").write_text(json.dumps([
+            {"id": "e1", "item": 7, "status": "failed", "enqueue_seq": 1, "branch": "build/sd-2"},
+            {"id": "e2", "item": 7, "status": "failed", "enqueue_seq": 2, "branch": "build/sd-1"}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-2", env=self.env)
+        self.assertEqual(found and found["id"], "e1")
+        self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env))
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e3", "item": 7, "status": "merged",
+                                                           "enqueue_seq": 1}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env)
+        self.assertEqual(found and found["id"], "e3")
+
     def test_an_unread_delivery_writes_nothing(self):
         """`cited` None (the commits were not read) is unknown: no enqueue, no outcome; the reap retries."""
         self.press()
@@ -951,6 +1055,49 @@ class Supervise(Case):
         self.assertIn("Write no file outside the worktree", prompt)
         self.assertIn("never amend", prompt)
         self.assertIn("Bash(git commit -F:*)", argv[argv.index("--allowedTools"):argv.index("--permission-mode")])
+
+    def test_a_builders_child_runs_its_tests_on_capped_threads(self):
+        """sd:10393: a builder's cargo, pytest and Unity runs took every core; its child now starts with the cap,
+        and a lower count the dispatcher's own environment set wins, as it does for a gate holder."""
+        gate = build_run._gate_slots()
+        for name in (*gate.CPU_VARIABLES, *build_run.THREAD_VARIABLES, "CI", "GITHUB_ACTIONS"):
+            self.env.pop(name, None)  # a gate holder runs this test with its own caps set: none may reach it
+        self.env.update(SD_GATE_SLOTS="1", TEST_WORKERS="1", XDG_CONFIG_HOME=str(self.root / "no-config"))
+        self.press()
+        self.plan(claude=["pass"])
+        supervisor = self.supervisor()
+        with mock.patch("os.getloadavg", return_value=(0.0, 0.0, 0.0)), mock.patch("os.cpu_count", return_value=16):
+            supervisor.run()
+        call = self.calls("claude")[0]
+        self.assertEqual((call["jobs"], call["xdist"]), ("16", "16"), "one slot: a gate's share is every core")
+        self.assertEqual(supervisor.env["TEST_WORKERS"], "1", "the lower count set wins")
+        prompt = call["argv"][call["argv"].index("-p") + 1]
+        self.assertIn("$CARGO_BUILD_JOBS", prompt)
+        with mock.patch("os.getloadavg", return_value=(30.0, 13.0, 9.0)), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["CARGO_BUILD_JOBS"], "3", "the load leaves 3 cores idle")
+        with mock.patch("os.getloadavg", side_effect=OSError), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["NEXTEST_TEST_THREADS"], "16", "an unread load caps at the share")
+
+    def test_the_thread_cap_takes_the_lower_of_the_gate_share_and_the_idle_cores(self):
+        """sd:10393: at most a gate holder's share of the cores, at most the cores the load leaves idle, at least 1."""
+        for slots, load, cap in (("4", 2.0, 4), ("4", 14.0, 2), ("4", 104.0, 1), ("4", None, 4),
+                                 ("4", math.nan, 4), ("4", math.inf, 4), ("0", 2.0, 14), ("bad", 0.0, 16),
+                                 ("20", 0.0, 1)):
+            with self.subTest(slots=slots, load=load):
+                env = {"SD_GATE_SLOTS": slots, "XDG_CONFIG_HOME": str(self.root / "no-config")}
+                self.assertEqual(build_run.thread_cap(env, load=load, cores=16), cap)
+
+    def test_the_thread_cap_reads_the_machine_setting_from_the_environment_it_is_given(self):
+        """Review of build/sd-1808: the cap's inputs come from the environment handed in, never the host's: the
+        variable first, then CI, then `sd.gate_slots` in that environment's config."""
+        home = self.root / "config"
+        (home / "sd-ai-command-pack").mkdir(parents=True)
+        (home / "sd-ai-command-pack" / "config.json").write_text(
+            json.dumps({"config": {"sd": {"gate_slots": "8"}}}), encoding="utf-8")
+        env = {"XDG_CONFIG_HOME": str(home)}
+        self.assertEqual(build_run.thread_cap(env, load=0.0, cores=16), 2)
+        self.assertEqual(build_run.thread_cap({**env, "SD_GATE_SLOTS": "4"}, load=0.0, cores=16), 4)
+        self.assertEqual(build_run.thread_cap({**env, "CI": "1"}, load=0.0, cores=16), 16, "CI caps no gate")
 
     def test_a_success_line_passes_whatever_the_exit_code(self):
         self.press()
@@ -1153,48 +1300,862 @@ class Supervise(Case):
         self.assertEqual(build.run(self.db, ended["retry"])["step"], "building")
 
     def test_review_rounds_bound(self):
-        """Failure table, Reviewing: blockers after REVIEW_ROUNDS rounds and one class pass block the items; each fix resumes."""
+        """Failure table, Reviewing: blockers after REVIEW_ROUNDS rounds, one class pass and one ruling round
+        block the items; each fix resumes."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
-        self.assertIn(f"{R + 1} review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
-        self.assertEqual(len(self.calls("sd-review")), R + 1)
+        self.assertIn(f"{R + 2} review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 2)
         fixes = [call["argv"] for call in self.calls("claude")][1:]
-        self.assertEqual([argv[argv.index("--resume") + 1] for argv in fixes], ["session-fixture"] * R)
+        self.assertEqual([argv[argv.index("--resume") + 1] for argv in fixes], ["session-fixture"] * (R + 1))
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
         self.assertIn("- work.txt:1 a blocker", prompts[0], "the fix names each blocker")
-        self.assertFalse(any("class pass" in prompt for prompt in prompts[1:-1]))
-        self.assertIn("class pass", prompts[-1], "sd:9263: the last round is a class pass")
-        self.assertIn("- work.txt:1 a blocker", prompts[-1])
+        self.assertIn("enumerate every instance", prompts[0], "sd:10903: round 1 is a class pass")
+        self.assertIn("from the code, not from the findings", " ".join(prompts[0].split()))
+        self.assertFalse(any("class pass" in prompt for prompt in prompts[1:-2]))
+        self.assertIn("do one class pass", prompts[-2], "sd:9263: the round past the bound is a class pass")
+        self.assertIn("rule each numbered blocker", prompts[-1], "sd:10286: the last round rules")
+        self.assertIn("1. work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
+
+    def fixed_ruling(self):
+        """The ruling round's child that rules its one blocker FIX, as each ruling round writes a file (sd:10913)."""
+        (self.plans / "rulings.txt").write_text(json.dumps([{"blocker": 1, "ruling": "fix", "reason": "a failing input"}]))
+        return "rule_apart"
+
+    def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2", rule="rule_apart",
+                     **options):
+        """A run whose class pass left `last`'s blockers, its ruling round writing `rulings` (text, or rows).
+        `rule`: the round's fix commits apart from the blockers' file, or (`rule_here`) to that file."""
+        R = build_run.REVIEW_ROUNDS
+        self.press(members)
+        self.write_pr()
+        if rulings is not None:
+            (self.plans / "rulings.txt").write_text(rulings if isinstance(rulings, str) else json.dumps(rulings))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), rule],
+                  sd_review=[*["blocking"] * R, last, *after])
+        return self.supervisor(**options).run()
+
+    def decisions(self, item=None):
+        """Each ruling the run noted: a comment, as every note the library writes is (sd:3008)."""
+        return [body for (body,) in self.db.execute(
+            "SELECT body FROM note WHERE item = ? AND kind = 'comment' AND body GLOB 'Build run * ruling [0-9]* at *' "
+            "ORDER BY id", (item or self.items[0],))]
+
+    def rebuttals(self):
+        return [json.loads(body)["proposal"] for (body,) in self.db.execute(
+            "SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:build-run:%' ORDER BY id")]
+
+    def test_a_run_at_the_cap_rules_its_blockers_and_delivers(self):
+        """sd:10286: a run at the cap with one fixable and one rejectable blocker delivers without a park. The
+        builder rules in a file; the supervisor records each ruling as a decision note and the reject as a
+        rebuttal at the head after the round's last commit, in the record `sd-review` reads."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "names  no failing\ninput"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        ruling = [call["argv"] for call in self.calls("claude")][-1]
+        prompt = ruling[ruling.index("-p") + 1]
+        self.assertEqual(ruling[ruling.index("--model") + 1], build_run.STRONGEST)
+        self.assertIn("1. work.txt:1 a blocker", prompt)
+        self.assertIn("2. work.txt:2 a later", prompt)
+        self.assertNotIn("name the class", prompt, "the ruling round fixes only its fix rulings")
+        for command in ("adjudicate", "sd task note", "sd task add"):
+            self.assertNotIn(command, prompt, "the builder is sent to a write only the supervisor can make")
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        first, second = self.decisions()
+        self.assertIn(f"ruling 1 at {head[:12]}: FIX, a failing input. Blocker: work.txt:1 a blocker", first)
+        self.assertIn(f"ruling 2 at {head[:12]}: REJECT, names no failing input. Blocker: work.txt:2", second)
+        (proposal,) = self.rebuttals()
+        self.assertEqual(proposal["bindings"]["head"], head, "the rebuttal is not at the head the round left")
+        (finding,) = proposal["findings"]
+        self.assertEqual((finding["raw_finding"]["path"], finding["raw_finding"]["line"],
+                          finding["response_disposition"], finding["reason"]),
+                         ("work.txt", 2, "rebutted", "names no failing input"))
+        self.assertFalse(self.rulings_file().exists(), "applied rulings stay for another head")
+
+    def test_a_ruled_blocker_the_next_review_repeats_clears(self):
+        """Lead round-3 ruling on sd:10286: a REJECT or FILE ruling stops that blocker parking the run when the
+        next review repeats it with its original evidence, which a rebuttal does not hold back. A repeat of a
+        FIX ruling, or of an unruled blocker, still parks."""
+        for ruling in ("reject", "file"):
+            with self.subTest(ruling):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": ruling, "reason": "no failing input"}],
+                                          after=("repeat2",))
+                self.assertEqual(ended.get("step"), "enqueued", ended)
+                self.assertTrue(any("cleared by its ruling" in body for (body,) in self.db.execute(
+                    "SELECT body FROM note WHERE item = ?", (self.items[0],))))
+        for after in (("blocking",), ("blocking2",)):
+            with self.subTest(after=after):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=after)
+                self.assertEqual(ended["outcome"], "blocked", ended)
+                self.assertIn("work.txt:1 a blocker", self.latest()["detail"])
+
+    def test_the_lane_holds_back_the_ruled_repeat_the_build_cleared(self):
+        """Review of sd:10286 (build_run.py:2199, :2256): `settled` clears a ruled repeat that cites evidence,
+        and the run enqueues; the lane's `sd-review` blocked that same repeat, a rebuttal holding back only an
+        uncited one. The ruling's rebuttal now holds back the cited repeat there too.
+
+        Class pass 4: the build and the lane judge a ruled repeat by one rule. The rebuttal carries the
+        evidence the ruling judged, so a fresh reproduction at the same place still blocks in the lane."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        review = importlib.import_module("tests.test_sd_review").sd_review
+        (body,) = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE "
+                                  "'ship-adjudication:build-run:%'").fetchone()
+        ruled = json.loads(body)["proposal"]["findings"][0]["raw_finding"]
+        self.assertEqual(ruled.get("evidence"), "the original evidence", "the rebuttal omits what it judged")
+        seen = review.rebuttals([(body,)], lambda _head: True, lambda _head, _path: True)
+        for evidence, lane in (("the original evidence", "advisory"), ("a new failing input", "blocking")):
+            with self.subTest(evidence=evidence):
+                repeat = {"path": ruled["path"], "line": ruled["line"], "summary": ruled["summary"],
+                          "severity": "high", "family": "correctness", "instances": [], "evidence": evidence}
+                (found,) = review.dispose([review._finding(repeat)], "high", seen)
+                self.assertEqual(found["disposition"], lane)
+
+    def test_a_settled_final_review_is_the_lanes_lead_pass(self):
+        """sd:10919: a final review whose blockers every ruling cleared, at head H, is recorded as the lead
+        pass the lane reuses: prepare at H skips its review; a head moved by a commit of its own reviews."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2_forked",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        work = Path(self.bundle["work_path"])
+        head = support.git(work, "rev-parse", "HEAD").strip()
+        sys.path.insert(0, str(BIN))
+        try:
+            lane = importlib.import_module("sd_ship_review")
+            key = importlib.import_module("sd_lib").lead_review_key("fixture/repo", self.bundle["branch"])
+        finally:
+            sys.path.remove(str(BIN))
+        found = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?", (key,)).fetchone()
+        self.assertIsNotNone(found, "the settled pass is not recorded for the lane")
+        self.assertEqual(json.loads(found[0])["status"], "advisory")
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], head, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNotNone(record, why)
+        # A clean merge of main far from the branch carries a plain pass; a ruling judged the tree at H, and
+        # main may add the caller it said was missing, so this pass covers H alone (review of sd:10919).
+        support.git(work, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        (work / "far").mkdir()
+        (work / "far" / "caller.txt").write_text("a new caller\n", encoding="utf-8")
+        support.git(work, "add", "far")
+        support.git(work, "commit", "-q", "-m", "feat: a new caller")
+        support.git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
+        support.git(work, "checkout", "-q", self.bundle["branch"])
+        support.git(work, "merge", "-q", "--no-edit", "refs/remotes/origin/main")
+        merged = support.git(work, "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(lane.carry_forward(work, head, merged, "refs/remotes/origin/main"))
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], merged, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
+        support.git(work, "commit", "-q", "--allow-empty", "-m", "fix: later")
+        moved = support.git(work, "rev-parse", "HEAD").strip()
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], moved, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
+
+    def test_two_rulings_one_words_and_place_clear_no_repeat(self):
+        """Night triage of sd:10286 (bin/sd-review:917, build_run.py:2199): two ruled blockers with one summary
+        and place but other evidence. The lane reads only the newest record there, so it blocked the repeat of
+        the older one that `settled` cleared and the run enqueued. Neither clears now: the run parks."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"},
+                                   {"blocker": 3, "ruling": "reject", "reason": "no failing input"}],
+                                  last="twin2", after=("repeat2",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_ruling_the_lane_cannot_read_clears_nothing(self):
+        """Class pass 4 on sd:10286: `settled` cleared a ruled repeat from its own checkpoint, written even
+        when no rebuttal was: a repository with no GitHub origin, where `sd-review` reads none, or a branch
+        delta that did not read. The lane then blocked what the build enqueued. Such a ruling is noted, not
+        applied, and its repeat parks the run."""
+        cases = {"no GitHub origin": lambda: self.db.execute("UPDATE repo SET remote = 'https://example.test/r.git'"),
+                 "an unread branch": lambda: self.enterContext(
+                     mock.patch.object(build_run.Supervisor, "branch_delta", return_value=None))}
+        for name, arrange in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                arrange()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=("repeat2",))
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual(self.rebuttals(), [])
+                self.assertIn("not applied: no rebuttal the lane's review reads", self.decisions()[1])
+
+    def test_a_settled_review_runs_the_gate_its_blocking_report_skipped(self):
+        """Review of sd:10286: `sd-review` runs no gate on a blocking report, so a managed run whose ruled
+        repeat settles to a pass runs the repository's checks before it enqueues; a failed one delivers
+        nothing."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        # Class pass: the gate itself (`sd gate check`: its tree, environment and recipe), which fails here,
+        # not the bare entrypoints, which pass in the builder's worktree and environment.
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(3)"])
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",), checks=lambda work: [[sys.executable, "-c", "exit(0)"]])
+        self.assertEqual(len(self.calls("gate")), 1, "the settled pass ran no gate")
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def known_failure(self, code):
+        """A managed run whose first review cleared and whose gate failed; its own check exits `code` after."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", f"exit({code})"])
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["gate_failed", "clean"])
+        return self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+
+    def test_a_known_failure_still_failing_spends_no_review(self):
+        """sd:10914: after a fix round for a failed gate, the check runs again before the review. One that
+        still fails starts no reviewer and goes back to the builder."""
+        ended = self.known_failure(3)
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(len(self.calls("sd-review")), 1, "a review ran on a head whose known failure stands")
+        self.assertGreater(len(self.calls("gate")), 1, "the check was not run again after each fix")
+        self.assertIn("exit 3", self.latest()["detail"])
+
+    def test_a_known_failure_that_passes_reviews_once_and_checks_once(self):
+        """sd:10914: a rerun that passes permits the usual review, and its pass is the round's check."""
+        ended = self.known_failure(0)
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual((len(self.calls("sd-review")), len(self.calls("gate"))), (2, 1))
+
+    def test_a_healthy_build_runs_no_extra_check(self):
+        """sd:10914: no known failure, no rerun: a clean managed review runs no check of its own."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(0)"])
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
+        ended = self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+        self.assertEqual(ended.get("step"), "enqueued")
+        self.assertEqual(self.calls("gate"), [])
+
+    def test_a_ruled_repeat_in_an_incomplete_review_is_no_pass(self):
+        """Review of sd:10286: clearing a ruled blocker turns no short or uncovered review into a pass. A
+        report one reviewer missed, or one that covers no delta, proves nothing else clean."""
+        for after in ("repeat2_short", "repeat2_uncovered"):
+            with self.subTest(after):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=(after,))
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_repeat_sd_review_holds_in_an_incomplete_review_is_no_pass(self):
+        """Review of sd:10286 (build_run.py:1798, sd-review:1832): `sd-review` downgrades the last blocker
+        under a ruling and reports `advisory`. A report one reviewer missed, or one that covers no delta,
+        proves nothing else clean, so the held repeat still blocks."""
+        for after in ("ruled2_short", "ruled2_uncovered"):
+            with self.subTest(after):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=(after, after))  # an uncovered delta is asked again whole
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_the_held_notes_are_the_ones_sd_review_writes(self):
+        """sd:10286: the build reads a held repeat by the note `sd-review` ends its summary with."""
+        import importlib.machinery
+        import types
+        bin_dir = str(Path(build_run.__file__).resolve().parents[2] / "bin")
+        sys.path.insert(0, bin_dir)
+        try:
+            loader = importlib.machinery.SourceFileLoader("sd_review_notes", os.path.join(bin_dir, "sd-review"))
+            review = types.ModuleType(loader.name)
+            review.__file__ = loader.path
+            loader.exec_module(review)
+        finally:
+            sys.path.remove(bin_dir)
+        self.assertEqual(build_run.HELD_NOTES, (review.REPEAT_NOTE, review.RULED_NOTE))
+
+    def test_a_ruled_repeat_in_an_uncovered_full_branch_review_is_no_pass(self):
+        """Review of sd:10286: the review after the ruling round reads the whole branch (the last round
+        covered none), and its report read patches only (no `covers_from`). Clearing the ruled repeat
+        turns it into no pass: it proves nothing else clean."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  last="blocking2_uncovered", after=("repeat2_uncovered",))
+        self.assertNotIn("--verify-report", self.calls("sd-review")[-1]["argv"], "a delta, not the branch")
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_ruling_lapses_when_its_round_changes_a_configuration_file(self):
+        """Review of sd:10286 (build_run.py:2325, :782, :2445): an unchanged function reads a setting the
+        round's fix changed; the finding names neither the file nor a name it defines, and no name edge
+        reaches it. A ruling judged the old value, so a round that changes a configuration file applies no
+        reject or file ruling: the repeat parks the run."""
+        # Class pass 7 (build_run.py:788): any file the name walk does not read as Python, whatever its name.
+        for mode, name in (("rule_config", "settings.json"), ("rule_data", "limits.dat")):
+            with self.subTest(name):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=("repeat2",), rule=mode)
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual(self.rebuttals(), [])
+                self.assertIn(f"not applied: the round changed {name} (no Python source)", self.decisions()[1])
+
+    def test_a_ruling_lapses_when_its_round_changes_declared_runtime_data(self):
+        """sd:10906: code reads a `.py` file as data, by no name, and the round changed it. The name walk read
+        it as source, so the reject applied. A path the policy's `runtime_data` declares lapses it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.rebuttals(), [])
+        self.assertIn("not applied: the round changed apart.py (declared runtime data)", self.decisions()[1])
+
+    def test_a_lapsed_file_ruling_still_files_its_follow_up(self):
+        """sd:10914 review: a FILE ruling the round's runtime-data change lapsed filed no item, and a review
+        that omitted the blocker enqueued the build: the follow-up was lost. A lapse skips the clearing and
+        the rebuttal alone; the item is filed and the lead's note names it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "file", "reason": "older than this change"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        (filed,) = self.db.execute("SELECT id FROM item WHERE title LIKE 'Review follow-up%work.txt:2%'").fetchall()
+        self.assertIn(f"FILE as sd:{filed['id']}, older than this change; not applied: the round changed "
+                      f"apart.py (declared runtime data)", self.decisions()[1])
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE ?",
+                                         (f"{build_run.RULED}%",)).fetchone()[0], 0)
+
+    def test_declared_runtime_data_is_matched_by_glob(self):
+        """sd:10906: `runtime_data` globs as `check_scope` reads them: `*` in one segment, `**` across them."""
+        self.assertEqual(build_run.unwalked(self.root, ["a/b.py", "data/x/t.py", "top.py", "c.py"],
+                                            data=["data/**", "c.py"]),
+                         ["c.py (declared runtime data)", "data/x/t.py (declared runtime data)"])
+
+    def test_only_python_source_is_a_file_the_name_walk_reads(self):
+        """Class pass 7: a `.py` file, or a regular file whose first line is a Python shebang; a symlink, a
+        missing file, a file that does not read or any other is none, fail closed."""
+        (self.root / "tool").write_text("#!/usr/bin/env python3\nx = 1\n")
+        (self.root / "run.sh").write_text("#!/bin/sh\n")
+        (self.root / "link.py").symlink_to("tool")
+        (self.root / "bytes").write_bytes(b"\xff\xfe#!python")
+        self.assertEqual(build_run.unwalked(self.root, ["a/b.py", "tool", "run.sh", "link.py", "gone", "bytes", ""]),
+                         [" (no Python source)", "bytes (no Python source)", "gone (no Python source)",
+                          "link.py (no Python source)", "run.sh (no Python source)"])
+
+    def test_a_ruling_lapses_when_its_round_changes_the_ruled_file(self):
+        """Class pass 3 on sd:10286: a ruling judged the code at the reviewed head. A fix in the same round
+        that changes a file the blocker names can make it reachable, so the reject clears nothing and takes
+        no rebuttal: the repeat parks the run, and the decision note says the ruling was not applied."""
+        for ruling in ("reject", "file"):
+            with self.subTest(ruling):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": ruling, "reason": "no failing input"}],
+                                          after=("repeat2",), rule="rule_here")
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertIn("work.txt:2 a later", self.latest()["detail"])
+                self.assertEqual(self.rebuttals(), [])
+                self.assertEqual(self.db.execute("SELECT count(*) FROM state WHERE kind = 'checkpoint' AND "
+                                                 "key LIKE 'build-run-ruled:%'").fetchone()[0], 0)
+                self.assertIn("not applied: the round changed work.txt", self.decisions()[1])
+
+    def test_a_ruling_lapses_when_its_rounds_changes_do_not_read(self):
+        """Class pass 3, fail closed: with no reviewed head or no delta to read, a reject is noted, not applied."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "work.txt", "line": 2, "summary": "a later", "instances": ["other.py:9"]}
+        supervisor.rule(1, row, "reject", "no failing input", "a" * 40, "example/repo", ["work.txt"], None)
+        supervisor.rule(2, row, "reject", "no failing input", "a" * 40, "example/repo", ["work.txt"], ["other.py"])
+        supervisor.rule(3, row, "reject", "no failing input", "a" * 40, "example/repo", ["work.txt"], ["far.py"])
+        first, second, third = self.decisions()
+        self.assertIn("not applied: the round's own changes did not read", first)
+        self.assertIn("not applied: the round changed other.py", second)
+        self.assertNotIn("not applied", third)
+        self.assertEqual(len(self.rebuttals()), 1)
+        self.assertEqual([key.rsplit(":", 1)[1] for (key,) in self.db.execute(
+            "SELECT key FROM state WHERE kind = 'checkpoint' AND key LIKE 'build-run-ruled:%'")], ["3"])
+
+    def test_a_ruling_lapses_when_its_round_changes_a_file_its_evidence_names(self):
+        """Lead ruling on sd:10286: a reject of the crash at parse.py, whose repro routes '' through
+        dispatch.py, judged the old caller. A fix that changes dispatch.py in the same round can make it
+        reachable, so the ruling is re-verified, not carried to the new head; one that changes neither
+        file carries."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "src/parse.py", "line": 4, "summary": "int('') raises on an empty count",
+               "evidence": "src/dispatch.py forwards '' to parse_count, and int('') raises ValueError"}
+        head = "a" * 40
+        supervisor.rule(1, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"])
+        supervisor.rule(2, dict(row, evidence="dispatch.py forwards ''"), "reject", "no caller passes ''",
+                        head, "example/repo", ["src/dispatch.py"], ["src/dispatch.py"])
+        supervisor.rule(3, row, "reject", "no caller passes ''", head, "example/repo", ["src/far.py"],
+                        ["src/far.py"])
+        first, second, third = self.decisions()
+        self.assertIn("not applied: the round changed src/dispatch.py", first)
+        self.assertIn("not applied: the round changed src/dispatch.py", second)
+        self.assertNotIn("not applied", third)
+        self.assertEqual(len(self.rebuttals()), 1)
+        answer = {"status": "blocking", "blockers": [row]}
+        self.assertEqual(supervisor.settled(answer, head)["status"], "advisory")
+
+    def test_a_ruling_lapses_when_its_round_changes_a_function_its_evidence_names(self):
+        """Review of sd:10286: the repro names the changed caller by function, not file (`forward()`
+        passes ''). A fix to that function in the round re-verifies the ruling; one to another does not."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "src/parse.py", "line": 4, "summary": "int('') raises on an empty count",
+               "evidence": "forward() passes '' to parse_count, and int('') raises ValueError"}
+        head = "a" * 40
+        supervisor.rule(1, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"], {"forward"})
+        supervisor.rule(2, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"], {"route"})
+        supervisor.rule(3, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"], None)
+        first, second, third = self.decisions()
+        self.assertIn("not applied: the round changed forward", first)
+        self.assertNotIn("not applied", second)
+        self.assertIn("not applied: the round's own changes did not read", third)
+
+    def test_a_ruling_lapses_when_its_round_adds_a_caller_no_finding_names(self):
+        """Class pass on sd:10286: the round's fix adds, in a file the blocker does not name, a caller of
+        the function the blocker sits in. The reject judged the code without that caller, so it clears
+        nothing: the repeat parks the run."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",), rule="rule_caller")
+        self.assertIn("not applied: the round changed a caller of work.txt:2", self.decisions()[1])
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.rebuttals(), [])
+
+    def test_a_rounds_reach_is_a_caller_or_a_name_the_blocker_uses(self):
+        """Class pass on sd:10286, each instance from the code: a round that changes a caller of the
+        blocker's function, direct or through an unchanged one, or a module name that function uses,
+        reaches it; one that changes unrelated code does not, and a delta git cannot read reaches all."""
+        self.press()
+        supervisor = self.supervisor()
+        work = Path(self.bundle["work_path"])
+        work.mkdir(parents=True, exist_ok=True)
+        support.git(work, "init", "-q")
+
+        def commit(files):
+            for name, text in files.items():
+                (work / name).parent.mkdir(parents=True, exist_ok=True)
+                (work / name).write_text(text)
+            support.git(work, "add", "-A")
+            support.git(work, "-c", "user.name=operator", "-c", "user.email=operator@example.test",
+                        "-c", "commit.gpgsign=false", "commit", "-qm", "fix: a round")
+            return support.git(work, "rev-parse", "HEAD")
+
+        base = commit({"src/parse.py": "import limits\n\ndef parse_count(text):\n    return int(text) + limits.LIMIT\n",
+                       "src/limits.py": "LIMIT = 3\n",
+                       "src/table.py": "TABLE = {\n    'count': 3,\n}\n",
+                       "src/size.py": "import table\n\ndef size(text):\n    return len(text) + table.TABLE['count']\n",
+                       "src/dispatch.py": "def forward(text):\n    return text\n",
+                       "src/route.py": "def route(text):\n    return middle(text)\n",
+                       "src/middle.py": "def middle(text):\n    return parse_count(text)\n",
+                       "src/far.py": "def far():\n    return 1\n",
+                       "src/run.py": "def run(payload):\n    return parse(payload)['k']\n",
+                       "src/load.py": "def parse(payload):\n    return decode(payload)\n",
+                       "src/decode.py": "def decode(payload):\n    return {'k': payload}\n"})
+        row = {"path": "src/parse.py", "line": 4, "summary": "an empty count raises"}
+        # Review of sd:10286: the round makes an unchanged helper's callee return None; `run` indexes it.
+        sized = {"path": "src/size.py", "line": 4, "summary": "a text count is no int"}
+        helper = {"path": "src/run.py", "line": 2, "summary": "`run()` indexes what `parse()` returns"}
+        support.git(work, "reset", "-q", "--hard", base)
+        head = commit({"src/decode.py": "def decode(payload):\n    return None if payload == 'null' else {}\n"})
+        reach = supervisor.reaches(helper, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
+        self.assertTrue(reach, "a changed callee below an unchanged helper reaches the blocker")
+        cases = {"src/dispatch.py": ("def forward(text):\n    return parse_count(text or '')\n", "a caller of"),
+                 "src/route.py": ("def route(text):\n    return middle(text or '')\n", "a caller of"),
+                 "src/limits.py": ("LIMIT = ''\n", "a name"),
+                 # Review of sd:10286: a change inside a binding written over lines binds its name too.
+                 "src/table.py": ("TABLE = {\n    'count': '',\n}\n", "a name"),
+                 "src/table.py ": ("TABLE = {\n}\n", "a name"),
+                 "src/far.py": ("def far():\n    return 2\n", None)}
+        for name, (text, said) in cases.items():
+            with self.subTest(name):
+                support.git(work, "reset", "-q", "--hard", base)
+                head = commit({name.strip(): text})
+                blocker = sized if name.startswith("src/table.py") else row
+                reach = supervisor.reaches(blocker, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
+                self.assertEqual(bool(reach), said is not None, reach)
+                if said:
+                    self.assertIn(said, reach[0])
+        self.assertTrue(supervisor.reaches(row, None, base), "an unread delta reaches every blocker")
+
+    def test_a_rounds_reach_reads_a_statement_past_what_its_text_holds(self):
+        """Class pass on sd:10286: a statement's bounds were counted from its brackets as text, so a bracket
+        in a string or a comment, or a continuation with no bracket, cut it short and its binding or its
+        entries were missed. Each instance from the code: the changed line's binding (`round_words`), a
+        table's later entries (`calls_into`), a reference inside a table (`called_from`), and a hunk that
+        does not hold the statement's first line, which reaches every blocker."""
+        self.press()
+        supervisor = self.supervisor()
+        work = Path(self.bundle["work_path"])
+        work.mkdir(parents=True, exist_ok=True)
+        support.git(work, "init", "-q")
+
+        def commit(files):
+            for name, text in files.items():
+                (work / name).parent.mkdir(parents=True, exist_ok=True)
+                (work / name).write_text(text)
+            support.git(work, "add", "-A")
+            support.git(work, "-c", "user.name=operator", "-c", "user.email=operator@example.test",
+                        "-c", "commit.gpgsign=false", "commit", "-qm", "fix: a round")
+            return support.git(work, "rev-parse", "HEAD")
+
+        size = "import table\n\ndef size(text):\n    return len(text) + table.{}['count']\n"
+        base = commit({
+            "src/string.py": "QUOTED = {\n    'close': ')}',\n    'count': 3,\n}\n",
+            "src/use_string.py": size.format("QUOTED"),
+            "src/comment.py": "NOTED = {\n    'a': 1,  # see a)\n    'count': 3,\n}\n",
+            "src/use_comment.py": size.format("NOTED"),
+            "src/text.py": "TEXT = \"\"\"\n    three\n\"\"\"\n",
+            "src/use_text.py": "import text\n\ndef size():\n    return int(text.TEXT)\n",
+            "src/slash.py": "TOTAL = 1 + \\\n    2\n",
+            "src/use_slash.py": "import slash\n\ndef size():\n    return slash.TOTAL\n",
+            "src/entries.py": "ENTRIES = {\n    'close': ')}',\n    'count': count_of,\n}\n",
+            "src/use_entries.py": size.format("ENTRIES"),
+            "src/count.py": "def count_of():\n    return 3\n",
+            "src/handlers.py": "HANDLERS = {\n    'close': ')}',\n    'a': handler_a,\n}\n",
+            "src/handle.py": "def handler_a(text):\n    return int(text)\n",
+            "src/serve.py": "def serve(key, text):\n    return HANDLERS[key](text)\n",
+            "src/far.py": "def far():\n    return 1\n"})
+        cases = {
+            "a bracket in a string": ("src/string.py", "QUOTED = {\n    'close': ')}',\n    'count': '',\n}\n",
+                                      "src/use_string.py", 4, "a name"),
+            "a bracket in a comment": ("src/comment.py", "NOTED = {\n    'a': 1,  # see a)\n    'count': '',\n}\n",
+                                       "src/use_comment.py", 4, "a name"),
+            "a string over lines": ("src/text.py", "TEXT = \"\"\"\n    none\n\"\"\"\n", "src/use_text.py", 4, "a name"),
+            "a backslash": ("src/slash.py", "TOTAL = 1 + \\\n    ''\n", "src/use_slash.py", 4, "a name"),
+            "a table's later entry": ("src/count.py", "def count_of():\n    return ''\n",
+                                      "src/use_entries.py", 4, "a name"),
+            "a reference in a table": ("src/serve.py", "def serve(key, text):\n    return HANDLERS[key](text or '')\n",
+                                       "src/handle.py", 2, "a caller of"),
+            "unrelated": ("src/far.py", "def far():\n    return 2\n", "src/use_string.py", 4, None)}
+        for name, (path, text, cited, line, said) in cases.items():
+            with self.subTest(name):
+                support.git(work, "reset", "-q", "--hard", base)
+                head = commit({path: text})
+                row = {"path": cited, "line": line, "summary": "a text count is no int"}
+                reach = supervisor.reaches(row, build_run.round_words(supervisor.tools.git, str(work), base, head), head)
+                self.assertEqual(bool(reach), said is not None, reach)
+                if said:
+                    self.assertIn(said, reach[0])
+        # A hunk that starts inside a statement names no binding: the delta is unknown, and reaches all.
+        cut = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -3 +3 @@\n     'a': 1,\n-    'count': 3,\n+    'count': '',\n"
+        with mock.patch.object(build_run, "_read", return_value=cut):
+            self.assertIsNone(build_run.round_words(["git"], str(work), base, base))
+
+    def test_a_ruling_clears_no_gate_blocker(self):
+        """Review of sd:10286: the review gate's own blocker (a response past its byte limit, a finding it could
+        not place) names no code a ruling judged. A reject of it records nothing, and its repeat still blocks:
+        the omitted evidence may hold a real blocker."""
+        self.press()
+        supervisor = self.supervisor()
+        head = "a" * 40
+        rows = [{"path": "<review-response>", "line": None, "severity": "high", "family": "correctness",
+                 "summary": "response exceeds the declared byte limit; omitted evidence may contain blocking findings"},
+                {"path": "<unknown>", "line": None, "summary": "a finding with no place"}]
+        for number, row in enumerate(rows, 1):
+            supervisor.rule(number, row, "reject", "no failing input", head, "example/repo", ["work.txt"], ["far.py"])
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM state WHERE kind = 'checkpoint' AND "
+                                         "key LIKE 'build-run-ruled:%'").fetchone()[0], 0)
+        for body in self.decisions():
+            self.assertIn("not applied: the review gate's own blocker", body)
+        answer = {"status": "blocking", "blockers": rows}
+        self.assertEqual(supervisor.settled(answer, head), answer)
+
+    def test_a_ruling_clears_only_its_own_place(self):
+        """Review of sd:10286: a finding with the ruled blocker's file and words at another line is another
+        defect, and it still parks the run."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("moved2",))
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("work.txt:5 a later", self.latest()["detail"])
+
+    def test_a_round_file_rewritten_after_the_rulings_clears_nothing(self):
+        """Review of sd:10286, a hub fault: the review after the ruling round rewrote the round's blockers, and
+        a replay maps ruling 2 onto the new blocker 2. The ruling is read as the blocker it ruled."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        other = {"path": "work.txt", "line": 7, "summary": "an unresolved defect"}
+        again.round_file.write_text(json.dumps([{"path": "work.txt", "line": 1, "summary": "a blocker"}, other]))
+        answer = again.settled({"status": "blocking", "blockers": [other]}, head)
+        self.assertEqual((answer["status"], answer["blockers"]), ("blocking", [other]))
+
+    def test_a_ruling_rebuttal_names_the_files_the_branch_changes(self):
+        """Review of sd:10286: as a follow-up's rebuttal does, a ruling's rebuttal lists each file the branch
+        changes, so a later change to a caller there lapses it in the lane."""
+        self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        (proposal,) = self.rebuttals()
+        self.assertIn("work.txt", proposal["findings"][0]["raw_finding"]["instances"])
+
+    def test_the_ruling_brief_carries_each_blockers_evidence(self):
+        """Review of sd:10286: the builder rules on the failing input, so the brief names it, on one line."""
+        self.press()
+        """Class pass: quoted as JSON, so a failing input's own whitespace reaches the builder unchanged, and
+        a cut one says so."""
+        supervisor = self.supervisor()
+        said = supervisor.numbered([{"path": "a.py", "line": 3, "summary": "s", "evidence": "run  x\n\tit fails "}])
+        self.assertEqual(said, '1. a.py:3 s (evidence, a JSON string: "run  x\\n\\tit fails ")')
+        long = supervisor.numbered([{"path": "a.py", "line": 3, "summary": "s",
+                                     "evidence": "é" * (build_run.EVIDENCE_MAX + 5)}])
+        self.assertIn(f"its first {build_run.EVIDENCE_MAX} of {build_run.EVIDENCE_MAX + 5} characters", long)
+        self.assertEqual(supervisor.numbered([{"path": "a.py", "line": 3, "summary": "s", "evidence": " \n"}]),
+                         "1. a.py:3 s")
+
+    def test_a_ruling_clears_only_the_blocker_it_ruled_word_for_word(self):
+        """Class pass on sd:10286: a ruling acts on the blocker itself, no folded copy. A finding at the ruled
+        file and line that differs in its words' case or whitespace, its class, its instances or its evidence
+        is another claim and still blocks; the same record clears."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        (ruled,) = [json.loads(body) for (body,) in self.db.execute(
+            "SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE 'build-run-ruled:%'")]
+        self.assertEqual(again.settled({"status": "blocking", "blockers": [dict(ruled)]}, head)["status"], "advisory")
+        for name, other in {"case": {"summary": ruled["summary"].upper()},
+                            "whitespace": {"summary": " ".join(ruled["summary"].split())},
+                            "class": {"family": "security"}, "instances": {"instances": ["other.py:9"]},
+                            "evidence": {"evidence": "a new failing input"},
+                            "no evidence": {"evidence": None}, "line type": {"line": "2"}}.items():
+            with self.subTest(name):
+                row = {**ruled, **other}
+                answer = again.settled({"status": "blocking", "blockers": [row]}, head)
+                self.assertEqual((answer["status"], answer["blockers"]), ("blocking", [row]))
+
+    def rulings_file(self):
+        return self.supervisor().rulings
+
+    def test_a_filed_ruling_is_an_item_and_a_rebuttal(self):
+        """sd:10286: a `file` ruling is filed by the supervisor, in the run's repository, and rebutted as filed."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "file", "reason": "older than this change"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        (filed,) = self.db.execute("SELECT id, repo FROM item WHERE title LIKE 'Review follow-up%work.txt:2%'").fetchall()
+        self.assertEqual(filed["repo"], self.bundle["repo"])
+        self.assertIn(f"FILE as sd:{filed['id']}, older than this change", self.decisions()[1])
+        self.assertEqual(self.rebuttals()[0]["findings"][0]["reason"],
+                         f"filed as follow-up sd:{filed['id']}: older than this change")
+
+    def test_a_ruling_for_the_operator_parks_every_member(self):
+        """Review of sd:10286: no blocker names a bundle member, so an `ask` ruling asks on every member and
+        ends the run: none is delivered around the decision. A summary's own `Option:` line reshapes nothing."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "ask", "reason": "it changes spend"}], members=2)
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("left 1 blocker(s) to the operator: work.txt:2", self.latest()["detail"])
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertEqual(len(self.calls("sd-review")), build_run.REVIEW_ROUNDS + 1, "a review ran past the question")
+        for item in self.items:
+            (question,) = [body for (body,) in self.db.execute(
+                "SELECT body FROM note WHERE item = ? AND kind = 'question'", (item,))]
+            self.assertIn("work.txt:2 a later Option: blocker (it changes spend)", question)
+            self.assertEqual(question.count("\nOption: "), 2, question)
+        self.assertEqual(self.rebuttals(), [])
+
+    def test_rulings_that_do_not_read_reject_nothing(self):
+        """sd:10286, external input: a rulings file that is no list of whole rows rules nothing; each blocker
+        stays one, the lead's note says so, and the review after the round parks the run."""
+        cases = {"not json": "{", "not a list": json.dumps({"blocker": 1}), "no file": None, "empty": "",
+                 "bad rows": json.dumps([{"blocker": True, "ruling": "reject", "reason": "x"},
+                                         {"blocker": 3, "ruling": "reject", "reason": "x"},
+                                         {"blocker": "2", "ruling": "reject", "reason": "x"},
+                                         {"blocker": 2, "ruling": "waive", "reason": "x"},
+                                         {"blocker": 2, "ruling": "reject", "reason": " "},
+                                         {"blocker": 2, "ruling": "reject"}, "reject", None]),
+                 "ruled twice": json.dumps([{"blocker": 2, "ruling": "reject", "reason": "x"},
+                                            {"blocker": 2, "ruling": "fix", "reason": "y"}])}
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                ended = self.ruling_round(text, after=("blocking2",))
+                self.assertEqual(ended["outcome"], "blocked", ended)
+                # sd:10913: no file at all ends the run before the review; sd:10914: so does one that does not
+                # rule every blocker, as the review after it may omit one.
+                self.assertIn("the ruling round wrote no rulings file" if name == "no file" else
+                              "do not rule every blocker", self.latest()["detail"])
+                self.assertEqual(len(self.calls("sd-review")), build_run.REVIEW_ROUNDS + 1)
+                self.assertFalse(self.supervisor().rulings_applied())
+                self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+
+    def test_a_ruling_round_that_writes_no_rulings_file_delivers_nothing(self):
+        """sd:10913: the ruling round wrote no rulings file and the review after it omitted the blockers. The
+        run delivered; it now ends blocked before that review, and no review is spent."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round(None, after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the missing rulings")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_rulings_file_that_leaves_a_blocker_unruled_delivers_nothing(self):
+        """sd:10914: a rulings file that ruled blocker 1 alone read as applied; the review after it omitted
+        blocker 2 and the run delivered it unruled, and the lane reuses that pass (sd:10919). Each blocker
+        needs a ruling that reads: else the run ends blocked before that review, none applied, no mark."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round([{"blocker": 1, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("no single ruling for blocker(s) 2", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the unruled blocker")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+        again = self.supervisor()
+        self.assertFalse(again.rulings_applied(), "a round with an unruled blocker reads as applied")
+        # A later walk reads the same file and stays blocked: the mark is never written around it.
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(again.ruled(head))
+        self.assertEqual(again.ending[0], "blocked")
+        self.assertFalse(again.rulings_applied())
+
+    def test_rulings_for_round_blockers_that_do_not_read_apply_nothing(self):
+        """sd:10914, class pass: a round file lost or not JSON reads as no blocker, so an empty rulings list
+        ruled them all. The round's blockers must read, else nothing applies and no mark is written."""
+        for name, text in {"no round file": None, "not json": "{", "empty list": "[]"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.ruling_round([], after=("clean",))
+                again = self.supervisor()
+                again.round_file.unlink(missing_ok=True)
+                if text is not None:
+                    again.round_file.write_text(text)
+                again.rulings.write_text("[]")
+                head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+                self.assertIsNotNone(again.ruled(head))
+                self.assertEqual(again.ending[0], "blocked")
+                self.assertIn("the round's blockers did not read", again.ending[1])
+                self.assertFalse(again.rulings_applied())
+
+    def test_applied_rulings_walked_again_review_as_usual(self):
+        """sd:10913: a later walk at the same count, the applied rulings file gone, is no missing file."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertFalse(again.rulings.exists())
+        self.assertIsNone(again.ruled(head))
+
+    def test_applied_rulings_clear_no_later_round_at_the_same_head(self):
+        """Review of sd:10913: the applied mark named the commit alone, so a later blocking round at that same
+        head, whose ruling round wrote no file, read as applied and reviewed as usual. It names the round."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        self.assertTrue(again.rulings_applied())
+        head = again.round_head()
+        # A later blocking round at the same commit, as `blocked_round` records it.
+        record_state(self.db, "checkpoint", key=f"{build_run.ROUND_HEAD}{again.row['assignment']}", body=head)
+        self.assertEqual(again.round_head(), head)
+        self.assertFalse(again.rulings_applied(), "a later round's missing rulings read as applied")
+
+    def test_a_reason_is_one_bounded_line(self):
+        """sd:10286, long input: a reason is folded and cut before it is a note or a rebuttal."""
+        self.ruling_round([{"blocker": 1, "ruling": "reject", "reason": "é" * 5000},
+                           {"blocker": 2, "ruling": "fix", "reason": "y"}])
+        self.assertEqual(self.rebuttals()[0]["findings"][0]["reason"], "é" * build_run.REASON_MAX)
+
+    def test_a_rulings_file_from_before_the_round_is_not_this_rounds(self):
+        """sd:10286, a stale value: a rulings file an earlier round left is gone before the ruling child
+        starts, so a builder that writes none rejects nothing, and delivers nothing (sd:10913)."""
+        self.press()
+        self.supervisor().logs.mkdir(parents=True, exist_ok=True)
+        self.rulings_file().write_text(json.dumps([{"blocker": 1, "ruling": "reject", "reason": "stale"}]))
+        R = build_run.REVIEW_ROUNDS
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=[*["blocking"] * (R + 1), "clean"])
+        self.assertEqual(self.supervisor().run().get("outcome"), "blocked")
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
+        self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+
+    def test_rulings_walked_twice_are_written_once(self):
+        """sd:10286, a step run twice: a second supervisor that applies the same rulings at the same head, its
+        marks gone, writes no second note, item or rebuttal."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "file", "reason": "older"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        (self.plans / "rulings.txt").replace(again.rulings)
+        self.assertIsNone(again.ruled(head))
+        self.assertEqual((len(self.decisions()), len(self.rebuttals())), (2, 2))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM item WHERE title LIKE 'Review follow-up%'").fetchone()[0], 1)
+
+    def test_a_check_blocker_takes_no_rebuttal(self):
+        """sd:10286: a blocker that is no review finding (an enqueue check, line "-") is noted, never rebutted
+        or filed: no review reads a rebuttal for it."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.rule(1, {"path": "enqueue check", "line": "-", "summary": "the title is long"}, "file", "x",
+                        "a" * 40, "example/fixture")
+        self.assertEqual(len(self.decisions()), 1)
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM item WHERE title LIKE 'Review follow-up%'").fetchone()[0], 0)
 
     def test_fix_rounds_past_the_third_escalate(self):
         """Pack sd:9264: early fix rounds run on the bundle's model; the class-pass round runs on the strongest
         model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
-        self.assertEqual(len(self.calls("sd-review")), R + 1, "the park moved")
+        self.assertEqual(len(self.calls("sd-review")), R + 2, "the park moved")
         fixes = [call["argv"] for call in self.calls("claude")][1:]
         models = [(argv[argv.index("--model") + 1], "--effort" in argv) for argv in fixes]
         E = build_run.ESCALATE_AFTER
         self.assertLess(E, R, "no fix escalates before the park (sd:10111)")
         self.assertEqual(models[:E], [("opus", False)] * E, "an early round escalated")
-        self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R - E), "a late round did not escalate")
+        self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R + 1 - E), "a late round did not escalate")
         self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "medium", "sd:10192")
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
-        self.assertNotIn("name the class", prompts[E - 1])
-        self.assertIn("name the class", prompts[E])
+        self.assertNotIn("These blockers repeat", prompts[E - 1])
+        self.assertIn("These blockers repeat", prompts[E])
         escalated = [body for (body,) in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))
                      if "escalated" in body]
         self.assertEqual(len(escalated), 1, "the escalation is not recorded once on the run's item")
 
     def test_review_rounds_cap_is_two(self):
-        """Operator 2026-11-23 (sd:10128): two rounds with blockers, then the class pass: a park after 3 reviews."""
+        """Operator 2026-11-23 (sd:10128, sd:10286): two rounds with blockers, the class pass, then the ruling
+        round: a park after 4 reviews."""
         self.assertEqual(build_run.REVIEW_ROUNDS, 2)
         self.assertEqual(build_run.ESCALATE_AFTER, 1)
 
@@ -1364,12 +2325,13 @@ class Supervise(Case):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
         R = build_run.REVIEW_ROUNDS
         self.press(2)
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         add_note(self.db, self.items[1], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
-        self.assertIn(f"{R + 1} review rounds left blockers", self.latest()["detail"])
-        self.assertEqual(len(self.calls("sd-review")), R + 1)
+        self.assertIn(f"{R + 2} review rounds left blockers", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 2)
 
     def test_an_open_question_skips_the_class_pass(self):
         """sd:9263: no fix round answers a question, so a build that asked one parks at REVIEW_ROUNDS."""
@@ -1487,6 +2449,102 @@ class Supervise(Case):
         fix = [call["argv"] for call in self.calls("claude")][1]
         self.assertIn("instances: src.py:1", fix[fix.index("-p") + 1], "the fix brief lacks the instance list")
 
+    def test_a_fix_with_no_commit_verifies_every_earlier_blocker_not_the_branch(self):
+        """sd:10902: a fix round that commits nothing (a rebuttal) leaves the last report at the head. The
+        next review verifies the older kept report over the same delta, with the last round's blockers
+        carried in, instead of reviewing the whole branch again."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "asked"], sd_review=["blocking", "blocking2", "clean"])
+        self.supervisor().run()
+        argvs = [call["argv"] for call in self.calls("sd-review")]
+        self.assertEqual(len(argvs), 3, self.latest()["detail"])
+        first, second, third = argvs
+        self.assertIn("--verify-report", third, "a fix with no commit reviewed the whole branch")
+        self.assertEqual(third[third.index("--base") + 1], second[second.index("--base") + 1],
+                         "the same delta was not verified")
+        prior = json.loads(Path(third[third.index("--verify-report") + 1]).read_text(encoding="utf-8"))
+        self.assertIn(("work.txt", 2), [(row["path"], row["line"]) for row in prior["findings"]],
+                      "the last round's blocker was not carried into the verified report")
+        self.assertEqual(sorted((row["path"], row["line"]) for row in prior["findings"]),
+                         [("work.txt", 1), ("work.txt", 2)], "not one row, one verdict id, for each open blocker")
+
+    def test_a_carried_blocker_keeps_its_own_identity_in_the_older_report(self):
+        """Class pass on sd:10902: a blocker carried from the last report at the head into the older kept
+        report keeps what makes it that blocker. An older row with the same place and words does not
+        match it away; the older report's pass numbers do not read it as resolved; and its path is read
+        at the head it was found at, not walked from the older head (a rename and a reused name)."""
+        import importlib.machinery
+        import types
+        bin_dir = str(Path(build_run.__file__).resolve().parents[2] / "bin")
+        sys.path.insert(0, bin_dir)
+        try:
+            loader = importlib.machinery.SourceFileLoader("sd_review_carry", os.path.join(bin_dir, "sd-review"))
+            review = types.ModuleType(loader.name)
+            review.__file__ = loader.path
+            loader.exec_module(review)
+        finally:
+            sys.path.remove(bin_dir)
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        head, older = "a" * 40, "b" * 40
+        row = {"path": "src.py", "line": 1, "summary": "a blocker", "severity": "high"}
+        open_row, other = {**row, "disposition": "blocking"}, {**row, "line": 9, "summary": "another", "disposition": "blocking"}
+        report = {"scope": "branch", "requested_reviews": 1, "completed_reviews": 1, "covers_from": "c" * 40}
+        passes = [{"pass": 1, "head": older, "completed": True}, {"pass": 2, "head": older, "completed": True}]
+        # name: the last report's rows, the kept report's rows, its history, whether the last report verified
+        # the kept one, and the open blockers `sd-review` must read (None: no link, so a full review)
+        cases = {
+            "same place and words": ([open_row], [{**row, "disposition": "advisory"}], None, True, [1]),
+            "older pass numbers": ([{**open_row, "prior_review": {"pass": 1, "head": head}}], [], passes, True, [1]),
+            "path at its head": ([open_row], [], None, True, [1]),
+            # One row, one verdict id, for a blocker both reports hold: the last report carried it (sd:10902).
+            "still open in both": ([{**open_row, "evidence": "seen again"}], [open_row], None, True, [1]),
+            # The last round's verdict stands: a blocker it cleared is not asked about again.
+            "cleared last round": ([other], [open_row], None, True, [9]),
+            "cleared, none left": ([], [open_row], None, True, []),
+            # A last report that verified another prior, or none, says nothing of the kept report's blockers.
+            "not its verification": ([other], [open_row], None, False, None),
+        }
+        # A short last round (a reader timed out), or one that covers no branch, cleared a blocker on part
+        # of the answers: its verdicts replace nothing, and the branch is reviewed in full (ruling round).
+        shorts: dict[str, dict] = {"short of a reader": {"completed_reviews": 0}, "a named shortfall": {"review_shortfall": "one timed out"},
+                  "covers no branch": {"covers_from": None}}
+        for name, short in shorts.items():
+            kept = {**report, "status": "blocking", "subject": {"head": older}, "findings": [open_row]}
+            supervisor.out("review").write_text(json.dumps(
+                {**report, **short, "status": "blocking", "subject": {"head": head}, "findings": [other],
+                 "verification_report_digest": hashlib.sha256(json.dumps(kept, sort_keys=True).encode()).hexdigest()}),
+                encoding="utf-8")
+            supervisor.out("prior").write_text(json.dumps(kept), encoding="utf-8")
+            with self.subTest(name), mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+                self.assertIsNone(supervisor.prior_review(head), "a short round's verdict dropped an open blocker")
+        for name, (last_rows, kept_rows, history, linked, want) in cases.items():
+            kept = {**report, "status": "blocking", "subject": {"head": older}, "findings": kept_rows,
+                    **({"history": history} if history else {})}
+            digest = hashlib.sha256(json.dumps(kept, sort_keys=True).encode()).hexdigest() if linked else None
+            supervisor.out("review").write_text(json.dumps(
+                {**report, "status": "blocking", "subject": {"head": head}, "findings": last_rows,
+                 "verification_report_digest": digest}), encoding="utf-8")
+            supervisor.out("prior").write_text(json.dumps(kept), encoding="utf-8")
+            with self.subTest(name), mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+                prior = supervisor.prior_review(head)
+                if want is None:
+                    self.assertIsNone(prior, "an unlinked last report was merged into the kept one")
+                    continue
+                self.assertIsNotNone(prior, "a fix with no commit dropped the chain")
+                blockers = review.prior_blockers(prior)
+                self.assertEqual([found["line"] for found in blockers], want,
+                                 "not one row for each blocker the last round left open")
+                self.assertEqual({(found.get("prior_review") or {}).get("head") for found in blockers},
+                                 {head} if want else set(), "a carried path would be walked from the older head")
+                again = supervisor.prior_review(head)  # a re-run reads the kept report it rewrote
+                self.assertEqual([found["line"] for found in review.prior_blockers(again)], want,
+                                 "a re-run changed the open blockers")
+
     def test_a_new_round_two_finding_on_unchanged_code_files_a_follow_up(self):
         """Pack sd:9769: a later round's finding off the delta and off the earlier findings is filed, not a block."""
         self.press()
@@ -1497,6 +2555,36 @@ class Supervise(Case):
         filed = self.db.execute("SELECT id, title, repo FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
         self.assertEqual(len(filed), 1, "no follow-up item was filed")
         self.assertIn("far.txt:1", filed[0]["title"])
+
+    def test_a_deferral_that_clears_a_managed_review_runs_its_gate(self):
+        """Class pass on sd:10286: a deferral turns a blocking report, on which `sd-review` ran no gate, into
+        a pass; a managed run runs the repository's checks before it enqueues, and a failure goes back."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(3)"])  # the gate itself fails
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
+        self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()  # bare entrypoints pass
+        self.assertGreaterEqual(len(self.calls("gate")), 1, "the deferral's pass ran no gate")
+        self.assertGreaterEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        # sd:10914: the check still fails after the fix, so it runs again and no third review is spent.
+        self.assertEqual(len(self.calls("sd-review")), 2)
+
+    def test_a_gate_that_refused_to_run_is_no_fix_round(self):
+        """Class pass on sd:10286: `sd gate check` that refuses (exit 1, no result) ran no check: unknown,
+        for the reap's retry, never a blocker a paid fix round is sent to mend."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        refuse = [sys.executable, "-c", "import sys; sys.exit('sd: HEAD names no commit')"]
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")], check=refuse)
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
+        ended = self.supervisor(checks=lambda work: []).run()
+        self.assertEqual((ended["outcome"], len(self.calls("claude"))), (None, 2), ended)
+        self.assertIn("sd gate check gave no result", ended["why"])
 
     def test_a_filed_follow_up_is_a_rebuttal_the_lane_review_honours(self):
         """Review of sd:9769: the lane reviews the branch again; the same finding must not block it there."""
@@ -2829,6 +3917,15 @@ class Supervise(Case):
         prompt = self.calls("claude")[-1]["argv"]
         self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
+    def test_a_question_holds_no_build_of_a_held_split(self):
+        """Lane review of build/sd-1867: Build of a held split's items read their questions too, so a
+        pending one held a fresh Build that worked before; the press takes a held split as it stands."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        self.release_all()
+        add_note(self.db, self.items[0], "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        queued = build.queue_again(self.db, self.items[:2], who="operator")
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(self.items[:2]))
+
     def test_the_build_press_takes_a_held_bundles_items_fresh(self):
         """Row 12: the held bundle's refusal says Build; the dashboard's Build dialog checks each item (`_item`) and
         its press calls `queue`, not `queue_again`, so both take the blocked items and build them on a new branch."""
@@ -2881,6 +3978,11 @@ class Supervise(Case):
             if kind == "ignored":
                 exclude(work, "local.conf\n")
                 (work / "local.conf").write_text("the left item's setting\n")
+            elif kind == "tagged":
+                exclude(work, "config/\n")
+                (work / "config").mkdir()
+                (work / "config" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+                (work / "config" / "local.toml").write_text("the left item's setting\n")
             elif kind == "cache":
                 exclude(work, "__pycache__/\n")
                 (work / "__pycache__").mkdir()
@@ -2909,6 +4011,10 @@ class Supervise(Case):
     def test_a_split_guard_holds_an_ignored_leftover(self):
         """Row 18: an ignored local config outside a `DISPOSABLE` folder, which `kept_files` counts."""
         self.assert_split_first(self.left_out_of_a_retry(self.leftover("ignored")))
+
+    def test_a_split_guard_holds_config_in_a_tagged_folder(self):
+        """Lead ruling on build/sd-1867: a cache tag alone never makes ignored files disposable."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("tagged")))
 
     def pending(self, state):
         """`prepare` that leaves `state`, an unfinished Git operation, over a clean tree at the base: HEAD and
@@ -3329,6 +4435,49 @@ class Supervise(Case):
         self.assertIn("do one class pass", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], R)
 
+    def test_a_usage_limit_in_the_ruling_round_resumes_the_ruling_round(self):
+        """sd:10286: a limit in the ruling round resumes with RULING, not the class pass or a plain fix."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), "rate_limited"],
+                  sd_review=["blocking"] * (R + 1))
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=[self.fixed_ruling()], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertIn("rule each numbered blocker", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], R + 1)
+
+    def test_a_usage_limit_resume_keeps_the_ruling_rounds_rulings(self):
+        """Review of sd:10286: the resumed run has a new id, so its own review file is not the review the
+        rulings judged. A reject the resumed ruling round writes still applies, as in one run."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), "rate_limited"],
+                  sd_review=[*["blocking"] * R, "blocking2"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        (self.plans / "rulings.txt").write_text(json.dumps([
+            {"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+            {"blocker": 2, "ruling": "reject", "reason": "no failing input"}]))
+        self.plan(claude=["rule_apart"], sd_review=["repeat2"])
+        ended = self.supervisor(again["id"]).run()
+        self.assertNotIn("not applied", self.decisions()[1])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
         guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""
@@ -3568,11 +4717,51 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "pending",
-                                                           "enqueue_seq": 1, "expected_head": head}]))
+                                                           "enqueue_seq": 1, "expected_head": head,
+                                                           "branch": self.bundle["branch"]}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
         self.assertEqual(len(json.loads((self.plans / "lane.json").read_text())), 1)
+
+    def legacy_resume(self, head_of=lambda head: head, status="pending"):
+        """A run resumed at enqueuing whose item an earlier version's queue file holds pending, not imported:
+        `lane list` shows only a cancelled entry, and the enqueue imports the file and then refuses the item."""
+        self.press()
+        self.write_pr()
+        work = Path(self.bundle["work_path"])
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(work), "origin/main")
+        (work / "work.txt").write_text("done\n")
+        support.git(work, "add", "work.txt")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
+        head = support.git(work, "rev-parse", "HEAD")
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "cancelled",
+                                                           "enqueue_seq": 1, "expected_head": head}]))
+        (self.plans / "legacy.json").write_text(json.dumps([{"id": "import-1", "item": self.items[0],
+                                                             "status": status, "expected_head": head_of(head)}]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        return self.supervisor().run()
+
+    def test_enqueue_resume_records_a_legacy_entry_only_once_it_is_imported(self):
+        """pack sd:10420 class pass: the run reads the shared queue alone. The enqueue imports the file, refuses
+        the item it queued, and the entry now in the queue at this head is the run's; no second entry."""
+        self.assertEqual(self.legacy_resume()["step"], "enqueued")
+        self.assertEqual([call["argv"][call["argv"].index("lane") + 1] for call in self.calls("sd-ship")],
+                         ["list", "enqueue", "list"])
+        self.assertEqual([row["id"] for row in json.loads((self.plans / "lane.json").read_text())], ["e1", "import-1"])
+        self.assertFalse((self.plans / "legacy.json").exists())
+
+    def test_enqueue_resume_takes_a_legacy_entry_the_lane_failed_at_this_head(self):
+        """pack sd:10420 review: the file failed this head; the run records it for the watch, never requeues it."""
+        self.assertEqual(self.legacy_resume(status="failed")["step"], "enqueued")
+        self.assertEqual([(row["id"], row["status"]) for row in json.loads((self.plans / "lane.json").read_text())],
+                         [("e1", "cancelled"), ("import-1", "failed")])
+
+    def test_enqueue_resume_blocks_on_a_legacy_entry_at_another_head(self):
+        """The imported entry holds another head, so the refusal stands and the run is blocked on it."""
+        answer = self.legacy_resume(lambda head: "f" * 40)
+        self.assertEqual(answer["outcome"], "blocked")
+        self.assertIn("already queued in this lane", answer["blocked"])
 
     def test_an_unread_lane_at_enqueuing_writes_nothing(self):
         """An unknown `lane list` is no answer: the supervisor stops unwritten, and the reap retries it."""
@@ -3599,22 +4788,86 @@ class Supervise(Case):
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("kept worktree", note["body"])
 
-    def test_cleaning_keeps_an_ignored_file(self):
-        """pack sd:6979: `git worktree remove` deletes ignored files, which plain `status --porcelain` omits."""
+    def test_cleaning_keeps_a_merged_worktree_that_holds_a_cargo_target(self):
+        """Pack sd:10506, class pass of build/sd-1867: no place in a cargo target proves a file there can be
+        rebuilt, so cleaning keeps the tree, and its note names the first file."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
         self.supervisor().run()
         work = Path(self.bundle["work_path"])
-        exclude(work, "__pycache__/\n.env\n")
-        (work / "__pycache__").mkdir()
-        (work / "__pycache__" / "x.pyc").write_bytes(b"x")
+        cargo(work)
+        exclude(work, "target/\n")
+        (work / "target" / "debug").mkdir(parents=True)
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
+        (work / "target" / "debug" / "app").write_bytes(b"x")
+        (work / "target" / "debug" / ".cargo-lock").write_bytes(b"")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "target" / "debug" / "app").read_bytes(), b"x")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_keeps_an_ignored_local_file(self):
+        """Review of build/sd-1867, pack sd:6979: `git worktree remove` deletes ignored files, and an ignored
+        `.env` is local work, not build output: it keeps the tree, whatever build output sits beside it."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, "target/\n.env\n")
+        (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
         self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("!! .env", note["body"])
+
+    def test_cleaning_keeps_ignored_config_beside_a_real_cache(self):
+        """Lead ruling on build/sd-1867 (notes #82533, #82540, #82541): a cache tag alone never makes ignored
+        files disposable. A hand-edited config in a tagged folder keeps the tree, as a cargo target does."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        cargo(work)
+        exclude(work, "target/\nconfig/\n.ruff_cache/\n")
+        for folder in (work / "target", work / "config"):
+            folder.mkdir()
+            (folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
+        (work / "config" / "local.toml").write_text("token = \"change-me\"\n")
+        (work / "target" / ".env").write_text("TOKEN=change-me\n")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "target" / ".env").read_text(), "TOKEN=change-me\n")
+        self.assertEqual((work / "config" / "local.toml").read_text(), "token = \"change-me\"\n")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_keeps_an_untracked_file(self):
+        """An untracked file is work no merge carried: cleaning still keeps its tree."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, "target/\n")
+        (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / "out.bin").write_bytes(b"x")
+        (work / "notes.txt").write_text("x\n")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / "notes.txt").exists())
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("?? notes.txt", note["body"])
 
     def test_cleaning_removes_a_clean_worktree(self):
         self.press()
@@ -4376,10 +5629,108 @@ class Unmanaged(Case):
         (work / "Makefile").write_text("check:\n\ttrue\ntest:\n\ttrue\n")
         self.assertEqual(ADAPTER.own_checks(work), [["make", "check"]])
 
+    def test_own_checks_run_the_precheck_the_gate_runs(self):
+        """A Makefile `precheck` runs first, as `sd-check` runs it: a pass built from a blocking review
+        runs these, and a failing precheck must not reach enqueue (sd:10286)."""
+        work = self.root / "prechecks"
+        work.mkdir()
+        (work / "Makefile").write_text("precheck:\n\ttrue\ncheck:\n\ttrue\n")
+        self.assertEqual(ADAPTER.own_checks(work), [["make", "precheck"], ["make", "check"]])
+
 
 def sd_quote(argv):
     import shlex
     return shlex.join(argv)
+
+
+class TargetSize(Case):
+    """sd:10384: a run that ends blocked or done notes the size of the Rust `target/` its kept worktree holds.
+
+    Ruling #91707 on #89515 dropped the automatic `cargo clean`: no file test tells a capture under
+    `target/debug/` from cargo's output, and the lane may still hold the worktree, so the run deletes nothing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.press()
+        self.work = Path(self.bundle["work_path"])
+
+    def rust(self):
+        """The run's worktree, holding a `Cargo.toml`, cargo's output and a capture under `target/debug/`."""
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        exclude(self.work, "target/\n")
+        (self.work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
+        (self.work / "target" / "debug" / "deps").mkdir(parents=True)
+        (self.work / "target" / "debug" / "deps" / "big.rlib").write_bytes(b"x" * 4096)
+        (self.work / "target" / "debug" / "repro.log").write_text("capture")
+        (self.work / "target" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+
+    def notes(self):
+        return [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+
+    def sized(self):
+        return [body for body in self.notes() if "Rust target/" in body]
+
+    def test_the_note_warns_that_a_clean_deletes_what_target_holds(self):
+        """Review of build/sd-1798: the note advised `cargo clean`, which deletes a capture saved under
+        `target/` too; on both paths, measured and unread, it says so and asks to move such files first."""
+        self.rust()
+        self.supervisor().note_target()
+        with mock.patch.object(build_run, "target_kib", side_effect=OSError("du")):
+            supervisor = self.supervisor()
+            supervisor.marks.clear()
+            supervisor.note_target()
+        self.assertEqual(len(self.sized()), 2, self.notes())
+        for body in self.sized():
+            self.assertNotIn("run cargo clean there", body)
+            self.assertIn("deletes every file in it", body)
+            self.assertIn("move out any file you keep first", body)
+
+    def capture_survives(self, outcome):
+        """Ruling #83955: target/debug/repro.log stays; the lead gets a note naming the size and the cleanup."""
+        self.rust()
+        self.assertEqual(self.supervisor().finish(outcome, "fixture end")["outcome"], outcome)
+        self.assertEqual((self.work / "target" / "debug" / "repro.log").read_text(), "capture")
+        self.assertTrue((self.work / "target" / "debug" / "deps" / "big.rlib").is_file())
+        sized = self.sized()
+        self.assertTrue(sized and all("GiB" in body and str(self.work) in body for body in sized), self.notes())
+
+    def test_a_capture_survives_a_blocked_run_and_the_size_is_noted(self):
+        self.capture_survives("blocked")
+
+    def test_a_capture_survives_a_done_run_and_the_size_is_noted(self):
+        self.capture_survives("done")
+
+    def test_a_replayed_end_notes_once(self):
+        self.rust()
+        supervisor = self.supervisor()
+        supervisor.note_target()
+        supervisor.note_target()
+        self.assertEqual(len(self.sized()), 1, self.notes())
+
+    def test_cancelled_and_timed_out_note_nothing(self):
+        self.rust()
+        for outcome in ("cancelled", "timed_out"):
+            self.supervisor().finish(outcome, "fixture end")
+        self.assertEqual(self.sized(), [])
+
+    def test_no_rust_no_target_a_linked_target_or_no_worktree_notes_nothing(self):
+        self.supervisor().note_target()  # no worktree
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        self.supervisor().note_target()  # no Cargo.toml
+        (self.work / "Cargo.toml").write_text("")
+        self.supervisor().note_target()  # no target/
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.work / "target").symlink_to(elsewhere)
+        self.supervisor().note_target()  # a linked target/ is someone else's
+        self.assertEqual(self.sized(), [])
+
+    def test_an_unread_size_still_notes_and_the_run_ends(self):
+        self.rust()
+        with mock.patch.object(build_run, "target_kib", side_effect=subprocess.TimeoutExpired(["du"], 300)):
+            self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
+        self.assertTrue(any("size unread" in body for body in self.sized()), self.notes())
 
 
 class Tick(Case):
@@ -4436,6 +5787,10 @@ class Tick(Case):
         beat = self.db.execute("SELECT * FROM state WHERE kind = 'heartbeat' AND key = ?",
                                (build_run.HEARTBEAT,)).fetchone()
         self.assertIsNotNone(beat)
+        # sd:10934: the beat names the sd_db build the tick loaded, so the hub can tell a mismatch from a loss.
+        from sd_db import remote
+
+        self.assertEqual(json.loads(beat["body"])["build"], remote.build_digest())
         build.register(self.db, result["claimed"][0], pid=os.getpid(), pgid=os.getpgrp(),
                        start=build.Probe.started(os.getpid()))
         again = self.tick()
@@ -4535,6 +5890,341 @@ class Tick(Case):
         build.queue_again(self.db, self.items, who="operator", finding="pin the fixture clock")
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
+
+    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
+                                   outsider=None, left_out=False, reverted=None, rebundled=False,
+                                   other_failed=False, claimed=False, newer=False, imported=False,
+                                   retried=False, jammed=False, made=False):
+        """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
+        builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
+        run = self.enqueued(2)
+        support.git(self.repo, "checkout", "-q", "-b", run["branch"])
+        (self.repo / "work.txt").write_text("the bundle's work\n", encoding="utf-8")
+        support.git(self.repo, "add", "work.txt")
+        trailers = "".join(f"\nCloses: sd:{item}" for item in self.items) if closes else ""
+        if outsider is not None:  # a trailer for an item outside the bundle, kept open by the failed entry
+            trailers += f"\nCloses: sd:{outsider}"
+        support.git(self.repo, "commit", "-qm", f"feat: the bundle's work\n{trailers}")
+        if reverted is not None:  # a commit that closes an item outside the bundle, reverted on the failed branch
+            (self.repo / "other.txt").write_text("another item's work\n", encoding="utf-8")
+            support.git(self.repo, "add", "other.txt")
+            support.git(self.repo, "commit", "-qm", f"feat: another item's work\n\nCloses: sd:{reverted}")
+            support.git(self.repo, "revert", "--no-edit", "HEAD")
+        head = support.git(self.repo, "rev-parse", "HEAD")
+        support.git(self.repo, "checkout", "-q", "main")
+        self.failed_branch = run["branch"]
+        if lost:  # the failed branch is gone and its entry names a commit this checkout lacks
+            support.git(self.repo, "branch", "-D", run["branch"])
+            head = "0" * 40
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red", "expected_head": head,
+                                       **({"imported_from": "queue.json"} if imported else {})}
+        self.tick()
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        if trimmed:  # the operator drops the failed branch's commit after the failure; the entry still names it
+            support.git(self.repo, "branch", "-f", run["branch"], f"{head}~1")
+            head = support.git(self.repo, "rev-parse", run["branch"])
+        rebuild = self.items[:count]
+        self.db.execute(f"UPDATE item SET status = 'ready' WHERE id IN ({', '.join('?' for _ in rebuild)})",
+                        rebuild)
+        queued = build.queue_again(self.db, rebuild, who="operator")
+        self.assertNotIn(run["assignment"], [entry["id"] for entry in queued], "a fresh press, not Fix")
+        if rebundled:  # that press is cancelled before a claim and pressed again: a bundle that never ran
+            self.db.execute(f"UPDATE assignment SET status = 'cancelled' WHERE id IN "
+                            f"({', '.join('?' for _ in queued)})", [entry["id"] for entry in queued])
+            build.queue(self.db, rebuild, who="operator")
+        if claimed:  # that press is claimed and cancelled before its builder ran: a run that built nothing
+            first = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+            assert first is not None
+            self.assertEqual(build.run(self.db, first["id"])["step"], "claimed")
+            self.assertIsNotNone(build.end(self.db, first["id"], "cancelled", "fixture: cancelled at its claim"))
+            with self.db:  # as the reap releases it once its groups read gone
+                stamp = build.clock()
+                self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (stamp, first["id"]))
+                self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, first["id"]))
+                for item in rebuild:
+                    build.unpark(self.db, item)
+            build.queue(self.db, rebuild, who="operator")
+        if newer:  # the lead was built since in a bundle of its own, which ran its builder and ended blocked
+            with self.db:
+                ran = self.db.execute("INSERT INTO assignment (item, role, status, lane, scope, run_count) "
+                                      "VALUES (?, 'author', 'blocked', 'parallel', ?, 1)",
+                                      (self.items[0], build.SCOPE)).lastrowid
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "step, outcome, released_at, created_at, updated_at) VALUES ('newer', ?, 1, ?, "
+                    "'build/sd-newer', 'fixture', '', '', 'building', 'blocked', '2999-01-01T00:00:00Z', "
+                    "'2999-01-01T00:00:00Z', '2999-01-01T00:00:00Z')", (ran, str(self.repo)))
+        if extra:  # an unrelated item, never built, queued beside them: the claim bundles it in
+            fresh = create_item(self.db, kind="task", title="Unrelated", repo=str(self.repo), status="ready")
+            if other_failed:  # its own bundle, with an item left out here, failed in the lane before
+                gone = create_item(self.db, kind="task", title="Left behind", repo=str(self.repo), status="ready")
+                build.queue(self.db, [fresh, gone], who="operator")
+                lead = self.db.execute("SELECT id FROM assignment WHERE item = ?", (fresh,)).fetchone()[0]
+                self.db.execute("UPDATE assignment SET status = 'done', parent = ? WHERE item = ?", (lead, gone))
+                self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (lead,))
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "outcome, released_at, created_at, updated_at) VALUES ('other', ?, 1, ?, 'build/sd-other', "
+                    "'fixture', '', '', 'lane_failed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', "
+                    "'2026-01-01T00:00:00Z')", (lead, str(self.repo)))
+                self.assertEqual(len(build.run(self.db, "other")["members"]), 2)
+            build.queue(self.db, [fresh], who="operator")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.assertNotEqual(self.bundle["branch"], run["branch"])
+        if left_out:  # a member cancelled out of the new bundle before its worktree: not selected
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+        if retried:  # a lane Retry of the failed entry since, on the same branch, which failed too
+            self.store({"id": "e2", "item": self.items[0], "status": "failed", "reason": "gate red again",
+                        "expected_head": head}, self.failed_branch)
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        if jammed:  # a file where the worktree goes: `git worktree add` fails
+            Path(self.bundle["work_path"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.bundle["work_path"]).write_text("in the way\n", encoding="utf-8")
+            self.assertEqual(supervisor.worktree().get("outcome"), "blocked")
+            return head, supervisor
+        if made:  # an earlier try of this start made the worktree, then stopped before anything else
+            support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], self.bundle["work_path"],
+                        support.git(self.repo, "rev-parse", self.failed_branch))
+        self.assertEqual(supervisor.worktree(), "building")
+        return head, supervisor
+
+    def test_a_fresh_build_after_a_lane_failure_starts_from_the_failed_head(self):
+        """sd:10379: it started from origin/main and dropped the bundle's commits; it starts from the branch tip."""
+        head, supervisor = self.rebuilt_after_lane_failure(2)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+        self.assertIn("gate red", supervisor.brief()["findings"])
+
+    def test_a_fresh_build_starts_from_the_failed_branch_as_the_operator_left_it(self):
+        """Review of build/sd-1808: it preferred the entry's head, so a commit the operator removed from the failed
+        branch came back. It starts from the branch's tip now."""
+        head, _ = self.rebuilt_after_lane_failure(2, trimmed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_fresh_build_at_the_failed_head_enters_the_lane_again(self):
+        """Review of build/sd-1808: the rebuilt branch starts at the failed head, so the old failed entry matched
+        its head, and the run took it as its own enqueue: it ended lane_failed again, never in the lane. Only an
+        entry of this run's branch is its own."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual([(row["status"], row["expected_head"]) for row in entries],
+                         [("failed", head), ("pending", head)])
+
+    def test_an_unchanged_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Lead review of build/sd-1808: an earlier version's entry failed head H on a flaky gate; the rebuild
+        started at H and changed nothing. The lane's guard (`sd_lane.refuse_ran`) refused H as already run, and
+        the recovery reads only this run's branch, so the run blocked. The rebuild that starts at the failed head
+        hands that entry back, as Fix does, and the same head enters the lane again."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
+        # A second try of the same start (a crash before its worktree) finds it handed back and writes nothing.
+        before = self.stored("e1")
+        failed = build.lane_failed_start(self.db, self.bundle["assignment"])
+        assert failed is not None
+        self.assertIn("cancelled", build.take_over(self.db, failed, self.bundle["id"]))
+        self.assertEqual(self.stored("e1"), before)
+
+    def test_a_rebuild_hands_back_only_the_entry_its_failed_run_recorded(self):
+        """Lead review of build/sd-1808: a lane Retry of the failed entry e1 queued e2 on the same branch, which
+        failed too, and the rebuild handed back e2, an attempt its failed run never read. Only the recorded
+        entry is handed back; another newest entry is left as it is."""
+        self.rebuilt_after_lane_failure(2, retried=True)
+        self.assertEqual(self.stored("e2")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e2"))
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_failed_worktree_add_hands_nothing_back(self):
+        """Lead review of build/sd-1808: the hand-back ran before `git worktree add`; the add failed, and the
+        failed entry was cancelled with no checkout to replace it, so Retry of it was refused. It runs after."""
+        self.rebuilt_after_lane_failure(2, jammed=True)
+        self.assertEqual(self.stored("e1")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_resumed_start_with_its_worktree_made_hands_the_entry_back(self):
+        """Lead review of build/sd-1808: a try that made the worktree and stopped before the hand-back left the
+        entry failed; the next try finds the worktree and hands it back then."""
+        self.rebuilt_after_lane_failure(2, made=True)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
+
+    def test_a_changed_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Class pass of the lead review of build/sd-1808: a rebuild that moved the head past the imported
+        entry's enters the lane as a new head, the old entry handed back."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        work = Path(self.bundle["work_path"])
+        (work / "fix.txt").write_text("the gate's fix\n", encoding="utf-8")
+        support.git(work, "add", "fix.txt")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", "fix: the gate's fix")
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual(entries[-1]["expected_head"], support.git(work, "rev-parse", "HEAD"))
+        self.assertNotEqual(entries[-1]["expected_head"], head)
+
+    def test_a_refused_rebuild_enqueue_never_adopts_the_failed_branchs_entry(self):
+        """Review of build/sd-1808: the enqueue refused, and its recovery took the newest entry at this head as the
+        run's own, the failed branch's included. Only an entry of this run's branch is its own: the run blocks."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "pending", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("already queued in this lane", ended["blocked"])
+
+    def test_a_rebuilt_failed_bundle_with_an_unrelated_item_beside_it_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: an item never built, bundled in with the whole failed bundle, sent the
+        branch to main and dropped the bundle's commits. Its commits cite only items this bundle holds."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, extra=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3, "the unrelated item rides along")
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+
+    def test_a_rebuild_bundled_afresh_twice_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: a press cancelled before its claim left each item a newer assignment that
+        never ran, so the read found no lane-failed build and the branch started from main. The newest build
+        that ran is the one that counts."""
+        head, _ = self.rebuilt_after_lane_failure(2, rebundled=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_rebuild_claimed_and_cancelled_before_its_builder_keeps_the_failed_head(self):
+        """Lane review of build/sd-1808: a fresh bundle of a whole failed bundle, claimed and cancelled before its
+        builder ran, left each item a newer run that built nothing, and the next fresh bundle started from main
+        without the failed bundle's commits. A run that never reached its builder hides no failed bundle."""
+        head, _ = self.rebuilt_after_lane_failure(2, claimed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(build.outside_rebuild(self.db, self.bundle["assignment"], [99999]), [99999],
+                         "the delivery keeps a citation outside the bundle open as well")
+
+    def test_a_failed_bundle_whose_item_was_built_since_starts_from_main(self):
+        """Lane review of build/sd-1808: the lead was built again after its bundle failed in the lane; the other
+        member's last build named the failed bundle, so the fresh bundle started there, from the lead's older
+        commits. A failed bundle sets the start only when it is the last build of every item it built."""
+        head, _ = self.rebuilt_after_lane_failure(2, newer=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        self.assertNotEqual(head, support.git(self.repo, "rev-parse", "main"))
+
+    def test_a_rebuild_beside_an_item_of_another_failed_bundle_starts_from_the_whole_one(self):
+        """Lane review of build/sd-1808: an item whose own earlier bundle failed in the lane, bundled in with a
+        whole failed bundle, named two runs, and the branch started from main. The whole one wins."""
+        head, _ = self.rebuilt_after_lane_failure(2, extra=True, other_failed=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_failed_branch_that_closes_an_item_outside_the_bundle_starts_from_main(self):
+        """Review of build/sd-1808: the failed branch's commit closes an open item this bundle does not hold, one the
+        failed entry kept open; its merge would close it unselected. It starts from main and says why."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True, outsider=kept)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in body for body in notes), notes)
+
+    def test_a_member_that_leaves_mid_run_turns_no_delivery_check_off(self):
+        """Class pass of build/sd-1808: the delivery's read of the rebuild is history alone, so a member cancelled
+        out since the start (`lane_failed_start` then answers None) still leaves the outside citation open."""
+        self.test_a_citation_revived_after_the_start_stays_open_at_delivery(leaves=True)
+
+    def test_a_citation_revived_after_the_start_stays_open_at_delivery(self, leaves=False):
+        """Class pass of build/sd-1808: the start read the failed branch's citations once. One a revert hid there
+        came back when the rebuild reverted the revert, and the merge would close an item no one selected. The
+        delivery reads them again and keeps each outside the bundle open with a `Refs:` line."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head, "the hidden citation passes the start")
+        support.git(work, "revert", "--no-edit", "HEAD")
+        if leaves:
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+            self.assertIsNone(build.lane_failed_start(self.db, self.bundle["assignment"]))
+        self.write_pr()
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertIn(f"Refs: sd:{kept}", body.splitlines())
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in note and "outside" in note for note in notes), notes)
+
+    def test_a_fenced_refs_line_keeps_no_outside_citation_open(self):
+        """Ruling on sd:10379: a `Refs:` line inside a code fence names nothing (`sd_ship_body.referenced_ids`),
+        so the delivery still adds a live one for a citation outside the bundle."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        support.git(Path(self.bundle["work_path"]), "revert", "--no-edit", "HEAD")
+        self.write_pr(body=f"## Summary\n\nx\n\n## Test plan\n\n```\nRefs: sd:{kept}\n```\n")
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertTrue(body.endswith(f"```\n\nRefs: sd:{kept}\n"), body)
+
+    def test_the_refs_lines_a_delivery_adds_pass_the_lane_line_check(self):
+        """Review of build/sd-1808: one `Refs:` line for many items ran past the lane's 72 characters, and
+        enqueue refused the body. Each added line keeps to the limit, and together they name every item."""
+        ship = build_run._ship_body()
+        items = list(range(10001, 10013))
+        body = build_run.with_refs("## Summary\n\nx\n", items)
+        assert body is not None
+        self.assertEqual(ship.long_lines(body), [])
+        self.assertEqual(ship.referenced_ids(body), set(items))
+        self.assertEqual(build_run.with_refs(body, items), body, "a second pass adds nothing")
+
+    def test_a_body_left_in_an_open_fence_gets_no_dead_refs_line(self):
+        """Review of build/sd-1808: a line added after an unclosed fence names nothing, so the merge would close
+        the item. The helper answers None; the delivery blocks rather than enqueue."""
+        self.assertIsNone(build_run.with_refs("## Summary\n\n```\nx\n", [10001]))
+
+    def test_a_member_cancelled_out_of_the_new_bundle_sends_it_to_main(self):
+        """Review of build/sd-1808: the bundle read counted a member cancelled out of it (`ALONE`) as selected."""
+        head, _ = self.rebuilt_after_lane_failure(2, left_out=True)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
+        """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""
+        head, supervisor = self.rebuilt_after_lane_failure(1)
+        work = Path(self.bundle["work_path"])
+        self.assertNotEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+
+    def test_a_failed_branch_that_does_not_read_starts_from_main_and_says_so(self):
+        """sd:10379: a fallback to main is no silent loss of the bundle's commits: a note on the lead says why."""
+        self.rebuilt_after_lane_failure(2, lost=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any("did not read here" in body for body in notes), notes)
 
     def reopened_dependency(self):
         """The bundle's lead waits on an item reopened since its build: the dependency is open again."""
@@ -5041,14 +6731,81 @@ class Sweep(Case):
         """Lane review: `git worktree remove` deletes ignored files, and plain `status --porcelain` omits them."""
         work = self.blocked()
         self.done()
-        common = Path(support.git(work, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        (common / "info").mkdir(exist_ok=True)
-        (common / "info" / "exclude").write_text(".env\n")
+        exclude(work, ".env\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.assertEqual(support.git(work, "status", "--porcelain"), "", "the plain read sees a clean tree")
         self.assertEqual(build_run.sweep(self.db), [])
         self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
         self.assertNotEqual(self.branches(), "")
+
+    def test_no_place_in_a_cargo_target_makes_a_file_disposable(self):
+        """Review of build/sd-1867, the class pass. The class: where an ignored file sits (a folder's name,
+        a cache tag, a manifest beside it, cargo's lock) stood in for proof that the file itself can be
+        rebuilt. Cargo records no list of its files, so each place cargo writes can hold the only copy of
+        a local one. Every ignored file of a complete cargo target keeps the tree, row by row."""
+        work = self.blocked()
+        self.done()
+        cargo(work, "", "crates/one")
+        exclude(work, "target/\n")
+        rows = {
+            "CACHEDIR.TAG": CACHE_TAG,                              # the tag and the manifest
+            ".rustc_info.json": "{}\n",                             # a cargo file name at the top
+            ".env": "TOKEN=change-me\n",                            # a local file at the top
+            "debug/.cargo-lock": "",                                # the lock itself
+            "debug/captured-input.bin": "x",                        # a captured input in a locked profile
+            "debug/deps/captured-input.bin": "x",                   # below a locked profile
+            "debug/build/example-0a1b/out/captured-input.bin": "x",  # a build script's output folder
+            "debug/incremental/captured-input.bin": "x",
+            "example-triple/release/.cargo-lock": "",               # a target triple's profile
+            "example-triple/release/captured-input.bin": "x",
+        }
+        for target in ("target", "crates/one/target"):
+            for path, text in rows.items():
+                (work / target / path).parent.mkdir(parents=True, exist_ok=True)
+                (work / target / path).write_text(text)
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(),
+                         sorted(f"!! {target}/{path}" for target in ("crates/one/target", "target")
+                                for path in rows))
+        self.assertEqual(build_run.sweep(self.db), [])
+        for path in rows:
+            self.assertTrue((work / "target" / path).is_file(), path)
+
+    def test_a_folder_only_named_like_build_output_keeps_the_tree(self):
+        """Review of build/sd-1867, the class: a folder's name alone made its ignored files disposable, so local
+        files under any `target/`, `node_modules/` or `.venv/` went with the tree. No name decides."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "target/\nnode_modules/\n.venv/\n*.local\n")
+        (work / "docs" / "target").mkdir(parents=True)
+        (work / "docs" / "target" / "notes.local").write_text("mine\n")
+        (work / "node_modules").mkdir()
+        (work / "node_modules" / "patch.js").write_text("mine\n")
+        (work / ".venv").mkdir()
+        (work / ".venv" / "secrets.cfg").write_text("mine\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)),
+                         "!! .venv/secrets.cfg\n!! docs/target/notes.local\n!! node_modules/patch.js")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "docs" / "target" / "notes.local").read_text(), "mine\n")
+
+    def test_the_sweep_keeps_ignored_config_beside_a_real_cache(self):
+        """Lead ruling on build/sd-1867: a cache tag makes no folder build output, so a hand-edited config in
+        one keeps the tree; a real cache (`__pycache__`) beside it changes nothing."""
+        work = self.blocked()
+        self.done()
+        cargo(work)
+        exclude(work, "target/\nconfig/\nout/\n__pycache__/\n")
+        for folder in ("target", "config", "out"):
+            (work / folder).mkdir()
+            (work / folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
+        (work / "__pycache__").mkdir()
+        (work / "__pycache__" / "x.pyc").write_bytes(b"x")
+        (work / "config" / "local.toml").write_text("mine\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
+            "!! config/CACHEDIR.TAG", "!! config/local.toml", "!! out/CACHEDIR.TAG",
+            "!! target/.rustc_info.json", "!! target/CACHEDIR.TAG"])
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "config" / "local.toml").read_text(), "mine\n")
 
     def test_a_tree_with_only_caches_is_swept(self):
         """pack sd:6979: a disposable cache is no reason to keep a tree; another ignored file still is."""
@@ -5819,6 +7576,184 @@ class Drafts(Case):
         queued = build.retry(self.db, self.bundle["assignment"], who="operator")["queued"]
         self.assertEqual([row["item"] for row in queued], [code, design])
 
+    def test_a_blocked_design_builds_again_after_its_code_bundle_ships(self):
+        """Pack sd:10294: a design the builder skipped with an open question ended blocked, and its code
+        bundle shipped. Retry refused, as the lead is done, and Build pressed it fresh, which refused a
+        blocked item. Once ruled, Build queues its ride again."""
+        design = self.designed("draft-plain")
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        build.queue(self.db, [code], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
+        asked = add_note(self.db, design, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [code]))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (code,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"question note #{asked}"):
+            build.queue_again(self.db, [design], who="operator")
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, design, "decision", f"Ruling on note #{asked}: A")
+        resolve_note(self.db, asked)
+        [ride] = build.queue_again(self.db, [design], who="operator")
+        self.assertEqual((ride["item"], ride["status"], ride["scope"]), (design, "queued", build.SCOPE))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "ready")
+
+    def test_a_blocked_task_builds_again_only_once_its_question_is_answered(self):
+        """Review of build/sd-1867: Build lifted a task its run blocked on a builder question to ready once
+        its bundle shipped, and the press checks no question on a task, so it built before the answer."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+
+    def test_the_dashboard_press_builds_an_answered_item_its_bundle_left_blocked(self):
+        """Review of build/sd-1867: only `queue_again` lifted a build's own block. The dashboard's dialog
+        check (`_item`) and its press (`queue`) refused the item as blocked, answered or not."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        for check in (lambda: build._item(self.db, second), lambda: build.queue(self.db, [second], who="dashboard")):
+            with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+                check()
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        build._item(self.db, second)
+        [again] = build.queue(self.db, [second], who="dashboard")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "ready")
+
+    def test_the_dashboard_press_leaves_a_retryable_bundles_block(self):
+        """Class pass of build/sd-1867: a member whose bundle Retry still takes keeps its block on a
+        press: a fresh build would leave the bundle's branch behind."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        self.db.execute("UPDATE assignment SET status = 'blocked', result = ? WHERE id = ? OR parent = ?",
+                        (f"build run {bundle['id']} ended", lead, lead))
+        for item in (first, second):
+            writes.transition(self.db, item, "blocked", who="build", reason=f"build run {bundle['id']} ended")
+        with self.assertRaisesRegex(build.BuildRefused, "is blocked"):
+            build.queue(self.db, [second], who="dashboard")
+
+    def test_build_keeps_an_operator_block_newer_than_its_run(self):
+        """Review of build/sd-1867: Build lifted any blocked item whose newest build ended blocked, so an
+        operator's later block went too. Only the build's own block, still the item's latest, lifts."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        writes.transition(self.db, second, "ready", who="operator")
+        writes.transition(self.db, second, "blocked", who="operator", reason="hold for the vendor")
+        with self.assertRaises(build.BuildRefused):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the operator's block stays")
+
+    def test_a_later_run_of_the_bundle_does_not_hide_the_blocking_question(self):
+        """Review of build/sd-1867: Build read questions from the bundle's newest run. A lane Fix claims
+        the bundle again after the run that blocked a skipped task, so its question went unread and the
+        task built unanswered. Questions are read from the run that blocked the item."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix",
+                              stamp="2999-01-01T00:00:00Z")  # the Fix's claim, since ended
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
+    def test_a_rebuild_claimed_at_the_block_stamp_does_not_hide_the_question(self):
+        """Class pass of build/sd-1867: Build found the run that blocked an item by time, so a lane rebuild
+        claimed in the block's own second read as that run and hid the question. The block's reason names
+        its run, and that run is the one read."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?", (bundle["id"],))
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:01Z' WHERE id = ?", (asked,))
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        ended = self.db.execute("SELECT ended FROM assignment WHERE item = ? AND status = 'blocked'",
+                                (second,)).fetchone()[0]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix", stamp=ended)
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
+    def test_a_block_that_names_no_run_reads_every_question(self):
+        """Class pass of build/sd-1867: a build block whose reason names no run of its bundle has no run to
+        read questions from, so no time stands in for one: every pending question holds the Build."""
+        self.assertEqual(build._blocking_run(self.db, 1, "refused; not built"), None)
+        self.assertEqual(build._blocking_run(self.db, 1, "build run " + "f" * 32 + " ended"), None,
+                         "a run id no run of this bundle holds")
+
+    def test_build_reads_only_the_questions_its_blocking_run_raised(self):
+        """Lane review of build/sd-1867: Build refused a run-blocked item on any pending question, so an
+        unrelated one asked before that build was queued held a Build that worked before."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        older = add_note(self.db, second, "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = ? WHERE id = ?", ("2000-01-01T00:00:00Z", older))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""
         design, _ = self.design()
@@ -6168,16 +8103,24 @@ class Hosts(Case):
             self.assertEqual(self.tick()["spawned"], hub["claimed"], "nor the satellite's on the hub")
 
     def test_the_hub_builds_a_satellite_lane_while_its_host_is_over_the_load_cap(self):
-        """sd:8991: a satellite over its load cap claimed nothing, and the hub left its rows queued; the hub now
-        builds them itself, and the repository's one slot holds the satellite's claim off meanwhile."""
+        """sd:8991: a satellite over its load cap claimed nothing, and the hub left its rows queued; with
+        `sd.overload_fallback` set to 1 the hub builds them itself, and the repository's one slot holds the
+        satellite's claim off meanwhile. Unset, the hub leaves them queued for the satellite (sd:10823)."""
         (self.satellite / ".git").mkdir(parents=True)  # the hub builds only a repository checked out here
         _, sat = self.both()
         with self.on("work"):
             self.assertEqual(self.tick(load=30.0, load_cap=24.0)["claimed"], [])
         with self.on("hub"):
-            hub = self.tick()
-            taken = [build.run(self.db, ident) for ident in hub["claimed"]]
-            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.repo), "fixture")])
+            with mock.patch.object(build, "overload_fallback", return_value=False):
+                hub = self.tick()
+                taken = [build.run(self.db, ident) for ident in hub["claimed"]]
+                self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.repo), "fixture")])
+                self.assertEqual(self.tick()["claimed"], [], "unset: the satellite's row waits for the satellite")
+            self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE item = ?", (sat,)).fetchone()[0],
+                             "queued")
+            fallback = mock.patch.object(build, "overload_fallback", return_value=True)
+            fallback.start()
+            self.addCleanup(fallback.stop)
             taken = [build.run(self.db, ident) for ident in self.tick()["claimed"]]
             self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.satellite), "fixture")])
         later = create_item(self.db, kind="task", title="Later", repo=str(self.satellite), status="ready")
@@ -6680,6 +8623,7 @@ class HubFaults(Case):
                 faults.append(1)
                 raise remote.UnknownOutcome("r" * 26, "lost")
 
+        self.db.execute("UPDATE repo SET managed = 0")  # an unmanaged repository's entrypoints; a managed one has a gate
         supervisor = self.supervisor(checks=lambda _: [])
         supervisor.db.outcome = mock.Mock(return_value="recorded")
         with mock.patch.object(build_run, "add_note", note):

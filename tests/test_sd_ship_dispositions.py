@@ -6,6 +6,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -269,6 +270,231 @@ class DispositionTests(unittest.TestCase):
         ):
             self.prepare()
 
+    def with_test(self, argv):
+        proposal = self.filled()
+        for row in proposal["findings"]:
+            row["test"] = argv
+        return proposal
+
+    def test_a_rebuttal_whose_test_passes_clears_and_one_whose_test_fails_keeps_the_blocker(self):
+        """sd:10893. A high blocks only while a failing test reproduces it: the builder's attempted test
+        passes, so the rebuttal records and prepare clears; a failing one refuses and nothing is written."""
+        self.blocked()
+        for argv in ([sys.executable, "-c", "raise SystemExit(1)"], ["tests/example_missing_test"]):
+            with self.subTest(argv=argv):
+                self.rejected_proposal(self.with_test(argv))
+        self.accepted(self.with_test([sys.executable, "-c", "pass"]))
+        with patch.object(ship, "review_process", side_effect=AssertionError("dispatched")):
+            self.prepare()
+
+    def test_prepare_reruns_the_test_and_a_failing_one_reopens_the_blocker(self):
+        """sd:10893. The lane counts a blocker open while its test fails, read at prepare, not only at record."""
+        self.blocked()
+        flag = self.directory / "reproduced"
+        script = f"import pathlib, sys; sys.exit(pathlib.Path({str(flag)!r}).exists())"
+        self.accepted(self.with_test([sys.executable, "-c", script]))
+        flag.write_text("x")
+        with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
+            self.prepare()
+
+    def test_a_test_that_fails_on_a_rerun_revokes_the_recorded_clearance(self):
+        """sd:10893 class pass: a rerun that runs the test and fails, at prepare or at a new recording, drops
+        the clearance a passing prepare saved, so a later read (merge, `verify-review`) cannot reuse it."""
+        self.blocked()
+        flag = self.directory / "reproduced"
+        script = f"import pathlib, sys; sys.exit(pathlib.Path({str(flag)!r}).exists())"
+        for rerun in ("prepare", "recording"):
+            with self.subTest(rerun=rerun):
+                flag.unlink(missing_ok=True)
+                self.accepted(self.with_test([sys.executable, "-c", script]))
+                self.prepare()
+                self.operation().check_review(self.head)
+                flag.write_text("x")
+                if rerun == "prepare":
+                    with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
+                        self.prepare()
+                else:
+                    self.proposal_file.write_text(json.dumps(self.with_test([sys.executable, "-c", script])))
+                    result = self.command("--dispositions-file", str(self.proposal_file))
+                    self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertIsNone(self.operation().state.get("review_clearance"))
+                with self.assertRaisesRegex(ship.Refusal, "prepare again"):
+                    self.operation().check_review(self.head)
+
+    def test_a_test_that_skips_or_expects_its_failure_is_no_pass(self):
+        """sd:10893 class pass: exit 0 is no pass when the run skipped, or a failure was expected, so the
+        finding was never tried. One check in `reproduces`, which recording and prepare both reach."""
+        root = self.root.resolve()
+        head = fixture._git(root, "rev-parse", "HEAD")
+        said = {"unittest skip": "OK (skipped=1)", "pytest skip": "1 passed, 2 skipped in 0.01s",
+                "unittest expected failure": "OK (expected failures=1)", "pytest xfail": "1 xfailed in 0.01s"}
+        for name, line in said.items():
+            with self.subTest(outcome=name), self.assertRaisesRegex(ship.Refusal, "never tried"):
+                sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", f"print({line!r})"])
+        sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", "print('OK')"])
+        self.blocked()
+        script = ("import unittest\nclass T(unittest.TestCase):\n    @unittest.skip('x')\n"
+                  "    def test_x(self): pass\nunittest.main(argv=['t'])")
+        self.rejected_proposal(self.with_test([sys.executable, "-c", script]))
+
+    def test_a_skip_is_read_from_the_runners_report_not_its_flags(self):
+        """sd:10893 class pass: the skip check read text the runner's own flags reshape. pytest now writes a
+        JUnit report (`PYTEST_ADDOPTS`) outside the tree, read whatever the terminal showed: `-qq` leaves
+        `s [100%]`, `-p no:terminal` nothing, forced colour splits the count. A stand-in plays pytest here."""
+        root = self.root.resolve()
+        head = fixture._git(root, "rev-parse", "HEAD")
+        runner = ("import os, pathlib, shlex, sys\n"
+                  "path = [o.split('=', 1)[1] for o in shlex.split(os.environ['PYTEST_ADDOPTS'])"
+                  " if o.startswith('--junit-xml=')][-1]\n"
+                  "pathlib.Path(path).write_text(sys.argv[1])\nprint(sys.argv[2])")
+        suite = '<testsuites><testsuite name="pytest" tests="1" skipped="{}"/></testsuites>'
+        shapes = {"-qq": (suite.format(1), "s [100%]"), "no terminal": (suite.format(1), ""),
+                  "xfail": (suite.format(2), "x [100%]"), "unreadable report": ("<testsuites", ""),
+                  "no count": ('<testsuite skipped="x"/>', "")}
+        for name, (report, shown) in shapes.items():
+            with self.subTest(shape=name), patch.dict("os.environ", {"PYTEST_ADDOPTS": "-p example"}), \
+                    self.assertRaisesRegex(ship.Refusal, "never tried"):
+                sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", runner, report, shown])
+        with self.assertRaisesRegex(ship.Refusal, "never tried"):  # forced colour, a runner with no report
+            sd_ship_dispositions.reproduces(
+                root, head, 1, [sys.executable, "-c", "print('\\x1b[33m1 skipped\\x1b[0m in 0.01s')"])
+        seen = self.directory / "example-addopts-seen"
+        keeps = f"import os, pathlib; pathlib.Path({str(seen)!r}).write_text(os.environ['PYTEST_ADDOPTS'])"
+        with patch.dict("os.environ", {"PYTEST_ADDOPTS": "-p example"}):
+            sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", keeps])
+            sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", runner, suite.format(0), "."])
+        self.assertRegex(seen.read_text(), r"^-p example --junit-xml=\S+$")
+        self.assertNotIn(str(root), seen.read_text())
+        self.assertFalse(pathlib.Path(seen.read_text().split("=", 1)[1]).parent.exists())
+
+    def test_a_test_runs_with_the_gates_jev_guard(self):
+        """sd:10893 class pass: a rebuttal test gets the guards the gate's rerun gives its shards
+        (`runner_guards`), so no rebuttal test sends a live, metered Jev call (sd:2136)."""
+        root = self.root.resolve()
+        head = fixture._git(root, "rev-parse", "HEAD")
+        seen = self.directory / "example-jev-seen"
+        script = f"import os, pathlib; pathlib.Path({str(seen)!r}).write_text(os.environ.get('JEV_ENABLED', ''))"
+        with patch.dict("os.environ", {"JEV_ENABLED": "1"}):
+            sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", script])
+        self.assertEqual(seen.read_text(), "0")
+
+    def test_a_test_reaches_no_code_in_the_live_checkout(self):
+        """sd:10893 class pass: the test runs the head's code alone. An environment entry or an argv path
+        naming the live checkout would load its uncommitted files and clear the finding against them."""
+        root = self.root.resolve()
+        with (root / ".git/info/exclude").open("a") as stream:
+            stream.write("example_probe.py\n")
+        (root / "example_probe.py").write_text("")
+        head = fixture._git(root, "rev-parse", "HEAD")
+        environments = {"PYTHONPATH": str(root), "EXAMPLE_SOURCE": str(root)}
+        script = "import os, sys; sys.path[:0] = [os.environ['EXAMPLE_SOURCE']]; import example_probe"
+        for argv in ([sys.executable, "-c", "import example_probe"], [sys.executable, "-c", script],
+                     [sys.executable, str(root / "example_probe.py")]):
+            with self.subTest(argv=argv), patch.dict("os.environ", environments):
+                with self.assertRaises(ship.Refusal):
+                    sd_ship_dispositions.reproduces(root, head, 1, argv)
+
+    def test_any_end_of_a_test_run_but_a_pass_leaves_no_clearance(self):
+        """sd:10893 class pass: the clearance is voided before the first test runs, so no way a run ends
+        without a pass keeps it: output that does not decode, an error that is no refusal, an interruption."""
+        self.blocked()
+        flag = self.directory / "reproduced"
+        script = (f"import pathlib, sys\nif pathlib.Path({str(flag)!r}).exists():\n"
+                  "    sys.stdout.buffer.write(b'\\xff\\xfe'); sys.exit(1)")
+        endings = {"undecodable": None, "error": RuntimeError("example"), "interrupted": KeyboardInterrupt()}
+        for name, raised in endings.items():
+            with self.subTest(ending=name):
+                flag.unlink(missing_ok=True)
+                self.accepted(self.with_test([sys.executable, "-c", script]))
+                self.prepare()
+                self.assertIsNotNone(self.operation().state.get("review_clearance"))
+                flag.write_text("x")
+                if raised is None:
+                    with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
+                        self.prepare()
+                else:
+                    with patch.object(sd_ship_dispositions, "reproduces", side_effect=raised), \
+                            self.assertRaises(type(raised)):
+                        self.prepare()
+                self.assertIsNone(self.operation().state.get("review_clearance"))
+
+    def test_a_path_into_the_live_checkout_is_named_in_any_spelling(self):
+        """sd:10893 class pass: the matcher refuses every spelling of the checkout, not one boundary shape:
+        quoted in an inline script, under `~` or `$HOME`, in another letter case, as given or resolved."""
+        home = pathlib.Path.home()
+        root = home / "example-area" / "Clone"
+        for value in (f"sys.path.insert(0, '{root}')", f'"{root}"', "~/example-area/Clone/x.py",
+                      "$HOME/example-area/Clone", "${HOME}/example-area/Clone", str(root).upper(),
+                      f"--source={root}", f"a{chr(10)}{root}{chr(10)}b"):
+            with self.subTest(value=value):
+                self.assertTrue(sd_ship_dispositions.names_root(root, value))
+        for value in ("tests/test_example.py", str(home / "example-area"), "-c", "import example"):
+            with self.subTest(value=value):
+                self.assertFalse(sd_ship_dispositions.names_root(root, value))
+        live = self.root.resolve()
+        head = fixture._git(live, "rev-parse", "HEAD")
+        inline = f"import sys; sys.path.insert(0, {str(live)!r})"
+        with self.assertRaisesRegex(ship.Refusal, "names a path in the live checkout"):
+            sd_ship_dispositions.reproduces(live, head, 1, [sys.executable, "-c", inline])
+        sibling = f"{live}-tools/bin"
+        with patch.dict("os.environ", {"PATH": os.pathsep.join([sibling, os.environ["PATH"]]),
+                                       "EXAMPLE_QUOTED": f"'{live}'"}):
+            environment = sd_ship_dispositions.rebuttal_environment(live)
+        self.assertNotIn("EXAMPLE_QUOTED", environment)
+        self.assertNotIn(sibling, environment["PATH"].split(os.pathsep))
+        self.assertTrue(environment["PATH"])
+
+    def test_only_recording_and_prepare_run_the_test_never_a_read(self):
+        """sd:10893 review: merge, publication and `verify-review` read the record and run nothing; a test
+        is code, so a read-only command executing it in the live checkout is not read-only."""
+        self.blocked()
+        runs = self.directory / "runs"
+        script = f"open({str(runs)!r}, 'a').write('x')"
+        self.accepted(self.with_test([sys.executable, "-c", script]))
+        self.assertEqual(runs.read_text(), "x")
+        self.prepare()
+        self.assertEqual(runs.read_text(), "xx")
+        self.operation().check_review(self.head)
+        self.operation().check_review(self.head, refresh_adjudication=True)
+        self.assertEqual(runs.read_text(), "xx")
+
+    def test_a_rebuttal_test_runs_in_a_disposable_worktree_at_the_head(self):
+        """sd:10893 class fix: the test runs in a throwaway worktree of the exact head, as the gate's rerun
+        does, so no test writes the live checkout, tracked or ignored, and git cannot restore an ignored file."""
+        self.blocked()
+        with (self.root / ".git/info/exclude").open("a") as stream:
+            stream.write("example-ignored.txt\n")
+        ignored = self.root / "example-ignored.txt"
+        ignored.write_text("operator data")
+        tracked = fixture._git(self.root, "ls-files", "--deduplicate").split()[0]
+        before = (self.root / tracked).read_bytes()
+        script = ("import os, subprocess; open('example-ignored.txt', 'w').write('clobbered'); "
+                  f"open({tracked!r}, 'w').write('clobbered'); subprocess.run(['git', 'checkout', '--', '.']); "
+                  f"assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == {self.head!r}")
+        self.accepted(self.with_test([sys.executable, "-c", script]))
+        self.assertEqual(ignored.read_text(), "operator data")
+        self.assertEqual((self.root / tracked).read_bytes(), before)
+        self.assertEqual(fixture._git(self.root, "status", "--porcelain"), "")
+        listed = fixture._git(self.root, "worktree", "list", "--porcelain")
+        self.assertEqual(listed.count("worktree "), 1, listed)
+
+    def test_a_test_that_dirties_the_checkout_or_is_malformed_refuses(self):
+        """sd:10893. The record binds the clean exact head; `test` is an argv list, not a shell string."""
+        self.blocked()
+        dirty = [sys.executable, "-c", "open('example-left-behind.txt', 'w').close()"]
+        self.rejected_proposal(self.with_test(dirty))
+        self.assertFalse((self.root / "example-left-behind.txt").exists())
+        for value in ("python3 -c pass", [""], [1], {"argv": []}, ["a\0b"]):
+            with self.subTest(value=value):
+                self.rejected_proposal(self.with_test(value))
+
+    def test_the_template_offers_an_empty_test(self):
+        """sd:10893. The template names the field; [] and an absent `test` both record as before."""
+        self.blocked()
+        template = json.loads(self.command().stdout)["proposal"]
+        self.assertEqual([row["test"] for row in template["findings"]], [[]])
+        self.accepted(self.with_test([]))
+
     def test_the_template_and_the_refusal_name_the_allowed_values(self):
         """sd:9881: a blank template and `rebut` left the values unnamed."""
         self.blocked()
@@ -530,6 +756,22 @@ class DispositionTests(unittest.TestCase):
             stale.adjudicate()
         self.assertEqual(list(self.connection.execute("SELECT * FROM state")), before)
 
+    def test_a_rebuttal_survives_a_review_tool_change(self):
+        """Operator 2026-11-27: a tool change alone keeps a recorded rebuttal; it does not void it."""
+        self.blocked()
+        self.accepted()
+        self.prepare()
+        original_read = pathlib.Path.read_bytes
+        for name in ("sd-review", "sd_registry.py", "SKILL.md", "sd_ship_dispositions.py"):
+
+            def changed(path, name=name):
+                value = original_read(path)
+                return value + b"changed" if path.name == name else value
+
+            with self.subTest(name=name), patch.object(pathlib.Path, "read_bytes", changed):
+                self.operation().check_review(self.head)
+
+    @patch.object(importlib.import_module("sd_lib"), "TOOL_CHANGES_KEEP_REVIEWS", False)
     def test_review_tool_adjudicator_tool_and_policy_changes_refuse(self):
         self.blocked()
         self.accepted()

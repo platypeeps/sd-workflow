@@ -239,6 +239,16 @@ class TheSweepSettings(BrowserSession):
             self.assertEqual(status, 400, (payload, answer))
         self.assertEqual(writes.read_settings(self.connection, list(realm_sweep.SETTINGS)), {})
 
+    def test_the_queue_advisories_row_takes_on_or_unset_and_nothing_else(self):
+        # sd:10915: Queue's Advisories toggle writes this row; unset hides advisory items.
+        key = "dashboard.queue_advisories"
+        status, _, answer = self.post("/api/settings/row", {"key": key, "value": "yes", "before": None})
+        self.assertEqual(status, 400, answer)
+        status, _, answer = self.post("/api/settings/row", {"key": key, "value": "on", "before": None})
+        self.assertEqual((status, answer), (200, {"key": key, "value": "on", "was": None}))
+        status, _, answer = self.post("/api/settings/row", {"key": key, "value": "", "before": "on"})
+        self.assertEqual((status, answer["value"]), (200, None))
+
 
 class TheDashboardSettings(BrowserSession):
     """sd:5109: the Dashboard section lists the dashboard lists and the adversarial review's model and effort as rows.
@@ -269,7 +279,7 @@ class TheDashboardSettings(BrowserSession):
         writes.set_setting(self.connection, "dashboard.hoa_thresholds", "tank|below|12")
         writes.set_setting(self.connection, "adversarial.model", "gpt-fixture")
         held = self.read()
-        self.assertEqual(list(held), list(setting_rows.LISTS) + ["dashboard.home_map_extent", "home.drive_folder", "home.google_account", "contributions.automation_logins"]
+        self.assertEqual(list(held), list(setting_rows.LISTS) + ["dashboard.home_map_extent", "dashboard.queue_advisories", "home.drive_folder", "home.google_account", "contributions.automation_logins"]
                          + list(adversarial.SETTINGS) + list(adversarial.DEEP))
         self.assertEqual((held["dashboard.realms"]["value"], held["dashboard.realms"]["source"]),
                          ("realm|work|Work|/repos/example-work/*\n", "file"))

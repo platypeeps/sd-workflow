@@ -480,7 +480,7 @@ def _print_rows(rows: list[dict[str, Any]], *, moved: bool = False, today: str |
 
 
 def _emit(value: Any, *, machine: bool, moved: bool = False, following: Any = None,
-          audit: bool = False, audited: Any = None) -> None:
+          audit: bool = False, audited: Any = None, reviews: dict | None = None) -> None:
     _name_refs(value)
     if machine:
         print(json.dumps(value, ensure_ascii=False))
@@ -493,7 +493,16 @@ def _emit(value: Any, *, machine: bool, moved: bool = False, following: Any = No
         _occurrence_line(value, following)
     if isinstance(value, dict):
         _print_notes(value, None if audit else audited)
+        if reviews:
+            print(_reviews_line(reviews))
         print(f"revision: {value['revision']}")
+
+
+def _reviews_line(row: dict) -> str:
+    """The item's review rounds and their cost, `reads.review_costs`'s totals (sd:10401)."""
+    return (f"reviews: {row['rounds']} rounds ({row['blocking']} blocking, {row['clean']} clean build, "
+            f"{row['lane']} lane) over {row['runs']} build runs · tokens {row['tokens_in']:,} in, "
+            f"{row['tokens_out']:,} out · ${row['usd']:.2f} API-equivalent")
 
 
 def _print_notes(value: dict[str, Any], audited: Any) -> None:
@@ -814,11 +823,15 @@ def _change_status(workflow: Any, connection: Any, args: argparse.Namespace,
         raise WorkRefusal(
             f"item {args.item} is a report, and a report closes by acknowledgement: "
             f"`sd reports acknowledge {args.item} --resolve-followups` also resolves its open followups")
+    resolve = bool(getattr(args, "resolve_followups", False))
+    # sd:10430: a `--delivered-by` close is a delivery, so it keeps a person's followup open
+    # and owed (`kept_followups`), as `sd work deliver` does, instead of refusing until all go.
+    delivered = args.status == "done" and bool(getattr(args, "delivered_by", None)) and not resolve
     try:
         result = workflow.change_status(
             connection, args.item, args.status, who=who, session=_session(who),
             expected_revision=getattr(args, "if_revision", None), reason=reason,
-            resolve_followups=bool(getattr(args, "resolve_followups", False)))
+            followups=() if delivered else None, resolve_followups=resolve)
     except workflow.TransitionRefused as refused:
         if not str(refused).startswith(f"item {args.item} has open followups; "):
             raise
@@ -1245,7 +1258,7 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
                      for line in (asked["body"] or "").splitlines())
         if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:") and (
                 offers or getattr(args, "option", None) is not None):
-            if _is_batch(review, connection, args.item):
+            if _asks_in_batch(review, connection, args.item, args.answers):
                 return _rule_batch(review, workflow, connection, args, body, who, revision)
         ruling = body if getattr(args, "option", None) is None else _plain_ruling(review, asked["body"], args, body)
         ruled = workflow.add_item_note(connection, args.item, kind="decision", who=who,
@@ -1257,14 +1270,15 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
         return state
 
 
-def _is_batch(review: Any, connection: Any, item: int) -> bool:
-    """Whether `review.read` reads the item: a lane review files its findings with a `review:` ref
-    and no batch header (sd:10097), and such an item is answered as any other is."""
+def _asks_in_batch(review: Any, connection: Any, item: int, note: int) -> bool:
+    """Whether `note` is one of the questions `review.read` reads on the item. A lane review files its
+    findings with a `review:` ref and no batch header (sd:10097), and a question asked after a batch's
+    header count is no batch question (sd:10505): each is answered as on any other item."""
     try:
-        review.read(connection, item)
+        questions = review.read(connection, item)["questions"]
     except review.ReviewError:
         return False
-    return True
+    return any(held["note"] == note for held in questions)
 
 
 def _plain_ruling(review: Any, asked: str | None, args: argparse.Namespace, body: str) -> str:
@@ -1397,12 +1411,15 @@ def run(args: argparse.Namespace) -> int:
         # thing `_emit` cannot read off the result: a row that already sat in
         # the destination looks the same afterwards as one that just moved.
         # `following` is the row a recurring completion created, if any.
-        moved, following, dedupe = False, None, None
+        moved, following, dedupe, reviews = False, None, None, None
         result: Any
         if action == "items":
             result = _items(sd_db, workflow, args, connection)
         elif action == "item":
             result = workflow.item_state(connection, args.item)
+            if not args.json:  # human output only: the JSON stays the row's state, as `task edit` prints it
+                from sd_db import reads
+                reviews = reads.review_costs(connection, [args.item]).get(args.item)
         elif action == "add":
             result, dedupe = _add(sd_db, workflow, args, connection, who)
         elif action == "edit" and getattr(args, "experiment", None):
@@ -1428,7 +1445,7 @@ def run(args: argparse.Namespace) -> int:
         else:
             raise WorkRefusal(f"unknown workflow operation: {action}")
         _emit(result, machine=args.json, moved=moved, following=following,
-              audit=getattr(args, "audit", False), audited=workflow.is_audit_note)
+              audit=getattr(args, "audit", False), audited=workflow.is_audit_note, reviews=reviews)
         _dedupe(dedupe)
         return 0
     except sd_db.SdDbError as error:
@@ -1861,7 +1878,8 @@ def register(groups: Any, store: Any) -> None:
                              "when it is not the item's own; the item keeps its checkout")
     status.add_argument("--resolve-followups", action="store_true",
                         help="with done: resolve every open followup too; without it, done refuses "
-                             "while a followup the machine did not write is open (sd:10407)")
+                             "while a followup the machine did not write is open (sd:10407), and "
+                             "--delivered-by keeps it open and owed (sd:10430)")
     _output(status, "status", revision=True)
 
     cancel = verbs.add_parser(

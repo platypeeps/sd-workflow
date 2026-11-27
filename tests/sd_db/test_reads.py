@@ -754,3 +754,119 @@ class BatchedRevisions(unittest.TestCase):
         self.assertEqual(len(found), 1000)
         self.assertEqual(found[items[-1]], workflow.item_state(self.connection, items[-1])["revision"])
         self.assertEqual(found[items[0]], workflow.item_state(self.connection, items[0])["revision"])
+
+
+class ReviewCosts(unittest.TestCase):
+    """sd:10401: per item, every review round (blocking and clean, build and lane) and what its runs cost."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        path = Path(self.tmp.name) / "sd.db"
+        initialise(path)
+        self.db = connect(path)
+        self.addCleanup(self.db.close)
+        upsert_repo(self.db, "/example/repo", remote="https://github.com/example/repo.git", managed=1)
+        self.runs = 0
+
+    def assignment(self, item, parent=None):
+        from sd_db.writes import create_assignment
+        ident = create_assignment(self.db, item=item, role="author", status="done", lane="parallel")
+        self.db.execute("UPDATE assignment SET scope = 'build', parent = ? WHERE id = ?", (parent, ident))
+        return ident
+
+    def build_run(self, lead, *, rounds=None, step="reviewing", session=None, usd=None, tokens=(0, 0)):
+        self.runs += 1
+        ident = f"run{self.runs}"
+        self.db.execute("INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                        "step, session_id, review_round, created_at, updated_at) VALUES "
+                        "(?, ?, ?, '/example/repo', 'build/sd-1', 'fixture', '/w', '/w', ?, ?, ?, ?, ?)",
+                        (ident, lead, self.runs, step, session, rounds, NOW, NOW))
+        if usd is not None:
+            self.db.execute("INSERT INTO cost (timestamp, role, assignment, pass, tokens_in, tokens_out, usd, source) "
+                            "VALUES (?, 'author', ?, ?, ?, ?, ?, 'run')", (NOW, lead, ident, *tokens, usd))
+
+    def test_a_three_round_build_counts_its_clean_round_and_sums_its_cost(self):
+        """The check the item names: 2 blocking rounds and the clean one are 3, not the 2 blocking notes alone."""
+        item = create_item(self.db, kind="task", title="Built", repo="/example/repo", status="done")
+        lead = self.assignment(item)
+        self.build_run(lead, rounds=2, step="enqueued", session="s1", usd=1.25, tokens=(100, 10))
+        found = reads.review_costs(self.db, [item])[item]
+        self.assertEqual((found["blocking"], found["clean"], found["rounds"]), (2, 1, 3))
+        self.assertEqual((found["tokens_in"], found["tokens_out"], found["usd"]), (100, 10, 1.25))
+
+    def test_a_retry_that_carries_its_rounds_counts_them_once(self):
+        """A loss retry resumes the session with the round count it had: 2 then 3 is 3 rounds, plus one clean."""
+        item = create_item(self.db, kind="task", title="Built", repo="/example/repo", status="done")
+        lead = self.assignment(item)
+        self.build_run(lead, rounds=2, step="fixing", session="s1", usd=1.0)
+        self.build_run(lead, rounds=3, step="enqueued", session="s1", usd=0.5)
+        self.build_run(lead, rounds=None, step="building", session="s2")  # a fresh Retry starts at 0
+        found = reads.review_costs(self.db, [item])[item]
+        self.assertEqual((found["blocking"], found["clean"], found["runs"], found["usd"]), (3, 1, 3, 1.5))
+
+    def test_a_member_cancelled_out_of_its_bundle_pays_only_for_the_runs_it_was_in(self):
+        """Lane review: a member a Retry or drop cancelled on its own (`ALONE`) after run 1 is in no later run."""
+        from sd_db.runner import ALONE
+        lead_item = create_item(self.db, kind="task", title="Lead", repo="/example/repo", status="done")
+        member = create_item(self.db, kind="task", title="Member", repo="/example/repo", status="done")
+        lead = self.assignment(lead_item)
+        gone = self.assignment(member, parent=lead)
+        self.build_run(lead, rounds=1, step="fixing", session="s1", usd=1.0)
+        self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = 'run1'", (NOW,))
+        self.db.execute("UPDATE assignment SET status = 'cancelled', run_count = 1, result = ? WHERE id = ?",
+                        (f"{ALONE}operator: left out", gone))
+        self.build_run(lead, rounds=2, step="enqueued", session="s2", usd=3.0)
+        found = reads.review_costs(self.db)
+        self.assertEqual((found[member]["runs"], found[member]["blocking"], found[member]["usd"]), (1, 1, 1.0))
+        self.assertEqual((found[lead_item]["runs"], found[lead_item]["usd"]), (2, 4.0))
+
+    def test_a_bundle_run_counts_for_each_member_and_lane_passes_count_per_item(self):
+        lead_item = create_item(self.db, kind="task", title="Lead", repo="/example/repo", status="done")
+        member = create_item(self.db, kind="task", title="Member", repo="/example/repo", status="done")
+        lead = self.assignment(lead_item)
+        self.assignment(member, parent=lead)
+        self.build_run(lead, rounds=1, step="enqueued", session="s1", usd=2.0)
+        passes = [{"head": "a", "report": {"outcomes": [{"cost": {"usd": 0.75, "input_tokens": 5,
+                                                                   "output_tokens": 2}}]}},
+                  {"head": "b", "report": {"outcomes": [{"cost": {"usd": "bad", "input_tokens": True}}]}},
+                  "not a pass"]
+        for body in ({"item": lead_item, "passes": [], "protocol": 1},
+                     {"item": lead_item, "passes": passes, "protocol": 1,
+                      "superseded_reviews": [{"passes": [{"head": "c"}]}]}):
+            record_state(self.db, "checkpoint", key="ship:lead", body=body)
+        record_state(self.db, "checkpoint", key="ship:broken", body="not json")
+        found = reads.review_costs(self.db)
+        self.assertEqual((found[lead_item]["lane"], found[lead_item]["rounds"], found[lead_item]["usd"]), (3, 5, 2.75))
+        self.assertEqual((found[member]["lane"], found[member]["rounds"], found[member]["usd"]), (0, 2, 2.0))
+
+
+class TheReviewGeneration(unittest.TestCase):
+    """The queue page's review generation lives in `reads`, not `ship`:
+    `adjudicator_binding` hashes `sd_db/ship.py` byte for byte, so a
+    dashboard-only query there voids every recorded adjudication when the
+    pack updates (sd:10814)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        path = Path(self.tmp.name) / "sd.db"
+        initialise(path)
+        self.connection = connect(path)
+        self.addCleanup(self.connection.close)
+
+    def test_the_ship_library_holds_no_dashboard_read(self):
+        from sd_db import ship
+
+        self.assertFalse(hasattr(ship, "review_generation"))
+
+    def test_only_ship_and_adjudication_checkpoints_move_it(self):
+        self.assertEqual(reads.review_generation(self.connection), 0)
+        record_state(self.connection, "checkpoint", key="ship:aa", body={})
+        first = reads.review_generation(self.connection)
+        self.assertGreater(first, 0)
+        record_state(self.connection, "checkpoint", key="ship-review-no-item:bb", body={})
+        record_state(self.connection, "checkpoint", key="lane:cc", body={})
+        self.assertEqual(reads.review_generation(self.connection), first)
+        record_state(self.connection, "checkpoint", key="ship-adjudication:dd", body={})
+        self.assertGreater(reads.review_generation(self.connection), first)
