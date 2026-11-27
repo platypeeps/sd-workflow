@@ -557,6 +557,33 @@ class ItemStatusOnly(BrowserSession):
         self.assertIn(f"resolve followup {note}", json.dumps(answer))
         self.assertEqual(workflow.item_state(self.connection, item)["item"]["status"], "planning")
 
+    def test_done_resolve_all_resolves_only_the_followups_it_names(self):
+        """sd:10429: Done, resolve all names the followups its confirm showed. One open that it does not name
+        refuses the close and resolves nothing; only a list of note ids with done is taken."""
+        item = self.item("Close me too", kind="task")
+        shown = add_note(self.connection, item, "followup", "Ask example.test")
+        self.connection.commit()
+        revision = Fields(self.status_form(item)).fields["revision"]["value"]
+        for bad in ({"status": "ready", "resolve_followups": [shown]}, {"status": "done", "resolve_followups": True},
+                    {"status": "done", "resolve_followups": "yes"}, {"status": "done", "resolve_followups": []},
+                    {"status": "done", "resolve_followups": [True]}, {"status": "done", "resolve_followups": [0]}):
+            status, _, _ = self.post(f"/api/items/{item}/status", {"revision": revision, **bad})
+            self.assertEqual(status, 400, bad)
+        unseen = add_note(self.connection, item, "followup", "Added after the confirm opened")
+        self.connection.commit()
+        revision = Fields(self.status_form(item)).fields["revision"]["value"]
+        status, _, answer = self.post(f"/api/items/{item}/status",
+                                      {"revision": revision, "status": "done", "resolve_followups": [shown]})
+        self.assertNotEqual(status, 200)
+        self.assertIn(f"followup {unseen}", json.dumps(answer))
+        state = workflow.item_state(self.connection, item)
+        self.assertEqual(state["item"]["status"], "planning")
+        self.assertEqual([n["id"] for n in state["notes"] if n["kind"] == "followup" and n["resolved_at"]], [])
+        status, _, state = self.post(f"/api/items/{item}/status", {"revision": state["revision"], "status": "done",
+                                                                   "resolve_followups": [shown, unseen]})
+        self.assertEqual((status, state["item"]["status"]), (200, "done"))
+        self.assertTrue(all(n["resolved_at"] for n in state["notes"] if n["kind"] == "followup"))
+
     def test_a_followup_with_a_queued_assignment_shows_the_hint_and_no_select(self):
         """The queued run owns the status, not the details. A task with a
         queued assignment keeps its `Save details` form for the same reason:

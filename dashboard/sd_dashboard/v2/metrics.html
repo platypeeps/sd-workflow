@@ -112,6 +112,12 @@
       <div class="scroll-x"><table class="tbl pr-waits" id="prs-table" aria-labelledby="prs-h"><thead><tr><th scope="col" class="g"><span class="sr">State</span></th><th scope="col">Item</th><th scope="col" class="num">On you</th><th scope="col" class="num">On reviewers</th><th scope="col" class="num hide-sm">First PR to merge</th></tr></thead><tbody id="prs-body"></tbody></table></div>
       <p class="foot-note" id="prs-note"></p>
     </section>
+    <section class="panel" id="reviews" aria-labelledby="rev-h">
+      <div class="panel-head"><div><h2 id="rev-h">Review rounds <button class="help" type="button" aria-label="Help: review rounds" data-help="<b>Each item's review rounds and what its runs cost, all time.</b> Build rounds are each build run's rounds that left blockers, plus one clean round when it reached the lane; lane rounds are its ship review passes. Tokens and dollars are the build runs' cost rows and each lane pass's reviewer cost, API-equivalent, not charges. A bundle's run counts for each of its items. The builder's own review records no cost yet."><svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button></h2>
+        <p>Review rounds, clean and blocking, build and lane, with tokens and API-equivalent dollars per item.</p></div></div>
+      <div class="scroll-x"><table class="tbl" id="rev-table" aria-labelledby="rev-h"><thead><tr><th scope="col">Item</th><th scope="col" class="hide-sm">Status</th><th scope="col" class="num">Rounds</th><th scope="col" class="num hide-sm">Blocking</th><th scope="col" class="num hide-sm">Clean</th><th scope="col" class="num hide-sm">Lane</th><th scope="col" class="num hide-sm">Tokens in</th><th scope="col" class="num hide-sm">Tokens out</th><th scope="col" class="num">Cost</th></tr></thead><tbody id="rev-body"></tbody></table></div>
+      <p class="foot-note" id="rev-note"></p>
+    </section>
   </div>
 
   <div id="view-age" aria-label="Age" hidden>
