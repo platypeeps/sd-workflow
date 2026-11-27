@@ -1810,6 +1810,8 @@ class Supervisor:
                 argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
+        # A blocking report this run settles to a pass is no pass `sd-review` recorded for the lane (sd:10919).
+        settled = answer["status"] == "blocking"
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
         # A rerun that passed at `head` is this round's check: it runs once (sd:10914).
         unmanaged = build.unmanaged(self.db, self.row["repo"])
@@ -1838,6 +1840,8 @@ class Supervisor:
                 return failed
             if failed:
                 return self.blocked_round(failed, head)
+            if whole and settled and answer["status"] in ("clean", "advisory"):
+                self.once(f"lead-pass:{head}", lambda: self.lead_pass(head, answer["status"]))
             self.reviewed = head
             return "enqueuing"
         return self.blocked_round(answer["blockers"], head)
@@ -2698,6 +2702,29 @@ class Supervisor:
     def late_brief(rounds: int) -> str:
         """The fix brief for a round at or past the bound: the class pass, then the ruling round (sd:10286)."""
         return CLASS_PASS if rounds == REVIEW_ROUNDS else RULING
+
+    def lead_pass(self, head: str, status: str) -> None:
+        """Record the review at `head` this run settled to a pass (every blocker ruled or deferred) as the lead
+        pass lane prepare reuses at the same head (sd:10919, pack sd:5988), in the record `sd-review` writes
+        for a pass of its own (`sd_lib.lead_review_key`, `record_lead_review`). The lane checks the binding,
+        the fork and the head itself, so a report that lacks one records nothing: the lane reviews in full."""
+        try:
+            report = json.loads(self.out("review").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(report, dict):
+            return
+        subject, base, binding = report.get("subject"), report.get("covers_from"), report.get("binding")
+        copilot = ((report.get("remote_reviews") or {}).get("copilot") or {}) if isinstance(
+            report.get("remote_reviews"), dict) else {}
+        repository = self.github()
+        if not (isinstance(subject, dict) and subject.get("head") == head and isinstance(base, str)
+                and isinstance(binding, dict) and repository and isinstance(copilot, dict)):
+            return
+        record_state(self.db, "checkpoint", key=f"review:v1:{repository}:{self.row['branch']}", body={
+            "repository": repository, "branch": self.row["branch"], "head": head, "base": base, "status": status,
+            "binding": binding, "reviewed_by": report.get("reviewed_by", []), "challenge": False,
+            "copilot_automatic": copilot.get("automatic"), "settled_by": f"build run {self.ident}"})
 
     def known_failure(self) -> bool:
         """Whether the last blocking round, after which a fix ran, failed a check: a blocker with no line

@@ -301,7 +301,9 @@ FAKE = textwrap.dedent('''
         # blocking2_uncovered: blocking2 read from patches only, so the next round reviews the branch whole
         short = mode == "repeat2_short"
         uncovered = mode in ("repeat2_uncovered", "blocking2_uncovered")
-        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered else mode
+        # repeat2_forked: repeat2 from the branch's real fork, with the binding `sd-review` reports (sd:10919)
+        forked = mode == "repeat2_forked"
+        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered or forked else mode
         if mode in ("blocking2", "repeat2", "moved2", "twin2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
                       "evidence": "the original evidence"}
@@ -316,7 +318,10 @@ FAKE = textwrap.dedent('''
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
                           "requested_reviews": 2, "completed_reviews": 1 if short else 2,
-                          "covers_from": None if mode == "clean_uncovered" or uncovered else "c" * 40,
+                          "covers_from": None if mode == "clean_uncovered" or uncovered else
+                          git("-C", work, "merge-base", "HEAD", "refs/remotes/origin/main") if forked else "c" * 40,
+                          **({"binding": {"fixture": "binding"}, "reviewed_by": ["fixture-reader"],
+                              "remote_reviews": {"copilot": {"automatic": False}}} if forked else {}),
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -1325,6 +1330,33 @@ class Supervise(Case):
                           "severity": "high", "family": "correctness", "instances": [], "evidence": evidence}
                 (found,) = review.dispose([review._finding(repeat)], "high", seen)
                 self.assertEqual(found["disposition"], lane)
+
+    def test_a_settled_final_review_is_the_lanes_lead_pass(self):
+        """sd:10919: a final review whose blockers every ruling cleared, at head H, is recorded as the lead
+        pass the lane reuses: prepare at H skips its review; a head moved by a commit of its own reviews."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2_forked",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        work = Path(self.bundle["work_path"])
+        head = support.git(work, "rev-parse", "HEAD").strip()
+        sys.path.insert(0, str(BIN))
+        try:
+            lane = importlib.import_module("sd_ship_review")
+            key = importlib.import_module("sd_lib").lead_review_key("fixture/repo", self.bundle["branch"])
+        finally:
+            sys.path.remove(str(BIN))
+        found = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?", (key,)).fetchone()
+        self.assertIsNotNone(found, "the settled pass is not recorded for the lane")
+        self.assertEqual(json.loads(found[0])["status"], "advisory")
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], head, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNotNone(record, why)
+        support.git(work, "commit", "-q", "--allow-empty", "-m", "fix: later")
+        moved = support.git(work, "rev-parse", "HEAD").strip()
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], moved, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
 
     def test_two_rulings_one_words_and_place_clear_no_repeat(self):
         """Night triage of sd:10286 (bin/sd-review:917, build_run.py:2199): two ruled blockers with one summary
