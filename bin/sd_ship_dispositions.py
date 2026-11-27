@@ -230,14 +230,14 @@ def untried(output: str, report: pathlib.Path) -> bool:
     `s [100%]`, `-p no:terminal` nothing), so its count is read from the JUnit `report` it wrote, where a
     skip and an xfail are both `skipped`; a report that cannot be read is no pass. Any other runner's
     count is read from `output`, colour removed."""
-    import xml.etree.ElementTree as ET  # noqa: PLC0415
+    import xml.etree.ElementTree as ET  # noqa: PLC0415  # nosec B405 - reads only the JUnit report this run wrote
 
     if UNTRIED.search(COLOUR.sub("", output)):
         return True
     if not report.exists():
         return False
     try:
-        return any(int(suite.get("skipped") or 0) for suite in ET.parse(report).iter("testsuite"))
+        return any(int(suite.get("skipped") or 0) for suite in ET.parse(report).iter("testsuite"))  # nosec B314 - this run's own report
     except (ET.ParseError, ValueError, OSError):
         return True
 
