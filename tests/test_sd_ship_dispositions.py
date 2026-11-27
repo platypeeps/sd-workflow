@@ -719,6 +719,22 @@ class DispositionTests(unittest.TestCase):
             stale.adjudicate()
         self.assertEqual(list(self.connection.execute("SELECT * FROM state")), before)
 
+    def test_a_rebuttal_survives_a_review_tool_change(self):
+        """Operator 2026-11-27: a tool change alone keeps a recorded rebuttal; it does not void it."""
+        self.blocked()
+        self.accepted()
+        self.prepare()
+        original_read = pathlib.Path.read_bytes
+        for name in ("sd-review", "sd_registry.py", "SKILL.md", "sd_ship_dispositions.py"):
+
+            def changed(path, name=name):
+                value = original_read(path)
+                return value + b"changed" if path.name == name else value
+
+            with self.subTest(name=name), patch.object(pathlib.Path, "read_bytes", changed):
+                self.operation().check_review(self.head)
+
+    @patch.object(importlib.import_module("sd_lib"), "TOOL_CHANGES_KEEP_REVIEWS", False)
     def test_review_tool_adjudicator_tool_and_policy_changes_refuse(self):
         self.blocked()
         self.accepted()

@@ -176,6 +176,10 @@ class SharedBindingTests(unittest.TestCase):
         home = patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config")})
         home.start()
         self.addCleanup(home.stop)
+        # These pin the strict reading; `ToolChangesKeepReviewTests` pins the default (operator 2026-11-27).
+        strict = patch.object(sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)
+        strict.start()
+        self.addCleanup(strict.stop)
         self.head = "a" * 40
         self.report = {"status": "blocking", "scope": "branch", "subject": {"head": self.head},
                        "requested_reviews": 1, "completed_reviews": 1, "reviewed_by": ["fixture"],
@@ -744,3 +748,42 @@ class HistoryChainTests(unittest.TestCase):
         second["report"] = dict(legacy, resume_report_digest=digest(review_history([first])))
         state["passes"][-1]["report"] = dict(now, verification_report_digest=digest(second["report"]))
         self.assertIsNone(ItemHistory()._validate_coverage(state, state["passes"][-1]["report"]))
+
+
+class ToolChangesKeepReviewTests(unittest.TestCase):
+    """Operator 2026-11-27: while the tools change daily, a tool change alone keeps a review; policy re-reviews."""
+
+    edited = staticmethod(SharedBindingTests.edited)
+
+    def setUp(self):
+        SharedBindingTests.setUp(self)
+        lenient = patch.object(sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", True)
+        lenient.start()
+        self.addCleanup(lenient.stop)
+        self.operation.save = lambda **updates: self.operation.state.update(updates)
+
+    def test_a_moved_review_tool_keeps_the_receipt_without_a_replay(self):
+        self.operation.runtime = dataclasses.replace(
+            self.operation.runtime, process=lambda *a, **k: self.fail("no replay is asked"))
+        for name in ("sd-review", "sd_route.py", "sd_registry.py"):
+            with self.subTest(name=name), self.edited(bindings.BIN / name):
+                self.assertEqual(self.operation.review_inputs(self.head), self.report)
+                self.assertEqual(self.operation.state["binding"], ship.binding(self.root))
+        kept = self.operation.state["review_binding_kept"]
+        self.assertEqual(len(kept), 3, "each move is rebound once and recorded")
+        self.assertEqual(kept[0]["changed"], [["sd-review", "verdict"]])
+        self.assertIn(["sd_registry.py", "verdict"], kept[-1]["changed"])
+        self.assertTrue(all(row["tools_only"] for row in kept))
+
+    def test_a_policy_change_still_re_reviews(self):
+        seed_declaration(self.home, self.root, "review", {})
+        with self.assertRaisesRegex(ship.Refusal, "review_declaration \\(policy\\)$"):
+            self.operation.review_inputs(self.head)
+
+    def test_a_lead_review_binding_ignores_only_the_tools_entry(self):
+        stored = {"tools": "old", "local": "L", "review_declaration": {"x": 1}}
+        self.assertTrue(sd_lib.same_review_binding(stored, dict(stored, tools="new")))
+        self.assertFalse(sd_lib.same_review_binding(stored, dict(stored, local="L2")))
+        with patch.object(sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False):
+            self.assertFalse(sd_lib.same_review_binding(stored, dict(stored, tools="new")))
+

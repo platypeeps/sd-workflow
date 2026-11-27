@@ -5206,10 +5206,22 @@ roles:
         _git(self.root, "merge", "-q", "--no-ff", "-m", "Merge origin/main\n\nAuthored-with: human", "origin/main")
         self.assert_full_review(calls, "it changed more than a clean merge of origin/main")
 
-    def test_a_lead_review_under_other_review_tools_gets_a_full_review(self):
+    def test_a_lead_review_under_other_review_tools_stands_for_the_lane_review(self):
+        """Operator 2026-11-27: a tool change alone keeps the lead's pass; the lane does not review again."""
+        calls = self.lead_reviewed_branch()
+        head = _git(self.root, "rev-parse", "HEAD")
+        self.rewrite_lead_record(binding={**self.lead_record()["binding"], "tools": "0" * 40})
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            result = self.prepare()
+        self.assertEqual(result["review_skipped"], "lead-review")
+        self.assertIn(f"lead review reused: the clean pass of {head[:12]} covers it", said.getvalue())
+        self.assertFalse(calls.exists(), "a reader was called for a head the lead's pass covers")
+
+    def test_a_lead_review_under_other_review_tools_gets_a_full_review_when_strict(self):
         calls = self.lead_reviewed_branch()
         self.rewrite_lead_record(binding={**self.lead_record()["binding"], "tools": "0" * 40})
-        self.assert_full_review(calls, "the review tools or policy changed since")
+        with unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False):
+            self.assert_full_review(calls, "the review tools or policy changed since")
 
     def test_a_lead_review_that_wanted_copilot_gets_the_lane_review(self):
         calls = self.lead_reviewed_branch()

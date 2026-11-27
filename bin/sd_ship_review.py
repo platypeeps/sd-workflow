@@ -277,7 +277,7 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     if (not isinstance(reviewed, str) or record.get("status") not in PASSING_LEAD_REVIEWS
             or (record.get("repository"), record.get("branch")) != (repository, branch)):
         return None, "it names another subject"
-    if binding is None or record.get("binding") != binding:
+    if binding is None or not sd_lib.same_review_binding(record.get("binding"), binding):
         return None, "the review tools or policy changed since, or do not read"
     if record.get("copilot_automatic") is not False:
         return None, "it selects an automatic Copilot review"
@@ -837,7 +837,26 @@ class SharedReview:
         return self._binding_moved
 
     def binding_holds(self) -> bool:
-        return self.state.get("binding") == self.runtime.binding(self.root) or self.request_unchanged()
+        return (self.state.get("binding") == self.runtime.binding(self.root) or self.tools_only_moved()
+                or self.request_unchanged())
+
+    def tools_only_moved(self) -> bool:
+        """Operator 2026-11-27: only review tools moved, so the receipt is rebound and kept, no pass spent."""
+        changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
+        if (not sd_lib.TOOL_CHANGES_KEEP_REVIEWS or manifest is None or not changed
+                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
+            return False
+        passes = self.history.native(self.state)
+        kept = {"head": passes[-1].get("head") if passes else None, "recorded_at": self.runtime.clock(),
+                "superseded_binding": self.state.get("binding"), "changed": [list(row) for row in changed],
+                "tools_only": True}
+        rebound = {"binding": self.runtime.binding(self.root), "binding_manifest": manifest(self.root),
+                   "review_binding_kept": [*(self.state.get("review_binding_kept") or []), kept]}
+        if self.read_only():
+            self.state.update(rebound)  # pack sd:7576: a read verb rebinds in memory only
+        else:
+            self.save(**rebound)
+        return True
 
     def request_unchanged(self) -> bool:
         """sd:1397, option E: only review code moved, and the reviewers would be asked the same.
@@ -1279,7 +1298,7 @@ class SharedReview:
         moved = sorted(name for name in expected if held.get(name) != expected[name])
         if moved:
             return refuse_held(path, f"bound to another {', '.join(moved)}")
-        if self.state.get("binding") != self.runtime.binding(self.root):
+        if not self.binding_holds():
             return refuse_held(path, "the review tools or policy changed since it ran")
         try:
             outcome = record["result"]
