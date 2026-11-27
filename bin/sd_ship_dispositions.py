@@ -24,6 +24,8 @@ DISPOSITIONS = ("rebutted", "parked")
 TEST_TIMEOUT_SECONDS = 300  # ponytail: one focused test; a suite belongs to the gate
 #: A run that exits 0 yet never tried the finding: unittest's or pytest's skip or expected-failure count.
 UNTRIED = re.compile(r"skipped=[1-9]|expected failures=[1-9]|\b[1-9][0-9]* (?:skipped|xfailed)\b")
+#: A terminal colour sequence, which a runner told to force colour puts inside the count `UNTRIED` reads.
+COLOUR = re.compile(r"\x1b\[[0-9;]*m")
 TEST_ARGV_BYTES = 4096
 
 
@@ -223,6 +225,23 @@ def rebuttal_environment(root: pathlib.Path) -> dict[str, str]:
     return {key: value for key, value in kept.items() if value or not env[key]}
 
 
+def untried(output: str, report: pathlib.Path) -> bool:
+    """The run skipped a test or expected its failure. pytest's flags reshape what it prints (`-qq` leaves
+    `s [100%]`, `-p no:terminal` nothing), so its count is read from the JUnit `report` it wrote, where a
+    skip and an xfail are both `skipped`; a report that cannot be read is no pass. Any other runner's
+    count is read from `output`, colour removed."""
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+
+    if UNTRIED.search(COLOUR.sub("", output)):
+        return True
+    if not report.exists():
+        return False
+    try:
+        return any(int(suite.get("skipped") or 0) for suite in ET.parse(report).iter("testsuite"))
+    except (ET.ParseError, ValueError, OSError):
+        return True
+
+
 def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> None:
     """sd:10893. A blocker stays open while its test exists and fails: run it at the exact `head`, no shell.
 
@@ -250,6 +269,8 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
             raise Refusal(f"finding {index}: no worktree of {head[:12]} for its test: {error}") from None
         try:
             env = {**rebuttal_environment(root), **sd_ship_review.runner_guards(tree)}  # Jev off, as the gate's rerun
+            report = tree.parent / "junit.xml"  # outside the tree, so it never dirties it
+            env["PYTEST_ADDOPTS"] = f"{env.get('PYTEST_ADDOPTS', '')} --junit-xml={report}".strip()
             done = sd_lib.run_group(argv, cwd=tree, env=env, timeout=TEST_TIMEOUT_SECONDS)
         except sd_lib.GroupTimeout:
             raise Refusal(f"finding {index}: its test did not finish in {TEST_TIMEOUT_SECONDS} s; "
@@ -262,13 +283,14 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
         else:
             if git(tree, "status", "--porcelain", "--untracked-files=all") or git(tree, "rev-parse", "HEAD") != head:
                 raise Refusal(f"finding {index}: its test changed its checkout; the record binds the clean exact head")
+            skipped = untried(done.stdout + done.stderr, report)
         finally:
             sd_lib.git_output(["worktree", "remove", "--force", str(tree)], root)
     if done.returncode != 0:
         tail = " ".join((done.stdout + done.stderr).split())[-SUMMARY_CHARS:]
         raise Refusal(f"finding {index}: its test fails (exit {done.returncode}), so it reproduces the finding: "
                       f"fix it, or name a test that passes; {tail}")
-    if UNTRIED.search(done.stdout + done.stderr):
+    if skipped:
         raise Refusal(f"finding {index}: its test passed by skipping or expecting a failure, so it never tried "
                       "the finding: name a test that runs it")
 

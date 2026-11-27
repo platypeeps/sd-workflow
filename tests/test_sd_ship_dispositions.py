@@ -300,6 +300,36 @@ class DispositionTests(unittest.TestCase):
                   "    def test_x(self): pass\nunittest.main(argv=['t'])")
         self.rejected_proposal(self.with_test([sys.executable, "-c", script]))
 
+    def test_a_skip_is_read_from_the_runners_report_not_its_flags(self):
+        """sd:10893 class pass: the skip check read text the runner's own flags reshape. pytest now writes a
+        JUnit report (`PYTEST_ADDOPTS`) outside the tree, read whatever the terminal showed: `-qq` leaves
+        `s [100%]`, `-p no:terminal` nothing, forced colour splits the count. A stand-in plays pytest here."""
+        root = self.root.resolve()
+        head = fixture._git(root, "rev-parse", "HEAD")
+        runner = ("import os, pathlib, shlex, sys\n"
+                  "path = [o.split('=', 1)[1] for o in shlex.split(os.environ['PYTEST_ADDOPTS'])"
+                  " if o.startswith('--junit-xml=')][-1]\n"
+                  "pathlib.Path(path).write_text(sys.argv[1])\nprint(sys.argv[2])")
+        suite = '<testsuites><testsuite name="pytest" tests="1" skipped="{}"/></testsuites>'
+        shapes = {"-qq": (suite.format(1), "s [100%]"), "no terminal": (suite.format(1), ""),
+                  "xfail": (suite.format(2), "x [100%]"), "unreadable report": ("<testsuites", ""),
+                  "no count": ('<testsuite skipped="x"/>', "")}
+        for name, (report, shown) in shapes.items():
+            with self.subTest(shape=name), patch.dict("os.environ", {"PYTEST_ADDOPTS": "-p example"}), \
+                    self.assertRaisesRegex(ship.Refusal, "never tried"):
+                sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", runner, report, shown])
+        with self.assertRaisesRegex(ship.Refusal, "never tried"):  # forced colour, a runner with no report
+            sd_ship_dispositions.reproduces(
+                root, head, 1, [sys.executable, "-c", "print('\\x1b[33m1 skipped\\x1b[0m in 0.01s')"])
+        seen = self.directory / "example-addopts-seen"
+        keeps = f"import os, pathlib; pathlib.Path({str(seen)!r}).write_text(os.environ['PYTEST_ADDOPTS'])"
+        with patch.dict("os.environ", {"PYTEST_ADDOPTS": "-p example"}):
+            sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", keeps])
+            sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", runner, suite.format(0), "."])
+        self.assertRegex(seen.read_text(), r"^-p example --junit-xml=\S+$")
+        self.assertNotIn(str(root), seen.read_text())
+        self.assertFalse(pathlib.Path(seen.read_text().split("=", 1)[1]).parent.exists())
+
     def test_a_test_runs_with_the_gates_jev_guard(self):
         """sd:10893 class pass: a rebuttal test gets the guards the gate's rerun gives its shards
         (`runner_guards`), so no rebuttal test sends a live, metered Jev call (sd:2136)."""
