@@ -1075,9 +1075,9 @@ def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[st
             line: Collection[str]) -> bool | None:
     """Whether side commit `sha`'s own change is gone at the head. Gone needs proof: the listing revert at
     `since` took its patch out whole (there before, absent after), and no commit of the head's first-parent
-    `line` since put it back: the whole patch, or one of its lines in one of its files, added or taken out
-    again. So a file the side shared, an unrelated edit in the revert, and a fix put back, changed or not,
-    and then moved, each keep it (class passes, review of build/sd-1654). A commit off that line, a branch
+    `line` since put it back for good: the whole patch, or one of its lines in one of its files, added or
+    taken out again, with no later commit taking that restore out again. So a file the side shared, an
+    unrelated edit in the revert, and a fix put back, changed or not, and then moved, each keep it (class passes, review of build/sd-1654). A commit off that line, a branch
     an `ours` merge discarded, restores nothing.
     None when nothing is proved: no patch (a merge, an empty commit), or it reads neither way at the revert.
     ponytail: a restore is matched by line, so a fix rewritten in every line reads as new work, which cites
@@ -1088,17 +1088,35 @@ def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[st
     revert = commits[since][0]
     if _present(worktree, patch, f"{revert}^") is not True or _present(worktree, patch, revert) is not False:
         return None
+    import sd_ship_body  # noqa: PLC0415
     names = _changed(worktree, sha)
-    for commit, _ in commits[:since]:
+    gone = True
+    # Oldest first, so the last restore or undo decides: a restore taken out again leaves the fix gone
+    # (review of build/sd-1654, sd_lane.py:1098).
+    for commit, message in reversed(commits[:since]):
         later = _patch(worktree, commit, names) if commit in line else None
         if not later:
             continue
-        # A line of it back, added or taken out again, or the whole patch back: a deletion adds no line, and
-        # a binary or mode-only change has none to match (ruling round, review of build/sd-1654).
-        if (_lines(patch, b"+") & _lines(later, b"+") or _lines(patch, b"-") & _lines(later, b"-")
-                or (_present(worktree, patch, f"{commit}^") is False and _present(worktree, patch, commit))):
-            return False
-    return True
+        if gone:
+            # A line of it back, added or taken out again, or the whole patch back: a deletion adds no line,
+            # and a binary or mode-only change has none to match (ruling round, review of build/sd-1654).
+            gone = not (_lines(patch, b"+") & _lines(later, b"+") or _lines(patch, b"-") & _lines(later, b"-")
+                        or (_present(worktree, patch, f"{commit}^") is False
+                            and _present(worktree, patch, commit)))
+            continue
+        # Taken out again: a revert, or a commit that adds nothing anywhere, takes a line of it out, or
+        # the whole patch; or one that takes out nothing puts back a line it took out. ponytail: a commit
+        # that takes the fix out and adds other lines reads as a move, so its item closes as restored.
+        whole = _patch(worktree, commit) or b""
+        if _lines(patch, b"-") & _lines(later, b"+"):
+            silent = not _lines(whole, b"-")
+        elif _lines(patch, b"+") & _lines(later, b"-") or (
+                _present(worktree, patch, f"{commit}^") is True and _present(worktree, patch, commit) is False):
+            silent = not _lines(whole, b"+")
+        else:
+            continue
+        gone = bool(sd_ship_body.REVERT_SUBJECT.match(message)) or silent
+    return gone
 
 
 def publish_parents(worktree: pathlib.Path, sha: str) -> list[str]:
@@ -1116,7 +1134,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     subject is a revert and the files it changed read at `head` as before
     it. A cited commit a merge a revert lists brought in (`listed_sides`,
     pack sd:10108) is undone only on proof (`_undone`): that revert took
-    its patch out and nothing put a line of it back. With no proof it is
+    its patch out and nothing put a line of it back for good. With no proof it is
     read as on the base: a `Closes:` commit by its files, and one cited
     only by a `Lane review fix` line stays, as it does on any other
     commit, where a later revert may keep the fix in another file

@@ -3968,6 +3968,93 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(sorted(entry["closes"]), sorted([b, c]))
 
+    def _restored(self, name: str, b: int, c: int) -> pathlib.Path:
+        """`_side_merge`, the listed merge revert, then a commit putting the side's fix back."""
+        tree, merge = self._side_merge(name, b, c)
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        (tree / "side.txt").write_text("side\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", "fix: put the side back")
+        return tree
+
+    def test_a_listed_merge_side_restored_then_deleted_again_closes_only_the_mainline(self) -> None:
+        """Review of build/sd-1654 (sd_lane.py:1098): the side's fix was put back, then a later commit
+        took it out again. The first restore read as final, so the side's item closed with no fix at the
+        head. A later commit that takes the fix out and adds nothing undoes the restore."""
+        b, c, *_ = self.open
+        tree = self._restored("topic-restored-gone", b, c)
+        git(tree, "rm", "-q", "side.txt")
+        git(tree, "commit", "-q", "-m", "chore: drop the side file")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_listed_merge_side_restored_then_reverted_closes_only_the_mainline(self) -> None:
+        """Same class (sd_lane.py:1137): `git revert` of the restoring commit undoes it too."""
+        b, c, *_ = self.open
+        tree = self._restored("topic-restored-reverted", b, c)
+        git(tree, "revert", "--no-edit", "HEAD")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_listed_merge_side_binary_restored_then_undone_closes_only_the_mainline(self) -> None:
+        """Same class (sd_lane.py:1099): a binary side fix has no line to match, so the whole patch put
+        back read as a final restore; the branch then put the old bytes back."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-binary-undone")
+        old, fixed = b"\x00\xffold bytes\n", b"\x00\xfffixed bytes\n"
+        (tree / "data.bin").write_bytes(old)
+        git(tree, "add", "data.bin")
+        git(tree, "commit", "-q", "-m", "chore: a data file")
+        git(tree, "switch", "-q", "-c", "topic-binary-undone-side")
+        (tree / "data.bin").write_bytes(fixed)
+        git(tree, "commit", "-q", "-am", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-binary-undone")
+        (tree / "a.txt").write_text("guard\n", encoding="utf-8")
+        git(tree, "add", "a.txt")
+        git(tree, "commit", "-q", "-m", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-binary-undone-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        (tree / "data.bin").write_bytes(fixed)
+        git(tree, "commit", "-q", "-am", "fix: the fixed bytes again")
+        (tree / "data.bin").write_bytes(old)
+        git(tree, "commit", "-q", "-am", "chore: the old bytes after all")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_listed_merge_side_deletion_repeated_then_undone_closes_only_the_mainline(self) -> None:
+        """Same class (sd_lane.py:1099): the side deleted a file, the branch deleted it again after the
+        revert, then put it back. The repeated deletion read as final, so the side's item closed."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-deletion-undone")
+        (tree / "obsolete.txt").write_text("old\nolder\n", encoding="utf-8")
+        git(tree, "add", "obsolete.txt")
+        git(tree, "commit", "-q", "-m", "chore: an obsolete file")
+        git(tree, "switch", "-q", "-c", "topic-deletion-undone-side")
+        git(tree, "rm", "-q", "obsolete.txt")
+        git(tree, "commit", "-q", "-m", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-deletion-undone")
+        (tree / "a.txt").write_text("guard\n", encoding="utf-8")
+        git(tree, "add", "a.txt")
+        git(tree, "commit", "-q", "-m", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-deletion-undone-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        git(tree, "rm", "-q", "obsolete.txt")
+        git(tree, "commit", "-q", "-m", "fix: delete it again")
+        (tree / "obsolete.txt").write_text("old\nolder\n", encoding="utf-8")
+        git(tree, "add", "obsolete.txt")
+        git(tree, "commit", "-q", "-m", "chore: keep the obsolete file after all")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open
