@@ -2891,33 +2891,36 @@ def branch_run(connection, branch: str) -> dict | None:
     return dict(found) if found else None
 
 
+def _last_builds(connection, ids: Collection[int], items: Collection[int]) -> list[dict]:
+    """Each of `items`' newest build run outside the assignments `ids`, by the bundle it rode in: an assignment
+    that never ran (a press cancelled before its claim) hides no earlier build (lane review of build/sd-1808)."""
+    marks = ", ".join("?" for _ in ids)
+    found = (connection.execute(
+        f"SELECT runner_run.id, runner_run.outcome FROM runner_run JOIN assignment "
+        f"ON assignment.id = runner_run.assignment OR assignment.parent = runner_run.assignment "
+        f"WHERE assignment.item = ? AND assignment.scope = ? AND assignment.id NOT IN ({marks}) "
+        f"ORDER BY runner_run.created_at DESC, runner_run.run DESC, runner_run.rowid DESC LIMIT 1", (item, SCOPE, *ids)).fetchone()
+        for item in items)
+    return [dict(row) for row in found if row]
+
+
 def lane_failed_start(connection, lead: int) -> dict | None:
     """Where a new bundle under assignment `lead` starts when its items were last built in a bundle whose lane entry
     failed: that run's `branch` and its `detail` (sd:10379). An item
     moved back to ready and built again is a fresh press with a new branch, which from origin/main dropped the
-    failed bundle's commits. None, so main, unless the items whose newest earlier build failed in the lane name one
-    such run, the same for all, and every item it built is in this bundle: its commits cite them, and a missing one
-    would not deliver. An item never built, or last built elsewhere, rides along: it cites nothing on that branch
-    (lane review of build/sd-1808)."""
+    failed bundle's commits. None, so main, unless exactly one lane-failed run that some item last rode in had
+    every item it built in this bundle: its commits cite them, and a missing one would not deliver. An item never
+    built, or last built elsewhere, rides along: it cites nothing on that branch (lane review of build/sd-1808)."""
     # A member cancelled out of this bundle (`ALONE`) is not selected: it neither builds nor delivers here.
     bundle = connection.execute(f"SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
                                 f"AND {_in_group()}", (lead, lead, SCOPE)).fetchall()
     ids, items = {row["id"] for row in bundle}, {row["item"] for row in bundle}
-    runs = set()
-    for item in items:
-        prior = connection.execute(
-            f"SELECT id, parent FROM assignment WHERE item = ? AND scope = ? AND id NOT IN "
-            f"({', '.join('?' for _ in ids)}) ORDER BY id DESC LIMIT 1", (item, SCOPE, *ids)).fetchone()
-        last = prior and connection.execute(
-            "SELECT id, outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-            (prior["parent"] or prior["id"],)).fetchone()
-        if last and last["outcome"] == "lane_failed":
-            runs.add(last["id"])
-    if len(runs) != 1:
+    runs = {last["id"] for last in _last_builds(connection, ids, items) if last["outcome"] == "lane_failed"}
+    whole = [failed for failed in (run(connection, ident) for ident in sorted(runs))
+             if {member["item"] for member in failed["members"]} <= items]
+    if len(whole) != 1:
         return None
-    failed = run(connection, runs.pop())
-    if not {member["item"] for member in failed["members"]} <= items:
-        return None
+    failed = whole[0]
     return {"run": failed["id"], "branch": failed["branch"], "detail": failed["detail"] or "", "items": items}
 
 
@@ -2929,15 +2932,8 @@ def outside_rebuild(connection, lead: int, cited: Collection[int]) -> list[int]:
     bundle = connection.execute("SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
                                 (lead, lead, SCOPE)).fetchall()
     ids, items = [row["id"] for row in bundle], {row["item"] for row in bundle}
-    for item in items:
-        prior = connection.execute(
-            f"SELECT id, parent FROM assignment WHERE item = ? AND scope = ? AND id NOT IN "
-            f"({', '.join('?' for _ in ids)}) ORDER BY id DESC LIMIT 1", (item, SCOPE, *ids)).fetchone()
-        last = prior and connection.execute(
-            "SELECT outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-            (prior["parent"] or prior["id"],)).fetchone()
-        if last and last["outcome"] == "lane_failed":
-            return sorted(set(cited) - items)
+    if any(last["outcome"] == "lane_failed" for last in _last_builds(connection, ids, items)):
+        return sorted(set(cited) - items)
     return []
 
 

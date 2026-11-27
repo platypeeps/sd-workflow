@@ -4584,7 +4584,8 @@ class Tick(Case):
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
     def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
-                                   outsider=None, left_out=False, reverted=None):
+                                   outsider=None, left_out=False, reverted=None, rebundled=False,
+                                   other_failed=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -4617,8 +4618,24 @@ class Tick(Case):
                         rebuild)
         queued = build.queue_again(self.db, rebuild, who="operator")
         self.assertNotIn(run["assignment"], [entry["id"] for entry in queued], "a fresh press, not Fix")
+        if rebundled:  # that press is cancelled before a claim and pressed again: a bundle that never ran
+            self.db.execute(f"UPDATE assignment SET status = 'cancelled' WHERE id IN "
+                            f"({', '.join('?' for _ in queued)})", [entry["id"] for entry in queued])
+            build.queue(self.db, rebuild, who="operator")
         if extra:  # an unrelated item, never built, queued beside them: the claim bundles it in
             fresh = create_item(self.db, kind="task", title="Unrelated", repo=str(self.repo), status="ready")
+            if other_failed:  # its own bundle, with an item left out here, failed in the lane before
+                gone = create_item(self.db, kind="task", title="Left behind", repo=str(self.repo), status="ready")
+                build.queue(self.db, [fresh, gone], who="operator")
+                lead = self.db.execute("SELECT id FROM assignment WHERE item = ?", (fresh,)).fetchone()[0]
+                self.db.execute("UPDATE assignment SET status = 'done', parent = ? WHERE item = ?", (lead, gone))
+                self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (lead,))
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "outcome, released_at, created_at, updated_at) VALUES ('other', ?, 1, ?, 'build/sd-other', "
+                    "'fixture', '', '', 'lane_failed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', "
+                    "'2026-01-01T00:00:00Z')", (lead, str(self.repo)))
+                self.assertEqual(len(build.run(self.db, "other")["members"]), 2)
             build.queue(self.db, [fresh], who="operator")
         again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
                             root=self.root / "worktrees")
@@ -4669,6 +4686,20 @@ class Tick(Case):
         self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3, "the unrelated item rides along")
         self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
         self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+
+    def test_a_rebuild_bundled_afresh_twice_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: a press cancelled before its claim left each item a newer assignment that
+        never ran, so the read found no lane-failed build and the branch started from main. The newest build
+        that ran is the one that counts."""
+        head, _ = self.rebuilt_after_lane_failure(2, rebundled=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_rebuild_beside_an_item_of_another_failed_bundle_starts_from_the_whole_one(self):
+        """Lane review of build/sd-1808: an item whose own earlier bundle failed in the lane, bundled in with a
+        whole failed bundle, named two runs, and the branch started from main. The whole one wins."""
+        head, _ = self.rebuilt_after_lane_failure(2, extra=True, other_failed=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
 
     def test_a_failed_branch_that_closes_an_item_outside_the_bundle_starts_from_main(self):
         """Review of build/sd-1808: the failed branch's commit closes an open item this bundle does not hold, one the
