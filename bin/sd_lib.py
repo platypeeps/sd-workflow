@@ -4359,6 +4359,12 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
     return [answers[index] for index in sorted(answers)]
 
 
+def finding_key(finding: Mapping[str, Any]) -> str:
+    """What makes two readers' findings copies of one for `distinct_findings`."""
+    return json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
+                      sort_keys=True, default=str)
+
+
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
@@ -4371,8 +4377,7 @@ def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, A
     seen: dict[str, dict[str, Any]] = {}
     cited: dict[str, list[str]] = {}
     for finding in findings:
-        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
-                         sort_keys=True, default=str)
+        key = finding_key(finding)
         kept = seen.setdefault(key, dict(finding))
         evidence, parts = finding.get("evidence"), cited.setdefault(key, [])
         if isinstance(evidence, str) and evidence.strip() and evidence not in parts:
