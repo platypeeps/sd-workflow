@@ -1892,17 +1892,17 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome], reb
     """Each prior blocker no listed rebuttal answers, unless every completed answer returned `fixed` for its id
     with evidence and no answer, failed or not, said `open` (pack sd:10087; a fallback's `fixed` must not clear
     what a failed reader found open): silence, a paraphrase, a nearby repeat or an `open` keeps it blocking, at
-    its stored place, with its stored evidence and each `open` answer's. With no completed answer nothing is
-    carried: the pass is incomplete and decides nothing."""
+    its stored place, with its stored evidence and each `open` answer's. With no completed answer nothing
+    clears: every blocker is carried, so an interrupted pass's report, a resume's input, keeps it (build/sd-2205)."""
     answered = [row for row in outcomes if row.status in (CLEAN, FINDINGS)]
     names = {f"B{index + 1}" for index in range(len(prior))}
     def _said(row: Outcome, name: str) -> list[dict[str, Any]]:  # an `open` naming no listed blocker holds every one
         return [given for given in row.verdicts if (key := given["id"].strip().upper()) == name or key not in names and given["verdict"] == "open"]
     kept = []
-    for index, old in enumerate(prior if answered else ()):
+    for index, old in enumerate(prior):
         name = f"B{index + 1}"
         opened = [given["evidence"] for row in outcomes for given in _said(row, name) if given["verdict"] == "open"]
-        if is_rebutted(rebutted, old) or not opened and all(_said(row, name) and all(
+        if is_rebutted(rebutted, old) or answered and not opened and all(_said(row, name) and all(
                 given["verdict"] == "fixed" and given["evidence"].strip() for given in _said(row, name)) for row in answered):
             continue
         notes = [old.get("evidence"), *opened]
@@ -2790,10 +2790,11 @@ def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed:
     """Keep every distinct finding, once, and every prior blocker `carried` holds; only complete answers count
     toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    disposed = dispose(collected, result["severity_floor"], rebutted, repro=repro) + carried(prior, outcomes, rebutted)
+    fresh = dispose(collected, result["severity_floor"], rebutted, repro=repro)
+    disposed = fresh + carried(prior, outcomes, rebutted)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []
-    if any(record.get("disposition") == "blocking" for record in disposed):
+    if any(record.get("disposition") == "blocking" for record in (disposed if reviewed else fresh)):  # an unread carry: incomplete
         status = "blocking"
     elif incomplete:
         failed = {outcome.status for outcome in outcomes}

@@ -1165,11 +1165,16 @@ class LineBudgetTests(unittest.TestCase):
         # Degraded input holds a prior blocker: a malformed verdict reads
         # as `open` (`held_verdicts`), and `followed` chains each commit's
         # renames. Measured: `sd-review` is 3132 here.
+        #
+        # 5102 -> 5103 is round 4 of build/sd-2205: `bin/sd-review` +1.
+        # A pass with no completed reader carries every prior blocker, so
+        # an interrupted report, a resume's input, keeps it with each
+        # `open` evidence. Measured: `sd-review` is 3133 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5102,
+            5103,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

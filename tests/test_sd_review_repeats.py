@@ -679,9 +679,17 @@ class PriorVerdictTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(verified(answer("one", verdicts=verdicts))["status"], status)
 
-    def test_no_completed_reader_carries_nothing(self) -> None:
-        result = verified(answer("one", status=sd_review.UNAVAILABLE))
-        self.assertEqual((result["status"], result["findings"]), (sd_review.UNAVAILABLE, []))
+    def test_an_interrupted_pass_keeps_every_prior_blocker_and_its_new_evidence(self) -> None:
+        # Review of build/sd-2205 (bin/sd-review:1902): a pass with no completed reader carried nothing, so its
+        # report, the next resume's input, lost each prior blocker and a failed reader's `open` evidence.
+        for label, verdicts, evidence in (("silent", (), REPRO),
+                                          ("open", [verdict("open", "python3 t.py: still 2")], f"{REPRO}\npython3 t.py: still 2"),
+                                          ("fixed", [verdict()], REPRO)):
+            with self.subTest(label):
+                result = verified(answer("one", status=sd_review.UNAVAILABLE, verdicts=verdicts))
+                [row] = result["findings"]
+                self.assertEqual((result["status"], result["completed_reviews"], row["disposition"], row["evidence"]),
+                                 (sd_review.UNAVAILABLE, 0, "blocking", evidence))
 
     def test_a_rebutted_prior_blocker_is_not_carried(self) -> None:
         rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
