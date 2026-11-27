@@ -1165,6 +1165,8 @@ class Supervise(Case):
         self.assertEqual([argv[argv.index("--resume") + 1] for argv in fixes], ["session-fixture"] * R)
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
         self.assertIn("- work.txt:1 a blocker", prompts[0], "the fix names each blocker")
+        self.assertIn("enumerate every instance", prompts[0], "sd:10903: round 1 is a class pass")
+        self.assertIn("from the code, not from the findings", " ".join(prompts[0].split()))
         self.assertFalse(any("class pass" in prompt for prompt in prompts[1:-1]))
         self.assertIn("class pass", prompts[-1], "sd:9263: the last round is a class pass")
         self.assertIn("- work.txt:1 a blocker", prompts[-1])
@@ -1187,8 +1189,8 @@ class Supervise(Case):
         self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R - E), "a late round did not escalate")
         self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "medium", "sd:10192")
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
-        self.assertNotIn("name the class", prompts[E - 1])
-        self.assertIn("name the class", prompts[E])
+        self.assertNotIn("These blockers repeat", prompts[E - 1])
+        self.assertIn("These blockers repeat", prompts[E])
         escalated = [body for (body,) in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))
                      if "escalated" in body]
         self.assertEqual(len(escalated), 1, "the escalation is not recorded once on the run's item")

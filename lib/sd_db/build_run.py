@@ -231,9 +231,13 @@ and its `test` to the argv of a test for it that runs and passes at that head, o
 `python3 -c` script: a failing one reproduces the finding, so fix it instead (sd:10893). Then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
 """
 
-FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in
-{worktree}, its item's `Closes: sd:N` trailer on it, then update the body at {body}. Never push. Your final
-message is your report.
+# sd:10903: round 1 is a class pass too: single-finding fixes drew the same class again the next round.
+FIX = """The review of branch {branch} found these blockers. Do a class pass, not a single-finding fix: name
+the class of each blocker, enumerate every instance of it in this change, from the code, not from the
+findings, and fix each one fail-first as a new commit in {worktree}, its item's `Closes: sd:N` trailer on it.
+Fix the class within this change's own scope: a new reader, audit or entry kind becomes its own item, not a
+commit here (sd:9584). Then update the body at {body}, each instance in its failure table if it has one.
+Never push. Your final message is your report: the class, each instance and its test.
 
 {blockers}
 """
