@@ -87,8 +87,9 @@ MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
 READ_SECONDS = 120
-# Ignored folders that `git worktree remove` may delete: tools rebuild them (pack sd:6979).
-DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache"})
+# Ignored folders that `git worktree remove` may delete: tools rebuild them (pack sd:6979). The same names as
+# repo-sync's `hyg_not_build` in the system repo, so a landed build worktree goes by either sweep (sd:10830).
+DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache", "node_modules", "target"})
 #: The pack checkout this module runs from: its `dashboard/dashboard.sh` is the health check.
 PACK = Path(__file__).resolve().parents[2]
 #: The `heartbeat` state row the tick writes first; a satellite's tick writes `<key>@<host>` (pack sd:7933).
@@ -936,10 +937,12 @@ def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> l
     return [name for name, path in zip(UNFINISHED, paths, strict=True) if Path(work, path).exists()]
 
 
-def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None) -> dict | None:
+def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None,
+               branch: str | None = None) -> dict | None:
     """The newest lane entry of any of `items` by enqueue order, from `sd-ship lane list`; None when there is none.
 
-    Any member: the entry's item is the first member the branch delivers.
+    Any member: the entry's item is the first member the branch delivers. With `branch`, only that branch's
+    entries: another branch's newer entry for a delivered item is not this run's (sd:10830).
     """
     try:
         answer = json.loads(_read([*ship, "-C", str(cwd), "lane", "list"], env=env))
@@ -948,7 +951,8 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env:
     entries = answer.get("entries") if isinstance(answer, dict) and answer.get("ok") else None
     if not isinstance(entries, list):
         raise Unread("sd-ship lane list gave no entries")
-    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items]
+    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items
+            and (branch is None or row.get("branch") == branch)]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
 
 

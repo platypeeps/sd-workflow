@@ -811,6 +811,16 @@ class Supervise(Case):
         self.assertEqual(found and found["id"], "e1")
         self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [5], env=self.env))
 
+    def test_the_lane_entry_of_a_branch_is_that_branchs(self):
+        """sd:10830: another branch's newer entry for a delivered item is not this run's; reading it kept a
+        merged run at `enqueued`, unreleased, so the sweep kept its worktree."""
+        (self.plans / "lane.json").write_text(json.dumps([
+            {"id": "e1", "item": 7, "status": "merged", "branch": "build/sd-1", "enqueue_seq": 1},
+            {"id": "e2", "item": 7, "status": "pending", "branch": "build/sd-2", "enqueue_seq": 2}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], env=self.env, branch="build/sd-1")
+        self.assertEqual(found and found["id"], "e1")
+        self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [7], env=self.env, branch="build/sd-3"))
+
     def test_an_unread_delivery_writes_nothing(self):
         """`cited` None (the commits were not read) is unknown: no enqueue, no outcome; the reap retries."""
         self.press()
@@ -5877,6 +5887,24 @@ class Sweep(Case):
         self.assertEqual(support.git(self.repo, "rev-parse", kept), head)
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn(kept, note["body"])
+
+    def test_ignored_build_output_does_not_keep_the_worktree(self):
+        """sd:10830: node_modules/ and target/ rebuild, as repo-sync's hygiene reads them; an ignored file
+        of that name, or any other ignored folder, still keeps the worktree."""
+        work = self.blocked()
+        self.done()
+        exclude = Path(support.git(self.repo, "rev-parse", "--git-common-dir"))
+        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        exclude.write_text("node_modules\ntarget\n.env\n")
+        (work / "target").write_text("data")
+        self.assertEqual(build_run.sweep(self.db), [], "a file named target is data")
+        (work / "target").unlink()
+        for folder in ("node_modules/left-pad", "target/debug"):
+            (work / folder).mkdir(parents=True)
+            (work / folder / "index.js").write_text("x")
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(work.exists())
 
     def test_a_head_off_its_branch_is_not_removed(self):
         """A worktree whose HEAD left its branch holds commits the branch's ref would not keep."""
