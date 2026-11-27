@@ -501,6 +501,20 @@ def fake_grep(files: dict[str, str], head: str, argv: list[str]) -> str:
                    for number, text in enumerate(body.splitlines(), 1) if any(test.search(text) for test in tests))
 
 
+#: A `CACHEDIR.TAG` as cargo writes it into `target/`.
+CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n"
+
+
+def cargo(work: Path, *folders: str) -> None:
+    """Commit a `Cargo.toml` in each of `folders` of `work` ("" for its top), as a real crate has beside
+    its `target/`."""
+    for folder in folders or ("",):
+        (work / folder).mkdir(parents=True, exist_ok=True)
+        (work / folder / "Cargo.toml").write_text("[package]\nname = \"example\"\n")
+        support.git(work, "add", "-f", str(Path(folder, "Cargo.toml")))
+    support.git(work, "commit", "-q", "-m", "add a manifest")
+
+
 def exclude(work: Path, patterns: str) -> None:
     """Ignore `patterns` in every worktree of `work`'s repository, through its common `info/exclude`."""
     common = Path(support.git(work, "rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -3903,6 +3917,15 @@ class Supervise(Case):
         prompt = self.calls("claude")[-1]["argv"]
         self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
+    def test_a_question_holds_no_build_of_a_held_split(self):
+        """Lane review of build/sd-1867: Build of a held split's items read their questions too, so a
+        pending one held a fresh Build that worked before; the press takes a held split as it stands."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        self.release_all()
+        add_note(self.db, self.items[0], "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        queued = build.queue_again(self.db, self.items[:2], who="operator")
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(self.items[:2]))
+
     def test_the_build_press_takes_a_held_bundles_items_fresh(self):
         """Row 12: the held bundle's refusal says Build; the dashboard's Build dialog checks each item (`_item`) and
         its press calls `queue`, not `queue_again`, so both take the blocked items and build them on a new branch."""
@@ -3955,6 +3978,11 @@ class Supervise(Case):
             if kind == "ignored":
                 exclude(work, "local.conf\n")
                 (work / "local.conf").write_text("the left item's setting\n")
+            elif kind == "tagged":
+                exclude(work, "config/\n")
+                (work / "config").mkdir()
+                (work / "config" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+                (work / "config" / "local.toml").write_text("the left item's setting\n")
             elif kind == "cache":
                 exclude(work, "__pycache__/\n")
                 (work / "__pycache__").mkdir()
@@ -3983,6 +4011,10 @@ class Supervise(Case):
     def test_a_split_guard_holds_an_ignored_leftover(self):
         """Row 18: an ignored local config outside a `DISPOSABLE` folder, which `kept_files` counts."""
         self.assert_split_first(self.left_out_of_a_retry(self.leftover("ignored")))
+
+    def test_a_split_guard_holds_config_in_a_tagged_folder(self):
+        """Lead ruling on build/sd-1867: a cache tag alone never makes ignored files disposable."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("tagged")))
 
     def pending(self, state):
         """`prepare` that leaves `state`, an unfinished Git operation, over a clean tree at the base: HEAD and
@@ -4756,22 +4788,86 @@ class Supervise(Case):
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("kept worktree", note["body"])
 
-    def test_cleaning_keeps_an_ignored_file(self):
-        """pack sd:6979: `git worktree remove` deletes ignored files, which plain `status --porcelain` omits."""
+    def test_cleaning_keeps_a_merged_worktree_that_holds_a_cargo_target(self):
+        """Pack sd:10506, class pass of build/sd-1867: no place in a cargo target proves a file there can be
+        rebuilt, so cleaning keeps the tree, and its note names the first file."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
         self.supervisor().run()
         work = Path(self.bundle["work_path"])
-        exclude(work, "__pycache__/\n.env\n")
-        (work / "__pycache__").mkdir()
-        (work / "__pycache__" / "x.pyc").write_bytes(b"x")
+        cargo(work)
+        exclude(work, "target/\n")
+        (work / "target" / "debug").mkdir(parents=True)
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
+        (work / "target" / "debug" / "app").write_bytes(b"x")
+        (work / "target" / "debug" / ".cargo-lock").write_bytes(b"")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "target" / "debug" / "app").read_bytes(), b"x")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_keeps_an_ignored_local_file(self):
+        """Review of build/sd-1867, pack sd:6979: `git worktree remove` deletes ignored files, and an ignored
+        `.env` is local work, not build output: it keeps the tree, whatever build output sits beside it."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, "target/\n.env\n")
+        (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
         self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("!! .env", note["body"])
+
+    def test_cleaning_keeps_ignored_config_beside_a_real_cache(self):
+        """Lead ruling on build/sd-1867 (notes #82533, #82540, #82541): a cache tag alone never makes ignored
+        files disposable. A hand-edited config in a tagged folder keeps the tree, as a cargo target does."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        cargo(work)
+        exclude(work, "target/\nconfig/\n.ruff_cache/\n")
+        for folder in (work / "target", work / "config"):
+            folder.mkdir()
+            (folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
+        (work / "config" / "local.toml").write_text("token = \"change-me\"\n")
+        (work / "target" / ".env").write_text("TOKEN=change-me\n")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "target" / ".env").read_text(), "TOKEN=change-me\n")
+        self.assertEqual((work / "config" / "local.toml").read_text(), "token = \"change-me\"\n")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_keeps_an_untracked_file(self):
+        """An untracked file is work no merge carried: cleaning still keeps its tree."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, "target/\n")
+        (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / "out.bin").write_bytes(b"x")
+        (work / "notes.txt").write_text("x\n")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / "notes.txt").exists())
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("?? notes.txt", note["body"])
 
     def test_cleaning_removes_a_clean_worktree(self):
         self.press()
@@ -6545,14 +6641,81 @@ class Sweep(Case):
         """Lane review: `git worktree remove` deletes ignored files, and plain `status --porcelain` omits them."""
         work = self.blocked()
         self.done()
-        common = Path(support.git(work, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        (common / "info").mkdir(exist_ok=True)
-        (common / "info" / "exclude").write_text(".env\n")
+        exclude(work, ".env\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.assertEqual(support.git(work, "status", "--porcelain"), "", "the plain read sees a clean tree")
         self.assertEqual(build_run.sweep(self.db), [])
         self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
         self.assertNotEqual(self.branches(), "")
+
+    def test_no_place_in_a_cargo_target_makes_a_file_disposable(self):
+        """Review of build/sd-1867, the class pass. The class: where an ignored file sits (a folder's name,
+        a cache tag, a manifest beside it, cargo's lock) stood in for proof that the file itself can be
+        rebuilt. Cargo records no list of its files, so each place cargo writes can hold the only copy of
+        a local one. Every ignored file of a complete cargo target keeps the tree, row by row."""
+        work = self.blocked()
+        self.done()
+        cargo(work, "", "crates/one")
+        exclude(work, "target/\n")
+        rows = {
+            "CACHEDIR.TAG": CACHE_TAG,                              # the tag and the manifest
+            ".rustc_info.json": "{}\n",                             # a cargo file name at the top
+            ".env": "TOKEN=change-me\n",                            # a local file at the top
+            "debug/.cargo-lock": "",                                # the lock itself
+            "debug/captured-input.bin": "x",                        # a captured input in a locked profile
+            "debug/deps/captured-input.bin": "x",                   # below a locked profile
+            "debug/build/example-0a1b/out/captured-input.bin": "x",  # a build script's output folder
+            "debug/incremental/captured-input.bin": "x",
+            "example-triple/release/.cargo-lock": "",               # a target triple's profile
+            "example-triple/release/captured-input.bin": "x",
+        }
+        for target in ("target", "crates/one/target"):
+            for path, text in rows.items():
+                (work / target / path).parent.mkdir(parents=True, exist_ok=True)
+                (work / target / path).write_text(text)
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(),
+                         sorted(f"!! {target}/{path}" for target in ("crates/one/target", "target")
+                                for path in rows))
+        self.assertEqual(build_run.sweep(self.db), [])
+        for path in rows:
+            self.assertTrue((work / "target" / path).is_file(), path)
+
+    def test_a_folder_only_named_like_build_output_keeps_the_tree(self):
+        """Review of build/sd-1867, the class: a folder's name alone made its ignored files disposable, so local
+        files under any `target/`, `node_modules/` or `.venv/` went with the tree. No name decides."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "target/\nnode_modules/\n.venv/\n*.local\n")
+        (work / "docs" / "target").mkdir(parents=True)
+        (work / "docs" / "target" / "notes.local").write_text("mine\n")
+        (work / "node_modules").mkdir()
+        (work / "node_modules" / "patch.js").write_text("mine\n")
+        (work / ".venv").mkdir()
+        (work / ".venv" / "secrets.cfg").write_text("mine\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)),
+                         "!! .venv/secrets.cfg\n!! docs/target/notes.local\n!! node_modules/patch.js")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "docs" / "target" / "notes.local").read_text(), "mine\n")
+
+    def test_the_sweep_keeps_ignored_config_beside_a_real_cache(self):
+        """Lead ruling on build/sd-1867: a cache tag makes no folder build output, so a hand-edited config in
+        one keeps the tree; a real cache (`__pycache__`) beside it changes nothing."""
+        work = self.blocked()
+        self.done()
+        cargo(work)
+        exclude(work, "target/\nconfig/\nout/\n__pycache__/\n")
+        for folder in ("target", "config", "out"):
+            (work / folder).mkdir()
+            (work / folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
+        (work / "__pycache__").mkdir()
+        (work / "__pycache__" / "x.pyc").write_bytes(b"x")
+        (work / "config" / "local.toml").write_text("mine\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
+            "!! config/CACHEDIR.TAG", "!! config/local.toml", "!! out/CACHEDIR.TAG",
+            "!! target/.rustc_info.json", "!! target/CACHEDIR.TAG"])
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "config" / "local.toml").read_text(), "mine\n")
 
     def test_a_tree_with_only_caches_is_swept(self):
         """pack sd:6979: a disposable cache is no reason to keep a tree; another ignored file still is."""
@@ -7322,6 +7485,184 @@ class Drafts(Case):
         self.park_bundle()
         queued = build.retry(self.db, self.bundle["assignment"], who="operator")["queued"]
         self.assertEqual([row["item"] for row in queued], [code, design])
+
+    def test_a_blocked_design_builds_again_after_its_code_bundle_ships(self):
+        """Pack sd:10294: a design the builder skipped with an open question ended blocked, and its code
+        bundle shipped. Retry refused, as the lead is done, and Build pressed it fresh, which refused a
+        blocked item. Once ruled, Build queues its ride again."""
+        design = self.designed("draft-plain")
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        build.queue(self.db, [code], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
+        asked = add_note(self.db, design, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [code]))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (code,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"question note #{asked}"):
+            build.queue_again(self.db, [design], who="operator")
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, design, "decision", f"Ruling on note #{asked}: A")
+        resolve_note(self.db, asked)
+        [ride] = build.queue_again(self.db, [design], who="operator")
+        self.assertEqual((ride["item"], ride["status"], ride["scope"]), (design, "queued", build.SCOPE))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "ready")
+
+    def test_a_blocked_task_builds_again_only_once_its_question_is_answered(self):
+        """Review of build/sd-1867: Build lifted a task its run blocked on a builder question to ready once
+        its bundle shipped, and the press checks no question on a task, so it built before the answer."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+
+    def test_the_dashboard_press_builds_an_answered_item_its_bundle_left_blocked(self):
+        """Review of build/sd-1867: only `queue_again` lifted a build's own block. The dashboard's dialog
+        check (`_item`) and its press (`queue`) refused the item as blocked, answered or not."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        for check in (lambda: build._item(self.db, second), lambda: build.queue(self.db, [second], who="dashboard")):
+            with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+                check()
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        build._item(self.db, second)
+        [again] = build.queue(self.db, [second], who="dashboard")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "ready")
+
+    def test_the_dashboard_press_leaves_a_retryable_bundles_block(self):
+        """Class pass of build/sd-1867: a member whose bundle Retry still takes keeps its block on a
+        press: a fresh build would leave the bundle's branch behind."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        self.db.execute("UPDATE assignment SET status = 'blocked', result = ? WHERE id = ? OR parent = ?",
+                        (f"build run {bundle['id']} ended", lead, lead))
+        for item in (first, second):
+            writes.transition(self.db, item, "blocked", who="build", reason=f"build run {bundle['id']} ended")
+        with self.assertRaisesRegex(build.BuildRefused, "is blocked"):
+            build.queue(self.db, [second], who="dashboard")
+
+    def test_build_keeps_an_operator_block_newer_than_its_run(self):
+        """Review of build/sd-1867: Build lifted any blocked item whose newest build ended blocked, so an
+        operator's later block went too. Only the build's own block, still the item's latest, lifts."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        writes.transition(self.db, second, "ready", who="operator")
+        writes.transition(self.db, second, "blocked", who="operator", reason="hold for the vendor")
+        with self.assertRaises(build.BuildRefused):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the operator's block stays")
+
+    def test_a_later_run_of_the_bundle_does_not_hide_the_blocking_question(self):
+        """Review of build/sd-1867: Build read questions from the bundle's newest run. A lane Fix claims
+        the bundle again after the run that blocked a skipped task, so its question went unread and the
+        task built unanswered. Questions are read from the run that blocked the item."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix",
+                              stamp="2999-01-01T00:00:00Z")  # the Fix's claim, since ended
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
+    def test_a_rebuild_claimed_at_the_block_stamp_does_not_hide_the_question(self):
+        """Class pass of build/sd-1867: Build found the run that blocked an item by time, so a lane rebuild
+        claimed in the block's own second read as that run and hid the question. The block's reason names
+        its run, and that run is the one read."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?", (bundle["id"],))
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:01Z' WHERE id = ?", (asked,))
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        ended = self.db.execute("SELECT ended FROM assignment WHERE item = ? AND status = 'blocked'",
+                                (second,)).fetchone()[0]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix", stamp=ended)
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
+    def test_a_block_that_names_no_run_reads_every_question(self):
+        """Class pass of build/sd-1867: a build block whose reason names no run of its bundle has no run to
+        read questions from, so no time stands in for one: every pending question holds the Build."""
+        self.assertEqual(build._blocking_run(self.db, 1, "refused; not built"), None)
+        self.assertEqual(build._blocking_run(self.db, 1, "build run " + "f" * 32 + " ended"), None,
+                         "a run id no run of this bundle holds")
+
+    def test_build_reads_only_the_questions_its_blocking_run_raised(self):
+        """Lane review of build/sd-1867: Build refused a run-blocked item on any pending question, so an
+        unrelated one asked before that build was queued held a Build that worked before."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        older = add_note(self.db, second, "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = ? WHERE id = ?", ("2000-01-01T00:00:00Z", older))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
 
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""

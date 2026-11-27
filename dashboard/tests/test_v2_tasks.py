@@ -2415,6 +2415,21 @@ if (D) { D.returnValue = 'build'; D.onclose(); await flush(); }"""
         self.assertIs(out["R"]["on"], True)
         self.assertIn("a build takes a ready task", out["R"]["off"])
 
+    def test_build_is_on_for_a_blocked_item_its_own_build_left_behind(self):
+        """Review of build/sd-1867: the press takes an item its own build blocked once its bundle shipped
+        (`build._rebuild_since`), but the row's flag read a held split only, so Build stayed greyed out."""
+        from sd_db import build
+
+        left, other = self.ids["plan"], self.ids["port"]
+        for item in (left, other):
+            self.connection.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
+        with patch.object(build, "_rebuild_since", side_effect=lambda connection, item: "" if item == left else None):
+            self.doc = tasks_screen.document(self.connection, now=NOW)
+        out = self.run_page(f"R.on = cmd('item.build').when(C.get('{left}'));"
+                            f" R.off = cmd('item.build').when(C.get('{other}'));", "() => [404, {}]")
+        self.assertIs(out["R"]["on"], True)
+        self.assertIn("a build takes a ready task", out["R"]["off"])
+
     def test_build_is_off_for_a_kind_no_build_takes_and_names_the_edit(self):
         """Pack sd:8532. build._item refuses a kind outside runner.RUNNABLE_KINDS, so a ready followup with a repository
         offers Build greyed out, with why and the command that makes it a task; a ready task in the same repo is on."""
