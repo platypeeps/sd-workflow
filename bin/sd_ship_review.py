@@ -840,8 +840,11 @@ class SharedReview:
         return (self.state.get("binding") == self.runtime.binding(self.root) or self.tools_only_moved()
                 or self.request_unchanged())
 
-    def tools_only_moved(self) -> bool:
-        """Operator 2026-11-27: only review tools moved, so the receipt is rebound and kept, no pass spent."""
+    def tools_only_moved(self, *, save: bool = True) -> bool:
+        """Operator 2026-11-27: only review tools moved, so the receipt is rebound and kept, no pass spent.
+
+        `save=False` only answers: the held-review path records its result first, and a rebind saved
+        before it would strand that result if the process stopped between the two writes."""
         changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
         if (not sd_lib.TOOL_CHANGES_KEEP_REVIEWS or manifest is None or not changed
                 or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
@@ -850,6 +853,8 @@ class SharedReview:
         current = manifest(self.root)
         if (self.state.get("binding_manifest") or {}).get("policy") != current["policy"]:
             return False
+        if not save:
+            return True
         passes = self.history.native(self.state)
         kept = {"head": passes[-1].get("head") if passes else None, "recorded_at": self.runtime.clock(),
                 "superseded_binding": self.state.get("binding"), "changed": [list(row) for row in changed],
@@ -1302,7 +1307,7 @@ class SharedReview:
         moved = sorted(name for name in expected if held.get(name) != expected[name])
         if moved:
             return refuse_held(path, f"bound to another {', '.join(moved)}")
-        if not self.binding_holds():
+        if self.state.get("binding") != self.runtime.binding(self.root) and not self.tools_only_moved(save=False):
             return refuse_held(path, "the review tools or policy changed since it ran")
         try:
             outcome = record["result"]
