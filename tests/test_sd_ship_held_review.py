@@ -57,11 +57,13 @@ class HeldReview(unittest.TestCase):
         self.folder = pathlib.Path(scratch.name) / "review"
         self.hub = Hub()
 
-    def prepare(self, *, key="key", head=HEAD, binding="binding", report_changes=None, args=None):
+    def prepare(self, *, key="key", head=HEAD, binding="binding", report_changes=None, args=None, manifest=None):
         """One prepare's review against `self.hub`, with the held folder under the test's own folder."""
         review, process = self.context(state=self.hub.state, head=head, report_changes=report_changes)
         review.runtime = dataclasses.replace(review.runtime, held=lambda _root: self.folder,
                                              binding=lambda _root: binding)
+        if manifest is not None:
+            review.runtime = dataclasses.replace(review.runtime, manifest=manifest)
         review.store, review.key, review.revision = self.hub, key, self.hub.revision
         for name, value in (args or {}).items():
             setattr(review.args, name, value)
@@ -262,6 +264,30 @@ class HeldReview(unittest.TestCase):
                          {"phase": "new", "head": "absent", "binding": "old-binding",
                           "binding_manifest": {"tools": "old"}, "review_clearance": {"cleared": "old"}})
         self.assertEqual(self.held_files(), [])
+
+    def test_a_tool_move_resumes_the_held_review_and_a_stop_after_one_save_loses_nothing(self):
+        """Lead review of sd:10928: the resume rebinds no receipt before it records the held result."""
+        def manifest(verdict):
+            return lambda _root: {"schema": 2, "normalizer": "n", "verdict": {"sd-review": verdict},
+                                  "gate": {}, "check": {}, "policy": {"local": "p"}}
+
+        self.review_done_then_hub_down(binding="binding", manifest=manifest("before"))
+        review, _process = self.prepare(binding="moved", manifest=manifest("after"))
+        saves = []
+        reserve = self.hub.save
+
+        def save(*args):
+            saves.append(args[3])
+            if len(saves) > 1:
+                raise HubDown("stopped after one save")
+            return reserve(*args)
+        review.store = unittest.mock.Mock(save=unittest.mock.Mock(side_effect=save))
+        with contextlib.suppress(HubDown), contextlib.redirect_stderr(io.StringIO()):
+            review.review(HEAD)
+        review, process = self.prepare(binding="moved", manifest=manifest("after"))
+        self.run_review(review)
+        self.assertEqual(process.call_count, 0, "the completed review was set aside and run again")
+        self.assertEqual(self.hub.state["passes"][-1]["report"]["status"], "clean")
 
     def test_a_named_provider_is_checked_against_the_resumed_review(self):
         """Codex review of sd:3340: a resume returned before `--provider` was compared with the receipt."""
