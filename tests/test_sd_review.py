@@ -45,6 +45,7 @@ def load_module() -> Any:
 
 sd_review = load_module()
 from tests import row_seed  # noqa: E402
+from tests.clean_env import clean_environment  # noqa: E402
 
 
 class FakeRunner:
@@ -1175,6 +1176,117 @@ class PipelineTests(ReviewFixture):
         self.assertNotIn("--timeout SECONDS", text)
         self.assertIn("the lane runs the full gate", text)
         self.assertIn("sd gate status", text)
+
+    def _topic_commit(self, root: pathlib.Path, name: str) -> str:
+        (root / name).write_text("y = 2\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(root), check=True, capture_output=True, env=clean_environment())
+        subprocess.run(["git", "commit", "--quiet", "-m", name], cwd=str(root), check=True, capture_output=True, env=clean_environment())
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root), check=True, capture_output=True,
+                              text=True, env=clean_environment()).stdout.strip()
+
+    def test_the_base_question_names_the_main_merge_base_in_every_code_scope(self) -> None:
+        """sd:10892 review: the `base` answer is judged against the merge base with the default branch,
+        by commit, whatever the diff's own base is: a fix pass's `--base` (a branch commit) or the
+        worktree's HEAD would let a defect an earlier branch commit added read as on main."""
+        root = self.make_repo()
+        main = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root), check=True, capture_output=True,
+                              text=True, env=clean_environment()).stdout.strip()
+        subprocess.run(["git", "checkout", "--quiet", "-b", "topic"], cwd=str(root), check=True, env=clean_environment())
+        prior = self._topic_commit(root, "first.py")
+        self._topic_commit(root, "second.py")
+        self.prepare(root)
+        branch = sd_review.resolve_subject(root, "branch")
+        self.assertEqual(branch.main_base, main)
+        self.assertIn(sd_review.base_ask(branch), sd_review.build_prompt(branch, False, ""))
+        self.assertIn(main, sd_review.base_ask(branch))
+        self.assertNotIn(prior, sd_review.base_ask(branch))
+        for subject in (sd_review.resolve_subject(root, "worktree"), sd_review.resolve_subject(root, "branch", base=prior)):
+            with self.subTest(scope=subject.scope, base=subject.base):  # round 4: its diff is not on main_base
+                self.assertEqual(subject.main_base, main)
+                self.assertEqual(sd_review.base_ask(subject), "")
+                self.assertNotIn("base says", sd_review.build_prompt(subject, False, ""))
+
+    def test_no_base_question_without_a_main_merge_base(self) -> None:
+        """Planning, or a repository with no default branch to measure from, asks nothing, so a
+        `has` answer there cannot downgrade a blocker."""
+        root = self.make_repo()
+        subprocess.run(["git", "branch", "-m", "main", "trunk"], cwd=str(root), check=True, env=clean_environment())
+        self.prepare(root)
+        subject = sd_review.resolve_subject(root, "worktree")
+        self.assertEqual(subject.main_base, "")
+        self.assertEqual(sd_review.base_ask(subject), "")
+        self.assertNotIn("base says", sd_review.build_prompt(subject, False, ""))
+
+    def test_a_has_answer_holds_only_where_git_shows_the_place_unchanged_since_the_main_merge_base(self) -> None:
+        """sd:10892 last round: a reader's `base: has` is a claim. It downgrades only from a reader that
+        reads the checkout, and only when every place the finding names is a line of a file the named
+        merge base holds and nothing since, committed or not, has touched. Everything else blocks."""
+        root = self.make_repo()
+        (root / "lib.py").write_text("a = 1\nb = 2\nc = 3\nd = 4\ne = 5\n", encoding="utf-8")
+        self._topic_commit(root, "seed.py")  # on main: lib.py and seed.py
+        subprocess.run(["git", "checkout", "--quiet", "-b", "topic"], cwd=str(root), check=True, env=clean_environment())
+        (root / "lib.py").write_text("a = 1\nb = 20\nc = 3\nd = 4\ne = 5\n", encoding="utf-8")
+        prior = self._topic_commit(root, "first.py")  # an earlier branch commit changes lib.py:2
+        self._topic_commit(root, "second.py")
+        (root / "lib.py").write_text("a = 1\nb = 20\nc = 3\nd = 4\ne = 50\n", encoding="utf-8")  # uncommitted: lib.py:5
+        (root / "loose.py").write_text("z = 0\n", encoding="utf-8")  # untracked
+
+        def row(path: str = "lib.py", line: Any = 4, **extra: Any) -> dict[str, Any]:
+            return {"path": path, "line": line, "backend": "local", "base": "has"} | extra
+
+        cases = (("an untouched line of a file on main", row(), True),
+                 ("with untouched instances", row(instances=["lib.py:4", "seed.py:1"]), True),
+                 ("a reader handed only a patch", row(backend="remote"), False),
+                 ("no backend named", {"path": "lib.py", "line": 4, "base": "has"}, False),
+                 ("a line an earlier branch commit changed", row(line=2), False),
+                 ("the line after a changed one", row(line=3), True),
+                 ("one instance on a changed line", row(instances=["lib.py:4", "lib.py:2"]), False),
+                 ("a file the branch added", row(path="first.py", line=1), False),
+                 ("no line", row(line=None), False),
+                 ("a line that is not a number", row(line="4; x"), False),
+                 ("an instance with no line", row(instances=["lib.py"]), False),
+                 ("a path outside the repository", row(path="../lib.py"), False),
+                 ("a path that is an option", row(path="--output=x"), False))
+        check = sd_review.base_check(root, sd_review.resolve_subject(root, "branch"), {"local"})
+        for label, finding, held in cases:
+            with self.subTest(label):
+                self.assertIs(check(finding), held)
+        # round 4: a reader whose diff is against another base (a fix pass's `--base`, the worktree's
+        # HEAD) judged the defect on that diff, not on the main merge base: nothing holds.
+        for subject in (sd_review.resolve_subject(root, "branch", base=prior), sd_review.resolve_subject(root, "worktree")):
+            with self.subTest(base=subject.base):
+                self.assertNotEqual(subject.base, subject.main_base)
+                self.assertIs(sd_review.base_check(root, subject, {"local"})(row()), False)
+        self.assertFalse((root / "x").exists())
+
+    def test_a_has_answer_holds_on_no_file_the_branch_changed_outside_its_lines(self) -> None:
+        """sd:10892 round 5: git shows a mode change, a deletion or a rename outside the line hunks a
+        `-U0` diff counts. A file the branch changed that way is touched at every line: nothing holds."""
+        root = self.make_repo()
+        names = ("tool.sh", "gone.py", "moved.py", "linked.py", "kept.py")
+        for name in names:
+            (root / name).write_text("a = 1\nb = 2\nc = 3\nd = 4\n", encoding="utf-8")
+        (root / "tool.sh").chmod(0o755)
+        self._topic_commit(root, "seed.py")
+        subprocess.run(["git", "checkout", "--quiet", "-b", "topic"], cwd=str(root), check=True, env=clean_environment())
+        (root / "tool.sh").chmod(0o644)  # the execute bit removed
+        (root / "gone.py").unlink()
+        (root / "moved.py").rename(root / "elsewhere.py")
+        (root / "linked.py").unlink()
+        (root / "linked.py").symlink_to("kept.py")
+        self._topic_commit(root, "first.py")
+        check = sd_review.base_check(root, sd_review.resolve_subject(root, "branch"), {"local"})
+        for name, held in (("kept.py", True), ("tool.sh", False), ("gone.py", False),
+                           ("moved.py", False), ("linked.py", False)):
+            with self.subTest(name):
+                self.assertIs(check({"path": name, "line": 3, "backend": "local", "base": "has"}), held)
+
+    def test_no_has_answer_holds_without_a_main_merge_base(self) -> None:
+        root = self.make_repo()
+        subprocess.run(["git", "branch", "-m", "main", "trunk"], cwd=str(root), check=True, env=clean_environment())
+        self.prepare(root)
+        check = sd_review.base_check(root, sd_review.resolve_subject(root, "worktree"), {"local"})
+        self.assertIs(check({"path": "README.md", "line": 1, "backend": "local", "base": "has"}), False)
 
     def test_the_code_prompt_names_the_six_operator_listed_defect_classes(self) -> None:
         """sd:1635: the classes a retired manual checklist held, named in the lane's own prompt."""
