@@ -270,6 +270,14 @@ def families(connection, config: Path | None = None) -> dict:
     return {"state": "partial" if problems else "read", "source": source, "problems": problems, "list": found}
 
 
+def local_day(stamp: str, *, tz=None) -> str | None:
+    """The local date of an ISO stamp, in `tz` (the machine's by default); None for one that does not read."""
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(tz).date().isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def local_days(now: str, *, tz=None) -> list[str]:
     """The last `DAYS` local dates, oldest first, ending on the local date of `now`."""
     today = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(tz).date()
@@ -439,7 +447,9 @@ def document(connection, *, now: str, jobs=None, tz=None, config: Path | None = 
     root = getattr(backend, "cron_root", None)
     logs = None if root is None else Path(root) / "logs"
     keep = (lambda rows, key: rows) if only is None else (lambda rows, key: [row for row in rows if row[key] in only])
-    for source, collect in (("reports", lambda: keep(_reports(connection), "job")),
+    # sd:10438: each report's local day, in the zone the cadence's days are in, so both group a run alike.
+    dated = lambda rows: [{**row, "day": local_day(row["at"], tz=tz)} for row in rows]  # noqa: E731
+    for source, collect in (("reports", lambda: dated(keep(_reports(connection), "job"))),
                             ("jobs", lambda: keep(_jobs(connection, backend), "name")),
                             ("cadence", lambda: cadence(out["jobs"], logs, days)),
                             *((("html", _html_folders),) if only is None else ())):

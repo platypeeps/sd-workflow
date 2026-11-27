@@ -182,6 +182,21 @@ class BuildRoutes(Fixture):
         self.assertEqual({member["item"] for member in build.run(self.connection, claimed["id"])["members"]},
                          {row["id"] for row in out["bundles"][0]["items"]})
 
+    def test_the_plan_puts_a_ride_in_the_bundle_the_claim_leads_first(self):
+        """sd:10693: one press made an ordinary bundle and a P1 bundle; the plan put the ride in the first in
+        press order, while the claim takes the P1 lead first, by priority, and the ride joins it."""
+        ride = self.designed()
+        plain, p1 = self.ready(), self.ready(priority=1, fields={"area": "alpha"})
+        out = builds.plan(self.connection, [plain, p1], now=NOW,
+                          sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0, "why": ""}},
+                          gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual([[row["id"] for row in bundle["items"]] for bundle in out["bundles"]],
+                         [[plain], [p1, ride]])
+        build.queue(self.connection, [plain, p1], who="operator")
+        claimed = build.claim(self.connection, owner="fixture", root=self.path.parent / "worktrees", **IDLE)
+        self.assertEqual({member["item"] for member in build.run(self.connection, claimed["id"])["members"]},
+                         {p1, ride})
+
     def test_the_plan_shows_each_items_wait_before_the_press(self):
         """Pack sd:8964: a readied item that waited on outside work showed nothing of it in the Build dialog.
         Each item carries its parked_at and the reason of its latest move to planning or blocked that gave one."""
