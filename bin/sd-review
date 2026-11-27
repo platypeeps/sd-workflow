@@ -371,6 +371,26 @@ def base_ask(subject: Subject) -> str:
             + "; ".join(f"{name}: {why}" for name, why in BASES.items()) + ".") if subject.main_base else ""
 
 
+def base_check(root: pathlib.Path, subject: Subject, readers: set[str]) -> Callable[[Mapping[str, Any]], bool]:
+    """Whether a finding's `base: has` holds: a claim, so git decides (sd:10892 last round). It holds only from
+    one of `readers`, who read the checkout (a patch shows no named commit), and only when every place it names
+    is a line of a file the main merge base holds that nothing since, committed or not, touched. A deleted
+    line counts as touching the lines beside it. Git failing, or no merge base, holds nothing."""
+    spec = subject.main_base if subject.head == "worktree" else f"{subject.main_base}..{subject.head}"
+    def _untouched(place: str) -> bool:
+        path, _, line = place.rpartition(":")
+        if not path or re.fullmatch(r"[0-9]+", line) is None or sd_lib.git_output(["cat-file", "-e", f"{subject.main_base}:{path}"], root) is None:
+            return False
+        diff = sd_lib.git_output(["diff", "-U0", "--text", "--no-ext-diff", spec, "--", path], root)
+        return diff is not None and not any(
+            int(start) <= int(line) <= int(start) + (int(count or 1) or 2) - 1  # `,0`: a deletion, both sides
+            for start, count in re.findall(r"^@@ -[0-9,]+ \+([0-9]+)(?:,([0-9]+))? @@", diff, re.M))
+    def _holds(row: Mapping[str, Any]) -> bool:
+        return bool(subject.main_base) and row.get("backend") in readers and all(
+            _untouched(place) for place in (f"{row.get('path')}:{row.get('line')}", *_instances(row.get("instances"))))
+    return _holds
+
+
 def _numstat(root: pathlib.Path, args: list[str]) -> tuple[list[str], int]:
     try:
         return sd_review_material.changed(root, args)
@@ -1857,13 +1877,14 @@ def run_provider(
 
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
             rebutted: Sequence[Rebuttal] = (), *, repro: bool = False,
-            prior: Sequence[Mapping[str, Any]] = (), base_asked: bool = False) -> list[dict[str, Any]]:
+            prior: Sequence[Mapping[str, Any]] = (),
+            on_base: Callable[[Mapping[str, Any]], bool] | None = None) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
     A finding at the floor posts as advisory, its summary saying why, when it cites no `evidence` and repeats
     one rebutted on this branch (pack sd:9270), or, with `repro`, outside the lane's own `LANE_PATHS` (pack
-    sd:9867, note #70162), a `synthetic` trigger (sd:10288), or, with `repro` and `base_asked` (the prompt named
-    the default branch's merge base), a defect that merge base already has (sd:10892). Only that evidence exists is read.
+    sd:9867, note #70162), a `synthetic` trigger (sd:10288), or, with `repro`, a defect the main merge base already
+    has, when `on_base` (`base_check`) confirms the reader's `has` (sd:10892). Only that evidence exists is read.
     A prior blocker is not a finding here: `carried` decides it by verdict (pack sd:10087).
     """
 
@@ -1878,7 +1899,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     def _synthetic(row: Mapping[str, Any]) -> bool:  # a repro nothing real carries, not the lane's own (sd:10288, note #77932)
         return repro and _floor(row) and row.get("trigger") == "synthetic" and str(row.get("path") or "").strip() not in LANE_PATHS
     def _downgrade(record: dict[str, Any]) -> str | None:  # why a blocker posts as advisory
-        if repro and base_asked and record.get("base") == "has":  # main already has it: filed, not this change's (sd:10892)
+        if repro and on_base is not None and record.get("base") == "has" and on_base(record):  # main already has it: filed, not this change's (sd:10892)
             return ON_BASE_NOTE
         cited = isinstance(record.get("evidence"), str) and record["evidence"].strip()
         return None if cited and not _synthetic(record) else SYNTHETIC_NOTE if _synthetic(record) else NO_REPRO_NOTE if repro and str(
@@ -2732,7 +2753,8 @@ def review(
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       [row._replace(path=spelled(row.path), instances=tuple(respelled(spelled, {"instances": list(row.instances)})["instances"]))
                        for row in rebutted], subject.scope != "planning",
-                      followed(root, previous, subject.head) if previous else (), bool(base_ask(subject)))
+                      followed(root, previous, subject.head) if previous else (),
+                      base_check(root, subject, {provider.name for provider in chosen if reads_checkout(provider)}))
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:
@@ -2916,11 +2938,12 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
                   rebutted: Sequence[Rebuttal] = (), repro: bool = False,
-                  prior: Sequence[Mapping[str, Any]] = (), base_asked: bool = False) -> dict[str, Any]:
+                  prior: Sequence[Mapping[str, Any]] = (),
+                  on_base: Callable[[Mapping[str, Any]], bool] | None = None) -> dict[str, Any]:
     """Keep every distinct finding, once, and every prior blocker `carried` holds; only complete answers count
     toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    fresh = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior, base_asked=base_asked)
+    fresh = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior, on_base=on_base)
     disposed = fresh + carried(prior, outcomes, rebutted)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []

@@ -1219,11 +1219,17 @@ class LineBudgetTests(unittest.TestCase):
         # commit (`Subject.main_base`, `base_ask`), never the diff's own
         # base, and only a review that asked it downgrades a `has`.
         # Measured: `sd-review` is 3263.
+        #
+        # 5233 -> 5256 is the sd:10892 last round: `bin/sd-review` +23 for
+        # `base_check`, so a reader's `base: has` downgrades only from a
+        # reader of the checkout and only where git shows every named
+        # place untouched since the main merge base. Measured:
+        # `sd-review` is 3286.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5233,
+            5256,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
