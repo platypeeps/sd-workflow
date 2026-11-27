@@ -1036,6 +1036,14 @@ def holds_fix(old: list[bytes], fixed: list[bytes], text: list[bytes]) -> bool:
     return True
 
 
+def puts_back(old: list[bytes], fixed: list[bytes], base: list[bytes]) -> bool:
+    """Whether a cited commit that changed `old` to `fixed` put back a line `base` holds and `old` lacked: it
+    undid part of an earlier branch commit, so a file back as `base` holds it may still ship the fix, and
+    the base read says nothing (sd:10214, class pass 19). A blank line is no text."""
+    # ponytail: added lines only; a fix that deletes a line a draft added reads as no put-back.
+    return any(line.strip() for line in (set(fixed) - set(old)) & set(base))
+
+
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
                base: str = "") -> list[tuple[str, str]]:
     """`commits` (newest first), each cited one a later hand-written revert undid with its message emptied (sd:8373).
@@ -1264,7 +1272,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         # ponytail: one walk per file and read; cache reads per commit if a wide commit makes this slow.
         judged = []
         for name in names:
-            verdicts = [undone(index, [name], before) for before in befores]
+            texts = [lines((blobs(rev, [name]) or {}).get(name)) or [] for rev in (f"{commits[index][0]}^",
+                                                                                  commits[index][0], *befores[1:])]
+            verdicts = [undone(index, [name], before) for at, before in enumerate(befores)
+                        if not at or not puts_back(texts[0], texts[1], texts[at + 1])]
             if True in verdicts or False in verdicts:
                 judged.append(True in verdicts)
         return bool(judged) and all(judged)
