@@ -284,6 +284,22 @@ class DispositionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ship.Refusal, "prepare again"):
                     self.operation().check_review(self.head)
 
+    def test_a_test_that_skips_or_expects_its_failure_is_no_pass(self):
+        """sd:10893 class pass: exit 0 is no pass when the run skipped, or a failure was expected, so the
+        finding was never tried. One check in `reproduces`, which recording and prepare both reach."""
+        root = self.root.resolve()
+        head = fixture._git(root, "rev-parse", "HEAD")
+        said = {"unittest skip": "OK (skipped=1)", "pytest skip": "1 passed, 2 skipped in 0.01s",
+                "unittest expected failure": "OK (expected failures=1)", "pytest xfail": "1 xfailed in 0.01s"}
+        for name, line in said.items():
+            with self.subTest(outcome=name), self.assertRaisesRegex(ship.Refusal, "never tried"):
+                sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", f"print({line!r})"])
+        sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", "print('OK')"])
+        self.blocked()
+        script = ("import unittest\nclass T(unittest.TestCase):\n    @unittest.skip('x')\n"
+                  "    def test_x(self): pass\nunittest.main(argv=['t'])")
+        self.rejected_proposal(self.with_test([sys.executable, "-c", script]))
+
     def test_a_test_reaches_no_code_in_the_live_checkout(self):
         """sd:10893 class pass: the test runs the head's code alone. An environment entry or an argv path
         naming the live checkout would load its uncommitted files and clear the finding against them."""

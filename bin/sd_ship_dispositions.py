@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +22,8 @@ MAX_PROPOSAL_BYTES = 2_000_000
 DISPOSITIONS = ("rebutted", "parked")
 #: sd:10893. How long one row's `test` may run, and the most argv bytes it may carry.
 TEST_TIMEOUT_SECONDS = 300  # ponytail: one focused test; a suite belongs to the gate
+#: A run that exits 0 yet never tried the finding: unittest's or pytest's skip or expected-failure count.
+UNTRIED = re.compile(r"skipped=[1-9]|expected failures=[1-9]|\b[1-9][0-9]* (?:skipped|xfailed)\b")
 TEST_ARGV_BYTES = 4096
 
 
@@ -263,6 +266,9 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
         tail = " ".join((done.stdout + done.stderr).split())[-SUMMARY_CHARS:]
         raise Refusal(f"finding {index}: its test fails (exit {done.returncode}), so it reproduces the finding: "
                       f"fix it, or name a test that passes; {tail}")
+    if UNTRIED.search(done.stdout + done.stderr):
+        raise Refusal(f"finding {index}: its test passed by skipping or expecting a failure, so it never tried "
+                      "the finding: name a test that runs it")
 
 
 def accepted(operation: Any, head: str, *, run_tests: bool = False) -> dict:
