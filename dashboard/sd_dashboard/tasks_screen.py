@@ -167,8 +167,11 @@ def _rows(connection, rows, found, *, now: str) -> list[dict]:
             "allowed": workflow.allowed_statuses(connection, row["id"], state=state),
             "edit": _edit_capability(row),
             "parked": row["parked_at"],
-            # Build takes a blocked item whose bundle a split holds (pack sd:9581); its Retry refuses.
-            "split_held": row["status"] == "blocked" and build.split_held(connection, row["id"]),
+            # Build takes a blocked item whose bundle a split holds (pack sd:9581); its Retry refuses. And one
+            # its own build blocked whose bundle Retry no longer takes (pack sd:10294): `build._item`'s two
+            # blocked cases, so the row's Build is on exactly where the press takes the item.
+            "split_held": row["status"] == "blocked" and (
+                build.split_held(connection, row["id"]) or build._rebuild_since(connection, row["id"]) is not None),
             # The place Tasks' Realm HOA and Home filter on: the HOA and Home pages' Tasks rule (`places.area_of`).
             # pack sd:8010: an item's own area (`fields.area`) wins, and `area_set` says so: such a row sits in its
             # area's tab alone, not in Personal or a realm tab.
