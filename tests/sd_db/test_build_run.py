@@ -313,8 +313,14 @@ FAKE = textwrap.dedent('''
             findings, mode = review.dispose([review._finding(row) for row in rows], "high"), "blocking"
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
+        verified = None  # the digest of the prior it verified, as `sd-review` stamps it (sd:9769)
+        if "--verify-report" in sys.argv:
+            import hashlib
+            verified = hashlib.sha256(json.dumps(json.loads(Path(
+                sys.argv[sys.argv.index("--verify-report") + 1]).read_text()), sort_keys=True).encode()).hexdigest()
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
                           "requested_reviews": 2, "completed_reviews": 1 if short else 2,
+                          "verification_report_digest": verified,
                           "covers_from": None if mode == "clean_uncovered" or uncovered else "c" * 40,
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
@@ -2151,6 +2157,102 @@ class Supervise(Case):
                          "round 2 does not review the delta since the last reviewed head")
         fix = [call["argv"] for call in self.calls("claude")][1]
         self.assertIn("instances: src.py:1", fix[fix.index("-p") + 1], "the fix brief lacks the instance list")
+
+    def test_a_fix_with_no_commit_verifies_every_earlier_blocker_not_the_branch(self):
+        """sd:10902: a fix round that commits nothing (a rebuttal) leaves the last report at the head. The
+        next review verifies the older kept report over the same delta, with the last round's blockers
+        carried in, instead of reviewing the whole branch again."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "asked"], sd_review=["blocking", "blocking2", "clean"])
+        self.supervisor().run()
+        argvs = [call["argv"] for call in self.calls("sd-review")]
+        self.assertEqual(len(argvs), 3, self.latest()["detail"])
+        first, second, third = argvs
+        self.assertIn("--verify-report", third, "a fix with no commit reviewed the whole branch")
+        self.assertEqual(third[third.index("--base") + 1], second[second.index("--base") + 1],
+                         "the same delta was not verified")
+        prior = json.loads(Path(third[third.index("--verify-report") + 1]).read_text(encoding="utf-8"))
+        self.assertIn(("work.txt", 2), [(row["path"], row["line"]) for row in prior["findings"]],
+                      "the last round's blocker was not carried into the verified report")
+        self.assertEqual(sorted((row["path"], row["line"]) for row in prior["findings"]),
+                         [("work.txt", 1), ("work.txt", 2)], "not one row, one verdict id, for each open blocker")
+
+    def test_a_carried_blocker_keeps_its_own_identity_in_the_older_report(self):
+        """Class pass on sd:10902: a blocker carried from the last report at the head into the older kept
+        report keeps what makes it that blocker. An older row with the same place and words does not
+        match it away; the older report's pass numbers do not read it as resolved; and its path is read
+        at the head it was found at, not walked from the older head (a rename and a reused name)."""
+        import importlib.machinery
+        import types
+        bin_dir = str(Path(build_run.__file__).resolve().parents[2] / "bin")
+        sys.path.insert(0, bin_dir)
+        try:
+            loader = importlib.machinery.SourceFileLoader("sd_review_carry", os.path.join(bin_dir, "sd-review"))
+            review = types.ModuleType(loader.name)
+            review.__file__ = loader.path
+            loader.exec_module(review)
+        finally:
+            sys.path.remove(bin_dir)
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        head, older = "a" * 40, "b" * 40
+        row = {"path": "src.py", "line": 1, "summary": "a blocker", "severity": "high"}
+        open_row, other = {**row, "disposition": "blocking"}, {**row, "line": 9, "summary": "another", "disposition": "blocking"}
+        report = {"scope": "branch", "requested_reviews": 1, "completed_reviews": 1, "covers_from": "c" * 40}
+        passes = [{"pass": 1, "head": older, "completed": True}, {"pass": 2, "head": older, "completed": True}]
+        # name: the last report's rows, the kept report's rows, its history, whether the last report verified
+        # the kept one, and the open blockers `sd-review` must read (None: no link, so a full review)
+        cases = {
+            "same place and words": ([open_row], [{**row, "disposition": "advisory"}], None, True, [1]),
+            "older pass numbers": ([{**open_row, "prior_review": {"pass": 1, "head": head}}], [], passes, True, [1]),
+            "path at its head": ([open_row], [], None, True, [1]),
+            # One row, one verdict id, for a blocker both reports hold: the last report carried it (sd:10902).
+            "still open in both": ([{**open_row, "evidence": "seen again"}], [open_row], None, True, [1]),
+            # The last round's verdict stands: a blocker it cleared is not asked about again.
+            "cleared last round": ([other], [open_row], None, True, [9]),
+            "cleared, none left": ([], [open_row], None, True, []),
+            # A last report that verified another prior, or none, says nothing of the kept report's blockers.
+            "not its verification": ([other], [open_row], None, False, None),
+        }
+        # A short last round (a reader timed out), or one that covers no branch, cleared a blocker on part
+        # of the answers: its verdicts replace nothing, and the branch is reviewed in full (ruling round).
+        shorts: dict[str, dict] = {"short of a reader": {"completed_reviews": 0}, "a named shortfall": {"review_shortfall": "one timed out"},
+                  "covers no branch": {"covers_from": None}}
+        for name, short in shorts.items():
+            kept = {**report, "status": "blocking", "subject": {"head": older}, "findings": [open_row]}
+            supervisor.out("review").write_text(json.dumps(
+                {**report, **short, "status": "blocking", "subject": {"head": head}, "findings": [other],
+                 "verification_report_digest": hashlib.sha256(json.dumps(kept, sort_keys=True).encode()).hexdigest()}),
+                encoding="utf-8")
+            supervisor.out("prior").write_text(json.dumps(kept), encoding="utf-8")
+            with self.subTest(name), mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+                self.assertIsNone(supervisor.prior_review(head), "a short round's verdict dropped an open blocker")
+        for name, (last_rows, kept_rows, history, linked, want) in cases.items():
+            kept = {**report, "status": "blocking", "subject": {"head": older}, "findings": kept_rows,
+                    **({"history": history} if history else {})}
+            digest = hashlib.sha256(json.dumps(kept, sort_keys=True).encode()).hexdigest() if linked else None
+            supervisor.out("review").write_text(json.dumps(
+                {**report, "status": "blocking", "subject": {"head": head}, "findings": last_rows,
+                 "verification_report_digest": digest}), encoding="utf-8")
+            supervisor.out("prior").write_text(json.dumps(kept), encoding="utf-8")
+            with self.subTest(name), mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+                prior = supervisor.prior_review(head)
+                if want is None:
+                    self.assertIsNone(prior, "an unlinked last report was merged into the kept one")
+                    continue
+                self.assertIsNotNone(prior, "a fix with no commit dropped the chain")
+                blockers = review.prior_blockers(prior)
+                self.assertEqual([found["line"] for found in blockers], want,
+                                 "not one row for each blocker the last round left open")
+                self.assertEqual({(found.get("prior_review") or {}).get("head") for found in blockers},
+                                 {head} if want else set(), "a carried path would be walked from the older head")
+                again = supervisor.prior_review(head)  # a re-run reads the kept report it rewrote
+                self.assertEqual([found["line"] for found in review.prior_blockers(again)], want,
+                                 "a re-run changed the open blockers")
 
     def test_a_new_round_two_finding_on_unchanged_code_files_a_follow_up(self):
         """Pack sd:9769: a later round's finding off the delta and off the earlier findings is filed, not a block."""
