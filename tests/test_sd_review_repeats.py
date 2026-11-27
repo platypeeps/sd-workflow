@@ -1081,6 +1081,7 @@ class RebuttalIdentityTests(unittest.TestCase):
         plain = adjudicated(("src.py", "A no-commit fix turns a filed follow-up into a blocker", "rebutted"), line=40)
         body = json.loads(plain)
         body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
         lead = json.dumps(body)
         repeat = row(summary="A no-commit fix turns an already-filed follow-up into a merge blocker", line=40,
                      evidence=REPRO)
@@ -1094,6 +1095,23 @@ class RebuttalIdentityTests(unittest.TestCase):
         body["proposal"]["bindings"]["source"] = "lead"
         self.assertEqual(gate([repeat], json.dumps(body)), ["blocking"], "only the exact source holds")
         self.assertIn("lead's review", sd_review.rebuttal_section(listed(lead)))
+        self.assertNotIn("blocks nothing.", sd_review.rebuttal_section(listed(lead)), "fresh evidence still blocks")
+
+    def test_a_lead_rejection_never_holds_fresh_evidence(self) -> None:
+        """sd:10926 review: a lead rebuttal held a different defect citing fresh evidence at its line. It holds
+        a cited repeat only of the evidence the lead rejected, in any words; other evidence blocks."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted"), line=40))
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        lead = json.dumps(body)
+        for summary in ("defect", "another defect"):
+            with self.subTest(summary=summary):
+                self.assertEqual(gate([row(summary=summary, line=40, evidence="python3 u.py: Traceback")], lead),
+                                 ["blocking"])
+        del body["proposal"]["findings"][0]["raw_finding"]["evidence"]
+        self.assertEqual(gate([row(line=40, evidence=REPRO)], json.dumps(body)), ["blocking"],
+                         "a lead finding with no evidence holds no cited repeat")
+        self.assertEqual(gate([row(summary="other words", line=40)], json.dumps(body)), ["advisory"])
 
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)

@@ -828,7 +828,7 @@ def blocker_checklist(root: pathlib.Path, subject: Subject, database: Any, env: 
 #: moved blocks again, so a stale rebuttal never clears another finding.
 REBUTTED_LINES, REBUTTED_SUMMARY_CHARS, REBUTTED_REASON_CHARS = 10, 200, 200
 REBUTTED_HEADER = "Findings already rebutted on this branch"
-LEAD_LINE = " A rebuttal of the lead's review: a repeat at this line blocks nothing (sd:10926)."
+LEAD_LINE = " A rebuttal of the lead's review: a repeat at this line blocks only with evidence it did not reject."
 REBUTTED_ROWS = 200
 #: The rows only: a body is ASCII JSON, while a field `json_extract` decodes may not be UTF-8 and failed the whole read.
 REBUTTED_QUERY = (
@@ -846,9 +846,9 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str | None, str, bool]]]:
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str | None, str, str | None]]]:
     """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, ruled, test, lead) per
-    accepted finding; malformed: none. `lead`: it answers the lead's review (sd:10926). `ruled`: the evidence a
+    accepted finding; malformed: none. `lead`: the evidence the lead's review cited, "" none (sd:10926). `ruled`: the evidence a
     build's ruling round judged, as recorded, "" for none, when that round wrote the row (sd:10286); None from
     `sd-ship adjudicate`, which cannot mark one. Never folded: the build clears only the exact evidence, and
     `-k ABC` is another repro than `-k abc` (night triage, sd:10286)."""
@@ -859,13 +859,18 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
     proposal = value.get("proposal") if isinstance(value, dict) and value.get("decision") == "accepted" else None
     rows = proposal.get("findings") if isinstance(proposal, dict) else None
     bindings = proposal.get("bindings") if isinstance(proposal, dict) else None
+    lead = isinstance(bindings, dict) and bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
          tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()),
-         (raw["evidence"] if isinstance(raw.get("evidence"), str) else "") if row.get("ruled") is True else None,
-         _test_text(row.get("test")), isinstance(bindings, dict) and bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE)
+         _said(raw) if row.get("ruled") is True else None, _test_text(row.get("test")), _said(raw) if lead else None)
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
+
+
+def _said(raw: dict) -> str:
+    """A recorded finding's evidence as recorded, "" unless text: never folded (sd:10286)."""
+    return raw["evidence"] if isinstance(raw.get("evidence"), str) else ""
 
 
 def _test_text(test: Any) -> str:
@@ -896,7 +901,7 @@ class Rebuttal(NamedTuple):
     instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
     ruled: str | None = None  # the evidence a build's ruling judged: a repeat citing it, or none, holds (sd:10286)
     test: str = ""  # the test `sd-ship adjudicate` ran passing (sd:10893): it holds a cited repeat too (sd:10918)
-    lead: bool = False  # a rebuttal of the lead's review: it holds any repeat at its line (sd:10926)
+    lead: str | None = None  # the evidence a lead's review cited: a repeat citing it holds (sd:10926)
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
@@ -1045,7 +1050,7 @@ def lines_now(record: Rebuttal, unchanged: Callable[[str, Any], bool],
 def rebuttal_section(seen: Sequence[Rebuttal]) -> str:
     """The prompt section for `rebuttals`; a static reader cites the lines it read."""
     lines = "".join(f"\n- {entry.place}{'' if entry.line is None else f':{entry.line}'}: {entry.text} Rebuttal: "
-                    f"{entry.reason}{f' Test: {entry.test}' if entry.test else ''}{LEAD_LINE if entry.lead else ''}"
+                    f"{entry.reason}{f' Test: {entry.test}' if entry.test else ''}{LEAD_LINE if entry.lead is not None else ''}"
                     for entry in seen if entry.listed)
     return (f"\n\n{REBUTTED_HEADER}, newest first, from its recorded adjudications. Raise one again only with new "
             "evidence that contradicts the rebuttal, given in the finding's evidence field: a check you ran and its "
@@ -2013,9 +2018,9 @@ def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], cited: str
     ruled = getattr(record, "ruled", None)
     if ruled is None:  # a rebuttal whose test passed holds a cited repeat in its words (sd:10918)
         tested = record is worded and bool(getattr(record, "test", "")) and not verdict
-        # sd:10926: a lead's rejection holds any repeat at its exact line until a change reaches it (`lines_now`).
-        # ponytail: another defect at that exact line is held too; it still posts, as advisory.
-        bound = getattr(record, "lead", False) and not verdict
+        # sd:10926: a lead's rejection holds a repeat of the evidence it rejected, in any words, at its line
+        # until a change reaches it (`lines_now`); fresh evidence is a new claim and blocks.
+        bound = bool(getattr(record, "lead", None)) and cited == record.lead and not verdict
         return (cited is None or tested or bound) and getattr(record, "listed", False)
     def _judged(old: Mapping[str, Any]) -> bool:
         kept = old.get("evidence") if isinstance(old.get("evidence"), str) and old["evidence"].strip() else None
