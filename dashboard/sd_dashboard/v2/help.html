@@ -1,0 +1,56 @@
+<!doctype html>
+<!--
+  Help (sd:10917), at /help: what to say to a session, and how the fleet works.
+  Data: /api/help (help_screen.document): the phrase table from the Operator runs list in skills/sd-next/SKILL.md, each
+  run's budget from its reference file, and the sections of v2/help.md with each live value read now from its source.
+  A value that does not read says why, and the page names it under the head. Nothing here is sample data.
+  Writes: none.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Help · system</title>
+<link rel="stylesheet" href="/ui/fonts.css">
+<link rel="stylesheet" href="/ui/tokens.css">
+<script src="/ui/theme.js"></script>
+<script src="/ui/markup.js"></script>
+<link rel="stylesheet" href="/ui/shell.css">
+<link rel="stylesheet" href="/ui/documents.css">
+</head>
+<body data-page="Help" data-scope="help" data-scope-note="the session phrases and how the fleet works">
+<script src="/ui/icons.js"></script>
+<div class="shell">
+  <main id="main">
+    <header class="head">
+      <div>
+        <h1>Help</h1>
+        <p><span id="sub">Reading the help…</span> · phrases from the sd-next skill, values read now</p>
+      </div>
+    </header>
+
+    <div id="state" hidden></div>
+    <p class="why" id="problems" hidden></p>
+    <!-- The toolbar standard (sd:5281): one control row, the shell's Shapeshift bar (sd:5539), which filters the run table. -->
+    <div class="toolbar" id="toolbar" data-shift></div>
+    <section aria-labelledby="runs-h">
+      <div class="sec-head">
+        <h2 id="runs-h">Runs a session knows</h2>
+      </div>
+      <table class="ledger" aria-labelledby="runs-h">
+        <thead><tr><th>Say</th><th>What it does</th><th>Budget</th><th>Mode</th></tr></thead>
+        <tbody id="runs"></tbody>
+      </table>
+    </section>
+    <div id="help-sections"></div>
+  </main>
+
+  <div class="details" id="details"><p class="why">Every value on this page is read when the page opens; Read again reads them now.</p></div>
+</div>
+<script src="/ui/sections.js"></script>
+<script src="/ui/read.js"></script>
+<script src="/ui/commands.js"></script>
+<script src="/ui/help.js"></script>
+<script src="/ui/shell.js"></script>
+</body>
+</html>

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -133,11 +134,25 @@ def adversarial(writing: Any, connection: Any, item: int, args: argparse.Namespa
     if not brief["research_exists"]:
         print(f"# warning: no research.md for {brief['piece']}; the citation-strength axis "
               "has nothing to check against", file=sys.stderr)
-    prompt = _render(brief)
-    print(f"# codex adversarial review: {brief['piece']} (sandbox=read-only, {brief['root']})", file=sys.stderr)
-    report = _codex(brief["root"], prompt, model=args.model, timeout=args.timeout, effort=getattr(args, "effort", None))
+    # The reviewer reads a frozen copy of the brief's index.md, never the live file: the hash the report attests is
+    # then the bytes it read, whatever lands on disk meanwhile, and a gate refuses other bytes (sd:10719).
+    with tempfile.TemporaryDirectory(prefix="sd-writing-draft-") as frozen:
+        data = (Path(brief["root"]) / brief["draft"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != brief["index_sha256"]:
+            raise WorkRefusal("index.md changed while the brief was read; rerun the review")
+        copy = Path(frozen) / "index.md"
+        copy.write_bytes(data)
+        copy.chmod(0o444)
+        # After cutover the headline is a row the draft file does not hold: the reviewer reads it here, and the
+        # report attests the hash of this headline, which a gate on another one refuses (sd:10719).
+        prompt = (_render({**brief, "draft": str(copy)})
+                  + f"\n\nThe headline readers see above this draft: {json.dumps(brief['title'], ensure_ascii=False)}\n")
+        print(f"# codex adversarial review: {brief['piece']} (sandbox=read-only, {brief['root']})", file=sys.stderr)
+        report = _codex(brief["root"], prompt, model=args.model, timeout=args.timeout,
+                        effort=getattr(args, "effort", None))
     result = writing.record_adversarial(connection, item, report, digest=brief["digest"], record=brief["record"],
-                                        generation=brief["generation"])
+                                        generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                        title_sha256=brief["title_sha256"])
     print(f"# reviewed draft {result['digest']}", file=sys.stderr)
     if not result["current"]:
         print("# draft changed during review; this report is stale and cannot clear readiness", file=sys.stderr)

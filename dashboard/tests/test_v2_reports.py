@@ -154,6 +154,19 @@ class TheDocument(ScreenCase):
         self.assertEqual(doc["attention"], {"state": "warning", "n": 1, "what": "reports want you"})
         self.assertEqual(reports_screen._attention(None), {"state": "unknown", "n": 0, "what": "reports not read"})
 
+    def test_an_open_report_behind_the_history_limit_still_shows_once_and_counts(self):
+        # sd:10432: 200 newer quiet reports pushed the open one out of the list, its badge and its filter.
+        for n in range(200):
+            reporting.ingest(self.connection, job=f"quiet-{n}", run_id="q", started="2026-09-09T00:00:00Z",
+                             ended="2026-09-09T00:01:00Z", exit_code=0, text="fine", source_path="sd-db scan",
+                             attention=False)
+        doc = self.doc()
+        ids = [r["id"] for r in doc["reports"]]
+        self.assertEqual(ids.count(self.ids["failed"]), 1)
+        self.assertEqual(len(ids), 201)
+        self.assertEqual(ids[-1], self.ids["failed"])
+        self.assertEqual(doc["attention"], {"state": "warning", "n": 1, "what": "reports want you"})
+
     def test_truncated_reads_the_kept_body_not_the_first_run(self):
         # sd:4652: pack sd:4641 lets a later whole body replace a cut first run, and `repeats.body_truncated` says
         # what the kept body is; `report.truncated` stays the first run's and is only the fallback.
@@ -1012,6 +1025,45 @@ R.p = ['job:weekly-scan', 'job:nightly-sync'].map(id => [C.get(id).failed, !!c.p
         self.assertEqual(out["R"]["filter"], ["reports"])
         self.assertEqual(out["R"]["a"][:2], ["act", True])
         self.assertGreater(out["R"]["a"][2], 0)
+
+    def late(self):
+        """A weekly-scan report at 02:00 UTC on 9 September: 20:00 on 8 September in the cadence's zone."""
+        n = reporting.ingest(self.connection, job="weekly-scan", run_id="r9", started="2026-09-09T01:59:00Z",
+                             ended="2026-09-09T02:00:00Z", exit_code=0, text="late", source_path="sd-db scan")["item"]["id"]
+        self.connection.execute("UPDATE item SET created_at = ? WHERE id = ?", ("2026-09-09T02:00:00+00:00", n))
+        self.connection.commit()
+        return n
+
+    def test_a_report_across_utc_midnight_groups_on_the_cadences_local_day(self):
+        """sd:10438: the list banded a run by its UTC date; Cadence by the local one. The stamp stays as stored."""
+        n = self.late()
+        doc = self.served()
+        row = next(r for r in doc["reports"] if r["id"] == n)
+        self.assertEqual((row["day"], row["at"]), ("2026-09-08", "2026-09-09T02:00:00+00:00"))
+        self.assertIn("2026-09-08", doc["days"])
+        out = self.run_page("R.rows = ELS.rows.html; R.bar = ELS.filters.html;", doc=doc)
+        self.assertNotIn("UTC", out["R"]["rows"])
+        bands = re.findall(r'<tr class="day" aria-hidden="true"><td colspan="6">([^<]+)</td>', out["R"]["rows"])
+        self.assertEqual(bands[:2], ["Tuesday 8 September · local time", "Sunday 6 September · local time"])
+        self.assertNotIn('value="2026-09-09"', out["R"]["bar"])
+        self.assertIn(f'datetime="{row["at"]}"', out["R"]["rows"])
+
+    def test_a_job_with_no_report_needing_action_says_so_and_offers_the_way_back(self):
+        """sd:10438: a cadence row's "show its reports" under Needs action showed only "Nothing matches"."""
+        row = "ELS['cad-body'].listeners.click[0]({ target: { closest: s => s === 'tr[data-job]' ? { dataset: { job: '%s' } } : null } });"
+        empty = "ELS.rows.listeners.click[0]({ target: { closest: s => s === '[data-empty]' ? { dataset: { empty: '%s' } } : null } });"
+        out = self.run_page("F.status = 'act'; " + row % "weekly-scan" + " R.scan = ELS.rows.html; "
+                            + empty % "cadence" + " R.views = OUT.views.slice(); "
+                            + empty % "all" + " R.F = [F.job, F.status, shown.length === ROWS.length]; "
+                            + "F.status = 'act'; " + row % "quiet-one" + " R.quiet = ELS.rows.html;")
+        R = out["R"]
+        self.assertIn("No weekly-scan report needs action: the filters hide its 2 reports. Its last run succeeded.", R["scan"])
+        self.assertIn('<button class="linkbtn" type="button" data-empty="all">Show all reports</button>', R["scan"])
+        self.assertIn('<button class="linkbtn" type="button" data-empty="cadence">Back to run history</button>', R["scan"])
+        self.assertNotIn("Nothing matches", R["scan"])
+        self.assertEqual(R["views"][-1], "cadence")
+        self.assertEqual(R["F"], ["", "", True])
+        self.assertIn("quiet-one has filed no report.", R["quiet"])
 
     def test_the_filters_are_activitys_bar_whose_tokens_remove_one_and_clear_all_removes_every_one(self):
         # sd:5463: Activity's layout from shell.list.fbar. Status is a segment with its counts, Job and Day are picks, the

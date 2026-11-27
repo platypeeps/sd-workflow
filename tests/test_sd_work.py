@@ -82,6 +82,26 @@ class TaskCLI(unittest.TestCase):
         self.call("task", "add", "An idea", "--kind", "work-idea")
         self.call("task", "add", "Ranked", "--priority", 3)
 
+    def test_task_show_prints_the_items_review_rounds_and_cost(self):
+        """sd:10401: `sd task show` gives the item's review rounds, clean ones too, and their cost; JSON is unchanged."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Built", "--json").stdout)["item"]["id"]
+        self.assertNotIn("reviews:", self.call("task", "show", item).stdout, "no run, no line")
+        with database(home=self.home) as connection:
+            lead = sd_db.create_assignment(connection, item=item, role="author", status="done", lane="parallel")
+            connection.execute("UPDATE assignment SET scope = 'build' WHERE id = ?", (lead,))
+            sd_db.upsert_repo(connection, "/example/repo", remote="https://github.com/example/repo.git", managed=1)
+            connection.execute(
+                "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, step, "
+                "review_round, created_at, updated_at) VALUES ('r1', ?, 1, '/example/repo', 'build/sd-1', 'fixture', "
+                "'/w', '/w', 'enqueued', 2, '2026-11-24T00:00:00Z', '2026-11-24T00:00:00Z')", (lead,))
+            connection.execute("INSERT INTO cost (timestamp, role, assignment, pass, tokens_in, tokens_out, usd, "
+                               "source) VALUES ('2026-11-24T00:00:00Z', 'author', ?, 'r1', 1200, 30, 3.5, 'run')",
+                               (lead,))
+        shown = self.call("task", "show", item).stdout
+        self.assertIn("reviews: 3 rounds (2 blocking, 1 clean build, 0 lane) over 1 build runs", shown)
+        self.assertIn("tokens 1,200 in, 30 out · $3.50", shown)
+        self.assertNotIn("reviews", json.loads(self.call("task", "show", item, "--json").stdout))
+
     def test_experiment_designates_and_refuses_a_bad_parent(self):
         """sd:3982: `--experiment` writes the designation; a task of itself or of an undesignated item refuses."""
         first = json.loads(self.call("task", "add", "--priority", "3", "An experiment", "--json").stdout)["item"]["id"]
@@ -149,6 +169,47 @@ class TaskCLI(unittest.TestCase):
             item = sd_db.create_item(connection, kind="report", title="Example report")
         refused = self.call("task", "status", item, "done", code=1)
         self.assertIn(f"`sd reports acknowledge {item} --resolve-followups`", refused.stderr)
+
+    def test_task_status_done_refuses_an_open_followup_until_asked_to_resolve_it(self):
+        """sd:10407: `done` resolved a person's followup unasked; it refuses now and names the flag."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "A task", "--json").stdout)["item"]["id"]
+        note = json.loads(self.call("task", "note", item, "Ask example.test", "--kind", "followup",
+                                    "--json").stdout)["note"]["id"]
+        refused = self.call("task", "status", item, "done", code=1)
+        self.assertIn(f"resolve followup {note}", refused.stderr)
+        self.assertIn(f"`sd task status {item} done --resolve-followups`", refused.stderr)
+        self.assertIn("--resolve-followups closes followups with done",
+                      self.call("task", "status", item, "blocked", "--resolve-followups", code=1).stderr)
+        # sd:10407 class pass: a person's followup that opens like the lane's is still a person's.
+        pasted = json.loads(self.call("task", "note", item, "Post-merge: check by hand", "--kind", "followup",
+                                      "--json").stdout)["note"]["id"]
+        self.call("note", "resolve", note)
+        self.assertIn(f"resolve followup {pasted}", self.call("task", "status", item, "done", code=1).stderr)
+        closed = json.loads(self.call("task", "status", item, "done", "--resolve-followups", "--json").stdout)
+        self.assertEqual(closed["item"]["status"], "done")
+        self.assertTrue(next(row for row in closed["notes"] if row["id"] == pasted)["resolved_at"])
+
+    def test_the_suggested_retry_keeps_the_evidence_and_the_revision_guard(self):
+        """sd:10407 review: the refusal suggested a bare `done --resolve-followups`, which dropped
+        `--reason`, `--delivered-by`, `--delivered-in` and `--if-revision` the caller gave."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "A task", "--json").stdout)["item"]
+        self.call("task", "note", item["id"], "Ask example.test", "--kind", "followup")
+        revision = json.loads(self.call("task", "show", item["id"], "--json").stdout)["revision"]
+        reason = "shipped by hand; it's <b>done</b>"
+        refused = self.call("task", "status", item["id"], "done", "--reason", reason,
+                            "--if-revision", revision, code=1).stderr
+        suggested = shlex.split(re.search(r"`(sd task status [^`]+)`", refused).group(1))
+        self.assertEqual(suggested, ["sd", "task", "status", str(item["id"]), "done", "--reason", reason,
+                                     "--if-revision", revision, "--resolve-followups"])
+        # `--delivered-by` is verified before the close, so its retry is read from the helper.
+        given = argparse.Namespace(item=7, reason=None, delivered_by="a" * 40,
+                                   delivered_in="/repos/example dir", if_revision=None)
+        self.assertEqual(shlex.split(sd_work._retry_with_resolve(given)),
+                         ["sd", "task", "status", "7", "done", "--delivered-by", "a" * 40,
+                          "--delivered-in", "/repos/example dir", "--resolve-followups"])
+        closed = json.loads(self.call("task", *suggested[2:], "--json").stdout)
+        self.assertEqual(closed["item"]["status"], "done")
+        self.assertIn(reason, closed["notes"][-1]["body"])
 
     def test_an_edit_with_no_field_names_the_edit_command(self):
         """sd:5065: the refusal names the command that fixes it."""
@@ -511,6 +572,24 @@ class TaskCLI(unittest.TestCase):
         filed = int(state["note"]["body"].rsplit("sd:", 1)[1])
         self.assertEqual(json.loads(self.call("task", "show", filed, "--json").stdout)["item"]["kind"], "task")
 
+    def test_option_on_a_batch_takes_the_exact_spelling_before_a_case_folded_one(self):
+        """Review of build/sd-1624: a batch question may offer `Use Foo` and `Use foo`; `--option 'Use foo'`
+        ruled `Use Foo`, the first case-folded match."""
+        import sd_db.review as review
+
+        with database(home=self.home) as connection:
+            item = review.file(connection, {
+                "schema": 1, "queue": "nightly", "batch": "2026-10-19", "title": "Nightly review 2026-10-19",
+                "source": "system@6c4317b", "mode": "open", "context": {"purpose": "Fixture batch.",
+                "rubric": ["Pick the option that fits."], "feeds": "This test."},
+                "questions": [{"subject": "case", "text": "Which spelling?", "options": ["Use Foo", "Use foo"]}]},
+                who="fixture")["item"]
+            connection.commit()
+            asked = review.read(connection, item)["questions"][0]["note"]
+        state = json.loads(self.call("task", "note", item, "Use foo", "--kind", "decision", "--answers", asked,
+                                     "--option", "Use foo", "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Use foo")
+
     def test_an_approval_task_records_the_session_and_the_ruling_the_user(self):
         """pack sd:6046: the task an approval files is the session's, so its trail lists it; the ruling
         and its comment keep the user, because the Review page shows their session as "ruled by"."""
@@ -558,7 +637,8 @@ class TaskCLI(unittest.TestCase):
         for name, row, flags, said in (
                 ("unknown label", item, ("--answers", asked, "--option", "Maybe"), "its options are Approve, Reject"),
                 ("no --answers", item, ("--option", "Approve"), "--option needs --answers"),
-                ("not a batch", plain, ("--answers", question, "--option", "Approve"), "not a review batch")):
+                ("not its option", plain, ("--answers", question, "--option", "Approve"),
+                 "its options are Pack store, Database rows")):
             with self.subTest(name):
                 before = json.loads(self.call("task", "show", row, "--json").stdout)
                 refused = self.call("task", "note", row, "Answer", "--kind", "decision", *flags, code=1)
@@ -585,15 +665,51 @@ class TaskCLI(unittest.TestCase):
         self.assertIn("--option LABEL, one of Approve, Reject", refused.stderr)
 
     def test_answers_refuses_a_review_batch_question(self):
-        """A batch question is Review's: its ruling may file a task, which `review.rule` writes and a note does not."""
-        with database(home=self.home) as connection:
-            item = sd_db.create_item(connection, kind="task", title="Batch", source="task-ref",
-                                     external_id="review:example:1")
-        asked = self.question(item)
+        """A batch question is Review's: its ruling may file a task, which `review.rule` writes and a note does not.
+        sd:10097: a `review:` ref alone is no batch; the batch is what `review.read` reads."""
+        item, asked = self.batch_question()
         before = json.loads(self.call("task", "show", item, "--json").stdout)
         refused = self.call("task", "note", item, "Pack store", "--kind", "decision", "--answers", asked, code=1)
         self.assertIn("review batch", refused.stderr)
         self.assertEqual(json.loads(self.call("task", "show", item, "--json").stdout), before)
+
+    def test_option_rules_a_question_on_a_review_ref_item_that_is_no_batch(self):
+        """sd:10097: an item a lane review filed has a `review:` ref but no batch header, so
+        `review.read` refused it, the question had no parsed options and every --option was
+        refused. The labels now come from the question's own `Option:` lines."""
+        body = ("Skipped on build/example: the fix needs helpers that exist only on another branch.\n"
+                "Option: Build it after build/example merges, on top of that branch (Recommended)\n"
+                "Option: Build a main-side guard now: Retry and Build by item refuse or go fresh")
+        with database(home=self.home) as connection:
+            item = sd_db.create_item(connection, kind="task", title="Finding", source="task-ref",
+                                     external_id="review:build-example-lane-move")
+            connection.commit()
+        asked = self.question(item, body)
+        before = json.loads(self.call("task", "show", item, "--json").stdout)
+        refused = self.call("task", "note", item, "Maybe", "--kind", "decision", "--answers", asked,
+                            "--option", "Maybe", code=1)
+        self.assertIn("its options are Build it after build/example merges, on top of that branch, "
+                      "Build a main-side guard now", refused.stderr)
+        self.assertEqual(json.loads(self.call("task", "show", item, "--json").stdout), before)
+        label = "build it after build/example merges, on top of that branch"
+        state = json.loads(self.call("task", "note", item, "Once it lands", "--kind", "decision",
+                                     "--answers", asked, "--option", label, "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Build it after build/example merges, "
+                                                "on top of that branch: Once it lands")
+        self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+        plain = self.question(item, body)
+        state = json.loads(self.call("task", "note", item, "Build a main-side guard now", "--kind", "decision",
+                                     "--answers", plain, "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{plain}: Build a main-side guard now")
+
+    def test_option_takes_the_exact_spelling_before_a_case_folded_one(self):
+        """Review of build/sd-1624: with `Use Foo (Recommended)` and `Use foo`, `--option 'Use foo'`
+        recorded `Use Foo`, the first case-folded match."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Asks", "--json").stdout)["item"]["id"]
+        asked = self.question(item, "Which?\nOption: Use Foo (Recommended)\nOption: Use foo")
+        state = json.loads(self.call("task", "note", item, "Use foo", "--kind", "decision", "--answers", asked,
+                                     "--option", "Use foo", "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Use foo")
 
     def test_answers_rules_a_question_with_no_options_on_a_review_ref_item(self):
         """sd:8975: a plain question on a review-ref item has no label to name, so --option
@@ -611,6 +727,20 @@ class TaskCLI(unittest.TestCase):
         self.assertEqual((state["note"]["kind"], state["note"]["body"]),
                          ("decision", f"Ruling on note #{asked}: Confirm destructive taps only"))
         self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+
+    def test_an_ordinary_question_on_a_review_batch_takes_the_linked_decision_path(self):
+        """sd:10505: a question asked on a batch after its header's count is no batch question;
+        it was sent to `review.rule`, which refused it with and without --option."""
+        item, _ = self.batch_question()
+        asked = self.question(item)
+        state = json.loads(self.call("task", "note", item, "Database rows", "--kind", "decision",
+                                     "--answers", asked, "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Database rows")
+        self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+        picked = self.question(item)
+        state = json.loads(self.call("task", "note", item, "Pack store", "--kind", "decision",
+                                     "--answers", picked, "--option", "pack store", "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{picked}: Pack store")
 
     def test_all_public_note_kinds_parse_and_persist_without_internal_kinds(self):
         self.assertEqual(set(NOTE_KINDS), {"comment", "followup", "question", "decision", "proposal"})
@@ -1800,7 +1930,7 @@ class TodayIsTheDashboardsToday(unittest.TestCase):
         self.call("task", "note", open_item, "--body", "Chase the vendor", "--kind", "followup")
         closed = self.task("Done with a followup")
         self.call("task", "note", closed, "--body", "Owed on a done item", "--kind", "followup")
-        self.call("task", "status", closed, "done", "--reason", "test")
+        self.call("task", "status", closed, "done", "--reason", "test", "--resolve-followups")
         asked = json.loads(self.call("task", "note", open_item, "--kind", "question", "--json",
                                      "--body", "Which store?\nOption: Pack store (Recommended)\nOption: Database rows").stdout)
         log = self.home / "run.log"
