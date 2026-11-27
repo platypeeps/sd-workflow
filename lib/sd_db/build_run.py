@@ -2539,8 +2539,9 @@ class Supervisor:
 
         A reject or file judged the code at the reviewed head. `moved` is what the round's own commits changed
         since: one that changed a file the blocker names can make it reachable, so that ruling is noted and
-        not applied (no item, no clearing, no rebuttal), as when `moved` does not read (None): the review
-        finds the blocker again and the run parks, fail closed (class pass 3).
+        not applied (no clearing, no rebuttal), as when `moved` does not read (None): the review finds the
+        blocker again and the run parks, fail closed (class pass 3). A lapsed FILE ruling still files its
+        item: a review that omits the blocker delivers the build, and the defect must not be lost.
 
         The note's opening names the run, the blocker's number and the head: a supervisor that walks this step
         again without its marks (a crash before the rulings file went) finds it and writes nothing twice."""
@@ -2560,6 +2561,9 @@ class Supervisor:
                   "" if touched == [] else
                   "; not applied: the round changed " + ", ".join(touched) if touched else
                   "; not applied: the round's own changes did not read")
+        # A lapse skips the clearing and the rebuttal, never the follow-up: a review that omits the blocker
+        # delivers the build, and the item is the one record of the ruling's defect (sd:10914 review).
+        follow_up = ruling == "file" and finding
         finding = finding and not lapsed
         mark = f"Build run {self.ident} ruling {number} at {head[:12]}: "
         with transaction(self.db):
@@ -2568,12 +2572,12 @@ class Supervisor:
                                (self.lead, len(mark), mark)).fetchone():
                 return
             filed = None
-            if ruling == "file" and finding:
+            if follow_up:
                 filed = create_item(self.db, kind="task", repo=self.row["repo"], title=(
                     f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')} "
                     f"{row.get('summary') or ''}")[:200])
                 add_note(self.db, filed, "comment", f"Build run {self.ident}'s ruling round filed this review "
-                                                    f"blocker, not caused by its change ({reason}): "
+                                                    f"blocker, not caused by its change ({reason}{lapsed}): "
                                                     f"{self.summary([row], None)}")
             # A comment: a note the library writes is never a decision, whoever ruled (sd:3008).
             add_note(self.db, self.lead, "comment",

@@ -1545,6 +1545,22 @@ class Supervise(Case):
         self.assertEqual(self.rebuttals(), [])
         self.assertIn("not applied: the round changed apart.py (declared runtime data)", self.decisions()[1])
 
+    def test_a_lapsed_file_ruling_still_files_its_follow_up(self):
+        """sd:10914 review: a FILE ruling the round's runtime-data change lapsed filed no item, and a review
+        that omitted the blocker enqueued the build: the follow-up was lost. A lapse skips the clearing and
+        the rebuttal alone; the item is filed and the lead's note names it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "file", "reason": "older than this change"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        (filed,) = self.db.execute("SELECT id FROM item WHERE title LIKE 'Review follow-up%work.txt:2%'").fetchall()
+        self.assertIn(f"FILE as sd:{filed['id']}, older than this change; not applied: the round changed "
+                      f"apart.py (declared runtime data)", self.decisions()[1])
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE ?",
+                                         (f"{build_run.RULED}%",)).fetchone()[0], 0)
+
     def test_declared_runtime_data_is_matched_by_glob(self):
         """sd:10906: `runtime_data` globs as `check_scope` reads them: `*` in one segment, `**` across them."""
         self.assertEqual(build_run.unwalked(self.root, ["a/b.py", "data/x/t.py", "top.py", "c.py"],
