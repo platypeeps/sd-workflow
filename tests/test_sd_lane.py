@@ -3758,6 +3758,20 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [c])
 
+    def test_a_listed_merge_whose_revert_matches_neither_side_reads_neither(self) -> None:
+        """Review of build/sd-1654 (sd_lane.py:1018): a revert listing the merge that also changed another
+        file matches neither side's patch, so it names no side to read and every citation stays: a missed
+        undo leaves an item to close by hand, a wrong one hides a surviving fix."""
+        b, c, *_ = self.open
+        tree, merge = self._side_merge("topic-no-side", b, c)
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        (tree / "extra.txt").write_text("extra\n", encoding="utf-8")
+        git(tree, "add", "extra.txt")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(sorted(entry["closes"]), sorted([b, c]))
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open
