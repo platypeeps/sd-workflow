@@ -205,6 +205,7 @@ class FixtureRemote:
         work = self.seed
         _git(work, "fetch", "-q", "origin", pull.base)
         _git(work, "checkout", "-q", "-B", pull.base, "FETCH_HEAD")
+        before = _git(work, "rev-parse", "HEAD")
         _git(work, "fetch", "-q", "origin", pull.head)
         title = pull.title or f"{pull.head} (#{number})"
         if method == "rebase":
@@ -220,9 +221,26 @@ class FixtureRemote:
         _git(work, "push", "-q", "origin", pull.base)
         pull.merge_commit_sha = _git(work, "rev-parse", "HEAD")
         pull.state = "MERGED"
+        self._mark_reached(pull.base, before)
         if self.delete_branch_on_merge:
             _git(self.path, "update-ref", "-d", f"refs/heads/{pull.head}")
         return pull.merge_commit_sha
+
+    def _mark_reached(self, base: str, before: str) -> None:
+        """Mark merged each open pull request on `base` whose head the merge made reachable, as GitHub does.
+
+        Its `merge_commit_sha` is the merge commit in the new range that has
+        its head as a later parent: a train member's own train merge (sd:9923).
+        """
+        merges = [line.split() for line in _git(self.path, "rev-list", "--merges", "--parents",
+                                                 f"{before}..{base}").splitlines()]
+        for other in self.pull_requests.values():
+            if other.state != "OPEN" or other.base != base:
+                continue
+            head = other.head_sha(self)
+            found = next((commit for commit, _first, *later in merges if head in later), None)
+            if found is not None:
+                other.merge_commit_sha, other.state = found, "MERGED"
 
     def fail_next(self, route: str, status: int, message: str) -> None:
         """Make the next `route` call (`"create issue"` or `"list issues"`) answer `status` with `message`, once."""
