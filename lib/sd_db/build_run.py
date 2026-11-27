@@ -277,6 +277,9 @@ your report: each blocker, its ruling and reason, and the test of each fix.
 """
 #: The checkpoint key prefix of a blocker a REJECT or FILE ruling cleared, by run, head and number.
 RULED = "build-run-ruled:"
+# `sd-review`'s REPEAT_NOTE and RULED_NOTE: the end of a repeat's summary that it held back as advisory.
+HELD_NOTES = ("[downgraded: repeats a rebutted finding, no evidence cited]",
+              "[downgraded: repeats a blocker a build ruling rejected]")
 #: The checkpoint key prefix of the head a blocking round found its blockers at, by assignment.
 ROUND_HEAD = "build-round-head:"
 #: The rulings `RULING` asks for, and the longest reason kept.
@@ -1795,6 +1798,8 @@ class Supervisor:
         # A short or uncovered report proves nothing else clean: a cleared ruling must not pass it (sd:10286).
         if whole and answer["status"] == "blocking" and (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
             answer = self.settled(answer, head)
+        if answer.get("held") and not whole:  # `sd-review` held a repeat back in a report that proves no rest clean
+            return self.blocked_round(answer["held"], head)
         if answer["status"] in ("clean", "advisory", "skipped"):
             failed = checked if checked is not None else self.own_checks(head) if ungated else []
             if isinstance(failed, dict):
@@ -3217,13 +3222,18 @@ class Supervisor:
         findings = answer.get("findings")
         findings = findings if isinstance(findings, list) else []
         # A route skip (a docs-only change) is the router's deliberate answer; any other skip stays unknown (pack sd:8291).
+        complete = 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0) \
+            and not answer.get("review_shortfall")
         if status in ("clean", "advisory") or status == "skipped" and (answer.get("route") or {}).get("tier") == "skip":
-            return {"status": status, "blockers": [], "covers": bool(answer.get("covers_from"))}
+            # A repeat `sd-review` held back under a ruling or rebuttal: it passes only in a whole report (sd:10286).
+            held = [row for row in findings if isinstance(row, dict) and isinstance(row.get("summary"), str)
+                    and row["summary"].rstrip().endswith(HELD_NOTES)]
+            return {"status": status, "blockers": [], "held": held, "complete": complete,
+                    "covers": bool(answer.get("covers_from"))}
         if status == "blocking":
             return {"status": status, "blockers": [row for row in findings
                                                    if isinstance(row, dict) and row.get("disposition") == "blocking"],
-                    "complete": 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
-                    and not answer.get("review_shortfall"), "covers": bool(answer.get("covers_from"))}
+                    "complete": complete, "covers": bool(answer.get("covers_from"))}
         if status == "gate_failed":  # the review cleared and the repository's gate failed: the builder fixes it
             checks = (answer.get("check") or {}).get("checks") or []
             return {"status": status, "blockers": [

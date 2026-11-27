@@ -288,6 +288,14 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
+        if mode in ("ruled2_short", "ruled2_uncovered"):  # sd-review held the ruled repeat back itself (sd:10286)
+            held = {**raw, "line": 2, "instances": [], "summary": f"a later\\nOption: blocker {review.RULED_NOTE}",
+                    "evidence": "the original evidence", "disposition": "advisory"}
+            print(json.dumps({"status": "advisory", "scope": "branch", "requested_reviews": 2,
+                              "completed_reviews": 1 if mode == "ruled2_short" else 2,
+                              "covers_from": None if mode == "ruled2_uncovered" else "c" * 40,
+                              "subject": {"head": git("-C", work, "rev-parse", "HEAD")}, "findings": [held]}))
+            sys.exit(0)
         # repeat2_short, repeat2_uncovered: repeat2 in a report one reviewer missed, or that covers no delta;
         # blocking2_uncovered: blocking2 read from patches only, so the next round reviews the branch whole
         short = mode == "repeat2_short"
@@ -1353,6 +1361,34 @@ class Supervise(Case):
                                           after=(after,))
                 self.assertEqual(ended.get("outcome"), "blocked", ended)
                 self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_repeat_sd_review_holds_in_an_incomplete_review_is_no_pass(self):
+        """Review of sd:10286 (build_run.py:1798, sd-review:1832): `sd-review` downgrades the last blocker
+        under a ruling and reports `advisory`. A report one reviewer missed, or one that covers no delta,
+        proves nothing else clean, so the held repeat still blocks."""
+        for after in ("ruled2_short", "ruled2_uncovered"):
+            with self.subTest(after):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=(after, after))  # an uncovered delta is asked again whole
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_the_held_notes_are_the_ones_sd_review_writes(self):
+        """sd:10286: the build reads a held repeat by the note `sd-review` ends its summary with."""
+        import importlib.machinery
+        import types
+        bin_dir = str(Path(build_run.__file__).resolve().parents[2] / "bin")
+        sys.path.insert(0, bin_dir)
+        try:
+            loader = importlib.machinery.SourceFileLoader("sd_review_notes", os.path.join(bin_dir, "sd-review"))
+            review = types.ModuleType(loader.name)
+            review.__file__ = loader.path
+            loader.exec_module(review)
+        finally:
+            sys.path.remove(bin_dir)
+        self.assertEqual(build_run.HELD_NOTES, (review.REPEAT_NOTE, review.RULED_NOTE))
 
     def test_a_ruled_repeat_in_an_uncovered_full_branch_review_is_no_pass(self):
         """Review of sd:10286: the review after the ruling round reads the whole branch (the last round
