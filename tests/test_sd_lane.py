@@ -6619,6 +6619,19 @@ class Watch(Lane):
         self.assertEqual((code, lines), (0, [f"pack sd:{one} merged at merged-{one}",
                                              f"pack sd:{two} merged at merged-{two}"]))
 
+    def test_watch_item_names_a_build_blocked_after_a_partial_merge(self) -> None:
+        """Review of sd:10908: an associate-only merge is an earlier pull request, not the item's end."""
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: part", self.body, self.environ, manual=True,
+                                  claim="associate-only")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.build(one, "blocked", "the last part blocked", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (1, [f"pack sd:{one} build blocked: the last part blocked",
+                                             f"pack sd:{two} merged at merged-{two}"]))
+
     def test_watch_item_names_a_build_blocked_in_the_second_of_the_enqueue(self) -> None:
         """Review of sd:10908: stamps hold whole seconds; a tie waited on the pending entry."""
         [item] = self.register_items(1)
