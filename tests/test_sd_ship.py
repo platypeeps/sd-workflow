@@ -2585,9 +2585,9 @@ roles:
     def test_one_unclaimed_review_confirms_one_receipt_only(self):
         """sd:10207 lane review. A review at a head no receipt names
         confirms one unsent receipt; a later unsent receipt stays owed."""
-        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
-        self.advance()
         self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.advance()
+        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
         self.prepare("--copilot-review", "skip")
         self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]],
                          ["requested"])
@@ -2597,6 +2597,33 @@ roles:
         self.prepare("--copilot-review", "skip")
         self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]],
                          ["requested", "requesting"])
+
+    def test_an_older_review_answers_no_receipt_at_a_later_head(self):
+        """sd:10207 lane review (class: a review taken as the answer to a
+        receipt it cannot answer). Copilot reviewed an older head; the
+        first automatic request at the changed head was killed before its
+        POST. That review predates the request, so it confirms nothing:
+        the rerun sends the request instead of `not_repeated`."""
+        self.enable_automatic_copilot()
+        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
+        self.advance()
+        self.interrupt_copilot_request(lands=False)
+        rerun = self.prepare()
+        self.assertEqual(rerun["copilot_review"]["status"], "requested")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        [entry] = self.operation().state["copilot_reviews"]
+        self.assertNotIn("claimed", entry)
+
+    def test_a_skipped_rerun_keeps_a_receipt_an_older_review_cannot_answer(self):
+        """sd:10207 lane review. The same older review settles nothing on a
+        rerun that skips Copilot: the receipt stays owed."""
+        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
+        self.advance()
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.prepare("--copilot-review", "skip")
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]], ["requesting"])
+        with self.assertRaises(ship.Refusal):
+            self.merge()
 
     def test_a_recovery_request_interrupted_after_it_landed_keeps_its_receipt(self):
         """sd:10207. The recovery of a disappeared request records before it

@@ -1197,12 +1197,27 @@ class Ship(SharedReview):
             if entry["pull"] == number and statuses.get(index, entry["status"]) != "absent"])
         for index in waiting:
             status, claim = statuses[index], {}
-            if status == "absent" and left:
+            # Only a review of the receipt's head or a later commit can answer its request.
+            answer = next((reviewed for reviewed in left if self.reviews_from(entries[index]["head"], reviewed)), None)
+            if status == "absent" and answer is not None:
                 # The receipt claims that review, so no later receipt counts it again.
-                status, claim = "requested", {"claimed": left.pop(0)}
+                left.remove(answer)
+                status, claim = "requested", {"claimed": answer}
             if status != "absent":
                 entries[index] = {**entries[index], "status": status, **claim}
         self.save(copilot_reviews=entries)
+
+    def reviews_from(self, head: str, reviewed: str) -> bool:
+        """Whether `reviewed` is `head` or descends from it, in local history (sd:10207).
+
+        A review of an older commit predates the request and answers none;
+        a commit unknown here proves nothing, so the receipt stays owed.
+        """
+        if reviewed == head:
+            return True
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head or ""):
+            return False
+        return sd_lib.git_output(["merge-base", "--is-ancestor", head, reviewed], self.root) is not None
 
     def unclaimed_copilot_reviews(self, reviews: list[dict], claims: list[str]) -> list[str]:
         """The heads of completed Copilot reviews no receipt claims.
