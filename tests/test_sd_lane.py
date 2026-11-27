@@ -4133,7 +4133,9 @@ class CitedCloses(SharedQueue):
                              ("stale-kept", {a}), ("moved-kept", {a}),
                              ("stale-other", set()), ("stale-other-kept", {a}),
                              ("own-move", set()), ("own-move-kept", {a}),
-                             ("own-move-back", set()), ("own-move-back-kept", {a})):
+                             ("own-move-back", set()), ("own-move-back-kept", {a}),
+                             # The ruling on class pass 23: other text that runs at the old name is not the fix.
+                             ("own-move-back-other", set()), ("own-move-back-other-kept", {a})):
             with self.subTest(case=case):
                 tree, _ = self.committed(f"topic-disabled-executable-{case}")
                 git(tree, "fetch", "-q", "origin")
@@ -4166,6 +4168,34 @@ class CitedCloses(SharedQueue):
                     (tree / "other.txt").write_text("other\n", encoding="utf-8")
                     git(tree, "add", "other.txt")
                 git(tree, "commit", "-q", "-m", "revert: the step 7 fix")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
+
+    def test_a_new_script_kept_whole_beside_a_stale_name_keeps_its_close(self) -> None:
+        """sd:10214, the ruling on class pass 23: a script the cited commit added has no text before it, so
+        the place holds its work while the script stands there whole and runs. A revert that adds another
+        script at the old name and a comment to the moved one took nothing out; one that rewrites the moved
+        script, or clears its executable bit, did."""
+        import sd_operations
+        a, *_ = self.open
+        script = "#!/bin/sh\n" + "".join(f"echo step {n}\n" for n in range(20))
+        for case, text, mode, closes in (("commented", script + "# a note\n", 0o755, {a}),
+                                         ("rewritten", "#!/bin/sh\necho other\n", 0o755, set()),
+                                         ("disabled", script + "# a note\n", 0o644, set())):
+            with self.subTest(case=case):
+                tree, _ = self.committed(f"topic-new-script-{case}")
+                (tree / "tool.sh").write_text(script, encoding="utf-8")
+                (tree / "tool.sh").chmod(0o755)
+                git(tree, "add", "tool.sh")
+                git(tree, "commit", "-q", "-m", f"feat: the tool\n\nCloses: sd:{a}")
+                git(tree, "mv", "tool.sh", "tool-new.sh")
+                git(tree, "commit", "-q", "-m", "refactor: rename the tool")
+                (tree / "tool.sh").write_text("#!/bin/sh\necho separate\n", encoding="utf-8")
+                (tree / "tool.sh").chmod(0o755)
+                (tree / "tool-new.sh").write_text(text, encoding="utf-8")
+                (tree / "tool-new.sh").chmod(mode)
+                git(tree, "add", "tool.sh", "tool-new.sh")
+                git(tree, "commit", "-q", "-m", "revert: an unrelated change")
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
 

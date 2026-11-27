@@ -1039,6 +1039,9 @@ def holds_fix(old: list[bytes], fixed: list[bytes], text: list[bytes]) -> bool:
     lines around it, which must stand there, and must read exactly as the fix wrote it: an edit elsewhere
     in the file keeps the work. No text tells an edited fix line from an undone one, so nothing nearer
     is guessed (class pass 17); a revert that keeps an edited fix cites the item itself."""
+    if not old:  # a file the fix added: no text before it, so the fix is the file, and stands whole or not
+        whole = fixed[:-1] if fixed[-1:] == [b""] else fixed
+        return bool(whole) and any(text[at:at + len(whole)] == whole for at in range(len(text) - len(whole) + 1))
     kept = {at + n: to + n for at, to, size in
             difflib.SequenceMatcher(None, old, text, autojunk=False).get_matching_blocks() for n in range(size)}
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, fixed, autojunk=False).get_opcodes():
@@ -1163,12 +1166,11 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             return None
         return done.stdout.split(b"\n") if done.returncode == 0 and b"\0" not in done.stdout else None
 
-    def keeps_fix(entry: str | None, fix: str | None, before: str | None, at: str, name: str) -> bool:
-        """Whether `entry` holds what the cited commit's `fix` changed in `before` (`holds_fix`), in a mode
-        that runs as the fix left it (`runs_as`)."""
-        text, fixed, old = lines(entry), lines(fix), lines(before)
-        return text is not None and fixed is not None and old is not None and \
-            runs_as(entry, fix, at, name) and holds_fix(old, fixed, text)
+    def keeps_fix(entry: str | None, fix: str | None, before: str | None) -> bool:
+        """Whether `entry` holds the text the cited commit's `fix` changed in `before` (`holds_fix`); the
+        caller reads the mode (`runs_as`)."""
+        text, fixed, old = lines(entry), lines(fix), lines(before) if before else []
+        return text is not None and fixed is not None and old is not None and holds_fix(old, fixed, text)
 
     def reads_before(where: dict[str, str], rev: str, names: list[str], before: str,
                      home: dict[str, str] | None = None, cited: str = "") -> bool | None:
@@ -1197,32 +1199,41 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             return None
         held = [name if at != name and now.get(at) == want.get(at) else at for at, name in zip(held, names, strict=True)]
 
-        def ships(path: str, name: str) -> bool:
-            """Whether `path` holds the fix `cited` left at `name`, in a mode that runs: its blob, or what it
-            changed (`keeps_fix`)."""
+        def runs(path: str, name: str) -> bool:
+            return runs_as(now.get(path), fix.get(name), path, name)
+
+        def holds(path: str, name: str) -> bool:
+            """Whether `path` holds the text of the fix `cited` left at `name`: its blob, or what it changed
+            (`keeps_fix`). `runs` reads the mode."""
             entry, left = now.get(path), fix.get(name)
-            return bool(entry and left) and runs_as(entry, left, path, name) and (
-                entry.split()[-1] == left.split()[-1] or keeps_fix(entry, left, want.get(name), path, name))
+            return bool(entry and left) and (
+                entry.split()[-1] == left.split()[-1] or
+                keeps_fix(entry, left, want.get(name) or want.get(home.get(name, name))))
+
+        def stopped(paths: list[str], name: str) -> bool:
+            """Whether the work at `paths` no longer runs: none can run it, or the fix stands in one that
+            cannot and in none that can. Other text that runs beside a disabled fix is not the fix."""
+            ships = [holds(path, name) and runs(path, name) for path in paths]
+            return not any(runs(path, name) for path in paths) or \
+                (not any(ships) and any(holds(path, name) and not runs(path, name) for path in paths))
 
         def one(at: str, name: str) -> bool:
             # Every return reads the mode with the text (`runs_as`, class pass 23): a place the work cannot
             # run in holds none of it, whichever read finds the place.
-            def runs(path: str) -> bool:
-                return runs_as(now.get(path), fix.get(name), path, name)
             if name in home:
                 changed = [path for path in {at, name, home[name]} if now.get(path) not in (None, want.get(path))]
                 return (at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))) \
-                    or (bool(changed) and not any(runs(path) for path in changed))
+                    or (bool(cited) and bool(changed) and stopped(changed, name))
             if cited and at != name and name in now:  # both names stand: the mapping may be stale
                 found = [now.get(at), now.get(name)]
                 if fix.get(name) is not None and fix[name] in found:
                     return False
                 if want.get(name) not in found:  # neither reads as before: the work is where the fix runs
-                    return not (ships(at, name) or ships(name, name))
+                    return not any(holds(path, name) and runs(path, name) for path in (at, name))
                 other = name if found[0] == want.get(name) else at
                 found.remove(want.get(name))
-                return not keeps_fix(found[0], fix.get(name), want.get(name), other, name)
-            return now.get(at) == want.get(name) or not runs(at)
+                return not (runs(other, name) and keeps_fix(found[0], fix.get(name), want.get(name)))
+            return now.get(at) == want.get(name) or not runs(at, name)
         return all(one(at, name) for at, name in zip(held, names, strict=True))
 
     def places_in(later: str, held: list[str], revert: bool, names: list[str],
