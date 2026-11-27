@@ -516,7 +516,9 @@ def _item(connection, item: int, *, lead: int | None = None, riding: Collection[
     if row["kind"] not in RUNNABLE_KINDS:  # named before the status, as a press of a chore reads it
         raise BuildRefused(_press_refusal(connection, row))
     if row["status"] != "ready" and not (row["status"] == "blocked" and split_held(connection, item)):
-        raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+        if row["status"] != "blocked" or (since := _rebuild_since(connection, item)) is None:
+            raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+        _answered(connection, item, since)
     refused = _press_refusal(connection, row, lead=lead, riding=riding)
     if refused:
         raise BuildRefused(refused)
@@ -715,8 +717,10 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                 raise BuildRefused(f"item {item} was parked after auto-pickup read it")
         created = []
         for item in items:
-            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # a split-held bundle's item
-                transition(connection, item, "ready", who=who, reason="its bundle's branch is held after a split")
+            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # `_item` took it blocked
+                transition(connection, item, "ready", who=who,
+                           reason="its bundle's branch is held after a split" if split_held(connection, item)
+                           else "Build after its bundle ended")
             if work_kind(connection, item) == DESIGN_KIND and draft_design(connection, item) is None:
                 # A design item with no design yet runs a design run first, beside the code (sd:10096).
                 from . import draft  # noqa: PLC0415 -- draft imports this module
@@ -1245,6 +1249,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     finding = finding.strip()
     with transaction(connection):
         leads, fixes, fresh = [], [], []
+        held: set[int] = set()
         named: dict[int, set[int]] = {}
         # Each lane-failed run this press split, and every member of its bundle: the split settled each, so a
         # later one of them is done, whatever the order (review of build/sd-1306).
@@ -1302,6 +1307,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
             if split_held(connection, item):  # its branch may hold a left item's work: a fresh press, new branch
                 fresh.append(item)
+                held.add(item)  # `queue` takes it blocked as it stands: no question holds it (lane review)
                 continue
             # A drop's kept lead never ran, and its Retry resumes the split branch (`retry`, review of build/sd-1306).
             if (state and state["status"] in AGAIN and row["status"] == state["status"] and not alone
@@ -1342,8 +1348,67 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+                elif (state["item"]["status"] == "blocked" and item not in held
+                      and (since := _build_blocked(connection, item)) is not None):
+                    # A member its run blocked, whose bundle cannot retry (its lead done: the code shipped
+                    # without it), builds fresh once its builder's question is answered (pack sd:10294): one
+                    # that run raised, as delivery read it (`asked_since`), not an older unrelated one.
+                    _answered(connection, item, since)
+                    transition(connection, item, "ready", who=who, reason="Build after its bundle ended")
         fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])
+
+
+def _build_blocked(connection, item: int) -> str | None:
+    """When the build run that blocked `item` reads questions from (`asked_since`), if `item`'s block
+    is that build's, which a Build lifts; else None. The block is the build's while that assignment ended
+    blocked and the item's latest status change is the build's move to blocked with that assignment's
+    reason. A block someone wrote after it, an operator's hold, is not the build's (review of build/sd-1867)."""
+    row = connection.execute("SELECT id, parent, status, result FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    if row is None or row["status"] != "blocked" or not row["result"]:
+        return None
+    moved = connection.execute("SELECT body FROM note WHERE item = ? AND kind = 'status_change' "
+                               "ORDER BY id DESC LIMIT 1", (item,)).fetchone()
+    if moved is None or re.fullmatch(r"\w+ -> blocked by build: " + re.escape(row["result"]),
+                                     moved["body"] or "", re.DOTALL) is None:
+        return None
+    lead = row["parent"] or row["id"]
+    number = _blocking_run(connection, lead, row["result"])
+    # A block that names no run of its bundle reads every question: no time stands in for the run.
+    return asked_since(connection, lead, number) if number is not None else ""
+
+
+def _rebuild_since(connection, item: int) -> str | None:
+    """`_build_blocked` for an item a fresh press may take blocked: its bundle Retry no longer takes, as
+    its lead ended otherwise or its lead's item is done (the code shipped without it, pack sd:10294).
+    The dashboard's press and dialog read it through `_item`, as Build by item does (review of sd-1867)."""
+    since = _build_blocked(connection, item)
+    if since is None:
+        return None
+    row = connection.execute("SELECT id, parent FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    state = queue_state(connection, row["parent"] or row["id"])
+    if state["status"] == "blocked" and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"]):
+        return None  # Retry of the bundle resumes its branch
+    return since
+
+
+def _answered(connection, item: int, since: str) -> None:
+    """Refuse while a question the blocking run raised on `item` still waits on the operator."""
+    if asked := open_question(connection, [item], since, pending=True):
+        raise BuildRefused(f"item {item} waits on question note #{asked['id']}; answer it, then Build it")
+
+
+def _blocking_run(connection, lead: int, reason: str) -> int | None:
+    """The number of the run of `lead` that a build block's `reason` names, or None. Every block a run writes
+    (`_block`) begins `build run <id> `, so the run is read by its id, never by time or as the newest: a
+    lane Fix runs the bundle again after it, even in the block's own second, and did not build the blocked
+    item, so its start would hide the question the item waits on (class pass of build/sd-1867)."""
+    named = re.match(r"build run ([0-9a-f]{32}) ", reason)
+    row = named and connection.execute("SELECT run FROM runner_run WHERE id = ? AND assignment = ?",
+                                       (named.group(1), lead)).fetchone()
+    return row["run"] if row else None
 
 
 def _retry_row(connection, item: int):
