@@ -1008,6 +1008,34 @@ class CitedIdTests(unittest.TestCase):
         commits = [("f" * 40, hidden), (b + "0" * 33, "fix: work\n\nCloses: sd:3\n")]
         self.assertEqual(sd_ship_body.cited_ids("", commits), (3,))
 
+    def test_a_lazy_line_is_read_with_its_indent_gone_and_starts_no_block(self) -> None:
+        """Last round, review of build/sd-1653, `bin/sd_ship_body.py:217` and `:356` (pack sd:10090).
+        The class: `_continues` hands a lazy line on with its indent stripped, and a rule that
+        counts indent then read it again. `123. Kept: <!-- example`, `    > q`: four spaces in is
+        less than the item's text column, so the line is lazy; stripped, `> q` read as a quote,
+        the comment's paragraph ended, and the `2. <sha>` it hid undid a retained commit. A lazy
+        line starts no block: `_continues` decided that with the indent in place. Each expected
+        value is what CommonMark shows."""
+        a = "a" * 7
+        starts = ("> q", ">", "# h", "***", "<div>", "- x", "1. x", "```", "~~~", "===", "---")
+
+        def message(lead: str, indent: int, start: str) -> str:
+            return f"{lead}Kept: <!-- example\n{' ' * indent}{start}\nReverted commits:\n2. {a}\n-->\n"
+
+        # (the item's marker, a lazy indent: four past what holds the item, less than its text)
+        for lead, indent in (("123. ", 4), ("1234567. ", 4), ("1234567. ", 8), ("- 123. ", 6)):
+            for start in starts:
+                with self.subTest(lead=lead, indent=indent, start=start):
+                    self.assertEqual(sd_ship_body._listed_undone(message(lead, indent, start)), [])
+        # Three in, each start is a block: it ends the item and the paragraph, so the `<!--` is text.
+        for start in ("> q", "# h", "***", "<div>", "- x", "1. x"):
+            for lead, indent in (("123. ", 3), ("- 123. ", 5)):
+                with self.subTest(lead=lead, indent=indent, start=start):
+                    self.assertEqual(sd_ship_body._listed_undone(message(lead, indent, start)), [a])
+        revert = "revert: undo\n\n" + message("123. ", 4, "> quoted text")
+        commits = [("f" * 40, revert), (a + "0" * 33, "fix: work\n\nCloses: sd:2\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (2,))
+
     def test_only_a_commonmark_block_ends_the_paragraph_of_a_comment(self) -> None:
         """Last round, review of build/sd-1653 (pack sd:10090). The paragraph of an inline comment ended
         by rules CommonMark does not have: the `plain` read's any-marker and colon-heading rules, a

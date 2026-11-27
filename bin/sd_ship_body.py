@@ -159,7 +159,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
         fence = ""  # the list item that held the fence ended, and the fence with it
         kind, opened, text = _wrapped(rest, commented) if lazy else _kind(
             rest, items, loose, commented, len(items) != depth, plain, spanned)
-        alone = _stands_alone(kind, text, line)
+        alone = _stands_alone(kind, text, line, lazy)
         if ticks and _ends_paragraph(kind, opened, alone, len(items) != depth):
             return rows, span_at  # the paragraph ended with the span open: its opener is text
         shown, joins = line, None
@@ -212,11 +212,12 @@ def _unclosed(inline_at: tuple[int, int] | None, line: str, rest: str, ended: bo
 
 def _ends_comment_paragraph(line: str, rest: str, ended: bool, lazy: bool) -> bool:
     """Whether `line` ends the paragraph an inline comment open over it sits in: a blank, a block that
-    interrupts a paragraph, a setext underline on a line that is not `lazy`, the end of its list item
-    or of the heading it opened on (`ended`). CommonMark then reads its `<!--` as text. These are
+    interrupts a paragraph or a setext underline, on a line that is not `lazy`, the end of its list
+    item or of the heading it opened on (`ended`). A `lazy` line starts no block (`_continues`), and
+    its `rest` has lost the indent that says so. CommonMark then reads its `<!--` as text. These are
     CommonMark's rules in either grammar: the `plain` rules rest while the comment is open, as in an
     open code span, so no read ends a comment a reader sees closed (pack sd:10090)."""
-    return ended or not line.strip() or _interrupts(rest) or (not lazy and bool(_SETEXT.match(rest)))
+    return ended or not line.strip() or (not lazy and (_interrupts(rest) or bool(_SETEXT.match(rest))))
 
 
 #: What a comment between two word characters reads as: a word character no sha holds, so the two
@@ -401,9 +402,12 @@ def _wrapped(rest: str, commented: bool) -> tuple[str, int, str]:
     return "comment" if commented else "wrapped", 0, rest
 
 
-def _stands_alone(kind: str, text: str, line: str) -> bool:
-    """Whether the line is no paragraph text: a fence, code, an underline, a blank, a heading or a break."""
-    return kind in ("fence", "code", "setext") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text))
+def _stands_alone(kind: str, text: str, line: str, lazy: bool = False) -> bool:
+    """Whether the line is no paragraph text: a fence, code, an underline, a blank, a heading or a break.
+    A `lazy` line is paragraph text: its `text` is stripped, so a heading or break four spaces in
+    would match (pack sd:10090)."""
+    return kind in ("fence", "code", "setext") or not line.strip() or (
+        not lazy and bool(_ATX.match(text) or _BREAK.match(text)))
 
 
 def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool = False,
