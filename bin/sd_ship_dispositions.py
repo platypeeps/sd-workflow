@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import pathlib
-import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -179,16 +178,13 @@ def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool = Fals
 
 
 def run_row_tests(operation: Any, head: str, tests: list[list[str]]) -> None:
-    """Each row's test at `head`; one that fails voids the clearance an earlier pass saved, so no read reuses it."""
+    """Each row's test at `head`. The clearance an earlier pass saved is voided before the first test runs,
+    so however a run ends short of a pass (a refusal, another error, a killed process) no read reuses it."""
+    if any(tests) and operation.state.get("review_clearance") is not None:
+        operation.save(review_clearance=None)
     for index, argv in enumerate(tests, 1):
-        if not argv:
-            continue
-        try:
+        if argv:
             reproduces(operation.root, head, index, argv)
-        except Refusal:
-            if operation.state.get("review_clearance") is not None:
-                operation.save(review_clearance=None)
-            raise
 
 
 def test_argv(value: Any) -> list[str]:
@@ -202,19 +198,26 @@ def test_argv(value: Any) -> list[str]:
 
 
 def names_root(root: pathlib.Path, value: str) -> bool:
-    """`value` names `root` or a path under it, as given or resolved: exactly, not `root` as a prefix of a sibling."""
-    return any(re.search(re.escape(str(place)) + r"(?:/|$|" + re.escape(os.pathsep) + ")", value)
-               for place in {root, root.resolve()})
+    """`value` mentions `root` in any spelling: as given or resolved, under `~`, `$HOME` or `${HOME}`, in any
+    letter case, anywhere in the text. A sibling whose name starts with `root`'s matches too: fail closed."""
+    home = os.path.expanduser("~").rstrip("/")
+    spellings = {str(root), str(root.resolve())}
+    for place in list(spellings):
+        if home and place.startswith(home + "/"):
+            spellings |= {prefix + place[len(home):] for prefix in ("~", "$HOME", "${HOME}")}
+    return any(spelling.casefold() in value.casefold() for spelling in spellings)
 
 
 def rebuttal_environment(root: pathlib.Path) -> dict[str, str]:
     """The gate's environment (no `PATH` entry, venv or `PYTHONPATH` in `root`) as a plain checkout's tests see
-    it, without `SD_LOCAL_GATE` and any variable naming `root`: the test loads the head's code alone."""
+    it, without `SD_LOCAL_GATE` and every entry that names `root`: the test loads the head's code alone."""
     import sd_gate_run  # noqa: PLC0415
 
     env = sd_gate_run.gate_environment(root)
     env.pop(sd_gate_run.GATE_VARIABLE, None)
-    return {key: value for key, value in env.items() if not names_root(root, value)}
+    kept = {key: os.pathsep.join(entry for entry in value.split(os.pathsep) if not names_root(root, entry))
+            for key, value in env.items()}
+    return {key: value for key, value in kept.items() if value or not env[key]}
 
 
 def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> None:
@@ -248,6 +251,9 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
                           "a blocker stays open until its test passes") from None
         except OSError as error:
             raise Refusal(f"finding {index}: its test could not start: {error.strerror or error}") from None
+        except ValueError:  # output that does not decode: no pass was read, so the finding stands
+            raise Refusal(f"finding {index}: its test wrote output that is not text, so it reproduces the "
+                          "finding: fix it, or name a test that passes") from None
         else:
             if git(tree, "status", "--porcelain", "--untracked-files=all") or git(tree, "rev-parse", "HEAD") != head:
                 raise Refusal(f"finding {index}: its test changed its checkout; the record binds the clean exact head")

@@ -6,6 +6,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -298,6 +299,56 @@ class DispositionTests(unittest.TestCase):
             with self.subTest(argv=argv), patch.dict("os.environ", environments):
                 with self.assertRaises(ship.Refusal):
                     sd_ship_dispositions.reproduces(root, head, 1, argv)
+
+    def test_any_end_of_a_test_run_but_a_pass_leaves_no_clearance(self):
+        """sd:10893 class pass: the clearance is voided before the first test runs, so no way a run ends
+        without a pass keeps it: output that does not decode, an error that is no refusal, an interruption."""
+        self.blocked()
+        flag = self.directory / "reproduced"
+        script = (f"import pathlib, sys\nif pathlib.Path({str(flag)!r}).exists():\n"
+                  "    sys.stdout.buffer.write(b'\\xff\\xfe'); sys.exit(1)")
+        endings = {"undecodable": None, "error": RuntimeError("example"), "interrupted": KeyboardInterrupt()}
+        for name, raised in endings.items():
+            with self.subTest(ending=name):
+                flag.unlink(missing_ok=True)
+                self.accepted(self.with_test([sys.executable, "-c", script]))
+                self.prepare()
+                self.assertIsNotNone(self.operation().state.get("review_clearance"))
+                flag.write_text("x")
+                if raised is None:
+                    with self.assertRaisesRegex(ship.Refusal, "reproduces the finding"):
+                        self.prepare()
+                else:
+                    with patch.object(sd_ship_dispositions, "reproduces", side_effect=raised), \
+                            self.assertRaises(type(raised)):
+                        self.prepare()
+                self.assertIsNone(self.operation().state.get("review_clearance"))
+
+    def test_a_path_into_the_live_checkout_is_named_in_any_spelling(self):
+        """sd:10893 class pass: the matcher refuses every spelling of the checkout, not one boundary shape:
+        quoted in an inline script, under `~` or `$HOME`, in another letter case, as given or resolved."""
+        home = pathlib.Path.home()
+        root = home / "example-area" / "Clone"
+        for value in (f"sys.path.insert(0, '{root}')", f'"{root}"', "~/example-area/Clone/x.py",
+                      "$HOME/example-area/Clone", "${HOME}/example-area/Clone", str(root).upper(),
+                      f"--source={root}", f"a{chr(10)}{root}{chr(10)}b"):
+            with self.subTest(value=value):
+                self.assertTrue(sd_ship_dispositions.names_root(root, value))
+        for value in ("tests/test_example.py", str(home / "example-area"), "-c", "import example"):
+            with self.subTest(value=value):
+                self.assertFalse(sd_ship_dispositions.names_root(root, value))
+        live = self.root.resolve()
+        head = fixture._git(live, "rev-parse", "HEAD")
+        inline = f"import sys; sys.path.insert(0, {str(live)!r})"
+        with self.assertRaisesRegex(ship.Refusal, "names a path in the live checkout"):
+            sd_ship_dispositions.reproduces(live, head, 1, [sys.executable, "-c", inline])
+        sibling = f"{live}-tools/bin"
+        with patch.dict("os.environ", {"PATH": os.pathsep.join([sibling, os.environ["PATH"]]),
+                                       "EXAMPLE_QUOTED": f"'{live}'"}):
+            environment = sd_ship_dispositions.rebuttal_environment(live)
+        self.assertNotIn("EXAMPLE_QUOTED", environment)
+        self.assertNotIn(sibling, environment["PATH"].split(os.pathsep))
+        self.assertTrue(environment["PATH"])
 
     def test_only_recording_and_prepare_run_the_test_never_a_read(self):
         """sd:10893 review: merge, publication and `verify-review` read the record and run nothing; a test
