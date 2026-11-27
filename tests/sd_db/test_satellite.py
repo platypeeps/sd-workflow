@@ -151,6 +151,22 @@ class TheSatelliteCheck(unittest.TestCase):
         again = self.check(port)
         self.assertIn(f"  ok      {self.config} names 127.0.0.1:{port}", again)
 
+    def test_address_writes_the_ip_beside_the_name_and_a_change_differs(self):
+        port = closed_port()
+        out = io.StringIO()
+        satellite.run("127.0.0.1", port, apply=True, home=self.home, out=out, address="127.0.0.1")
+        self.assertEqual(json.loads(self.config.read_text()),
+                         {"hub": "127.0.0.1", "port": port, "address": "127.0.0.1"})
+        self.assertIn(f"  DIFFERS {self.config} names 127.0.0.1:{port} at 127.0.0.1, not 127.0.0.1:{port}",
+                      self.check(port))
+
+    def test_an_address_that_is_not_an_ip_is_refused_and_nothing_written(self):
+        out = io.StringIO()
+        self.assertEqual(satellite.run("127.0.0.1", closed_port(), apply=True, home=self.home,
+                                       out=out, address="hub.example.test"), 2)
+        self.assertIn("is not an IP address", out.getvalue())
+        self.assertFalse(self.config.exists())
+
     def test_a_hub_json_naming_another_hub_differs(self):
         port = closed_port()
         self.config.parent.mkdir(parents=True)
