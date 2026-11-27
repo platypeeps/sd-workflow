@@ -2093,13 +2093,16 @@ def parse_sections(pairs: list[str]) -> dict[str, str]:
             raise UsageError(f"{pair!r} names no section")
         if name in filled:
             raise UsageError(f"section {name!r} is given twice")
-        for line in text.splitlines():
-            # `^ {0,3}## `, not `startswith`. CommonMark renders a heading
-            # indented by up to three spaces, so `   ## Score` reaches Obsidian
-            # as a heading while `body_headings` -- which reads column 0 -- does
-            # not see it. Refusing the wider shape keeps the two from
-            # disagreeing about what the note contains.
-            if SMUGGLED_HEADING.match(line):
+        # `^ {0,3}## `, not `startswith`. CommonMark renders a heading
+        # indented by up to three spaces, so `   ## Score` reaches Obsidian
+        # as a heading while `body_headings` -- which reads column 0 -- does
+        # not see it. A `## ` line inside a fence the text closes is code,
+        # as `note_heading_lines` reads it back (sd:10784): a sentinel
+        # heading after the text is the only heading found then; an unclosed
+        # fence hides the sentinel, and would hide the note's later headings.
+        lines = text.splitlines()
+        if any(SMUGGLED_HEADING.match(line) for line in lines):
+            if note_heading_lines([*lines, "## end"], 0) != [(len(lines), "end")]:
                 raise Refusal(
                     f"section {name!r} carries its own `## ` heading;"
                     " section text is the body under a heading, not more headings")
@@ -2227,7 +2230,8 @@ def rendered_body(kind: dict[str, object], root: pathlib.Path, args: argparse.Na
             resolve_pair_files(args.section or [], "--section-file", sequences=False)))
 
     order = declared_sections(kind)
-    rendered = body_headings(body)
+    # Fence-aware, as the note is read back: section text may hold a fenced `## ` line (sd:10784).
+    rendered = [heading for _, heading in note_heading_lines(body.splitlines(), 0)]
     if order and rendered != order:
         # The first thing in this rollout that gives `sections.order` a
         # consequence. `validate_sections` never opens the template, so until

@@ -191,6 +191,19 @@ class TheWrites(DbStoreFixture):
         again = self.ok("store", "set-section", "pp.tip", "First tip", "--section", "Notes=Seen twice.")
         self.assertIn("already holds", again.stdout)
 
+    def test_a_fenced_heading_line_in_section_text_is_text(self) -> None:
+        """sd:10784: a shell comment `## ...` in a fenced example refused, though the
+        reader skips fences and reads the text back as one section."""
+        code = "Run it:\n```sh\n## build first\nmake\n```"
+        self.add("First tip", "--section", f"Tip={code}")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Tip").stdout, code + "\n")
+        self.ok("store", "set-section", "pp.tip", "First tip", "--section", f"Notes={code}")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout, code + "\n")
+        for text in ("x\n## Notes", "```\n## Notes", "```\n```\n## Notes", "~~~\n## Notes\n```"):
+            with self.subTest(text=text):
+                self.refused("store", "set-section", "pp.tip", "First tip", "--section", f"Tip={text}",
+                             says="its own `## ` heading")
+
     def test_a_missing_row_refuses(self) -> None:
         self.refused("store", "set", "pp.tip", "No such tip", "score", "8", says="no tip row has the title")
 
