@@ -73,7 +73,7 @@ from . import (
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
-from .errors import SchemaTooNew
+from .errors import SchemaTooNew, SdDbError
 from .registry import read as read_registry
 from .ship import this_host
 from .workflow import WorkflowError

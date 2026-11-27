@@ -48,6 +48,7 @@ from sd_db import (
     writes,
 )
 from sd_db.database import connect
+from sd_db.errors import SdDbError
 from sd_db.migrate import initialise
 from sd_db.ship import this_host
 from sd_db.workflow import item_state
@@ -833,6 +834,13 @@ class Supervise(Case):
         self.assertEqual(ended, {"run": self.bundle["id"], "outcome": None, "step": "enqueued"})
         cost = self.db.execute("SELECT provider, bill, usd FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchall()
         self.assertEqual([tuple(row) for row in cost], [(None, None, 0.42)])
+
+    def test_a_declaration_read_refused_is_unread_runtime_data(self):
+        """Fix-up of sd:10400's cherry-pick: it dropped the `SdDbError` import `runtime_data` catches, so a
+        refused declaration read raised `NameError` instead of reading as unknown (None)."""
+        self.press(1)
+        with mock.patch.object(build_run.repos, "declarations", side_effect=SdDbError("refused")):
+            self.assertIsNone(self.supervisor().runtime_data())
 
     def test_a_skipped_member_is_not_delivered(self):
         """Review round 2: only the members a branch commit's `Closes:` trailer cites are enqueued and done; the
