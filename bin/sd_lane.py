@@ -1197,18 +1197,32 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             return None
         held = [name if at != name and now.get(at) == want.get(at) else at for at, name in zip(held, names, strict=True)]
 
+        def ships(path: str, name: str) -> bool:
+            """Whether `path` holds the fix `cited` left at `name`, in a mode that runs: its blob, or what it
+            changed (`keeps_fix`)."""
+            entry, left = now.get(path), fix.get(name)
+            return bool(entry and left) and runs_as(entry, left, path, name) and (
+                entry.split()[-1] == left.split()[-1] or keeps_fix(entry, left, want.get(name), path, name))
+
         def one(at: str, name: str) -> bool:
+            # Every return reads the mode with the text (`runs_as`, class pass 23): a place the work cannot
+            # run in holds none of it, whichever read finds the place.
+            def runs(path: str) -> bool:
+                return runs_as(now.get(path), fix.get(name), path, name)
             if name in home:
-                return at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))
+                changed = [path for path in {at, name, home[name]} if now.get(path) not in (None, want.get(path))]
+                return (at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))) \
+                    or (bool(changed) and not any(runs(path) for path in changed))
             if cited and at != name and name in now:  # both names stand: the mapping may be stale
                 found = [now.get(at), now.get(name)]
-                if (fix.get(name) is not None and fix[name] in found) or want.get(name) not in found:
+                if fix.get(name) is not None and fix[name] in found:
                     return False
+                if want.get(name) not in found:  # neither reads as before: the work is where the fix runs
+                    return not (ships(at, name) or ships(name, name))
                 other = name if found[0] == want.get(name) else at
                 found.remove(want.get(name))
                 return not keeps_fix(found[0], fix.get(name), want.get(name), other, name)
-            # A place the cited commit's work cannot run in holds none of it (class pass 22).
-            return now.get(at) == want.get(name) or not runs_as(now.get(at), fix.get(name), at, name)
+            return now.get(at) == want.get(name) or not runs(at)
         return all(one(at, name) for at, name in zip(held, names, strict=True))
 
     def places_in(later: str, held: list[str], revert: bool, names: list[str],

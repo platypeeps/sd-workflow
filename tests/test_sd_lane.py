@@ -4127,8 +4127,13 @@ class CitedCloses(SharedQueue):
         a, *_ = self.open
         original = "#!/bin/sh\n" + "".join(f"echo step {n}\n" for n in range(20))
         fixed = original.replace("echo step 7\n", "echo step 7 fixed\n")
+        # Class pass 23: every way a place is read, the early returns too. `stale-other` puts other text
+        # at the old name; `own-move` has the cited commit itself rename the script.
         for case, closes in (("in-place", set()), ("moved", set()), ("stale", set()),
-                             ("stale-kept", {a}), ("moved-kept", {a})):
+                             ("stale-kept", {a}), ("moved-kept", {a}),
+                             ("stale-other", set()), ("stale-other-kept", {a}),
+                             ("own-move", set()), ("own-move-kept", {a}),
+                             ("own-move-back", set()), ("own-move-back-kept", {a})):
             with self.subTest(case=case):
                 tree, _ = self.committed(f"topic-disabled-executable-{case}")
                 git(tree, "fetch", "-q", "origin")
@@ -4141,14 +4146,17 @@ class CitedCloses(SharedQueue):
                     git(tree, "push", "-q", "origin", "HEAD:main")
                     git(tree, "fetch", "-q", "origin")
                 (tree / "run.sh").write_text(fixed, encoding="utf-8")
+                if case.startswith("own-move"):
+                    git(tree, "mv", "run.sh", "tool.sh")
                 git(tree, "commit", "-q", "-am", f"fix: step 7\n\nCloses: sd:{a}")
                 name = "run.sh"
                 if case != "in-place":
-                    git(tree, "mv", "run.sh", "tool.sh")
-                    git(tree, "commit", "-q", "-m", "refactor: rename run to tool")
+                    if not case.startswith("own-move"):
+                        git(tree, "mv", "run.sh", "tool.sh")
+                        git(tree, "commit", "-q", "-m", "refactor: rename run to tool")
                     name = "tool.sh"
-                if case.startswith("stale"):  # the old name comes back as before, the new one stays
-                    (tree / "run.sh").write_text(original, encoding="utf-8")
+                if case.startswith(("stale", "own-move-back")):  # the old name comes back, the new one stays
+                    (tree / "run.sh").write_text("echo other\n" if "other" in case else original, encoding="utf-8")
                     (tree / "run.sh").chmod(0o755)
                     git(tree, "add", "run.sh")
                 if not case.endswith("kept"):
