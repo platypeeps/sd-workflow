@@ -5143,7 +5143,8 @@ def build_ended_last(build: dict[str, Any] | None, entry: dict[str, Any] | None)
 def item_end(queue: Queue, item: int, entry: dict[str, Any] | None, build: dict[str, Any] | None,
              write: Callable[[str], Any]) -> bool | None:
     """None while `item`'s entry or build runs; else its one line written, and whether it merged."""
-    from sd_db.repos import item_ref  # noqa: PLC0415 - `watch_items` requires sd_db
+    require_sd_db()
+    from sd_db.repos import item_ref  # noqa: PLC0415 - sd_db is required above
     status, ref = (entry.get("status") if entry else "none"), item_ref(item, queue.repository)
     if status in ("pending", "running") or (build and build["status"] in BUILDING):
         return None
