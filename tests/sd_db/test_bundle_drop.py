@@ -1281,6 +1281,25 @@ class Advisories(Repo):
         self.assertEqual((new / "b.txt").read_text(), body + "kept\n")
         self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "0", "replayed onto main")
 
+    def test_a_kept_edit_of_a_dropped_file_main_landed_renamed_still_drops(self):
+        """sd:10020: the dropped commit adds a.txt, a kept commit edits it, main lands the same file as b.txt.
+        The replay lands the edit on b.txt; the fork never had a.txt, so the check reads renames from the
+        kept commit's parent."""
+        body = "".join(f"line {n}\n" for n in range(20))
+        items = [self.item(repo=str(self.repo)) for _ in range(2)]
+        build.queue(self.db, items, who="operator")
+        run = self.claim()
+        work = Path(run["work_path"])
+        git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
+        self.commit(work, "a.txt", body, f"feat: dropped\n\nCloses: sd:{items[0]}")
+        self.commit(work, "a.txt", body + "kept\n", f"feat: kept\n\nCloses: sd:{items[1]}")
+        self.end(run)
+        self.main_moves("b.txt", body)
+        new = self.drop(run, items[0])
+        self.assertEqual(self.files(new), ["README", "b.txt"])
+        self.assertEqual((new / "b.txt").read_text(), body + "kept\n")
+        self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "0", "replayed onto main")
+
 
 class GitConfigScope(unittest.TestCase):
     """pack sd:9863: command-scope config may redirect a child's remote (`url.*.insteadOf`), so it is stripped; only
