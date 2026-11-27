@@ -258,6 +258,26 @@ class TheRun(Stubs, unittest.TestCase):
         self.assertEqual((self.record()["state"], self.record()["reason"]),
                          ("failed", "sh tools/mission/mission.sh export exited 1: mission export: the portal session is logged out"))
 
+    def test_a_failure_keeps_the_last_good_downloads_time(self):
+        """sd:10616: a failed or interrupted run still names when the last good download finished."""
+        self.assertEqual(hoa_download.status("mission")["last_done"], "")
+        self.assertEqual(self.run_now(), 0)
+        done = self.record()["finished"]
+        self.assertEqual((self.record()["last_done"], hoa_download.status("mission")["last_done"]), (done, done))
+        (self.stub / "code").write_text("1")
+        self.assertEqual(self.run_now(), 1)
+        self.assertEqual((self.record()["state"], self.record()["last_done"]), ("failed", done))
+        self.assertEqual(hoa_download.status("mission")["last_done"], done)
+        # A record from before the field: a done one is its own last good download, a failed one names none.
+        path = hoa_download.state_dir("mission") / "last.json"
+        path.write_text(json.dumps({"state": "done", "finished": "2026-09-01T00:00:00Z"}))
+        self.assertEqual(hoa_download.status("mission")["last_done"], "2026-09-01T00:00:00Z")
+        self.assertEqual(self.run_now(), 1)
+        self.assertEqual(self.record()["last_done"], "2026-09-01T00:00:00Z")
+        for odd in ('{"state": "failed", "last_done": 7}', "[]", "not json"):
+            path.write_text(odd)
+            self.assertEqual(hoa_download._last_done(hoa_download._read_record(path)), "")
+
     def test_a_record_left_running_by_a_stopped_runner_reads_failed(self):
         state = hoa_download.state_dir("mission")
         state.mkdir(parents=True)

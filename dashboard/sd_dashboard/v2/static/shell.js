@@ -67,10 +67,10 @@
     ['Knowledge', [['Documents', 'file-text', 'd'], ['Notes', 'notebook-pen', 'n'], ['Watches', 'eye', 'y'], ['Studio', 'mic', 'z']]],
     // Operator 2026-11-20: realm places first (places:start below), then Home; HOA last.
     ['Places',    [['Home', 'house', 'o'], ['HOA', 'droplets', 'h']]],
-    ['Fleet',     [['Skills', 'sparkles', 's'], ['Metrics', 'chart-no-axes-column', 'm'], ['Management', 'settings', 'g'], ['Health', 'heart-pulse', 'e'], ['Activity', 'activity', 'a'], ['Reports', 'clipboard-list', 'p'], ['Designs', 'palette', 'x'], ['Settings', 'sun-moon', 'v']]],
+    ['Fleet',     [['Skills', 'sparkles', 's'], ['Metrics', 'chart-no-axes-column', 'm'], ['Management', 'settings', 'g'], ['Health', 'heart-pulse', 'e'], ['Activity', 'activity', 'a'], ['Reports', 'clipboard-list', 'p'], ['Designs', 'palette', 'x'], ['Settings', 'sun-moon', 'v'], ['Help', 'circle-help', 'f']]],
   ];
   // build: a page that is built sets window.SHELL_PAGES; a section missing from it shows as not built yet.
-  const PAGES = window.SHELL_PAGES || { Today: 'today.html', Briefs: 'briefs.html', Tasks: 'tasks.html', Research: 'research.html', Documents: 'documents.html', HOA: 'hoa.html', Home: 'home.html', Skills: 'skills.html', Metrics: 'metrics.html', Activity: 'activity.html', Reports: 'reports.html', Writing: 'writing.html', Notes: 'notes.html', Contributions: 'contributions.html', Health: 'health.html', Management: 'management.html', Designs: 'designs.html', Watches: 'watches.html', Studio: 'studio.html' };
+  const PAGES = window.SHELL_PAGES || { Today: 'today.html', Briefs: 'briefs.html', Tasks: 'tasks.html', Research: 'research.html', Documents: 'documents.html', HOA: 'hoa.html', Home: 'home.html', Skills: 'skills.html', Metrics: 'metrics.html', Activity: 'activity.html', Reports: 'reports.html', Writing: 'writing.html', Notes: 'notes.html', Contributions: 'contributions.html', Health: 'health.html', Management: 'management.html', Designs: 'designs.html', Watches: 'watches.html', Studio: 'studio.html', Help: 'help.html' };
   // build (sd:2163): an unported section opens its old screen until its port moves it into SHELL_PAGES.
   const CLASSIC = window.SHELL_CLASSIC || {}, SCREENS = window.SHELL_SCREENS || {};
   // places:start

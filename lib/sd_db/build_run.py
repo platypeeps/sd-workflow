@@ -41,8 +41,10 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import glob
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -55,14 +57,23 @@ import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from . import build, contributions, draft, paths, remote, runner_journal, sessions
+from . import (
+    build,
+    contributions,
+    draft,
+    paths,
+    remote,
+    repos,
+    runner_journal,
+    sessions,
+)
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
-from .errors import SchemaTooNew
+from .errors import SchemaTooNew, SdDbError
 from .ship import this_host
 from .workflow import WorkflowError
 from .writes import add_note, create_item, now, record_cost, record_state
@@ -72,8 +83,8 @@ from .writes import add_note, create_item, now, record_cost, record_state
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
-#: Reviews with blockers before the class pass and park: 2, so a park comes after 3
-#: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
+#: Reviews with blockers before the class pass: 2, then one ruling round (`RULING`, sd:10286), so a park
+#: comes after 4 reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
 REVIEW_ROUNDS = 2
 #: Fix rounds past this many blocked reviews run on the strongest model at medium effort (operator
 #: 2026-11-23, sd:10192), the brief asking for the blockers' class (pack sd:9264); the park stays.
@@ -192,6 +203,8 @@ Rules:
   `git commit -m` or `git commit -F <file inside the worktree>`; add new commits and never amend.
 - The dispatcher owns every item's status: never run `sd task status`, never push, never open a pull request.
 - Write a test that fails before each fix, then make it pass; skip no test.
+- Start no test run on more threads than `$CARGO_BUILD_JOBS`, which the dispatcher sets from the machine's
+  load: `cargo -j`, `pytest -n`, Unity's `-job-worker-count`. Builders' own runs drove the load to 104.
 - Run tests in the foreground, focused on the modules you touch, 10 minutes or less: give each Bash call
   `timeout: 600000` and never `run_in_background`. Past its timeout (120 s by default) a call moves to
   the background, and no exit wakes you (sd:9183). The lane runs the full gate.
@@ -227,12 +240,17 @@ Your final message is your report: the commits, the tests run with their result 
 ADJUDICATE = """A finding that rejects a review finding adds no commit; record its disposition instead, at the
 reviewed head: `sd-ship -C {worktree} adjudicate --item {item} --expected-head <HEAD> --json` prints the
 template; set each rejected row's `response_disposition` to `rebutted` and `reason` to the ruling's reason,
-then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
+and its `test` to the argv of a test for it that runs and passes at that head, one committed there or an inline
+`python3 -c` script: a failing one reproduces the finding, so fix it instead (sd:10893). Then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
 """
 
-FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in
-{worktree}, its item's `Closes: sd:N` trailer on it, then update the body at {body}. Never push. Your final
-message is your report.
+# sd:10903: round 1 is a class pass too: single-finding fixes drew the same class again the next round.
+FIX = """The review of branch {branch} found these blockers. Do a class pass, not a single-finding fix: name
+the class of each blocker, enumerate every instance of it in this change, from the code, not from the
+findings, and fix each one fail-first as a new commit in {worktree}, its item's `Closes: sd:N` trailer on it.
+Fix the class within this change's own scope: a new reader, audit or entry kind becomes its own item, not a
+commit here (sd:9584). Then update the body at {body}, each instance in its failure table if it has one.
+Never push. Your final message is your report: the class, each instance and its test.
 
 {blockers}
 """
@@ -254,6 +272,41 @@ within this change's own scope: a new reader, audit or entry kind becomes its ow
 
 {blockers}
 """
+
+# sd:10286: the round after the class pass, once, on the strongest model: the merge lane's rule, applied by the
+# run, in place of the park the lead ruled by hand. A FIX that survives, or a question, still parks.
+RULING = """The review of branch {branch} still found blockers after {rounds} rounds and the class pass. Do
+not fix everything: rule each numbered blocker below by the merge-lane rule, then act on your rulings.
+- fix: it names a concrete failing input, command or interruption that this change causes, in code it
+  touched or an unchanged caller it breaks. Fix it fail-first as a new commit in {worktree}.
+- reject: it names no such input, or its claim does not hold. Give a reason a reader can check.
+- file: a real defect this change does not cause. The supervisor files it as an item.
+- ask: the ruling touches money, security or privacy risk, or a standing operator ruling. It is the
+  operator's: the supervisor asks, and the build waits. Leave that blocker as it is.
+Record nothing yourself: run no `sd` command for a ruling. Write them as a JSON list to `{rulings}`, the
+one more file outside the worktree you may write, one object per blocker, every blocker ruled:
+{{"blocker": <its number>, "ruling": "fix" | "reject" | "file" | "ask", "reason": "<one line>"}}
+The supervisor reads that file after your last commit: it notes each ruling on the item, records each
+reject and file as a rebuttal at the final head, files the items and asks the questions. A blocker with no
+ruling it can read stays a blocker. Then update the body at {body}. Never push. Your final message is
+your report: each blocker, its ruling and reason, and the test of each fix.
+
+{blockers}
+"""
+#: The checkpoint key prefix of a blocker a REJECT or FILE ruling cleared, by run, head and number.
+RULED = "build-run-ruled:"
+# `sd-review`'s REPEAT_NOTE and RULED_NOTE: the end of a repeat's summary that it held back as advisory.
+HELD_NOTES = ("[downgraded: repeats a rebutted finding, no evidence cited]",
+              "[downgraded: repeats a blocker a build ruling rejected]")
+#: The checkpoint key prefix of the head a blocking round found its blockers at, by assignment.
+ROUND_HEAD = "build-round-head:"
+#: The checkpoint key prefix of the round head whose rulings `ruled` applied, by assignment (sd:10913).
+RULINGS_APPLIED = "build-rulings-applied:"
+#: The rulings `RULING` asks for, and the longest reason kept.
+RULINGS = ("fix", "reject", "file", "ask")
+REASON_MAX = 500
+#: The longest evidence the ruling brief quotes per blocker.
+EVIDENCE_MAX = 1500
 
 DRAFT = """You are the headless lead, run by the build dispatcher (pack sd:6361). Draft the spec for one
 captured item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
@@ -283,6 +336,43 @@ Risks: <what could make this wrong>
 <At most {questions}, only those whose answer changes the work. Each is its text, then two or more lines
 that start "Option:", the recommended one first, ending " (Recommended)". Leave the section out when there
 is none.>
+"""
+
+DESIGN = """You are the headless lead, run by the build dispatcher (sd:10096). Write the design page for one
+design-only item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
+and AGENTS.md, its `templates/design.md` when it has one, and the code the item touches. You write nothing;
+the dispatcher writes your reply on the item, and the repository's next code bundle commits it as
+`docs/work/<date>-<slug>/design.md`.
+
+The item is sd:{item}, in {repo}:
+Title: {title}
+{body}
+
+Ask only what would change the design and the repository cannot answer. Keep requirements apart from
+assumptions; each acceptance criterion names a check and its result. A design that moves state in steps
+carries a failure table: step, state moved, failure, recovery, test.
+
+Your final message is the reply, in exactly this form and nothing else:
+
+## Spec
+
+<the design page's text, its sections as `###` headings>
+
+## Questions
+
+<At most {questions}, only those whose answer changes the design. Each is its text, then two or more lines
+that start "Option:", the recommended one first, ending " (Recommended)". Leave the section out when there
+is none.>
+"""
+
+#: Added to a bundle's brief for each design item it carries (sd:10096).
+DESIGNS = """
+Each design below is a design item's whole work, written by its design run. Commit it, with the rulings
+under it applied, as `docs/work/<date>-<slug>/design.md` in your first commit, `<date>` today's and
+`<slug>` from the item's title, with a `Closes: sd:N` trailer for its item. Each design gets a directory
+of its own, even when two titles match, and its front matter names its item alone: `item: sd:N`. Change
+no word of it but its headings and what a ruling changes.
+{designs}
 """
 
 RESUME = """Your run was interrupted. Continue the brief in {worktree}: finish the items, commit, write the
@@ -422,6 +512,8 @@ class Tools:
     #: An unmanaged repository's run (pack sd:7868): its own checks wait for a gate slot through `<gate>`,
     #: and its draft pull request opens through `<gh>`.
     gate: list[str] = field(default_factory=lambda: [sys.executable, str(PACK / "bin" / "sd_gate_slots.py"), "run"])
+    #: A managed repository's gate, `sd gate check`: the lane's own check, for a pass `sd-review` ran none on.
+    check: list[str] = field(default_factory=lambda: [sys.executable, str(PACK / "bin" / "sd"), "gate", "check"])
     gh: list[str] = field(default_factory=lambda: ["gh"])
     #: Before that push, `<guard>` reads the title, body and commits on stdin: `leak-guard.sh scan`, run whatever
     #: pre-push hook the repository has, since an unmanaged one normally has none (review of pack sd:7868).
@@ -548,6 +640,30 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+
+
+def ruleable(row: dict) -> bool:
+    """A blocker a ruling may clear: a review finding at a repository path. A gate line ("-") or the review
+    gate's own blocker (`<review-response>`: omitted evidence; `<unknown>`) names no code a ruling judged."""
+    path = row.get("path")
+    return row.get("line") != "-" and isinstance(path, str) and bool(path) and not path.startswith("<")
+
+
+def finding_words(row: dict) -> str:
+    """A finding's own words, its evidence among them: each field but its place."""
+    return " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
+
+
+def names_in(words: str, paths: Collection[str]) -> list[str]:
+    """Each of `paths` the words name, whole, as a path-like word (`./x`, `a/../x`, absolute) or its file
+    name; a file name shared with another path names both, more, never less. A name with a space or other
+    character no word holds (`bin/my tool`) is found literally and whole."""
+    spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
+    spelled |= {os.path.basename(word) for word in spelled}
+    return sorted(path for path in paths if any(
+        name in spelled or re.search(r"[^\w./-]", name)
+        and re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
+        for name in {path, os.path.basename(path)} if name))
 
 
 def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
@@ -686,6 +802,63 @@ def implicit(lines: list[str], start: int, *, named: Collection[str] = ()) -> bo
     return False
 
 
+def unwalked(work: Path, paths: Collection[str], *, data: Collection[str] = ()) -> list[str]:
+    """Each of `paths` the name walk does not read: anything but Python source, a `.py` file or a regular file
+    under `work` whose first line is a Python shebang (class pass 7 on sd:10286), and any path a `data` glob
+    matches, the repository's declared runtime data (policy `runtime_data`, sd:10906), Python or not. Code
+    reads such a file as data, by no name, so a round's change there reaches a blocker no edge finds. A closed
+    test, not a list of configuration kinds: a symlink, a missing file or one that does not read is none, fail
+    closed. Globs read as `check_scope`'s do: `*` within one segment, `**` across them."""
+    declared = [re.compile(glob.translate(pattern, recursive=True, include_hidden=True)) for pattern in data]
+
+    def python(path: str) -> bool:
+        if not path or (work / path).is_symlink():
+            return False
+        if PurePosixPath(path).suffix == ".py":
+            return True
+        try:
+            with open(work / path, "rb") as file:
+                first = file.readline(200)
+        except OSError:
+            return False
+        return first.startswith(b"#!") and b"python" in first
+    return [f"{path} (declared runtime data)" if any(pattern.match(path) for pattern in declared)
+            else f"{path} (no Python source)" for path in sorted(paths)
+            if any(pattern.match(path) for pattern in declared) or not python(path)]
+
+
+def round_words(git: Collection[str], work: str, base: str, head: str, *,
+                env: dict | None = None) -> tuple[set[str], set[str]] | None:
+    """What a ruling round's commits `base..head` changed, for `Supervisor.reaches` (sd:10286): every
+    identifier in the functions they change, each read whole, and the names those changes define: each
+    function changed, and each name a changed line binds at module level. None when git cannot answer.
+    Unlike `function_words`, a change outside any function reads too: its names are what it binds."""
+    try:
+        diff = _read([*git, "-C", work, "diff", "-U0", "--function-context", "--no-renames", "--no-color",
+                      "--no-ext-diff", "--no-textconv", base, head], env=env)
+    except Unread:
+        return None
+    lines = [line for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
+    defined = {name for line in lines for name in defined_names(line[1:])}
+    # A changed line binds what its whole statement binds: `TABLE = {` over lines, its entry changed. Each
+    # side of each hunk is read as text, its context included (`--function-context`), so the statement's
+    # first line is there.
+    for hunk in re.split(r"^(?:@@|diff --git ).*$", diff, flags=re.M)[1:]:
+        rows = [line for line in hunk.splitlines() if line and line[0] in "+- " and not line.startswith(("+++", "---"))]
+        for side in "+-":
+            text = [line[1:] for line in rows if line[0] in (" ", side)]
+            marks = [index for index, line in enumerate(line for line in rows if line[0] in (" ", side))
+                     if line[0] == side]
+            for index in marks:
+                first = statement(text, index)[0]
+                # Still indented: the hunk holds no first line for it. Inside a definition the hunk shows,
+                # it binds nothing at module level; else what it binds is unknown, and reaches all.
+                if first.strip() and first[:1].isspace() and not any(map(defined_names, text[:index + 1])):
+                    return None
+                defined |= set() if first[:1].isspace() else bound_names(first)
+    return {name for line in lines for name in re.findall(r"[A-Za-z_]\w*", line[1:])}, defined
+
+
 def defined_names(line: str) -> set[str]:
     """The names one source line defines, in any common form (pack sd:9769): a keyword (`def`, `function`,
     `fn`, `func`, `class`, `sub`, ...), a declaration or assignment (`const x =`, `x := func`, `x = lambda`,
@@ -696,6 +869,17 @@ def defined_names(line: str) -> set[str]:
     assigned = r"\b([A-Za-z_]\w*)\s*(?::=|=(?!=)|:)\s*(?:async\s+)?(?:function\b|func\b|lambda\b|fn\b|\([^()]*\)\s*=>|[A-Za-z_]\w*\s*=>)"
     method = r"^\s*(?:(?:async|static|public|private|protected|export|def)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*\{"
     return {name for pattern in (keyword, assigned, method) for name in re.findall(pattern, line)}
+
+
+def _has_text(path: Path) -> bool:
+    """Whether `path` holds a report: more than whitespace, or a file that exists but does not read (no
+    permission, not UTF-8), which the caller must not skip for an older one (lane review of build/sd-1726)."""
+    try:
+        return bool(path.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
 
 
 def instance_files(instances: Any) -> list[str]:
@@ -728,7 +912,8 @@ def bound_names(line: str) -> set[str]:
 def statement(lines: list[str], index: int) -> list[str]:
     """The lines of the statement that holds `lines[index]`: back to the last line no bracket is open at,
     on to the line that closes the brackets left open, so a table written over lines is one statement
-    (pack sd:9769). ponytail: brackets inside strings count, which only widens the statement."""
+    (pack sd:9769), then out to the lines indentation gives it, which only widens it.
+    ponytail: text at column 0 inside a string over lines still ends it; a tokenizer if that costs."""
     depths, depth = [], 0
     for text in lines:
         depths.append(depth)
@@ -738,6 +923,17 @@ def statement(lines: list[str], index: int) -> list[str]:
         return []
     start = next(row for row in range(index, -1, -1) if depths[row] == 0)
     end = next((row for row in range(index + 1, len(depths)) if depths[row] == 0), len(lines))
+    # The count reads text, so a `)` in a string or a comment ends it early, and a string or a backslash
+    # over lines opens nothing: an indented line belongs to the last line above that is not indented, and
+    # the statement runs on over indented lines, blank ones and closing brackets (class pass, sd:10286).
+    if lines[start].strip() and lines[start][:1].isspace():
+        start = next((row for row in range(start, -1, -1) if lines[row].strip() and not lines[row][:1].isspace()), 0)
+    stop = end
+    while end < len(lines) and (not lines[end].strip() or lines[end][:1].isspace()
+                                or lines[end].startswith((")", "]", "}", '"""', "'''"))):
+        end += 1
+    while end > stop and not lines[end - 1].strip():  # the blank lines after it are not its own
+        end -= 1
     return lines[start:end]
 
 
@@ -761,10 +957,13 @@ def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> l
     return [name for name, path in zip(UNFINISHED, paths, strict=True) if Path(work, path).exists()]
 
 
-def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None) -> dict | None:
+def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, branch: str | None = None,
+               env: dict | None = None) -> dict | None:
     """The newest lane entry of any of `items` by enqueue order, from `sd-ship lane list`; None when there is none.
 
-    Any member: the entry's item is the first member the branch delivers.
+    Any member: the entry's item is the first member the branch delivers. With `branch`, only that branch's
+    entries: a rebuild of a lane-failed bundle shares its items, and can share its head, with the failed
+    branch's entry (review of build/sd-1808). A row that names no branch, an earlier version's import, counts.
     """
     try:
         answer = json.loads(_read([*ship, "-C", str(cwd), "lane", "list"], env=env))
@@ -773,7 +972,8 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env:
     entries = answer.get("entries") if isinstance(answer, dict) and answer.get("ok") else None
     if not isinstance(entries, list):
         raise Unread("sd-ship lane list gave no entries")
-    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items]
+    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items
+            and (branch is None or not row.get("branch") or row.get("branch") == branch)]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
 
 
@@ -927,7 +1127,7 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
     why = why or build.unread(load, load_cap, interactive) or (
         build.RESTORING if build.restoration_pending(connection) else "") or build.rate_hold(connection)
     record_state(connection, "heartbeat", key=HEARTBEAT if hub else f"{HEARTBEAT}@{build.this_host()}",
-                 body={"pid": os.getpid(), "owner": owner, "why": why,
+                 body={"pid": os.getpid(), "owner": owner, "why": why, "build": remote.build_digest(),
                        "load": build.over_load(load, load_cap) if not build.unread(load, load_cap, []) else ""})
     reaped = build.reap(connection, probe=probe, kill=kill, hosts=hosts)
     if hub:
@@ -951,8 +1151,9 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
             why, taken = str(refusal), None
         claimed += [taken["id"]] if taken else []
     drafted: list[str] = []
-    if not why and hub and not claimed:
-        # A tick that claimed no build: a draft takes what machine room the builds leave, and no repository slot.
+    if not why and hub:
+        # A draft or design run takes what machine room the builds leave, and no repository slot, so it claims
+        # beside a bundle in the same tick (sd:10096); one runs at a time, so a tick starts at most two.
         available = build.room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         taken = draft.claim(connection, owner=owner, available=available)
         drafted += [taken["id"]] if taken else []
@@ -1029,17 +1230,23 @@ def _same_copy(path: Path, target: Path) -> tuple[int, int, int] | None:
 
 def _released(connection, path: Path) -> bool:
     """Whether every run that owns `path` ended and was released: all of the assignment's for its
-    `sd-N.title` or `.body.md`, else the run its name starts with."""
+    `sd-N.title`, `.body.md` or `.blockers.json` and for a run's `.review.out` or `.prior.out`, which a later
+    run of the assignment reads back (`Supervisor.review_files`, pack sd:10236); else the run its name starts with."""
     owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md|blockers\.json)", path.name)
+    ident = path.name.split(".", 1)[0]
+    lead = int(owner[1]) if owner else None
+    if path.name in (f"{ident}.review.out", f"{ident}.prior.out"):
+        row = connection.execute("SELECT assignment FROM runner_run WHERE id = ?", (ident,)).fetchone()
+        lead = row[0] if row else None  # no such run: the query below finds none, and the file stays
     ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
-    rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
-        else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
+    rows = connection.execute(ended + "assignment = ?", (lead,)) if lead is not None \
+        else connection.execute(ended + "id = ?", (ident,))
     released = [row[0] for row in rows]
     # A usage limit releases its run and queues the bundle again: the resume reads these files locally
     # (`Supervisor.round_blockers`, the body), so they wait while the last run is that one (review of build/sd-1557).
-    if owner and released:
+    if lead is not None and released:
         last = connection.execute("SELECT outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-                                  (int(owner[1]),)).fetchone()
+                                  (lead,)).fetchone()
         if last is not None and last[0] == build.RATE_LIMITED:
             return False
     return bool(released) and all(released)
@@ -1068,7 +1275,8 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
     `sd-<assignment>.title`, `.body.md` and `.blockers.json` move once every run of that assignment ended and was
-    released and its last did not end at a usage limit, which resumes on them; the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
+    released and its last did not end at a usage limit, which resumes on them, as do a run's `.review.out` and
+    `.prior.out`, which a resumed run of the assignment verifies (pack sd:10236); the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
     groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
     last `settle` seconds or one whose copy fails stays for a later tick.
 
@@ -1182,12 +1390,77 @@ def _environ(environ: dict | None, ident: str) -> dict:
     return env
 
 
+#: The test thread counts a builder's child gets at its cap (sd:10393): the gate's own (`CPU_VARIABLES`), pytest-xdist's
+#: `-n auto`, and the pack's `run-tests.sh` workers. Unity reads none, so the brief names its flag.
+THREAD_VARIABLES = ("PYTEST_XDIST_AUTO_NUM_WORKERS", "TEST_WORKERS")
+
+
+@functools.cache
+def _gate_slots():
+    """`bin/sd_gate_slots.py`, stdlib only, as the gate itself reads its thread caps."""
+    import importlib.util  # noqa: PLC0415 - only a builder's spawn needs it
+    spec = importlib.util.spec_from_file_location("sd_gate_slots", PACK / "bin" / "sd_gate_slots.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@functools.cache
+def _ship_body():
+    """`bin/sd_ship_body.py`, the lane's own reader of a body's `Refs:` lines; it imports its `bin/` siblings."""
+    import importlib  # noqa: PLC0415 - only a delivery needs it
+    if str(PACK / "bin") not in sys.path:
+        sys.path.append(str(PACK / "bin"))
+    return importlib.import_module("sd_ship_body")
+
+
+def with_refs(body: str, items: Collection[int]) -> str | None:
+    """`body` with `Refs:` lines for each of `items` no live one names yet, or None when an added line would
+    name nothing (an unclosed fence or comment). Only a live line counts (ruling on sd:10379), and each added
+    line keeps to the lane's line limit, or enqueue refuses the body (review of build/sd-1808)."""
+    ship = _ship_body()
+    missing = [item for item in dict.fromkeys(items) if item not in ship.referenced_ids(body)]
+    if not missing:
+        return body
+    lines = ["Refs:"]
+    for item in missing:
+        if len(f"{lines[-1]} sd:{item}") > ship.LINE_LIMIT:
+            lines.append("Refs:")
+        lines[-1] += f" sd:{item}"
+    body = body.rstrip("\n") + "\n\n" + "\n".join(lines) + "\n"
+    return body if set(missing) <= ship.referenced_ids(body) else None
+
+
+def thread_cap(env: dict, *, load: float | None, cores: int | None = None) -> int:
+    """How many test threads one builder's child may start (sd:10393): no more than a gate holder's share of the
+    cores, nor than the cores the five-minute `load` leaves idle, and at least one. On 2026-11-24 builders' own
+    `cargo`, Unity and pytest runs, each on every core, drove the load to 104 on 16 cores while the gates kept to
+    their caps. An unread `load` caps at the share alone."""
+    gate = _gate_slots()
+    cores = cores or os.cpu_count() or 1
+    try:
+        slots = gate.configured(env, gate.machine_settings(env)["gate_slots"])[0]
+    except ValueError:  # a bad count caps no gate either
+        slots = 0
+    share = gate.cpu_share(slots, cores) if slots > 0 else cores
+    idle = cores if load is None or not math.isfinite(load) else int(cores - load)
+    return max(1, min(share, idle))
+
+
 def _checks_environ(env: dict) -> dict:
     """A repo's own checks may fetch private release assets with GITHUB_TOKEN (sd:8506). Only they get it
     from the PAT: elsewhere gh and its credential helper would act as the PAT, not the gh login (sd:8515)."""
     if env.get("GITHUB_TOKEN") or not env.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
         return env
     return {**env, "GITHUB_TOKEN": env["GITHUB_PERSONAL_ACCESS_TOKEN"]}
+
+
+def target_kib(target: Path) -> int:
+    """`du -sk` of `target`, bounded: the supervisor beats no heartbeat while it runs."""
+    out = subprocess.run(["du", "-sk", str(target)], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                         timeout=build.STALE_SECONDS // 2, check=True).stdout
+    return int(out.split()[0])
 
 
 class Supervisor:
@@ -1227,11 +1500,14 @@ class Supervisor:
         self.body = self.logs / f"sd-{lead_id}.body.md"
         # The last blocking round's findings whole, for a fix a usage limit interrupted (`walk`).
         self.round_file = self.logs / f"sd-{lead_id}.blockers.json"
+        # The ruling round's rulings, one per blocker of `round_file` (sd:10286).
+        self.rulings = self.logs / f"sd-{lead_id}.rulings.json"
         self.log = self.logs / f"{ident}.jsonl"
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
         self.last_beat = 0.0
         self.env = _environ(environ, ident)
+        self.own_env = dict(self.env)  # before `threads` caps it: each spawn caps from this again
         # Claude Code's own OTel, where the machine turns it on, names the run
         # by these (pack sd:6943); the switch and endpoint are system sd:6944's.
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
@@ -1471,11 +1747,31 @@ class Supervisor:
 
     def finish(self, outcome: str, detail: str, *, question: str | None = None) -> dict:
         self.ending = (outcome, detail, question)  # kept: a hub fault here must not lose how the run ended
+        if outcome in ("blocked", "done"):
+            self.note_target()
         ended = build.end(self.db, self.ident, outcome, detail, question=question)
         return ended or {"run": self.ident, "outcome": None, "why": "the run ended or moved before its last write"}
 
     def fresh(self) -> dict:
         return build.run(self.db, self.ident)
+
+    def note_target(self) -> None:
+        """A note on the lead naming the size of the kept worktree's Rust `target/` (sd:10384: one held 106 GiB).
+
+        It deletes nothing (ruling #91707 on #89515): no file test tells a capture under `target/debug/` from
+        cargo's output, and the lane may still hold the worktree. One note per run: a replayed end adds none.
+        """
+        manifest, target = self.work / "Cargo.toml", self.work / "target"
+        if not manifest.is_file() or target.is_symlink() or not target.is_dir():
+            return
+        try:
+            size = f"{target_kib(target) / 2**20:.1f} GiB"
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError) as fault:
+            size = f"size unread ({type(fault).__name__})"
+        body = (f"Build run {self.ident}: its kept worktree {self.work} holds a Rust target/ of {size}, "
+                f"not cleaned: cargo clean deletes every file in it, a capture saved there too, "
+                f"so move out any file you keep first")
+        self.once("target-size", lambda: add_note(self.db, self.lead, "comment", body))
 
     def enter(self, step: str, **fields) -> None:
         if self.fresh()["cancel_requested"] and step in build.CANCELLABLE:
@@ -1490,7 +1786,10 @@ class Supervisor:
         self.enter("worktree")
         branch = self.row["branch"]
         if self.work.is_dir():
-            return self.guarded() or "building"
+            if held := self.guarded():
+                return held
+            self.take_over()
+            return "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1498,10 +1797,63 @@ class Supervisor:
             _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], env=self.env)
             argv = ["worktree", "add", str(self.work), branch]
         except Unread:
-            argv = ["worktree", "add", "-b", branch, str(self.work), self.base()]
+            start = self.start_point()
+            if start is None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
+                why = self.start_refused or "did not read here"
+                self.once("start", lambda: add_note(
+                    self.db, self.lead, "comment", f"Build run {self.ident}: {failed['branch']}, whose lane entry "
+                    f"failed, {why}, so {branch} starts from {self.base()} without its commits"))
+            argv = ["worktree", "add", "-b", branch, str(self.work), start or self.base()]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
-        return self.split_first() or "building"
+        if held := self.split_first():
+            return held
+        self.take_over()
+        return "building"
+
+    def take_over(self) -> None:
+        """Hand back the failed lane entry whose tip this branch holds (`build.take_over`), once the worktree exists:
+        a failed `git worktree add` leaves the entry as it was, for its Retry or Fix. A try that made the worktree
+        and stopped finds it on the next try's kept-worktree path, and an entry already handed back writes nothing
+        (lead review of build/sd-1808). A tip not read, or not in this branch, hands nothing back."""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None:
+            return
+        try:
+            tip = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env).strip()
+            _read([*self.tools.git, "-C", str(self.work), "merge-base", "--is-ancestor", tip, "HEAD"], env=self.env)
+        except Unread:
+            return
+        build.take_over(self.db, failed, self.ident)
+
+    def start_point(self) -> str | None:
+        """The commit a new branch starts from when its items' last bundle failed in the lane: the failed branch's
+        local tip as the operator left it, not the entry's head or a pushed copy, which can hold commits the
+        operator removed (sd:10379); None, so the base, when there is none or it does not read. None too when its
+        commits close an item this bundle does not hold, one the failed entry kept open: the lane's merge closes
+        every open item a trailer cites, so it would close one no one selected (review of build/sd-1808);
+        `start_refused` says which."""
+        self.start_refused = ""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None:
+            return None
+        try:
+            tip = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env).strip()
+        except Unread:
+            return None
+        if not tip:
+            return None
+        cited = self.cited(self.repo, self.base(), tip, "")
+        if cited is None:
+            self.start_refused = "has commits whose trailers did not read"
+            return None
+        if outside := sorted(set(cited) - set(failed["items"])):
+            self.start_refused = ("has commits that close " + ", ".join(f"sd:{item}" for item in outside)
+                                  + ", outside this bundle")
+            return None
+        return tip
 
     def guarded(self) -> dict | None:
         """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on
@@ -1552,16 +1904,32 @@ class Supervisor:
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))
         session = self.fresh()["session_id"]
+        if not session:
+            # Before the brief reads them: a ruling between the two is one the brief may not carry (sd:10096).
+            for item in [self.lead, *self.others]:
+                if draft.is_design(self.db, item) and draft.design(self.db, item) is not None:
+                    build.note_brief(self.db, item, self.ident)
         prompt = (RESUME if session else BRIEF).format(**self.brief())
         return self.claude(prompt, session=session, then="reviewing", role="building")
 
     def reviewing(self) -> str | dict:
         self.enter("reviewing")
         head = self.head()
+        if (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
+            asked = self.ruled(head)  # the ruling round ran: its rulings, before the review that reads them
+            if asked is not None:
+                return asked
         # What enqueue would refuse goes back to the builder before a review is spent (pack sd:6926).
         refused = self.prechecked(head)
         if refused:
-            return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
+            return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused], head)
+        # A check the last round failed runs again first: one that still fails spends no review (sd:10914).
+        # ponytail: the whole check, not only its failing tests; a narrower rerun if the gate's cost bites.
+        rerun = self.own_checks(head) if self.known_failure() else None
+        if isinstance(rerun, dict):
+            return rerun
+        if rerun:
+            return self.blocked_round(rerun, head)
         answer: dict | None = None
         argv, prior = self.review_plan(head)
         unknown = waits = 0
@@ -1591,25 +1959,41 @@ class Supervisor:
                 argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
+        # A blocking report this run settles to a pass is no pass `sd-review` recorded for the lane (sd:10919).
+        settled = answer["status"] == "blocking"
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
-        unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
+        # A rerun that passed at `head` is this round's check: it runs once (sd:10914).
+        unmanaged = build.unmanaged(self.db, self.row["repo"])
+        checked: list[dict] | dict | None = rerun
+        # `sd-review` runs no gate on a blocking report: a pass made from one here runs the checks (sd:10286).
+        ungated = unmanaged or answer["status"] == "blocking"
+        # Read before `file_new_findings` rebuilds the answer: only a whole report may settle to a pass. A
+        # full-branch one with no `covers_from` read patches only, as a delta's does (sd:10286).
+        whole = bool(answer.get("complete")) and bool(answer.get("covers"))
         # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
         if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
             new, blockers = self.deferred(answer, prior, head)
-            if unmanaged and not blockers:  # before any rebuttal: a failed check means a fix round follows
+            if ungated and not blockers and checked is None:  # before any rebuttal: a failed check, a fix round
                 checked = self.own_checks(head)
             answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
             if isinstance(checked, dict):
                 return checked
+        # A short or uncovered report proves nothing else clean: a cleared ruling must not pass it (sd:10286).
+        if whole and answer["status"] == "blocking" and (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
+            answer = self.settled(answer, head)
+        if answer.get("held") and not whole:  # `sd-review` held a repeat back in a report that proves no rest clean
+            return self.blocked_round(answer["held"], head)
         if answer["status"] in ("clean", "advisory", "skipped"):
-            failed = checked if checked is not None else self.own_checks(head) if unmanaged else []
+            failed = checked if checked is not None else self.own_checks(head) if ungated else []
             if isinstance(failed, dict):
                 return failed
             if failed:
-                return self.blocked_round(failed)
+                return self.blocked_round(failed, head)
+            if whole and settled and answer["status"] in ("clean", "advisory"):
+                self.once(f"lead-pass:{head}", lambda: self.lead_pass(head, answer["status"]))
             self.reviewed = head
             return "enqueuing"
-        return self.blocked_round(answer["blockers"])
+        return self.blocked_round(answer["blockers"], head)
 
     def review_plan(self, head: str) -> tuple[list[str], dict | None]:
         """This round's `sd-review` argv and the prior report it verifies, if any.
@@ -1658,12 +2042,17 @@ class Supervisor:
         """
         if not (self.fresh()["review_round"] or 0):
             return None
-        last, kept = self.out("review"), self.out("prior")
-        for path in (last, kept):
+        last, mine = self.review_files()
+        kept = self.out("prior")
+        carried: list[dict] | None = None  # the open blockers of a last report at `head`
+        verified: Any = None  # the digest of the prior that report verified
+        for path in (last, mine):
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except (OSError, ValueError):
+                return None  # a report that does not read proves nothing: review the branch in full
             if not text.strip():
                 continue  # no last report: the kept one is the last round's
             # A last report that fails a check below falls through to None, never to the older kept report,
@@ -1675,8 +2064,21 @@ class Supervisor:
                     return None
                 continue
             reviewed = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
-            if reviewed == head:  # a fix with no commit: an older report would omit this round's blockers
-                return None
+            if reviewed == head:
+                # A fix with no commit (a rebuttal): the older kept report verifies the same delta again, its
+                # blockers replaced by the ones this round left open (sd:10902). Anything else reviews in full.
+                # A round short of a reader, or one that covers no branch, cleared a blocker on part of the
+                # answers: its verdicts replace nothing.
+                if (path != last or not isinstance(answer, dict) or not isinstance(answer.get("findings"), list)
+                        or not 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
+                        or answer.get("review_shortfall") or not answer.get("covers_from")):
+                    return None
+                # Each read at this head, with no pass number: `sd-review` walks a row's path from its own
+                # `prior_review.head`, and reads a pass number against the older report's history.
+                carried = [dict(row, prior_review={"head": head}) for row in answer["findings"]
+                           if isinstance(row, dict) and row.get("disposition") == "blocking"]
+                verified = answer.get("verification_report_digest")
+                continue
             # `sd-review` verifies only these statuses: a `skipped` round has no prior to verify (sd:2721).
             if (not isinstance(reviewed, str) or answer.get("scope") != "branch"
                     or answer.get("status") not in ("clean", "advisory", "blocking", "gate_failed")
@@ -1697,6 +2099,20 @@ class Supervisor:
                 if path == last:
                     return None
                 continue
+            if carried is not None:
+                # One row for each open blocker, so one verdict id: the last round verified this report and
+                # carried what it left open, so its blockers are the open ones, a cleared one among neither.
+                # No row is matched across the two reports. Its digest names the report it verified; a kept
+                # report that already holds exactly its blockers is a re-run of this step.
+                held = [row for row in answer["findings"]
+                        if isinstance(row, dict) and row.get("disposition") == "blocking"]
+                if held != carried and verified != hashlib.sha256(
+                        json.dumps(answer, sort_keys=True).encode()).hexdigest():
+                    return None  # it verified another prior, or none: review the branch in full
+                rest = [row for row in answer["findings"] if row not in held]
+                answer["findings"] = [*rest, *carried]
+                if carried:
+                    answer["status"] = "blocking"
             for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
                 if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
                     row["path"] = self.locations({"path": row["path"]})[0][0]
@@ -1711,6 +2127,32 @@ class Supervisor:
             kept.write_text(encoded, encoding="utf-8")
             return answer
         return None
+
+    def review_files(self) -> tuple[Path, Path]:
+        """The last and kept review reports: this run's, or, when it holds neither, the latest earlier run's of
+        its assignment that does. A usage-limit or loss resume is a new run that keeps the round, so its own
+        names hold no review, and the next round would review the branch afresh (pack sd:10236). Only the runs
+        it resumed: the walk stops at a fresh claim (`claimed`), whose earlier attempt's review covers another
+        start (review of build/sd-1726). The files are read here, under the local root: the archive leaves them
+        until every run of the assignment is released (`_released`), and while a rate_limited run is the last.
+        So an earlier run that ended otherwise may have lost a report to the archive before this run claimed:
+        its prior with no last report beside it, or no report at all, ends the walk with none (lane review of
+        build/sd-1726): an older report omits the moved round's blockers."""
+        rows = [(self.ident, self.row["start_step"], None), *((row[0], row[1], row[2]) for row in self.db.execute(
+            "SELECT id, start_step, outcome FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+            (self.row["assignment"], self.row["run"])))]
+        for ident, start, outcome in rows:
+            pair = (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out")
+            earlier = ident != self.ident
+            if any(_has_text(path) for path in pair):
+                if earlier and not os.path.lexists(pair[0]):
+                    break  # its last report moved: the prior left beside it is an older round's
+                return pair
+            if start in ("claimed", None):  # a row with no start step reads as fresh: fail closed
+                break
+            if earlier and outcome != build.RATE_LIMITED:
+                break  # its reports may be in the archive: a run before it reviewed an older round
+        return self.out("review"), self.out("prior")
 
     def verifiable(self, path: Any, head: str) -> bool:
         """Whether `sd-review --verify-report` takes a prior blocker at `path`: inside the checkout and a
@@ -1771,8 +2213,6 @@ class Supervisor:
         # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held,
         # unless the finding's own words name a changed file. Its `evidence` is among them: a blocker's repro
         # routes the failing input through the change (pack sd:9867), so a dropped check holds (sd:9900).
-        # A changed path or its file name; a name shared with an unchanged file holds more, never less.
-        names = {name for path in changed or () for name in (path, os.path.basename(path)) if name}
         # The identifiers of the functions the branch changes, read whole: a caller named by function (sd:9769).
         functions = self.branch_words(head) if changed is not None else None
 
@@ -1791,9 +2231,8 @@ class Supervisor:
                 return True
             # A finding cited at unchanged code that names a changed file (a new caller) is the branch's own.
             # Each path-like word, as `./x`, `a/../x` or an absolute path spells it: whole names, not substrings.
-            words = " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
-            spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
-            if any(word in names or os.path.basename(word) in names for word in spelled):
+            words = finding_words(row)
+            if names_in(words, changed):
                 return True
             # A function or method the change touches, as `name(`, `a_b`, `camelCase` or `` `x.name` ``.
             # Or a plain word that is the name of a function the change defines (`export`).
@@ -1810,9 +2249,7 @@ class Supervisor:
                    or self.called_from(path, line, head, sources, functions[0])
                    or self.calls_into(path, line, head, sources, functions[1]) for path, line in self.locations(row)):
                 return True
-            # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
-            return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
-                       for name in names if re.search(r"[^\w./-]", name))
+            return False
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
 
@@ -1998,9 +2435,7 @@ class Supervisor:
         The lane reviews the branch again; the rebuttal, in the record `sd-review` reads for this branch
         (pack sd:9270), holds back the same finding there and tells its readers where it went."""
         title = f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')}"
-        remote = self.db.execute(f"SELECT remote FROM repo WHERE path IN ({paths.placeholders(paths.keys(self.row['repo']))})",
-                                 paths.keys(self.row["repo"])).fetchone()
-        repository = build.github_repository(remote["remote"] if remote else None).lower()
+        repository = self.github()
         with transaction(self.db):
             filed = create_item(self.db, kind="task", title=f"{title} {row.get('summary') or ''}"[:200],
                                 repo=self.row["repo"])
@@ -2019,8 +2454,304 @@ class Supervisor:
                                       "reason": f"filed as follow-up sd:{filed}: it is on code the build's fix did "
                                                 f"not change (pack sd:9769)"}]}})
 
+    def github(self) -> str:
+        """The repository's GitHub `owner/name`, lowercased, as a rebuttal binds it; "" with no GitHub origin."""
+        remote = self.db.execute(f"SELECT remote FROM repo WHERE path IN ({paths.placeholders(paths.keys(self.row['repo']))})",
+                                 paths.keys(self.row["repo"])).fetchone()
+        return build.github_repository(remote["remote"] if remote else None).lower()
+
+    def numbered(self, blockers: list[dict]) -> str:
+        """The blockers as the ruling round names them: `N. path:line summary`, N from 1 (sd:10286)."""
+        def evidence(row: dict) -> str:
+            # The failing input the builder rules on, as a JSON string: one line, its own whitespace kept
+            # (class pass on sd:10286); a cut one says so, never a shorter input passed off as the whole.
+            text = row["evidence"] if isinstance(row.get("evidence"), str) else ""
+            if not text.strip():
+                return ""
+            cut = f", its first {EVIDENCE_MAX} of {len(text)} characters" if len(text) > EVIDENCE_MAX else ""
+            return f" (evidence, a JSON string{cut}: {json.dumps(text[:EVIDENCE_MAX], ensure_ascii=False)})"
+        return "\n".join(f"{at}. {self.summary([row], None)[2:]}{evidence(row)}" for at, row in enumerate(blockers, 1))
+
+    def read_rulings(self, count: int) -> tuple[dict[int, tuple[str, str]], str]:
+        """The rulings file as {blocker number: (ruling, reason)} and what did not read, "" for nothing.
+
+        External input: a row counts only as an object with an int `blocker` in 1..count, a known `ruling` and a
+        `reason` that is text; the reason is folded to one line and cut. Two rulings for one blocker rule
+        neither: no order says which the builder meant."""
+        try:
+            rows = json.loads(self.rulings.read_text(encoding="utf-8"))
+        except OSError:
+            return {}, "no rulings file"
+        except (ValueError, RecursionError):
+            return {}, "the rulings file is not JSON"
+        if not isinstance(rows, list):
+            return {}, "the rulings file is not a JSON list"
+        found: dict[int, tuple[str, str]] = {}
+        twice, bad = set[int](), 0
+        for row in rows:
+            number, ruling, reason = (row.get(key) for key in ("blocker", "ruling", "reason")) if isinstance(
+                row, dict) else (None, None, None)
+            reason = " ".join(reason.split())[:REASON_MAX] if isinstance(reason, str) else ""
+            if type(number) is not int or not 1 <= number <= count or ruling not in RULINGS or not reason:
+                bad += 1
+            elif number in found or number in twice:
+                twice.add(number)
+                found.pop(number, None)
+            else:
+                found[number] = (ruling, reason)
+        unruled = [str(at) for at in range(1, count + 1) if at not in found]
+        return found, "; ".join(filter(None, (
+            f"{bad} row(s) did not read" if bad else "",
+            f"no single ruling for blocker(s) {', '.join(unruled)}" if unruled else "")))
+
+    def ruled(self, head: str) -> dict | None:
+        """Apply the ruling round's rulings at `head`, once, before the review after it (sd:10286); the blocked
+        end when one is the operator's, else None.
+
+        The supervisor writes what the builder cannot: the builder's review is no ship review `sd-ship
+        adjudicate` reads, and no blocker names a bundle member. So each ruling is a note on the lead;
+        a reject or file is a rebuttal in the record `sd-review` reads for this branch, bound to `head`, the
+        head after the round's last commit; a file is an item too. An `ask` ends the run with the question on
+        every member, so none is delivered around it. No file, a blocker with no ruling that reads, or round
+        blockers that do not read apply nothing and end the run blocked before the review: that review may
+        omit an unruled blocker, and the lane reuses its pass (sd:10914, sd:10919). The applied mark is
+        written only past that check, so no caller reads a partial round as applied.
+        A blocker that is no review finding (an enqueue check, a failed gate: line "-") takes no rebuttal: no
+        review reads one for it."""
+        if not self.rulings.exists():
+            # Applied at this round head already (a later walk, a retry that kept the count): review as usual.
+            # Else the ruling round wrote none: its blockers stand unruled, and a review that omits them must
+            # not deliver around them (sd:10913).
+            if self.rulings_applied():
+                return None
+            return self.finish("blocked", f"the ruling round wrote no rulings file at {head[:12]}, so its "
+                                          f"blockers stand unruled: {' '.join(self.summary(self.round_blockers()).split())}")
+        blockers = self.round_blockers()
+        found, unread = self.read_rulings(len(blockers))
+        if not blockers:  # a ruling round follows a blocking round: none that read is a round file lost
+            unread = "the round's blockers did not read"
+        if unread:
+            # Fail closed (sd:10914): apply no ruling and write no mark, so a later walk reads the same file and
+            # ends the same way; the review after it may omit the unruled blocker and the lane reuses its pass.
+            # The blocked end notes the lead with this detail.
+            return self.finish("blocked", f"the ruling round's rulings at {head[:12]} do not rule every blocker "
+                                          f"({unread}), so none is applied: "
+                                          f"{' '.join(self.summary(blockers).split()) if blockers else 'no blocker read'}")
+        repository = self.github()
+        delta = self.branch_delta(head, head) if found else {}
+        changed = None if delta is None else delta.keys()
+        # What the round's own commits changed since the head its rulings judged; None when it does not read.
+        reviewed = self.round_head() if found else None
+        moved = changed_lines(self.tools.git, str(self.work), reviewed, head, env=self.env) if reviewed else None
+        # The names the round's commits use and define, for a finding that names a changed caller by
+        # function, or that names nothing the round changed and is reached all the same (`reaches`).
+        words = (round_words(self.tools.git, str(self.work), reviewed, head, env=self.env)
+                 if reviewed and moved is not None else None)
+        data = self.runtime_data() if found else []
+        if data is None:  # a declaration that does not read: every path the round changed may be one (fail closed)
+            data = ["**"]
+        for number, (ruling, reason) in sorted(found.items()):
+            row = blockers[number - 1]
+            reached = (self.reaches(row, words, head) + unwalked(self.work, moved or {}, data=data)
+                       if ruling in ("reject", "file") and ruleable(row) and words is not None else [])
+            self.once(f"ruling:{head}:{number}", functools.partial(
+                self.rule, number, row, ruling, reason, head, repository, changed,
+                None if moved is None else moved.keys(), None if words is None else words[1], reached))
+        asked = [(blockers[number - 1], reason) for number, (ruling, reason) in sorted(found.items()) if ruling == "ask"]
+        if asked:
+            # Kept beside the body until the run ends: a replay of this end reads the same rulings.
+            # One line: a summary's own newline or `Option:` line must not reshape the question.
+            text = " ".join("; ".join(f"{self.summary([row])} ({reason})" for row, reason in asked).split())
+            return self.finish(
+                "blocked", f"the ruling round left {len(asked)} blocker(s) to the operator: {text}",
+                question=(f"Build run {self.ident} cannot rule on: {text}"[:build.FINDING_MAX - 80]
+                          + "\nOption: Fix it in this build (Recommended)\nOption: Reject it and deliver"))
+        # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
+        # Bound to the blocking round itself (its `ROUND_HEAD` record), not its commit: a later round at the
+        # same commit is another round, whose rulings are its own (review of sd:10913).
+        self.once(f"rulings-applied:{head}", lambda: record_state(
+            self.db, "checkpoint", key=f"{RULINGS_APPLIED}{self.row['assignment']}", body=self.round_mark()))
+        self.rulings.unlink(missing_ok=True)
+        return None
+
+    def rulings_applied(self) -> bool:
+        """Whether `ruled` applied rulings for the blockers of the last blocking round (`round_mark`), in this
+        run or one before it on the assignment; False when that round does not read (fail closed)."""
+        mark = self.round_mark()
+        if mark is None:
+            return False
+        for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?",
+                                       (f"{RULINGS_APPLIED}{self.row['assignment']}",)):
+            try:
+                if json.loads(body) == mark:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def runtime_data(self) -> list[str] | None:
+        """The repository's declared runtime-data globs (policy `runtime_data`, sd:10906); [] for none, None
+        for a declaration that does not read or a value that is no list of globs."""
+        try:
+            held = repos.declarations(self.db, self.row["repo"])
+        except (SdDbError, sqlite3.Error):
+            return None
+        policy = (held or {}).get("policy") or {}
+        globs = policy.get("runtime_data", []) if isinstance(policy, dict) else None
+        if not isinstance(globs, list) or not all(isinstance(text, str) and text.strip() for text in globs):
+            return None
+        return globs
+
+    def reaches(self, row: dict, words: tuple[set[str], set[str]] | None, head: str) -> list[str]:
+        """How a ruling round's own changes (`round_words`) reach a blocker that names none of them, at each
+        of its places (class pass on sd:10286): a changed function calls the function around the place,
+        directly or through unchanged callers (`called_from`), or that function uses a name the round
+        defines, directly or through unchanged callees (`calls_into`). A ruling judged the code without that
+        change, so `rule` does not apply it. A delta, or a place, git cannot read reaches, fail closed."""
+        if words is None:
+            return ["code that did not read"]
+        sources: dict[str, list[str] | None] = {}
+        found = []
+        for path, line in self.locations(row):
+            at = f"{path}:{line}" if line else path
+            if self.called_from(path, line, head, sources, words[0]):
+                found.append(f"a caller of {at}")
+            elif self.calls_into(path, line, head, sources, words[1]):
+                found.append(f"a name {at} uses")
+        return found
+
+    def round_mark(self) -> dict | None:
+        """The last blocking round as one record names it: its `ROUND_HEAD` row and head; None when it does not
+        read. Two rounds at one commit are two marks (review of sd:10913)."""
+        found = self.db.execute("SELECT id FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                "LIMIT 1", (f"{ROUND_HEAD}{self.row['assignment']}",)).fetchone()
+        head = self.round_head()
+        return None if found is None or head is None else {"round": found[0], "head": head}
+
+    def round_head(self) -> str | None:
+        """The head the last blocking round, whose blockers the ruling round ruled, read, as `blocked_round`
+        kept it for the assignment, whichever run of it found them; None when it does not read."""
+        found = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                "LIMIT 1", (f"{ROUND_HEAD}{self.row['assignment']}",)).fetchone()
+        try:
+            head = json.loads(found[0]) if found else None
+        except (TypeError, ValueError):
+            return None
+        return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40,64}", head) else None
+
+    def place(self, row: dict) -> str:
+        """A blocker as a ruling clears its repeat: the claim itself, no folded copy (class pass on sd:10286).
+        Its file, as the worktree spells it, and its line, words, class, instances and evidence as recorded,
+        types included: a finding that differs in any is another claim and blocks, fail closed."""
+        return json.dumps([self.locations(row)[0][0], *(row.get(key) for key in (
+            "line", "summary", "family", "instances", "evidence"))], sort_keys=True, default=str)
+
+    def settled(self, answer: dict, head: str) -> dict:
+        """The review after the ruling round, less each blocker that repeats one ruled REJECT or FILE at `head`
+        (lead ruling on sd:10286): a repeat that cites evidence blocks past its rebuttal in `sd-review`, so the
+        ruling clears it here. A repeat is the same file and summary at any line: the round's fixes move lines.
+        The ruled blockers come from the checkpoints `rule` wrote with each ruling note, never the round's
+        file: a replay after the review rewrote it would shift a number onto another blocker. A repeat is the
+        same record (`place`): the same words at another line, or other words, instances or evidence at the
+        same line, are another claim, and a fix that moved the line parks the run, fail closed. A FIX ruling,
+        an unruled blocker or a new one still blocks."""
+        key = f"{RULED}{self.ident}:{head}:"
+        ruled: set[str] = set()
+        twins: dict[str, set[str]] = {}
+        for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND substr(key, 1, ?) = ?",
+                                       (len(key), key)):
+            try:
+                row = json.loads(body)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(row, dict) and ruleable(row):
+                ruled.add(self.place(row))
+                said = " ".join(str(row.get("summary") or "").split()).casefold()
+                twins.setdefault(said, set()).add(self.place(row))
+        # The lane holds back only the newest record with a ruling's folded words at any place it shares
+        # (`recorded_at`), its instances among them, so two rulings with those words clear neither repeat
+        # here: the run parks, fail closed (night triage).
+        ruled -= {place for places in twins.values() if len(places) > 1 for place in places}
+        left = [row for row in answer["blockers"] if self.place(row) not in ruled]
+        if len(left) == len(answer["blockers"]):
+            return answer
+        cleared = [row for row in answer["blockers"] if row not in left]
+        self.once(f"settled:{head}", lambda: self.note(
+            self.lead, f"Build run {self.ident}: the review at {head[:12]} repeated {len(cleared)} blocker(s) "
+                       f"the ruling round rejected or filed, cleared by its ruling: {self.summary(cleared)}"))
+        return dict(answer, blockers=left) if left else dict(answer, status="advisory", blockers=[])
+
+    def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str,
+             changed: Collection[str] | None = (), moved: Collection[str] | None = (),
+             functions: Collection[str] | None = (), reached: Collection[str] = ()) -> None:
+        """One ruling's writes in one transaction: the ruling note, a filed item, the rebuttal (sd:10286).
+
+        A reject or file judged the code at the reviewed head. `moved` is what the round's own commits changed
+        since: one that changed a file the blocker names can make it reachable, so that ruling is noted and
+        not applied (no clearing, no rebuttal), as when `moved` does not read (None): the review finds the
+        blocker again and the run parks, fail closed (class pass 3). A lapsed FILE ruling still files its
+        item: a review that omits the blocker delivers the build, and the defect must not be lost.
+
+        The note's opening names the run, the blocker's number and the head: a supervisor that walks this step
+        again without its marks (a crash before the rulings file went) finds it and writes nothing twice."""
+        said = " ".join(self.summary([row]).split())
+        finding = row.get("line") != "-"
+        # A file the finding or its evidence names: a fixed caller its repro runs through (lead ruling).
+        # Or a function the round changed that its words name as code (`forward()`): a fixed caller by name.
+        touched = (sorted({path for path, _ in self.locations(row)} & set(moved) | set(names_in(finding_words(row), moved))
+                          | callable_words(finding_words(row)) & set(functions) | set(reached))
+                   if moved is not None and functions is not None else None)
+        lapsed = ("" if ruling not in ("reject", "file") or not finding else
+                  "; not applied: the review gate's own blocker, no code it judged" if not ruleable(row) else
+                  # One rule with the lane (class pass 4): `settled` clears only what the rebuttal below holds
+                  # back there, so no rebuttal (no GitHub origin, an unread branch, no words) is no ruling.
+                  "; not applied: no rebuttal the lane's review reads" if not (
+                      repository and changed is not None and str(row.get("summary") or "").strip()) else
+                  "" if touched == [] else
+                  "; not applied: the round changed " + ", ".join(touched) if touched else
+                  "; not applied: the round's own changes did not read")
+        # A lapse skips the clearing and the rebuttal, never the follow-up: a review that omits the blocker
+        # delivers the build, and the item is the one record of the ruling's defect (sd:10914 review).
+        follow_up = ruling == "file" and finding
+        finding = finding and not lapsed
+        mark = f"Build run {self.ident} ruling {number} at {head[:12]}: "
+        with transaction(self.db):
+            # Any kind: a run from before sd:3008 applied here wrote this note as a decision.
+            if self.db.execute("SELECT 1 FROM note WHERE item = ? AND substr(body, 1, ?) = ?",
+                               (self.lead, len(mark), mark)).fetchone():
+                return
+            filed = None
+            if follow_up:
+                filed = create_item(self.db, kind="task", repo=self.row["repo"], title=(
+                    f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')} "
+                    f"{row.get('summary') or ''}")[:200])
+                add_note(self.db, filed, "comment", f"Build run {self.ident}'s ruling round filed this review "
+                                                    f"blocker, not caused by its change ({reason}{lapsed}): "
+                                                    f"{self.summary([row], None)}")
+            # A comment: a note the library writes is never a decision, whoever ruled (sd:3008).
+            add_note(self.db, self.lead, "comment",
+                     (f"{mark}{ruling.upper()}{f' as sd:{filed}' if filed else ''}, {reason}{lapsed}. Blocker: {said}"
+                      )[:build.FINDING_MAX])
+            if ruling in ("reject", "file") and finding:  # the blocker itself, for `settled`
+                record_state(self.db, "checkpoint", key=f"{RULED}{self.ident}:{head}:{number}", body=row)
+            # Each file the branch changes is an instance too, as for a follow-up: a later change to a caller
+            # there lapses the rebuttal in the lane. A branch that does not read takes none (fail closed).
+            # Its evidence too: the lane holds back a cited repeat of that evidence alone, never a fresh one.
+            if ruling in ("reject", "file") and finding:
+                raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
+                       "evidence": row.get("evidence"),
+                       "instances": [str(entry) for entry in row.get("instances") or []] + sorted(changed or ())}
+                record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:ruling:{head}:{number}",
+                             body={"decision": "accepted", "proposal": {
+                                 "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},
+                                 # `ruled`: the lane's `sd-review` holds back its repeat with this evidence
+                                 # too, as `settled` does here; else the run enqueues what the lane blocks.
+                                 "findings": [{"raw_finding": raw, "response_disposition": "rebutted", "ruled": True,
+                                               "reason": f"filed as follow-up sd:{filed}: {reason}" if filed else reason}]}})
+
     def own_checks(self, head: str) -> list[dict] | dict:
-        """Run an unmanaged repository's own checks at `head`, each in a gate slot; a blocker per failure.
+        """Run the checks `sd-review` did not at `head`, each in a gate slot; a blocker per failure: a managed
+        repository's gate (`sd gate check`), an unmanaged one's own entrypoints.
 
         No check found is noted on the lead item and passes: a repository with none did not fail one.
         Entrypoints that do not read are a configuration fault, no code blocker: the run's blocked end (a
@@ -2028,8 +2759,12 @@ class Supervisor:
         """
         if self.checks is None:
             return []
+        # A managed repository has a gate: the pass runs that gate itself, in its clean tree at `head`, its
+        # environment and its test recipe, never a copy of its commands that can differ (class pass, sd:10286).
+        managed = not build.unmanaged(self.db, self.row["repo"])
         try:
-            commands = self.checks(self.work)
+            commands = ([[*self.tools.check, "--base", self.base().removeprefix("origin/")]] if managed
+                        else self.checks(self.work))
         except ValueError as error:
             return self.finish("blocked", f"the repository's check entrypoints did not read, a configuration "
                                           f"fault no fix round can mend: {error}")
@@ -2043,12 +2778,16 @@ class Supervisor:
             for name in ("checks", "checks.err"):
                 self.empty(self.out(name), "checks")
             code = self.child([*self.tools.gate, "--label", f"build {self.row['branch']} checks", "--", *argv],
-                              cwd=self.work, name="checks", descendants=True, env=_checks_environ(self.env))
+                              cwd=self.work, name="checks", descendants=True,
+                              env=self.env if managed else _checks_environ(self.env))  # the gate takes no PAT
             if code == 125 and self.refused():  # the gate started nothing: unknown, never a failure of the code
                 raise Unread(f"sd gate run did not start `{said}`; see {self.out('checks.err')}")
             if code != 0:
                 tail = "".join(path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
                                for path in (self.out("checks"), self.out("checks.err")))
+                if managed and code == 1 and not tail.lstrip().startswith("{"):
+                    # `sd gate check` refused (no worktree, no commit): it printed no result, so no check ran.
+                    raise Unread(f"sd gate check gave no result at {head[:12]}: {tail.strip()[-500:]}")
                 return [{"path": said, "line": "-", "summary": f"exit {code}: {tail.strip()[-1500:]}"}]
             # A check that rewrote a tracked file tested a tree `head` does not hold; an unread status raises Unread.
             changed = _read([*self.tools.git, "-C", str(self.work), "-c", "core.quotePath=false", "status",
@@ -2072,7 +2811,35 @@ class Supervisor:
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
         refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
-        return refused + self.untabled(head, body)
+        return refused + self.untabled(head, body) + self.undesigned(head, body)
+
+    def undesigned(self, head: str, body: str) -> list[str]:
+        """The refusal for a design item the branch closes with no design.md of its own, or none (review of
+        sd:10096): two designs with one title closed from one file that kept only one. A design.md the branch
+        adds or changes under `docs/work` is the file of the item its front matter's `item: sd:N` line names."""
+        designs = [item for item in [self.lead, *self.others] if draft.is_design(self.db, item)]
+        cited = self.cited(self.work, self.base(), head, body) if designs else None
+        designs = [item for item in designs if item in (cited or ())]
+        if not designs:
+            return []
+        git = [*self.tools.git, "-C", str(self.work)]
+        owned = set()
+        for path in _read([*git, "diff", "--name-only", "-z", "--diff-filter=d", f"{self.base()}...{head}", "--",
+                           "docs/work"], env=self.env).split("\0"):
+            if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
+                text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
+                # The front matter's `item:` line alone: one in a Markdown example names no owner (review).
+                # It ends at the first closing `---` line, an empty one too (class pass).
+                lines = text.split("\n")
+                front = lines[1:lines.index("---", 1)] if lines[0] == "---" and "---" in lines[1:] else []
+                named = next((found for line in front if (found := re.fullmatch(r"item:\s*sd:([0-9]+)\s*", line))),
+                             None)
+                owned |= {int(named.group(1))} if named else set()
+        missing = [item for item in designs if item not in owned]
+        if not missing:
+            return []
+        return [f"each design item the branch closes needs a docs/work/<date>-<slug>/design.md of its own: "
+                f"{', '.join(f'sd:{item}' for item in missing)} has none whose first `item:` line names it"]
 
     def untabled(self, head: str, body: str) -> list[str]:
         """The failure-table refusal for a change that moves state in steps, or none (sd:9770).
@@ -2103,8 +2870,11 @@ class Supervisor:
         return [f"this change moves state in steps ({', '.join(bare)}), and neither that design.md nor "
                 f"the body holds its failure table: {FAILURE_TABLE_RULE}. Add the table, one row per step"]
 
-    def blocked_round(self, blockers: list[dict]) -> str | dict:
+    def blocked_round(self, blockers: list[dict], head: str) -> str | dict:
         self.blockers = blockers
+        # The head these blockers were found at, for the ruling round's rulings: a run a usage limit
+        # resumes has another id, so its own review file is no record of it (sd:10286).
+        record_state(self.db, "checkpoint", key=f"{ROUND_HEAD}{self.row['assignment']}", body=head)
         # Whole, as the fix reads them: the lead's note is cut at FINDING_MAX (review of build/sd-1557).
         part = self.round_file.with_name(f".{self.round_file.name}.{os.getpid()}.part")
         part.write_text(json.dumps(blockers))
@@ -2119,13 +2889,51 @@ class Supervisor:
         rounds = self.fresh()["review_round"] or 0
         if rounds < REVIEW_ROUNDS:
             return self.fix()
-        # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
-        # a question on one member leaves the others to fix, as enqueue delivers them without it.
+        # One class-pass round past the bound (sd:9263), then one ruling round (sd:10286). None when every member
+        # waits on a question no fix answers; a question on one member leaves the others to fix, as enqueue
+        # delivers them without it.
         unasked = [item for item in [self.lead, *self.others]
-                   if not build.open_question(self.db, [item], self.row["asked_since"])]
-        if rounds == REVIEW_ROUNDS and unasked:
-            return self.fix(CLASS_PASS, rounds=rounds)
+                   if not build.waits_on_operator(self.db, item, self.row["asked_since"])]
+        if rounds <= REVIEW_ROUNDS + 1 and unasked:
+            return self.fix(self.late_brief(rounds), rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
+
+    @staticmethod
+    def late_brief(rounds: int) -> str:
+        """The fix brief for a round at or past the bound: the class pass, then the ruling round (sd:10286)."""
+        return CLASS_PASS if rounds == REVIEW_ROUNDS else RULING
+
+    def lead_pass(self, head: str, status: str) -> None:
+        """Record the review at `head` this run settled to a pass (every blocker ruled or deferred) as the lead
+        pass lane prepare reuses at the same head (sd:10919, pack sd:5988), in the record `sd-review` writes
+        for a pass of its own (`sd_lib.lead_review_key`, `record_lead_review`). The lane checks the binding,
+        the fork and the head itself, so a report that lacks one records nothing: the lane reviews in full. The record
+        covers `head` alone: the lane carries no ruled pass across a merge (review of sd:10919)."""
+        try:
+            report = json.loads(self.out("review").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(report, dict):
+            return
+        subject, base, binding = report.get("subject"), report.get("covers_from"), report.get("binding")
+        copilot = ((report.get("remote_reviews") or {}).get("copilot") or {}) if isinstance(
+            report.get("remote_reviews"), dict) else {}
+        repository = self.github()
+        if not (isinstance(subject, dict) and subject.get("head") == head and isinstance(base, str)
+                and isinstance(binding, dict) and repository and isinstance(copilot, dict)):
+            return
+        record_state(self.db, "checkpoint", key=f"review:v1:{repository}:{self.row['branch']}", body={
+            "repository": repository, "branch": self.row["branch"], "head": head, "base": base, "status": status,
+            "binding": binding, "reviewed_by": report.get("reviewed_by", []), "challenge": False,
+            "copilot_automatic": copilot.get("automatic"), "settled_by": f"build run {self.ident}",
+            # Its rulings judged the tree at `head`: a catch-up merge may add the caller one said was missing.
+            "head_only": True})
+
+    def known_failure(self) -> bool:
+        """Whether the last blocking round, after which a fix ran, failed a check: a blocker with no line
+        that is no enqueue check, from this run's checks or the review's gate (sd:10914)."""
+        return bool(self.fresh()["review_round"]) and any(
+            row.get("line") == "-" and row.get("path") != "enqueue check" for row in self.round_blockers())
 
     def round_blockers(self) -> list[dict]:
         """The last blocking round's findings as `blocked_round` kept them; [] for none or an unreadable file."""
@@ -2136,9 +2944,9 @@ class Supervisor:
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
     def resume_fix(self) -> str | dict:
-        """The interrupted fix again, with its own brief: the last round's is the class pass (`blocked_round`)."""
+        """The interrupted fix again, with its own brief: the class pass or the ruling round (`blocked_round`)."""
         rounds = self.fresh()["review_round"] or 0
-        return self.fix(CLASS_PASS, rounds=rounds) if rounds == REVIEW_ROUNDS else self.fix()
+        return self.fix(self.late_brief(rounds), rounds=rounds) if rounds >= REVIEW_ROUNDS else self.fix()
 
     def count_round(self) -> None:
         if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):
@@ -2153,12 +2961,21 @@ class Supervisor:
         session = self.fresh()["session_id"]
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
-        prompt = brief.format(blockers=self.summary(self.blockers, limit=None), **self.brief(), **extra)
+        blockers = self.summary(self.blockers, limit=None)
+        if brief is RULING:
+            # Numbered, as the rulings name them. A rulings file from an earlier child is not this round's
+            # (a usage-limit resume, a retry that kept the count); a replayed child keeps what it wrote.
+            blockers = self.numbered(self.blockers)
+            if not self.will_replay("claude", self.fix_role()):
+                self.rulings.unlink(missing_ok=True)
+        prompt = brief.format(blockers=blockers, **self.brief(), **extra, rulings=self.rulings)
         rounds = self.fresh()["review_round"] or 0
         if rounds <= ESCALATE_AFTER:
             return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
         self.once("escalated", lambda: self.escalate(rounds))
-        return self.claude(prompt + ESCALATED.format(rounds=rounds), session=session, then="reviewing",
+        # The ruling round rules, then fixes only its FIX rulings: no class enumeration (sd:10286).
+        suffix = "" if brief is RULING else ESCALATED.format(rounds=rounds)
+        return self.claude(prompt + suffix, session=session, then="reviewing",
                            role=self.fix_role(), model=STRONGEST, effort=ESCALATED_EFFORT)
 
     def escalate(self, rounds: int) -> None:
@@ -2196,23 +3013,58 @@ class Supervisor:
         delivered = [item for item in [self.lead, *self.others] if item in cited]
         # A retry's branch keeps the lost run's trailers: a member this run's builder skipped with a question
         # waits on it (pack sd:6571).
-        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["asked_since"])]
+        # Nor does a design whose ruling was taken back since the claim deliver (class pass of sd:10096).
+        asked = [item for item in delivered if build.waits_on_operator(self.db, item, self.row["asked_since"])]
         delivered = [item for item in delivered if item not in asked]
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
                                           f"{', '.join(f'sd:{item}' for item in asked)}")
+        # A member ships with the design it waits on or not at all: one left out above, or with no commit,
+        # holds the delivery (class pass of sd:10096).
+        left = build.design_left(self.db, delivered, [self.lead, *self.others])
+        if left:
+            return self.finish("blocked", f"{left}; rule on the design or commit its design.md, then Retry")
+        # A design left out so still has its design.md on the branch, written under the old ruling: it would
+        # land with the code while its item stays open (review of sd:10096).
+        # Done or not: done says nothing of this branch's design.md, which would still land (review of sd:10096).
+        stale = sorted(build.aboard(self.db, asked))
+        if stale:
+            return self.finish("blocked", f"design {', '.join(f'sd:{item}' for item in stale)} waits on the "
+                                          f"operator again, and the branch holds its design.md written under the "
+                                          f"old ruling; rule on it, then Retry")
+        # Nor does a design ship without code: the lane refuses a branch of design records
+        # (`design_only_delivery`), and no reader of a delivery expects one with no code item (class pass).
+        if delivered and build.aboard(self.db, delivered) == set(delivered):
+            return self.finish("blocked", f"the branch delivers only design "
+                                          f"{', '.join(f'sd:{item}' for item in delivered)}, and a design ships "
+                                          f"with code; settle what held the code items, then Retry")
         # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
-        if asked:
+        # A rebuild of a lane-failed bundle can hold that bundle's trailers (`start_point`), and the start read
+        # them once: one a revert hid there, revived since, would close an item no one selected. Read again
+        # here, each outside the bundle stays open (class pass of build/sd-1808).
+        outside = build.outside_rebuild(self.db, self.row["assignment"], cited)
+        if outside:
+            self.once("outside", lambda: add_note(
+                self.db, self.lead, "comment", f"Build run {self.ident}: {self.row['branch']} has commits that "
+                f"close {', '.join(f'sd:{item}' for item in outside)}, outside this bundle; a `Refs:` line in the "
+                f"body keeps each open"))
+        if asked or outside:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
-            refs = f"Refs: {' '.join(f'sd:{item}' for item in asked)}"
-            if refs not in body.splitlines():
-                body = body.rstrip("\n") + f"\n\n{refs}\n"
+            kept = with_refs(body, [*asked, *outside])
+            if kept is None:
+                return self.finish("blocked", f"the body at {self.body} ends inside a code fence or a comment, "
+                                              f"so no `Refs:` line added after it keeps an item open; close it, "
+                                              f"then Retry")
+            if kept != body:
+                body = kept
                 self.body.write_text(body, encoding="utf-8")
         if not delivered:
             return self.finish("blocked", "the branch delivers no item: no commit has a `Closes: sd:N` trailer "
                                           "for one of the run's items")
         if not unmanaged:
-            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
+            # Only this run's branch's entry is its own (`lane_entry`): a rebuild that starts at a failed
+            # bundle's head (`start_point`) shares that head with the old failed entry (review of build/sd-1808).
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
         try:
@@ -2248,6 +3100,12 @@ class Supervisor:
         except (OSError, ValueError):
             answer = None
         if not isinstance(answer, dict) or answer.get("ok") is not True:
+            # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
+            # that file queued or ended at this head; the shared queue says whether that entry is this head, read
+            # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
+            if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
+                return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"
             return self.finish("blocked", f"sd-ship lane enqueue refused: {reason}; see {out}")
         return self.lane_done(answer, delivered)
@@ -2465,7 +3323,27 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "checklist": self.checklist(), "denied": self.denied()}
+                "findings": self.started() + self.findings(items) + self.designs(items), "checklist": self.checklist(),
+                "denied": self.denied()}
+
+    def started(self) -> str:
+        """The brief's line for a branch started from a failed lane entry (`start_point`, sd:10379); "" otherwise."""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None or self.start_point() is None:
+            return ""
+        return (f"\nThe branch starts from {failed['branch']}, whose lane entry failed: its commits are these items'\n"
+                f"earlier work, so build on them and fix what the lane said: {failed['detail'][:1500]}\n")
+
+    def designs(self, items: list[int]) -> str:
+        """The design and rulings of each design item in `items` (sd:10096); "" for none."""
+        found = []
+        for item in items:
+            text = draft.design(self.db, item) if draft.is_design(self.db, item) else None
+            if text is None:
+                continue
+            rulings = build.design_rulings(self.db, item)
+            found.append("\n".join([f"\n- sd:{item}:\n\n{text}", *(f"\n  {ruling}" for ruling in rulings)]))
+        return DESIGNS.format(designs="\n".join(found)) if found else ""
 
     def checklist(self) -> str:
         """The blocker classes recorded review rounds of the last `CHECKLIST_DAYS` found most, top first; "" for
@@ -2533,6 +3411,7 @@ class Supervisor:
                 "--model", model or self.row["model"] or build.OPUS, *(["--effort", effort] if effort else [])]
         if session:
             argv += ["--resume", session]
+        self.env.update(self.threads())  # read again at each spawn: the load moves over a run
         offset = self.start_offset(role)
         before = self.read_head()
         self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset, role=role)
@@ -2634,6 +3513,16 @@ class Supervisor:
             return f"the worktree was not read: {unread}"
         return "" if ahead.strip().isdigit() and int(ahead) > 0 else f"the builder left no commit on {self.row['branch']}"
 
+    def threads(self) -> dict[str, str]:
+        """The thread counts a builder's child starts with, each at most `thread_cap` now; a lower one the
+        dispatcher's own environment set wins, as the gate's does (sd:10393)."""
+        try:
+            load: float | None = os.getloadavg()[1]
+        except OSError:
+            load = None
+        cap, gate = thread_cap(self.own_env, load=load), _gate_slots()
+        return {name: gate.thread_cap(self.own_env.get(name), cap) for name in (*gate.CPU_VARIABLES, *THREAD_VARIABLES)}
+
     def base(self) -> str:
         try:
             ref = _read([*self.tools.git, "-C", str(self.repo), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], env=self.env)
@@ -2683,13 +3572,18 @@ class Supervisor:
         findings = answer.get("findings")
         findings = findings if isinstance(findings, list) else []
         # A route skip (a docs-only change) is the router's deliberate answer; any other skip stays unknown (pack sd:8291).
+        complete = 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0) \
+            and not answer.get("review_shortfall")
         if status in ("clean", "advisory") or status == "skipped" and (answer.get("route") or {}).get("tier") == "skip":
-            return {"status": status, "blockers": [], "covers": bool(answer.get("covers_from"))}
+            # A repeat `sd-review` held back under a ruling or rebuttal: it passes only in a whole report (sd:10286).
+            held = [row for row in findings if isinstance(row, dict) and isinstance(row.get("summary"), str)
+                    and row["summary"].rstrip().endswith(HELD_NOTES)]
+            return {"status": status, "blockers": [], "held": held, "complete": complete,
+                    "covers": bool(answer.get("covers_from"))}
         if status == "blocking":
             return {"status": status, "blockers": [row for row in findings
                                                    if isinstance(row, dict) and row.get("disposition") == "blocking"],
-                    "complete": 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
-                    and not answer.get("review_shortfall"), "covers": bool(answer.get("covers_from"))}
+                    "complete": complete, "covers": bool(answer.get("covers_from"))}
         if status == "gate_failed":  # the review cleared and the repository's gate failed: the builder fixes it
             checks = (answer.get("check") or {}).get("checks") or []
             return {"status": status, "blockers": [
@@ -2925,6 +3819,7 @@ class DraftSupervisor(Supervisor):
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
         self.env = _environ(environ, ident)
+        self.own_env = dict(self.env)  # before `threads` caps it: each spawn caps from this again
         self.reviewed: str | None = None
         self.take_resume(settle_seconds)
 
@@ -2948,7 +3843,7 @@ class DraftSupervisor(Supervisor):
 
     def argv(self) -> list[str]:
         title, body = draft.item_text(self.db, self.item)
-        prompt = DRAFT.format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
+        prompt = (DESIGN if draft.is_design(self.db, self.item) else DRAFT).format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
                               questions=draft.QUESTIONS_MAX)
         return [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--tools", *draft.TOOLS, "--permission-mode", "dontAsk", "--strict-mcp-config",
@@ -2982,15 +3877,18 @@ class DraftSupervisor(Supervisor):
         if parsed is None:
             return self.finish("blocked", f"the reply has no `## Spec`, or a question short of two Option: "
                                           f"lines or of a recommended one; nothing was written; log {self.log}")
-        if not draft.write(self.db, self.ident, *parsed):
-            raise Lost
+        try:
+            if not draft.write(self.db, self.ident, *parsed):
+                raise Lost
+        except draft.Moved as moved:
+            return self.finish("blocked", f"{moved}; log {self.log}")
         return {"run": self.ident, "outcome": "done", "questions": len(parsed[1])}
 
 
 def failure_table(text: str) -> bool:
     """Whether `text` holds a failure table (sd:9770): a header line whose `|`-separated cells begin with the five
-    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it. Prose naming the
-    words, or a header with only its separator, is no table."""
+    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it, with a cell for
+    each column (pack sd:9866). Prose naming the words, or a header with only its separator, is no table."""
     lines = text.splitlines()
     for at, line in enumerate(lines):
         cells = [cell.strip().lower() for cell in line.strip().strip("|").split("|")]
@@ -2999,6 +3897,7 @@ def failure_table(text: str) -> bool:
         for row in lines[at + 1:]:
             if "|" not in row:
                 break
-            if not TABLE_SEPARATOR.fullmatch(row.strip()):
+            if (not TABLE_SEPARATOR.fullmatch(row.strip())
+                    and len(row.strip().strip("|").split("|")) >= len(FAILURE_COLUMNS)):
                 return True
     return False

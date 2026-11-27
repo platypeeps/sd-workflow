@@ -277,7 +277,7 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     if (not isinstance(reviewed, str) or record.get("status") not in PASSING_LEAD_REVIEWS
             or (record.get("repository"), record.get("branch")) != (repository, branch)):
         return None, "it names another subject"
-    if binding is None or record.get("binding") != binding:
+    if binding is None or not sd_lib.same_review_binding(record.get("binding"), binding):
         return None, "the review tools or policy changed since, or do not read"
     if record.get("copilot_automatic") is not False:
         return None, "it selects an automatic Copilot review"
@@ -290,6 +290,8 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
         return None, f"it reviewed from {str(record.get('base'))[:12]}, not the fork from origin/{base}"
     if reviewed == head:
         return record, f"the {record['status']} pass of {head[:12]} covers it"
+    if record.get("head_only"):  # a build's settled pass: its rulings judged that tree alone (sd:10919)
+        return None, f"the pass of {reviewed[:12]} settled on rulings, which cover that head alone"
     try:
         carried = carry_forward(root, reviewed, head, f"refs/remotes/origin/{base}")
     except Refusal:
@@ -614,7 +616,7 @@ class SharedReview:
     def check_review(self, head: str, *, refresh_adjudication: bool = False, run_gate: bool = False) -> dict | None:
         report = self.review_inputs(head)
         if report["status"] == "blocking":
-            clearance = sd_ship_dispositions.accepted(self, head)
+            clearance = sd_ship_dispositions.accepted(self, head, run_tests=run_gate)  # a read runs no test (sd:10893)
             if (report.get("check") or {}).get("status") == GATE_NOT_RUN:
                 self.adjudicated_gate(head, run=run_gate)
             if not refresh_adjudication and self.state.get("review_clearance") != clearance:
@@ -837,7 +839,35 @@ class SharedReview:
         return self._binding_moved
 
     def binding_holds(self) -> bool:
-        return self.state.get("binding") == self.runtime.binding(self.root) or self.request_unchanged()
+        return (self.state.get("binding") == self.runtime.binding(self.root) or self.tools_only_moved()
+                or self.request_unchanged())
+
+    def tools_only_moved(self, *, save: bool = True) -> bool:
+        """Operator 2026-11-27: only review tools moved, so the receipt is rebound and kept, no pass spent.
+
+        `save=False` only answers: the held-review path records its result first, and a rebind saved
+        before it would strand that result if the process stopped between the two writes."""
+        changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
+        if (not sd_lib.TOOL_CHANGES_KEEP_REVIEWS or manifest is None or not changed
+                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
+            return False
+        # A normalizer move reports alone and hides the policy entries, so policy is compared here too.
+        current = manifest(self.root)
+        if (self.state.get("binding_manifest") or {}).get("policy") != current["policy"]:
+            return False
+        if not save:
+            return True
+        passes = self.history.native(self.state)
+        kept = {"head": passes[-1].get("head") if passes else None, "recorded_at": self.runtime.clock(),
+                "superseded_binding": self.state.get("binding"), "changed": [list(row) for row in changed],
+                "tools_only": True}
+        rebound = {"binding": self.runtime.binding(self.root), "binding_manifest": current,
+                   "review_binding_kept": [*(self.state.get("review_binding_kept") or []), kept]}
+        if self.read_only():
+            self.state.update(rebound)  # pack sd:7576: a read verb rebinds in memory only
+        else:
+            self.save(**rebound)
+        return True
 
     def request_unchanged(self) -> bool:
         """sd:1397, option E: only review code moved, and the reviewers would be asked the same.
@@ -1279,7 +1309,7 @@ class SharedReview:
         moved = sorted(name for name in expected if held.get(name) != expected[name])
         if moved:
             return refuse_held(path, f"bound to another {', '.join(moved)}")
-        if self.state.get("binding") != self.runtime.binding(self.root):
+        if self.state.get("binding") != self.runtime.binding(self.root) and not self.tools_only_moved(save=False):
             return refuse_held(path, "the review tools or policy changed since it ran")
         try:
             outcome = record["result"]
@@ -1804,28 +1834,45 @@ def row_tests(row: dict) -> list[str]:
     # `make test` before it says so.
     if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
         return []
-    found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(text) or []]
     if not steps or not failing or not all(test_step(step, failing) for step in steps):
         return []
-    return found
+    # Only a failing shard's headers name its failures: a passing one may print one as output (sd:9866). The
+    # blocks are the ones validation counted, so an early end line a test printed hides no failure.
+    blocks = "\n".join(failing.values())
+    return [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(blocks) or []]
 
 
-def unittest_failed_shards(text: str) -> set[str]:
+def unittest_failed_shards(text: str) -> dict[str, str]:
     """The shards in `run-tests.sh` output `text` that finished with unittest's own failure exit and printed a FAIL
-    or ERROR header; empty when any shard did not write its complete end line (killed or hung), ended with any
-    other non-zero exit (137 for a kill), or failed with no header: then more than a test failed."""
-    started = SHARD_START.findall(text)
-    ended = {match.group(1): match for match in SHARD_END.finditer(text)}
+    or ERROR header, each with its block, from its start line to its end line; empty when any shard did not write
+    its complete end line (killed or hung), ended with any other non-zero exit (137 for a kill), or failed with no
+    header: then more than a test failed.
+
+    Empty too unless the markers read as `run-tests.sh` writes them: one
+    planned line, then each planned shard's start line and end line once,
+    each pair whole before the next starts. A test's output can quote any
+    of them (a multiline assertion, a captured runner log), in its own
+    block or another's, and a quoted one could move a block or its exit:
+    then no block is trusted, and no flake (class pass of the lane review
+    of sd:9862).
+    """
     planned = SHARDS_PLANNED.findall(text)
+    marks = sorted([*SHARD_START.finditer(text), *SHARD_END.finditer(text)], key=lambda match: match.start())
+    starts, ends = marks[0::2], marks[1::2]
+    names = [match.group(1) for match in starts]
     # Every planned shard finished: one that never launched left no log to count (review of sd:9768).
-    if any(name not in ended for name in started) or planned != [str(len(ended))]:
-        return set()
-    failing = {name for name, match in ended.items() if match.group(2) != "0"}
-    for name in failing:
-        match = ended[name]
-        opened = text.rfind(f"shard {name}: start\n", 0, match.start())
-        if match.group(2) != UNITTEST_FAILED or opened < 0 or not read_failures(text[opened:match.start()]):
-            return set()
+    if (planned != [str(len(starts))] or len(starts) != len(ends) or len(set(names)) < len(names)
+            or any(start.re is not SHARD_START or end.re is not SHARD_END or end.group(1) != start.group(1)
+                   for start, end in zip(starts, ends, strict=True))):
+        return {}
+    failing: dict[str, str] = {}
+    for start, end in zip(starts, ends, strict=True):
+        if end.group(2) == "0":
+            continue
+        block = text[start.start():end.start()]
+        if end.group(2) != UNITTEST_FAILED or not read_failures(block):
+            return {}
+        failing[start.group(1)] = block
     return failing
 
 
@@ -1846,7 +1893,7 @@ def read_failures(block: str) -> bool:
     return sum(int(count) for count in re.findall(r"(?:^|, )(?:failures|errors)=(\d+)", summaries[0])) == len(named)
 
 
-def test_step(step: str, failing: set[str]) -> bool:
+def test_step(step: str, failing: dict[str, str]) -> bool:
     """`make target test`, or one complete `shard X: Ns exit=1` line of a shard in `failing`: a listed step that
     only starts like one (`exit=1` of `exit=137`) or names an unfinished shard is not a test failure."""
     if step == "make target test":
@@ -1935,7 +1982,8 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
     import sd_gate_run  # noqa: PLC0415
 
     with tempfile.TemporaryDirectory(**sd_gate_cache.worktree_place(root, head)) as parent:
-        tree = pathlib.Path(parent) / "tree"
+        # Resolved, as make's `abspath` names the interpreter: `/var` links to `/private/var` (sd:10530).
+        tree = pathlib.Path(parent).resolve() / "tree"
         try:
             sd_gate_run.gate_git(root, "worktree", "add", "--detach", str(tree), head)
         except sd_gate_run.GateError as error:
@@ -1943,8 +1991,9 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
         try:
             if sd_gate_run.gate_git(tree, "rev-parse", "HEAD") != head:
                 return None, "", f"the rerun's worktree is not at {head[:12]}"
-            # The runner's git entries replace the gate's; fsmonitor stays off on top of them.
-            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(tree), **runner_guards(tree)})
+            # The runner's git entries replace the gate's; fsmonitor stays off on top of them. The gate's own
+            # environment: no PATH entry in the checkout `root`, as `check_in_worktree` cuts it (sd:9866).
+            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(root), **runner_guards(tree)})
             python = gate_python(tree, environment)
             if python is None:
                 return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"

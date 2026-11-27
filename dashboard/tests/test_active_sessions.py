@@ -455,7 +455,7 @@ class TodayDraws(ScreenCase):
         self.assertIn('data-type="working" data-item="11"', out["R"]["none"])
 
     def test_suggested_adds_each_repos_ready_items_that_the_default_hides(self):
-        # pack sd:7222's Live + next is the Suggested filter: each repo's ready items, at most 6 (sd:7869), in order; a repo
+        # pack sd:7222's Live + next is the Suggested filter: each repo's ready items, all of them (sd:10760), in order; a repo
         # with only ready items gets its row too. Off (`?show=` empty) shows none.
         self.grouped()
         out = self.draw("R.before = repos(); press('suggested'); R.after = repos(); R.bar = ELS['queue-filters'].html;"

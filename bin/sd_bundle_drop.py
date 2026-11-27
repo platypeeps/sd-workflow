@@ -11,6 +11,7 @@ cites only others. One that cites nothing refuses the drop: no message says whos
 
 from __future__ import annotations
 
+import functools
 import subprocess
 from pathlib import Path
 
@@ -114,6 +115,37 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
     return kept, dropped
 
 
+def _done_delivered(work: str | Path, start: str, dropped: list[str], done: set[int]) -> None:
+    """Refuse when a dropped commit cites a done member the base delivers nowhere: its work exists only on this
+    branch, and a kept commit may need it, so the kept branch would lose it unseen (sd:10021). A delivered member's
+    commits stay aside, as before: carried, their `Closes:` would close it again once reopened (pack sd:9863)."""
+    if not done:
+        return
+    cited = {sha: set(sd_ship_body.cited_ids("", [(sha, _out("log", "-1", "--format=%B", sha, cwd=work))])) & done
+             for sha in dropped}
+    wanted = set().union(*cited.values()) if cited else set()
+    if not wanted:
+        return
+    # As `sd_lib._closed_by`: first parent, `--grep` narrows, the trailer block decides, and a squash held at
+    # merge delivers nothing (review of sd:10021); this git, this env.
+    raw = _out("log", "--first-parent", "--format=%H%x1f%P%x1f%B%x1e", "-E", "--grep", "^(Delivers|Closes): ", start,
+               cwd=work)
+    commits = [entry.strip().split("\x1f", 2) for entry in raw.split("\x1e") if entry.count("\x1f") >= 2]
+
+    def ancestor(commit: str, count: int) -> str:
+        # A missing ancestor names nothing, as `sd_lib._ancestor` answers: the tip stays held.
+        return _git("rev-parse", f"{commit}~{count}", cwd=work, check=False).stdout.strip()
+
+    landed = {number for number in wanted if any(
+        sd_lib._closes(message, f"sd:{number}", parents, functools.partial(ancestor, commit))
+        for commit, parents, message in commits)}
+    for sha, numbers in cited.items():
+        if numbers - landed:
+            names = ", ".join(f"sd:{number}" for number in sorted(numbers - landed))
+            raise DropRefused(f"commit {sha[:12]} holds work of {names}, which is done but which {start} does not "
+                              f"deliver; the kept branch would lose it: split it by hand")
+
+
 def _clean(work: str | Path, branch: str) -> None:
     if _out("branch", "--show-current", cwd=work) != branch:
         raise DropRefused(f"worktree {work} is not on {branch}")
@@ -144,6 +176,7 @@ def split_branch(plan: dict, done: dict) -> dict:
     _merges(work, fork, tip)
     aside = set(plan["aside"])
     kept, dropped = drop_sides(work, fork, tip, item, aside, set(plan["built"]))
+    _done_delivered(work, start, dropped, set(plan.get("done", ())))
     new_work, new_branch = Path(plan["new_work"]), plan["new_branch"]
     if new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
         raise DropRefused(f"{new_work} or branch {new_branch} exists already")
@@ -152,7 +185,7 @@ def split_branch(plan: dict, done: dict) -> dict:
     # Marked made first: a failed add may leave a half-made worktree or branch; undo removes both either way.
     _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
     done["onto"] = _replay(new_work, start, fork, kept)
-    check_branch(new_work, done["onto"], kept, aside, fork)
+    check_branch(new_work, done["onto"], kept, aside)
     done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     return done
 
@@ -191,9 +224,10 @@ def _renames(work: str | Path, old: str, new: str) -> dict[str, str]:
     return renamed
 
 
-def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int], fork: str) -> None:
+def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int]) -> None:
     """The new branch holds the kept commits alone: one commit each, no path past theirs, no `aside` citation.
-    A kept path main renamed since `fork` counts under its new name too (note #71874)."""
+    A kept path counts under the name `start` gives it too: read from each kept commit's parent, not the fork,
+    since a file the dropped commit added and main landed under a new name is not on the fork (sd:10020)."""
     shas = _out("rev-list", "--reverse", f"{start}..HEAD", cwd=work).split()
     if len(shas) != len(kept):
         raise DropRefused(f"the new branch holds {len(shas)} commits, not the {len(kept)} kept")
@@ -201,10 +235,11 @@ def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int],
     cited = aside & set(sd_ship_body.cited_ids("", commits))
     if cited:
         raise DropRefused(f"the new branch still cites {', '.join(f'sd:{n}' for n in sorted(cited))}")
-    allowed = set().union(*(_paths(work, sha) for sha in kept)) if kept else set()
-    if kept:
-        renamed = _renames(work, fork, start)
-        allowed |= {renamed[path] for path in allowed if path in renamed}
+    allowed: set[str] = set()
+    for sha in kept:
+        paths = _paths(work, sha)
+        renamed = _renames(work, f"{sha}^", start)
+        allowed |= paths | {renamed[path] for path in paths if path in renamed}
     changed = _names("diff", "--name-only", "-z", start, "HEAD", cwd=work)
     if changed - allowed:
         raise DropRefused(f"the new branch changes {', '.join(sorted(changed - allowed))}, which no kept commit does")

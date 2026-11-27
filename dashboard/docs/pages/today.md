@@ -66,6 +66,10 @@ lamp, review the caution lamp when a PR waits on you; the cell's label says all 
 Suggested is on by default (pack sd:7314); All items and Ended builds are off. On, a repo that has only those rows
 shows too. `?show=` keeps the choice: no key is the default, and an empty `show=` keeps every filter off.
 All items lists no idea kind (pack sd:7699): ideas live on Writing.
+Advisories (sd:10915) shows or hides the advisory items, those whose ref starts `advisory-sweep:` or
+`advisory:`, in Suggested, All items and Parked; hidden by default. It is no `?show=` key: a press posts the
+setting row `dashboard.queue_advisories` to `/api/settings/row`, so the choice follows the operator to every
+session and machine. A read of them that failed hides none and is named under the table.
 The view reads its three documents when it first shows, on each Today read after, and every 30 s while it shows.
 A source that was not read is named under the table.
 Read again on this view first posts `/api/queue/prs/check` with the items its PR rows show, at most 20 (sd:8375):

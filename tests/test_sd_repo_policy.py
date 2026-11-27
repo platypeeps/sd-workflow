@@ -104,11 +104,16 @@ class Policy(unittest.TestCase):
                    {"user": {"login": "y"}, "state": "CHANGES_REQUESTED", "commit_id": head}]
         self.assertEqual(sd_repo_policy.approvals(reviews, head), ["x"])
 
+    def test_runtime_data_is_a_list_of_globs(self):
+        """sd:10906: a build's ruling round reads the declared runtime data; the reader takes a list of globs."""
+        self.assertEqual(sd_repo_policy.problems({"runtime_data": ["data/**", "templates/*.py"]}), [])
+
     def test_extreme_values_are_refused_not_raised(self):
         for value in ([], "x", None, 1, {"review": []}, {"review": {"human": True}}, {"review": {"human": 10 ** 30}},
                       {"commit_convention": {"footer": "("}}, {"commit_convention": {"line_max": float("inf")}},
                       {"commit_convention": {"title_max": 0}}, {"links": "x"}, {"ci": []},
-                      {"commit_convention": {"aliases": {"a": 1}}}, {"review": {"reviewers": [""]}}):
+                      {"commit_convention": {"aliases": {"a": 1}}}, {"review": {"reviewers": [""]}},
+                      {"runtime_data": "data/**"}, {"runtime_data": [" "]}, {"runtime_data": [1]}):
             with self.subTest(value=value):
                 self.assertTrue(sd_repo_policy.problems(value))
 

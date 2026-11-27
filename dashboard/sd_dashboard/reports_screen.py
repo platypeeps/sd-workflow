@@ -8,8 +8,8 @@ They were Operations > Resources until then.
 Since sd:2121 it also builds the documents behind the default UI's Reports
 page (`v2/reports.html`, at `/reports`); the page holds no rows:
 
-- `/api/reports` is `document`: the newest 200 reports `reporting.reports`
-  gives v1, each with its provenance, its body's last `BODY_CHARS`
+- `/api/reports` is `document`: the open reports, at most 200, and the newest 200
+  reports `reporting.reports` gives v1 (sd:10432), each with its provenance, its body's last `BODY_CHARS`
   characters, the revision the acknowledge route checks and its open
   followups; the scheduled jobs `operations.inventory` gives Management; each
   job's run cadence over the last seven local days, read from its
@@ -270,6 +270,14 @@ def families(connection, config: Path | None = None) -> dict:
     return {"state": "partial" if problems else "read", "source": source, "problems": problems, "list": found}
 
 
+def local_day(stamp: str, *, tz=None) -> str | None:
+    """The local date of an ISO stamp, in `tz` (the machine's by default); None for one that does not read."""
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(tz).date().isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def local_days(now: str, *, tz=None) -> list[str]:
     """The last `DAYS` local dates, oldest first, ending on the local date of `now`."""
     today = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(tz).date()
@@ -401,7 +409,10 @@ def _reports(connection) -> list[dict]:
 
     # One revision read and one note read for the page, not an `item_state` per report (sd:3531).
     with _one_snapshot(connection):
-        rows = reporting.reports(connection)
+        # sd:10432: the open reports first, then the newest history; an open one behind 200 newer rows still shows.
+        rows = {row["id"]: row for row in reporting.reports(connection, open_only=True)}
+        rows.update((row["id"], row) for row in reporting.reports(connection) if row["id"] not in rows)
+        rows = sorted(rows.values(), key=lambda row: (row["created_at"], row["id"]), reverse=True)
         ids = [row["id"] for row in rows]
         revisions = reads.revisions(connection, ids)
         followups = {item: [] for item in ids}
@@ -436,7 +447,9 @@ def document(connection, *, now: str, jobs=None, tz=None, config: Path | None = 
     root = getattr(backend, "cron_root", None)
     logs = None if root is None else Path(root) / "logs"
     keep = (lambda rows, key: rows) if only is None else (lambda rows, key: [row for row in rows if row[key] in only])
-    for source, collect in (("reports", lambda: keep(_reports(connection), "job")),
+    # sd:10438: each report's local day, in the zone the cadence's days are in, so both group a run alike.
+    dated = lambda rows: [{**row, "day": local_day(row["at"], tz=tz)} for row in rows]  # noqa: E731
+    for source, collect in (("reports", lambda: dated(keep(_reports(connection), "job"))),
                             ("jobs", lambda: keep(_jobs(connection, backend), "name")),
                             ("cadence", lambda: cadence(out["jobs"], logs, days)),
                             *((("html", _html_folders),) if only is None else ())):

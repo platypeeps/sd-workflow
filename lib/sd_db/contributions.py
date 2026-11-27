@@ -677,7 +677,8 @@ def _close_merged(connection, row: dict, metadata: dict, value: dict, merged: st
     try:
         why = _merge_close_refusal(connection, row, metadata, metadata["pull_url"], value.get("opened_at"))
         if why is None:
-            change_status(connection, item, "done", who=OBSERVER, reason=f"{merged}; its commit says Closes: sd:{item}")
+            change_status(connection, item, "done", who=OBSERVER, resolve_followups=True,
+                          reason=f"{merged}; its commit says Closes: sd:{item}")
             return
     except (WorkflowError, TransitionRefused) as error:
         why = str(error)

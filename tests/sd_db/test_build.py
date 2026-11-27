@@ -28,6 +28,8 @@ from sd_db.writes import (
     create_item,
     read_settings,
     record_state,
+    reopen_note,
+    resolve_note,
     set_setting,
     transition,
     upsert_repo,
@@ -664,7 +666,171 @@ class OpenQuestion(Case):
         add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
         found = build.open_question(self.db, [item], since, pending=True)
         self.assertEqual(found and found["id"], asked)
-        self.assertIsNone(build.open_question(self.db, [item], since), "the skip evidence reads as before")
+        found = build.open_question(self.db, [item], since)
+        self.assertEqual(found and found["id"], asked, "a withdrawn ruling counted as an answer at delivery")
+
+    def test_a_withdrawn_ruling_leaves_the_skip_evidence_standing(self):
+        """pack sd:10236: delivery and the class pass read the question as the builder's skip; a withdrawn
+        ruling answered it there, so a skipped item went back to planning, not blocked. A resolved question
+        still counts, and a ruling on another note answers nothing."""
+        item = self.item()
+        since = "2000-01-01T00:00:00+00:00"
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        ruling = add_note(self.db, item, "decision", f"Ruling on note #{asked}: A")
+        self.assertIsNone(build.open_question(self.db, [item], since), "a standing ruling answers the skip")
+        for other in (f"#{ruling + 1000} on note #{asked}", f"#{ruling} on note #{asked}9"):
+            add_note(self.db, item, "decision", f"Withdrawn: ruling {other}")
+            self.assertIsNone(build.open_question(self.db, [item], since), f"{other}'s withdrawal counted")
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
+        found = build.open_question(self.db, [item], since)
+        self.assertEqual(found and found["id"], asked, "a withdrawn ruling counted as an answer at delivery")
+
+    def test_a_reversed_ruling_answers_the_skip_evidence_no_more(self):
+        """Lane review of build/sd-1726: the skip evidence read only withdrawals, so ruling R1 that Decide
+        reversed answered the question again once the operator withdrew its replacement R2. Both reads take
+        a ruling back by reversal or by a withdrawal that names its own note, `; sd:N stays filed` too."""
+        item = self.item()
+        since = "2000-01-01T00:00:00+00:00"
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        first = add_note(self.db, item, "decision", f"Ruling on note #{asked}: A")
+        add_note(self.db, item, "decision", f"Reversed ruling #{first}: question #{asked} asks again.")
+        second = add_note(self.db, item, "decision", f"Ruling on note #{asked}: B")
+        for pending in (False, True):
+            self.assertIsNone(build.open_question(self.db, [item], since, pending=pending), "R2 answers it")
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{second} on note #{asked}9")
+        for pending in (False, True):
+            self.assertIsNone(build.open_question(self.db, [item], since, pending=pending),
+                              "a withdrawal naming another note took R2 back")
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{second} on note #{asked}; sd:1 stays filed")
+        for pending in (False, True):
+            found = build.open_question(self.db, [item], since, pending=pending)
+            self.assertEqual(found and found["id"], asked, "the reversed R1 answered the question again")
+
+
+class DesignChain(Case):
+    """Review of sd:10096: a design aboard the bundle is no dependency, but what it waits on still is."""
+
+    def test_a_prerequisite_behind_a_riding_design_is_ahead_of_the_lead(self):
+        later = self.item()
+        design = self.item(fields={"work_kind": "design", "blocked_by": [later]})
+        lead = self.item(fields={"blocked_by": [design]})
+        members = [{"item": design}, {"item": later}]
+        ahead, behind = build._inside(self.db, lead, members)
+        self.assertEqual([member["item"] for member in ahead], [later])
+        self.assertEqual([member["item"] for member in behind], [design])
+
+
+class DesignRulings(Case):
+    """Class pass of sd:10096: every reader of a design's rulings reads the standing one, so a ruling Decide
+    reversed (`Reversed ruling #N`) holds the design as a review withdrawal does."""
+
+    def designed(self):
+        """A design item whose design run wrote its design and one question: (item, question)."""
+        item = self.item(fields={"work_kind": "design"})
+        [run] = build.queue(self.db, [item], who="operator")
+        self.assertEqual(run["scope"], build.DRAFT)
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (run["id"],))
+        add_note(self.db, item, "comment", "Design:\n\nProblem: x", session="draft:fixture")
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B",
+                         session="draft:fixture")
+        return item, asked
+
+    def rule(self, item, asked, answer):
+        ruling = add_note(self.db, item, "decision", f"Ruling on note #{asked}: {answer}")
+        resolve_note(self.db, asked)
+        return ruling
+
+    def reverse(self, item, asked, ruling):
+        """As Decide's reverse writes it (`sd_dashboard.decisions.reverse`)."""
+        add_note(self.db, item, "decision", f"Reversed ruling #{ruling}: question #{asked} asks again.")
+        reopen_note(self.db, asked)
+
+    def test_a_reversed_ruling_leaves_its_question_pending(self):
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        self.assertIsNone(build.open_question(self.db, [item], "", pending=True))
+        self.reverse(item, asked, ruling)
+        found = build.open_question(self.db, [item], "", pending=True)
+        self.assertEqual(found and found["id"], asked)
+
+    def test_the_press_refuses_a_design_whose_ruling_decide_reversed(self):
+        item, asked = self.designed()
+        self.reverse(item, asked, self.rule(item, asked, "A"))
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on design question note #{asked}"):
+            build.queue(self.db, [item], who="operator")
+        self.assertNotIn(item, [row["id"] for row in build.eligible(self.db)])
+
+    def test_the_claim_leaves_out_a_ride_whose_ruling_decide_reversed(self):
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        [ride] = build.queue(self.db, [item], who="operator")
+        code = self.item()
+        build.queue(self.db, [code], who="operator")
+        self.reverse(item, asked, ruling)
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", ride["id"]), "queued")
+
+    def test_a_retried_bundle_holds_while_its_design_ruling_is_reversed(self):
+        """A bundle that ran before claims whole, past the fresh rows' check: a ruling reversed between its
+        Retry and the claim holds it, as a reopened dependency does."""
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        code = self.item()
+        build.queue(self.db, [code, item], who="operator")
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code, item])
+        build.write(self.db, bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, bundle["id"], "blocked", "3 review rounds left blockers: a.py:2 one item")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        build.retry(self.db, bundle["assignment"], who="operator")
+        self.reverse(item, asked, ruling)
+        self.assertIsNone(self.claim())
+        results = [row["result"] for row in self.db.execute(
+            "SELECT result FROM assignment WHERE scope = ? AND item IN (?, ?) ORDER BY id", (build.SCOPE, code, item))]
+        self.assertTrue(all(f"waits on design question note #{asked}" in (result or "") for result in results),
+                        results)
+        with self.assertRaisesRegex(build.BuildRefused, "waits on design question"):
+            build.retry(self.db, bundle["assignment"], who="operator")
+
+    def test_a_p1_design_rides_an_ordinary_code_bundle(self):
+        """Review of sd:10096: a P1 row joined only a P1 lead of its area, and a ride never leads, so a P1
+        design waited while ordinary code bundles shipped. A ride takes no slot: it joins any fresh bundle."""
+        item = self.item(priority=1, fields={"work_kind": "design"})
+        [run] = build.queue(self.db, [item], who="operator")
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (run["id"],))
+        add_note(self.db, item, "comment", "Design:\n\nProblem: x", session="draft:fixture")
+        build.queue(self.db, [item], who="operator")
+        code = self.item(priority=2)
+        build.queue(self.db, [code], who="operator")
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code, item])
+
+    def test_delivery_holds_unless_the_standing_rulings_are_the_briefs(self):
+        """Class pass of sd:10096: delivery held only a ruling the brief lacked. One the brief carried and
+        that stands no more holds too, also when its question was not reopened."""
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))  # no brief sent: nothing to compare
+        build.note_brief(self.db, item, "run-1")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))
+        self.assertEqual(build.briefed(self.db, item), {ruling})
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
+        self.assertIsNone(build.open_question(self.db, [item], "", pending=True))
+        self.assertIn(f"ruling #{ruling}", build.design_waits(self.db, item, delivered=True) or "")
+        replaced = self.rule(item, asked, "B")
+        self.assertIn(f"ruling #{replaced}", build.design_waits(self.db, item, delivered=True) or "")
+        build.note_brief(self.db, item, "run-2")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))
+
+    def test_the_brief_rulings_are_the_standing_ones(self):
+        """A reversed ruling, and one a later ruling replaced, are no instruction."""
+        item, asked = self.designed()
+        self.reverse(item, asked, self.rule(item, asked, "A"))
+        self.assertEqual(build.design_rulings(self.db, item), [])
+        self.rule(item, asked, "B")
+        self.rule(item, asked, "C")
+        self.assertEqual(build.design_rulings(self.db, item), [f"Ruling on note #{asked}: C"])
 
 
 class Writes(Case):
@@ -2599,6 +2765,31 @@ class Pickup(Case):
                         (later(build.clock(), 3600),))
         self.assertIsNone(build.stop_on_blocks(self.db, now=self.NOW), "On again counts only what ends after it")
 
+    def blocked_design(self):
+        """A design item auto-pickup queued, whose design run then ended blocked (draft `_block`)."""
+        item = self.item(fields={"work_kind": "design"})
+        self.assertIn(item, build.pickup(self.db, self.room(), now=self.NOW))
+        lead = self.count("SELECT id FROM assignment WHERE item = ? AND scope = ?", item, build.DRAFT)
+        stamp = later(build.clock(), self.count("SELECT COUNT(*) FROM assignment"))
+        self.db.execute("UPDATE assignment SET status = 'blocked', started = ?, ended = ? WHERE id = ?",
+                        (stamp, stamp, lead))
+        return item
+
+    def test_a_blocked_design_run_is_not_picked_again(self):
+        """Review of sd:10096: a failed design run left its item ready with no design, so every tick picked
+        it again and ran it again. Like a blocked build, it waits on the operator's Build."""
+        self.on()
+        item = self.blocked_design()
+        self.assertNotIn(item, build.pickup(self.db, self.room(), now=self.NOW))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", item), 1)
+
+    def test_two_blocked_design_runs_turn_off(self):
+        """Review of sd:10096: the stop counted build rows only, so blocked design runs never turned it off."""
+        self.on()
+        self.blocked_design()
+        self.blocked_design()
+        self.assertIn("ended blocked in a row", build.stop_on_blocks(self.db, now=self.NOW) or "")
+
     def picked_run(self):
         item = self.item()
         build.set_pickup(self.db, True, now=self.NOW)
@@ -2688,6 +2879,33 @@ class Hosts(Case):
 
     OVER = {"load": "the five-minute load is 30, above the cap of 24"}
 
+    def overloaded(self, *, fallback: bool):
+        """The satellite `work` beats over its load cap; this hub's `sd.overload_fallback` reads 1 or is unset."""
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        config = {"config": {"sd": {"overload_fallback": "1"}}} if fallback else {}
+        (folder / "config.json").write_text(json.dumps(config))
+
+    def test_the_hub_leaves_an_overloaded_satellites_fresh_row_queued_unless_the_fallback_is_on(self):
+        """sd:10823: the hub built an overloaded satellite's fresh rows whenever it had the repository checked
+        out (sd:8991); the operator ruled it waits for the satellite unless `sd.overload_fallback` reads 1."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        self.overloaded(fallback=False)
+        self.assertIsNone(self.claim(hosts=HUB), "unset: the satellite's fresh row waits for its lane")
+        self.assertEqual(self.count("SELECT status FROM assignment"), "queued", "skipped, not blocked")
+        self.overloaded(fallback=True)
+        self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture", "set to 1: the hub builds it, as before")
+
+    def test_the_overload_fallback_setting_reads_only_0_or_1(self):
+        """sd:10823: anything but "1" reads off, the default."""
+        self.assertFalse(build.overload_fallback())
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        for value, on in (("1", True), ("0", False), ("2", False), ("yes", False), (1, False), ("1\n", False)):
+            (folder / "config.json").write_text(json.dumps({"config": {"sd": {"overload_fallback": value}}}))
+            self.assertIs(build.overload_fallback(), on, f"{value!r}")
+
     def test_the_hub_takes_no_overloaded_satellite_row_whose_repository_it_has_not_checked_out(self):
         """sd:8991 review: the hub claimed a satellite's row for a repository with no checkout on its disk, and the
         run blocked at the worktree step, once per queued row while the satellite stayed busy."""
@@ -2730,7 +2948,7 @@ class Hosts(Case):
         """sd:8991 review round 2: the quiet-dispatcher refusal ran before `_ran_on` routed the later rows, so the
         retry of the hub's fallback build, queued behind another row, blocked once its satellite went quiet."""
         build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.overloaded(fallback=True)
         fallback = self.claim(hosts=HUB)
         self.retried(fallback)
         build.queue(self.db, [self.item(priority=1)], who="operator")
@@ -2759,7 +2977,7 @@ class Hosts(Case):
         """sd:8991 review: the retry of a bundle the hub built for a busy satellite moved back to the satellite,
         whose disk holds none of its work."""
         build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.overloaded(fallback=True)
         fallback = self.claim(hosts=HUB)
         self.assertEqual(fallback["owner"], "fixture", "a fresh row of a checked-out repository moves")
         self.retried(fallback)
@@ -2798,7 +3016,7 @@ class Hosts(Case):
     def fallback_retried(self):
         """A bundle the hub built for the busy satellite's lane, ended blocked and released; its run."""
         build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.overloaded(fallback=True)
         fallback = self.claim(hosts=HUB)
         self.retried(fallback)
         self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (fallback["assignment"],))
@@ -3478,6 +3696,39 @@ class Hosts(Case):
                    hosts=WORK)
         self.assertIsNotNone(build.run(self.db, run["id"])["released_at"], "work's own probe releases it")
         self.assertFalse(self.lease_held(run))
+
+    def test_the_hub_pauses_the_runs_of_a_satellite_on_another_build(self):
+        """sd:10934: a hub refresh refuses a satellite's every call until it follows the pins, so its dispatcher
+        and runs go quiet while its builders still run. A quiet host whose last beat named another sd_db build
+        is paused for `MISMATCH_SECONDS`, its runs left open; past that it strands as any quiet host's."""
+        from sd_db import remote
+
+        run = self.satellite_run()
+        now = later(run["created_at"], build.STALE_SECONDS + 1)
+        other = "0" * 16 if remote.build_digest() != "0" * 16 else "1" * 16
+        quiet = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=quiet,
+                     body={"pid": 1, "why": "", "build": other})
+        self.assertIsNotNone(build.dispatcher_gone(self.db, "work"))
+        self.assertEqual(self.strand(run), [], "a mismatch pauses the run")
+        self.assertIsNone(build.run(self.db, run["id"])["outcome"])
+        lapsed = (datetime.fromisoformat(now) - timedelta(seconds=build.MISMATCH_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=lapsed,
+                     body={"pid": 1, "why": "", "build": other})
+        [settled] = self.strand(run)
+        self.assertEqual((settled["run"], settled["outcome"]), (run["id"], "blocked"))
+        self.assertIn(f"its last beat ran sd_db build {other}", build.run(self.db, run["id"])["detail"])
+        self.assertTrue(self.lease_held(run))
+
+    def test_the_hub_strands_a_quiet_run_whose_beat_names_this_build_or_none(self):
+        """sd:10934: only another build pauses; a beat on the hub's own build, or an unreadable one, does not."""
+        from sd_db import remote
+
+        for body in ({"build": remote.build_digest()}, {"build": ["0" * 16]}, {"build": ""}):
+            with self.subTest(body=body):
+                self.assertFalse(build.mismatched_build(json.dumps(body)))
+        self.assertFalse(build.mismatched_build("not json"))
+        self.assertFalse(build.mismatched_build(None))
 
     def test_the_hub_strands_a_run_whose_beat_leads_past_stale_seconds(self):
         """Pack sd:7970: a run beat is stamped on its satellite's clock, so it takes the dispatcher beat's lead

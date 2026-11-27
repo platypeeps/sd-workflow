@@ -119,6 +119,84 @@ class BuildRoutes(Fixture):
         self.assertEqual([[(row["id"], row["queued"]) for row in bundle["items"]] for bundle in out["bundles"]],
                          [[(earlier, True), (pressed[0], False), (pressed[1], False)], [(pressed[2], False)]])
 
+    def test_the_plan_splits_p1_items_as_the_claim_does(self):
+        """Review of pack sd:9862: dispatch keeps P1 items out of the ordinary bundle, bundles them by area, and
+        gives them room beside the repository's running build; the plan shows that split and that room."""
+        queued = self.ready()
+        build.queue(self.connection, [queued], who="operator")
+        plain = self.ready()
+        p1 = [self.ready(priority=1, fields={"area": "alpha"}) for _ in range(2)]
+        other = self.ready(priority=1, fields={"area": "beta"})
+        full = {"machine": 6, "why": "", "held": [], "used": {REPO: build.repo_cap()}}
+        with patch.object(build, "room", return_value=full):
+            out = builds.plan(self.connection, [plain, *p1, other], now=NOW,
+                              sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0,
+                                                                                                "why": ""}},
+                              gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual(out["refused"], [])
+        self.assertEqual([([row["id"] for row in bundle["items"]], bundle["room"]) for bundle in out["bundles"]],
+                         [([queued, plain], 0), (p1, 6), ([other], 6)])
+
+    def designed(self, *, queue=True, **columns):
+        """A ready design item whose design run wrote its design, queued again so it rides unless not `queue`
+        (sd:10096)."""
+        from sd_db.writes import add_note
+        item = self.ready(fields={"work_kind": "design", **columns.pop("fields", {})}, **columns)
+        [run] = build.queue(self.connection, [item], who="operator")
+        self.connection.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (run["id"],))
+        add_note(self.connection, item, "comment", "Design:\n\nProblem: x", session="draft:fixture")
+        if queue:
+            build.queue(self.connection, [item], who="operator")
+        return item
+
+    def test_the_plan_shows_a_pressed_p1_design_in_the_code_bundle_it_rides(self):
+        """Review of pack sd:9862: a pressed P1 design showed as a bundle beside the code it rides."""
+        code = self.ready()
+        ride = self.designed(queue=False, priority=1, fields={"area": "beta"})
+        out = builds.plan(self.connection, [code, ride], now=NOW,
+                          sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0, "why": ""}},
+                          gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual(out["refused"], [])
+        self.assertEqual([[row["id"] for row in bundle["items"]] for bundle in out["bundles"]], [[code, ride]])
+        alone = builds.plan(self.connection, [ride], now=NOW,
+                            sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0,
+                                                                                              "why": ""}},
+                            gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual([[row["id"] for row in bundle["items"]] for bundle in alone["bundles"]], [[ride]])
+
+    def test_the_plan_shows_a_queued_design_ride_where_the_claim_takes_it(self):
+        """Review of pack sd:9862: a queued design rides any fresh code bundle and takes no slot (sd:10096), but
+        the plan kept it to its own P1 area and counted it against the cap, so it hid a ride the claim took."""
+        from sd_db.writes import add_note
+        ride = self.designed(priority=1, fields={"area": "beta"})
+        held = self.designed()
+        add_note(self.connection, held, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        pressed = [self.ready() for _ in range(build.bundle_max())]
+        out = builds.plan(self.connection, pressed, now=NOW,
+                          sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0, "why": ""}},
+                          gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual([[(row["id"], row["queued"]) for row in bundle["items"]] for bundle in out["bundles"]],
+                         [[*((item, False) for item in pressed), (ride, True)]])
+        build.queue(self.connection, pressed, who="operator")
+        claimed = build.claim(self.connection, owner="fixture", root=self.path.parent / "worktrees", **IDLE)
+        self.assertEqual({member["item"] for member in build.run(self.connection, claimed["id"])["members"]},
+                         {row["id"] for row in out["bundles"][0]["items"]})
+
+    def test_the_plan_puts_a_ride_in_the_bundle_the_claim_leads_first(self):
+        """sd:10693: one press made an ordinary bundle and a P1 bundle; the plan put the ride in the first in
+        press order, while the claim takes the P1 lead first, by priority, and the ride joins it."""
+        ride = self.designed()
+        plain, p1 = self.ready(), self.ready(priority=1, fields={"area": "alpha"})
+        out = builds.plan(self.connection, [plain, p1], now=NOW,
+                          sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0, "why": ""}},
+                          gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual([[row["id"] for row in bundle["items"]] for bundle in out["bundles"]],
+                         [[plain], [p1, ride]])
+        build.queue(self.connection, [plain, p1], who="operator")
+        claimed = build.claim(self.connection, owner="fixture", root=self.path.parent / "worktrees", **IDLE)
+        self.assertEqual({member["item"] for member in build.run(self.connection, claimed["id"])["members"]},
+                         {p1, ride})
+
     def test_the_plan_shows_each_items_wait_before_the_press(self):
         """Pack sd:8964: a readied item that waited on outside work showed nothing of it in the Build dialog.
         Each item carries its parked_at and the reason of its latest move to planning or blocked that gave one."""

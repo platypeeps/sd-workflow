@@ -327,7 +327,7 @@ the `research.conf.py` it executed, each document's string fields, and a
 destination. The dashboard never executes the config, so it reads a computed
 one from there, designations set in a loop included.
 
-Rendering ends by writing each document's Markdown into the Obsidian vault,
+Rendering ends by writing each designated document's Markdown into the Obsidian vault,
 registering `docs/dashboard/` with the dashboard, and queueing a sync for every
 document that designates an outward destination. Every step is idempotent. See
 Publishing, and `references/publication-contract.md`.
@@ -477,13 +477,14 @@ default.
 
 ### Obsidian and the dashboard are the defaults
 
-`sd-research-kit render` ends by writing each document's Markdown into
-`$OBSIDIAN_VAULT/Briefs/<repo>/<name>.md`. The repo's channels setting may name
+`sd-research-kit render` ends by writing the Markdown of each document that
+designates `obsidian=dict()` into `$OBSIDIAN_VAULT/Briefs/<repo>/<name>.md`. The repo's channels setting may name
 another vault folder, or turn Obsidian off; see the publication contract's
 "A repo's channels setting". The document is the Markdown in the repo; the vault
 copy and everything else are duplicates of it in another format. The note carries
 frontmatter naming the source repo, path and revision, so a reader knows which
-checkout owns it and that the note is not the place to edit.
+checkout owns it and that the note is not the place to edit. The revision is the
+commit whose bytes the note holds; a file no commit holds says `uncommitted`.
 
 `render` also registers `docs/dashboard/` with the local dashboard's Documents
 tab, and the tab lists and serves **everything it finds there**. That folder is

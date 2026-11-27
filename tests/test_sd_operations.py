@@ -1,6 +1,7 @@
 """CLI boundary checks use a fake service and never execute launchctl."""
 
 import argparse
+import contextlib
 import importlib
 import io
 import json
@@ -872,6 +873,56 @@ class OperationsCLI(unittest.TestCase):
         self.launchd.stop_service.assert_not_called()
         self.launchd.restart_service.assert_not_called()
         self.connection.close.assert_called_once()
+
+    def pickup_database(self):
+        """A real store for `assignments pickup`: each call gets its own connection, as the CLI closes it."""
+        from sd_db.database import connect
+        from sd_db.migrate import initialise
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        database = Path(scratch.name) / "sd.db"
+        initialise(database)
+        self.connect.side_effect = lambda library, write=False: connect(database)  # the CLI closes each
+        return database
+
+    def test_assignments_pickup_reads_and_sets_auto_pickup(self):
+        """pack sd:10001: `pickup` prints the state; `pickup on` writes it bound to the value read, then
+        kickstarts the dispatcher as the panel does; `pickup off` clears it and kickstarts nothing."""
+        build = importlib.import_module("sd_db.build")  # the module the CLI imports: setUp resets sys.modules
+        from sd_db.database import connect
+        database = self.pickup_database()
+        kick = Mock(return_value={"ok": True, "why": ""})
+        with patch.object(cli, "kickstart_dispatch", kick, create=True):
+            code, output = self.call("assignments", "pickup")
+            self.assertEqual((code, output.split()[:2]), (0, ["auto-pickup", "off"]))
+            code, output = self.call("assignments", "pickup", "on", "--json")
+            self.assertEqual((code, json.loads(output)["on"]), (0, True))
+            kick.assert_called_once_with()
+            with contextlib.closing(connect(database)) as reader:
+                self.assertTrue(build.pickup_state(reader)["on"])
+            code, output = self.call("assignments", "pickup", "off")
+            self.assertEqual((code, output.split()[:2]), (0, ["auto-pickup", "off"]))
+            self.assertEqual(kick.call_count, 1)
+        with contextlib.closing(connect(database)) as reader:
+            self.assertFalse(build.pickup_state(reader)["on"])
+
+    def test_assignments_pickup_writes_nothing_over_a_stale_value(self):
+        """pack sd:10001: a value that moved after the read is SettingStale, exit 1, and no row."""
+        build = importlib.import_module("sd_db.build")  # the module the CLI imports: setUp resets sys.modules
+        from sd_db.database import connect
+        database = self.pickup_database()
+        stale = {"on": True, "value": "on", "since": None}
+        kick = Mock()
+        with patch.object(cli, "kickstart_dispatch", kick, create=True), \
+                patch.object(build, "pickup_state", side_effect=[stale]), redirect_stderr(io.StringIO()) as error:
+            code, _ = self.call("assignments", "pickup", "off")
+        self.assertEqual(code, 1)
+        self.assertIn("changed since", error.getvalue())
+        kick.assert_not_called()
+        with contextlib.closing(connect(database)) as reader:
+            rows = reader.execute("SELECT COUNT(*) FROM state WHERE kind = 'setting' AND key = ?",
+                                  (build.AUTO_PICKUP,)).fetchone()[0]
+        self.assertEqual(rows, 0)
 
     def test_parser_excludes_unsupported_actions_and_client_paths(self):
         for arguments in (("assignments", "retry", "8"),

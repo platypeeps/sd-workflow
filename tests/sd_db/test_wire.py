@@ -691,5 +691,25 @@ class TheServer(ServedCase):
         self.assertFalse(self.served.token_file.exists())
 
 
+class TheLog(unittest.TestCase):
+    def test_each_line_carries_its_local_time_and_zone(self):
+        """pack sd:10221: satellites timed out at named minutes, and the hub's log had no time on any line, so
+        no stall could be matched to what the hub did then. Each line now starts with the local time and zone."""
+        from io import StringIO
+
+        from sd_db import serve
+
+        stream = StringIO()
+        try:
+            with mock.patch.dict(os.environ, {"TZ": "America/Denver"}):
+                time.tzset()
+                with mock.patch.object(serve.time, "time", return_value=1795473000.0):
+                    serve.Log(stream).transaction(7, 3, 0.25, 12.5, "'COMMIT'")
+        finally:
+            time.tzset()
+        self.assertEqual(stream.getvalue(), "2026-11-23 15:30:00 MST sd-db serve: session 7 write transaction: "
+                                            "3 frames, longest gap 250.0 ms, wall 12500.0 ms, before 'COMMIT'\n")
+
+
 if __name__ == "__main__":
     unittest.main()

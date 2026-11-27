@@ -117,7 +117,7 @@ def _money(value: float | None) -> str:
 
 def text(usage: reads.Usage) -> str:
     """The month as a person reads it: the four numbers per bill, the roles,
-    the `bound` rows, and the total against the invoice line."""
+    their areas, the `bound` rows, and the total against the invoice line."""
     lines = [f"usage {usage.month}: {_money(usage.spent)} spent, {_money(usage.held)} held"]
     if not usage.bills:
         lines.append("  no bills")
@@ -137,6 +137,11 @@ def text(usage: reads.Usage) -> str:
             f"{row['calls']} call(s), spent {_money(row['spent'])}, held {_money(row['held'])}, "
             f"tokens {row['tokens_in']} in / {row['tokens_out']} out"
         )
+    if usage.areas:
+        lines.append("areas:")
+    for area in usage.areas:
+        lines.append(f"  {area['area']}: {area['calls']} call(s), spent {_money(area['spent'])}, "
+                     f"tokens {area['tokens_in']} in / {area['tokens_out']} out")
     lines.append(f"bound rows ({len(usage.bound)}): billed at the bound, estimated until corrected")
     for row in usage.bound:
         lines.append(
