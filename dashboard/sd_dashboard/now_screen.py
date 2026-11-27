@@ -920,12 +920,10 @@ def advisories(connection: sqlite3.Connection) -> dict:
     posts back as `before`; `show`, whether they show. A read that failed is `error`, and the page hides nothing."""
     from sd_db import writes
 
-    clause = " OR ".join("substr(external_id, 1, ?) IS ?" for _ in ADVISORY_REFS)
     try:
         row = writes.read_settings(connection, [ADVISORY_KEY]).get(ADVISORY_KEY)
-        ids = [found[0] for found in connection.execute(
-            f"SELECT id FROM item WHERE source IS 'task-ref' AND status != 'done' AND ({clause}) ORDER BY id",
-            [value for ref in ADVISORY_REFS for value in (len(ref), ref)])]
+        ids = sorted(found["id"] for ref in ADVISORY_REFS for found in reads.ref_items(connection, ref)
+                     if found["status"] != "done")
     except (SdDbError, sqlite3.Error) as failure:
         return {"key": ADVISORY_KEY, "ids": [], "row": None, "show": True,
                 "error": str(failure) or "the advisory items could not be read"}
