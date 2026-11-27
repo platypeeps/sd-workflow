@@ -1060,21 +1060,25 @@ def holds_fix(old: list[bytes], fixed: list[bytes], text: list[bytes]) -> bool:
 TEXT_MODES = ("100644", "100755")
 
 
-def mode_holds(cited: str, holder: str, cited_path: str, holder_path: str) -> bool:
+def mode_holds(cited: str, holder: str, cited_path: str, holder_path: str, script: bool = True) -> bool:
     """Whether an entry of mode `holder` at `holder_path` can hold the work of one of mode `cited` at
     `cited_path`: the same kind, or an executable file for a plain one, with the same file suffix. A
-    plain-text copy of an executable does not run, nor does a script kept in a document (class pass 11)."""
+    plain-text copy of an executable does not run, nor does a script kept in a document (class pass 11).
+    The executable bit is the work only for a `script`, a file that starts with `#!`: a module runs by
+    import, so a plain copy of an executable one still holds its work (class pass 24)."""
     # ponytail: the suffix stands for the file's kind; a move that renames `tool` to `tool.py` loses its
     # close (fixed by hand), never a false close. Read the language if that matters.
-    return (holder == cited or (cited, holder) == TEXT_MODES) and \
+    return (holder == cited or (cited, holder) == TEXT_MODES or
+            (not script and {cited, holder} <= set(TEXT_MODES))) and \
         pathlib.PurePosixPath(cited_path).suffix == pathlib.PurePosixPath(holder_path).suffix
 
 
-def runs_as(entry: str | None, fix: str | None, at: str, name: str) -> bool:
+def runs_as(entry: str | None, fix: str | None, at: str, name: str, script: bool = True) -> bool:
     """Whether `entry` at `at` is a kind that can hold the work the cited commit's `fix` left at `name`:
     the work is the entry, its mode with its text, so a script whose executable bit a revert cleared
-    holds none (class pass 22). True when either side is absent: the content read decides there."""
-    return not entry or not fix or mode_holds(fix.split()[0], entry.split()[0], name, at)
+    holds none (class pass 22), unless the fix is no `script` (class pass 24). True when either side is
+    absent: the content read decides there."""
+    return not entry or not fix or mode_holds(fix.split()[0], entry.split()[0], name, at, script)
 
 
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
@@ -1138,6 +1142,17 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         return None if listed is None else {path: entry for entry, _, path in
                                             (line.partition("\t") for line in listed if line)}
 
+    @functools.cache
+    def script(blob: str) -> bool:
+        """Whether `blob` starts with `#!`, so its executable bit is part of its work; True when git gives
+        no answer: the bit then counts, as it did before class pass 24 (a lost close, never a false one)."""
+        try:
+            done = subprocess.run(["git", "cat-file", "blob", blob], cwd=worktree, capture_output=True,
+                                  timeout=PUBLISH_SECONDS, check=False, env=sd_lib.without_fsmonitor(os.environ))
+        except (OSError, subprocess.SubprocessError):
+            return True
+        return done.returncode != 0 or done.stdout.startswith(b"#!")
+
     def renames_since(sha: str, rev: str) -> dict[str, str] | None:
         """Where `rev` holds each file of `sha` that a commit between them renamed. A pair whose new mode
         cannot hold the old one's work (`mode_holds`) is no rename (sd:10214 review)."""
@@ -1149,7 +1164,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             meta = status[at].split()
             names = 2 if meta[-1][:1] in "RC" else 1
             if meta[-1][:1] == "R" and at + 2 < len(status) and \
-                    mode_holds(meta[0][1:], meta[1], status[at + 1], status[at + 2]):
+                    mode_holds(meta[0][1:], meta[1], status[at + 1], status[at + 2], script(meta[2])):
                 found[status[at + 1]] = status[at + 2]
             at += 1 + names
         return found
@@ -1200,13 +1215,16 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         held = [name if at != name and now.get(at) == want.get(at) else at for at, name in zip(held, names, strict=True)]
 
         def runs(path: str, name: str) -> bool:
-            return runs_as(now.get(path), fix.get(name), path, name)
+            wrote = fix.get(name)
+            return runs_as(now.get(path), wrote, path, name, not wrote or script(wrote.split()[-1]))
 
         def holds(path: str, name: str) -> bool:
             """Whether `path` holds the text of the fix `cited` left at `name`: its blob, or what it changed
             (`keeps_fix`). `runs` reads the mode."""
             entry, left = now.get(path), fix.get(name)
-            return bool(entry and left) and (
+            if not entry or not left:
+                return False
+            return (
                 entry.split()[-1] == left.split()[-1] or
                 keeps_fix(entry, left, want.get(name) or want.get(home.get(name, name))))
 

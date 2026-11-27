@@ -4199,6 +4199,51 @@ class CitedCloses(SharedQueue):
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
 
+    def test_a_mode_only_revert_of_a_module_keeps_the_close(self) -> None:
+        """sd:10214 review, class pass 24: the executable bit is the work only for a script, a file that
+        starts with `#!`. A revert that clears the bit of a Python module, which runs by import, leaves the
+        fix shipping: at its own name, after a move, at a stale mapping's new name, and through a refactor
+        that moves the module and clears the bit at once. A script so disabled still undoes it."""
+        import sd_operations
+        a, *_ = self.open
+        module = "".join(f"STEP_{n} = {n}\n" for n in range(20))
+        script = "#!/usr/bin/env python3\n" + module
+        for case, closes in (("in-place", {a}), ("moved", {a}), ("stale", {a}), ("refactor", {a}),
+                             ("script", set())):
+            with self.subTest(case=case):
+                original = script if case == "script" else module
+                fixed = original.replace("STEP_7 = 7\n", "STEP_7 = 70\n")
+                tree, _ = self.committed(f"topic-mode-only-module-{case}")
+                git(tree, "fetch", "-q", "origin")
+                git(tree, "reset", "-q", "--hard", "origin/main")
+                lib = f"lib_{case.replace('-', '_')}.py"
+                self.on_main(tree, {lib: original})
+                (tree / lib).chmod(0o755)
+                git(tree, "add", lib)
+                git(tree, "commit", "-q", "-m", f"chore: {lib} lands")
+                git(tree, "push", "-q", "origin", "HEAD:main")
+                git(tree, "fetch", "-q", "origin")
+                (tree / lib).write_text(fixed, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", f"fix: step 7\n\nCloses: sd:{a}")
+                name = lib
+                if case in ("moved", "stale", "refactor"):
+                    name = f"moved_{lib}"
+                    git(tree, "mv", lib, name)
+                    if case == "refactor":
+                        (tree / name).chmod(0o644)
+                        git(tree, "add", name)
+                    git(tree, "commit", "-q", "-m", "refactor: move the module")
+                if case == "stale":  # the old name comes back as before, the new one stays
+                    (tree / lib).write_text(original, encoding="utf-8")
+                    (tree / lib).chmod(0o755)
+                    git(tree, "add", lib)
+                if case != "refactor":
+                    (tree / name).chmod(0o644)
+                    git(tree, "add", name)
+                    git(tree, "commit", "-q", "-m", "revert: the step 7 fix")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
+
     def test_a_reverted_script_kept_only_in_documentation_closes_nothing(self) -> None:
         """sd:10214 class pass 11: a file of another kind than the cited one cannot hold its work. A revert
         that moves a cited script into a document, whether git pairs the move as a rename or the text lands
