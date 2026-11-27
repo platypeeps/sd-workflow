@@ -1207,11 +1207,17 @@ class LineBudgetTests(unittest.TestCase):
         # 5200 -> 5201 is the last round of build/sd-2205: `bin/sd-review`
         # +1, a docstring line: `_rebuts` tests the saved evidence beside
         # every `open` citation. Measured: `sd-review` is 3231.
+        #
+        # 5201 -> 5218 is sd:10892: `bin/sd-review` +17 for the `base`
+        # finding key, its prompt ask, the `dispose` leg that posts a
+        # defect the merge base already has as advisory, and `_bad_enum`,
+        # which keeps `_finding_error` under the complexity ceiling.
+        # Measured: `sd-review` is 3248.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5201,
+            5218,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

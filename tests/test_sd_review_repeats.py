@@ -381,6 +381,36 @@ class ReproRuleTests(unittest.TestCase):
                                  "trigger: invalid enum value")
         self.assertEqual(sd_review._finding_error(finding(REPRO, trigger="untrusted", instances=["src.py:1"])), "")
 
+    def test_a_defect_the_merge_base_already_has_is_advisory(self) -> None:
+        """sd:10892: a finding blocks only when the merge base lacks the same defect; one main already
+        has posts as advisory, filed for the repo, and says why."""
+        parsed = sd_review._finding(finding(REPRO, base="has"))
+        assert parsed is not None
+        [record] = sd_review.dispose([parsed], "high", repro=True)
+        self.assertEqual((record["disposition"], record["summary"]),
+                         ("advisory", f"defect {sd_review.ON_BASE_NOTE}"))
+
+    def test_a_defect_the_change_causes_still_blocks(self) -> None:
+        """sd:10892: `lacks`, an older answer without `base`, or a value not exactly `has` still blocks."""
+        for base in ("lacks", None, "Has", " has", 3, []):
+            with self.subTest(base=base):
+                parsed = sd_review._finding(finding(REPRO) if base is None else finding(REPRO, base=base))
+                assert parsed is not None
+                [record] = sd_review.dispose([parsed], "high", repro=True)
+                self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_the_prompt_asks_whether_the_merge_base_has_it(self) -> None:
+        self.assertIn("base", sd_review.FINDING_PROPERTIES)
+        self.assertIn('"base": "lacks"', sd_review.URL_OUTPUT_CONTRACT)
+        self.assertIn("merge base", sd_review.BASE_ASK)
+
+    def test_an_unknown_base_is_a_schema_error(self) -> None:
+        for value in ("maybe", [], None, "Has"):
+            with self.subTest(value=value):
+                self.assertEqual(sd_review._finding_error(finding(REPRO, base=value, instances=["src.py:1"])),
+                                 "base: invalid enum value")
+        self.assertEqual(sd_review._finding_error(finding(REPRO, base="lacks", instances=["src.py:1"])), "")
+
     def test_the_lanes_own_blockers_need_no_repro(self) -> None:
         parsed = sd_review.oversized_findings()
         assert parsed is not None

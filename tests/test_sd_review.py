@@ -1176,6 +1176,12 @@ class PipelineTests(ReviewFixture):
         self.assertIn("the lane runs the full gate", text)
         self.assertIn("sd gate status", text)
 
+    def test_the_code_prompt_asks_whether_the_merge_base_has_the_defect(self) -> None:
+        """sd:10892: a finding blocks only when the merge base lacks it; the prompt asks the reader."""
+        root = self.make_repo()
+        self.prepare(root)
+        self.assertIn(sd_review.BASE_ASK, sd_review.build_prompt(sd_review.resolve_subject(root, "worktree"), False, ""))
+
     def test_the_code_prompt_names_the_six_operator_listed_defect_classes(self) -> None:
         """sd:1635: the classes a retired manual checklist held, named in the lane's own prompt."""
         root = self.make_repo()
