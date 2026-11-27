@@ -121,7 +121,6 @@ COMMANDS = (
     Command(r"/api/claude-sessions/end", "End session", _key("id")),
     Command(r"/api/skills/intake", "Skill intake", _key("source", "scope")),
     Command(r"/api/skills/intake/tracking", "Skill tracking", _key("action", "url")),
-    Command(r"/api/shared-upload/regenerate", "Regenerate upload link"),
     Command(r"/api/items/([1-9][0-9]*)/fix", "Fix session", _item),
     Command(r"/api/now/fix", "Fix session", _key("row")),
     Command(r"/api/actions/run", "Run", _key("action", "job", "path", "port", "row", "entity_id")),

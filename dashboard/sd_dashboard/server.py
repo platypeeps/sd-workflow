@@ -604,13 +604,6 @@ def action_route(path, payload, *, principal, operations_backend=None, services_
         if values:
             raise ValueError("Refresh satellites takes no values.")
         return lambda connection: refresh_satellites(connection)
-    if path == "/api/shared-upload/regenerate":
-        from . import upload_link
-
-        # sd:5405: sign a new upload link with local-shared-upload's signer and keep it as one setting row.
-        if values:
-            raise ValueError("Regenerate takes no values.")
-        return lambda connection: upload_link.regenerate(connection)
     match = re.fullmatch(r"/api/repos/(runner-merge|managed|lane-host|channels|dependabot|github-issues|issues-scope|jira-project)", path)
     if match:
         from .management_screen import set_repo

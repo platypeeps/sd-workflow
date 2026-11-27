@@ -36,9 +36,6 @@ source guarded on its own so one that fails is a reason and not an empty list
 - `satellites`: `local-repo-sync/satellite_refresh.py`'s `document`, the
   last Refresh satellites request and each satellite's result for it; the
   satellites are the hosts whose `repo-sync-follow` job reported a run (sd:5108).
-- `upload`: `upload_link.document`, the shared upload bucket's console link
-  and the current upload link the workflow database's setting row holds, or
-  "not set up" naming `<config>/shared-upload/.env` (sd:5405).
 
 Each repo also carries the overview's columns (sd:1629): its required checks
 and `strict` from the protection reading, and `runtimes`, the Python and Node
@@ -53,8 +50,7 @@ and restart, and the sd-db repo verbs (`repos.set_runner_merge`,
 `repos.set_managed`, `repos.set_lane_host`, `repos.set_dependabot`, `repos.set_github_issues`, `repos.set_issues_scope`, `repos.set_jira_project`), which refuse a stale `before`
 and, on a satellite, refuse with `HubOnly` (sd:1629, sd:3075), and
 Refresh satellites (`refresh_satellites`), which writes a new request row, and
-End session (`claude_sessions.end`), which sends SIGTERM to a Claude session on this Mac (sd:5126), and
-Regenerate (`upload_link.regenerate`), which signs a new upload link and writes it as that setting row (sd:5405).
+End session (`claude_sessions.end`), which sends SIGTERM to a Claude session on this Mac (sd:5126).
 """
 
 from __future__ import annotations
@@ -82,7 +78,7 @@ from sd_db import (
 )
 from sd_db.errors import SdDbError
 
-from . import adversarial, claude_sessions, fix_session, upload_link
+from . import adversarial, claude_sessions, fix_session
 from . import fleet as fleet_module
 from .repos_screen import primary
 
@@ -579,8 +575,7 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
                             ("claude", lambda: _claude(read, connection, now, claude)),
                             ("services", lambda: _services(connection, services)),
                             ("jobs", lambda: _jobs(connection, jobs or operations.LaunchdBackend())),
-                            ("satellites", lambda: _satellite_refresh().document(connection)),
-                            ("upload", lambda: upload_link.document(connection, now=now))):
+                            ("satellites", lambda: _satellite_refresh().document(connection))):
         try:
             out[source] = collect()
         except FAILURES as failure:

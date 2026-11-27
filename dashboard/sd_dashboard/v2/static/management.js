@@ -17,7 +17,7 @@ const SDDB = 'sd-db';
 
 // ---------- Data (build): /api/management, read through shell.read on load and after each write ----------
 let DOC = null, READ = '';
-let REPOS = [], ALL = [], GIT = null, SESS = null, CLAUDE = null, SERVICES = [], CRON = [], SATS = null, UPLOAD = null;
+let REPOS = [], ALL = [], GIT = null, SESS = null, CLAUDE = null, SERVICES = [], CRON = [], SATS = null;
 const tilde = p => { const h = GIT?.root ? GIT.root.replace(/\/repos\/?$/, '') : ''; return h && p.startsWith(h + '/') ? '~' + p.slice(h.length) : p; };
 const nameOf = p => p.replace(/^~\/(repos\/)?/, '');
 const hhmm = iso => iso ? iso.slice(11, 16) : '';
@@ -47,7 +47,7 @@ function absorb(doc) {
   // build (sd:1629): the settings columns sort on their shown words.
   ALL.forEach(r => { const rv = r.review || {}, rt = r.runtimes || {}; r.floor = rv.severity_floor || ''; r.copilot = rv.automatic_deep == null ? '' : String(rv.automatic_deep);
     r.python = rt.python?.value || ''; r.node = rt.node?.value || ''; });
-  SESS = doc.sessions; CLAUDE = doc.claude; SERVICES = doc.services || []; SATS = doc.satellites || null; UPLOAD = doc.upload || null;
+  SESS = doc.sessions; CLAUDE = doc.claude; SERVICES = doc.services || []; SATS = doc.satellites || null;
   CRON = (doc.jobs || []).map(j => ({ ...j, next: nextRun(j.schedule), rank: stateOf(j) }));
 }
 // Age of the last fetch at the reading, as v1 words it (repos_screen._age).
@@ -663,7 +663,6 @@ function objects() {
   out.push({ id: 'repos:git', type: 'git state', label: 'Git state' });
   if (SATS) out.push({ id: 'sats:request', type: 'satellite refresh', label: 'Refresh satellites', request: SATS.request },
     ...SATS.satellites.map(x => ({ id: `sat:${x.host}`, type: 'satellite', label: x.host })));
-  if (UPLOAD?.set_up) out.push({ id: 'upload:link', type: 'upload link', label: `${UPLOAD.prefix} upload link`, state: UPLOAD.link_state });
   CRON.forEach(c => out.push({ id: `cron:${c.name}`, type: 'job', label: c.name, job: c.name, name: c.name, service: c.service, failed: c.rank === 'warning', running: c.state === 'running', pid: c.pid, exit: c.last_exit, revision: c.revision, caps: c.capabilities || {} }));
   return [...out, ...pending];
 }
@@ -766,12 +765,6 @@ function registerCommands() {
       cli: () => 'no CLI: the dashboard writes the refresh.request row', executes: true,
       consequence: () => 'Each other machine checks for this request every five minutes. It waits for its merges to finish, updates to the hub\'s versions, and reports here.',
       run: () => landing(refreshSatellites(), v => `Refresh requested · ${v.id}`) },
-    // sd:5405: local-shared-upload's signer, run by the server; the link is one setting row and the toast never holds it.
-    { id: 'upload.regenerate', on: 'upload link', label: 'Regenerate', does: 'Signs a new 7-day upload link under inbox/ and shows it here.', icon: 'link-2', risk: 'confirm',
-      primary: () => true, cli: () => 'no CLI: the dashboard signs the link with local-shared-upload and keeps it as the dashboard.shared_upload_link row', executes: true,
-      sends: () => 'aws configure export-credentials --profile <SHARED_UPLOAD_PROFILE>',
-      consequence: () => `Signs a new link for uploads under ${UPLOAD?.prefix || 'inbox/'} that works for 7 days and shows it here in place of the current one. Links already handed out keep working until they expire.`,
-      run: () => landing(regenerateUpload(), v => `Upload link signed · expires ${v.expiry.slice(0, 16).replace('T', ' ')} UTC`) },
     // launchd calendar jobs. Retry (commands.js) posts /api/jobs/<name>/retry; operations.inventory's capability is the off
     // reason. Exit 127 is "command not found": Print is the row's act (sd:3392).
     window.commands.retry({ job: o => ({ name: o.job, service: o.service, failed: o.failed, exit: o.exit, running: o.running, capability: o.caps.retry }),
@@ -801,7 +794,6 @@ function endWhat(o) {
 }
 async function endSession(o) { const got = await window.shell.post('/api/claude-sessions/end', { id: o.sid, pid: o.pid }); await reread(); return got; }
 async function refreshSatellites() { const got = await window.shell.post('/api/satellites/refresh', {}); await reread(); return got; }
-async function regenerateUpload() { const got = await window.shell.post('/api/shared-upload/regenerate', {}); await reread(); return got; }
 // Land (sd:5104): no git state, an unread tree or nothing new is the off reason; the server reads the tree again anyway.
 const landWhy = o => { const g = o.row.git;
   if (!o.row.registered) return 'register this repo first (sd-db repo add)';
@@ -988,19 +980,6 @@ function serviceRows() {
     && free.every(f => [s.name, s.label, s.scope, s.domain, s.category, s.state].join(' ').toLowerCase().includes(f)))
     .sort((a, b) => String(key(a)).localeCompare(String(key(b))) * DS.dir || a.label.localeCompare(b.label));
 }
-// sd:5405: the shared upload link's state, its glyph and its words.
-const UPSTATE = { current: 'ok', expired: 'caution', other: 'caution', none: 'queued', unread: 'unknown' };
-const upWords = u => ({ current: 'expires', expired: 'expired', none: 'none signed yet', other: 'signed for another bucket', unread: 'not read' })[u.link_state] || u.link_state;
-function uploadSection() {
-  const u = UPLOAD, st = u ? UPSTATE[u.link_state] || 'unknown' : 'unknown', l = u?.link;
-  return html`<div class="sec-head"><h2 id="up-h">Shared upload <button class="help" type="button" aria-label="Help: Shared upload" data-help="<b>One upload link.</b> Anyone holding it can upload files under inbox/ until it expires, each up to the size cap; it cannot read, list or delete. Every uploaded file is public, and so is the bucket's file list. Regenerate signs a new link; links already handed out keep working until they expire.">${I('circle-help')}</button></h2><p class="tally">${u?.set_up ? html`<span><a href="${u.console}" target="_blank" rel="noopener noreferrer">${u.bucket} in the S3 console</a></span><span>${u.region}</span>` : ''}</p></div>
-    ${!u ? unknown('Shared upload was not read', why('upload'), 'local-shared-upload') : !u.set_up ? html`<p class="empty">Not set up. ${u.remedy}</p>`
-      : html`<table class="ledger" aria-labelledby="up-h"><tbody><tr data-id="upload:link"><td class="g g-${st}">${GLYPH[st]}<span class="sr">${u.link_state}</span></td><td class="what"><button type="button">${u.prefix} upload link</button></td><td class="d mono">${upWords(u)}</td><td class="d mono">${l ? html`<time class="rel" datetime="${l.expiry}" data-future></time>` : u.link_reason || '—'}</td>${ACT('upload:link')}</tr></tbody></table>
-      ${u.link_state === 'current' ? html`<p class="why">Expires <time class="rel" datetime="${l.expiry}" data-future data-long></time>. Links handed out before keep working until they expire.</p>
-      <div class="cli fold"><button class="cli-line" type="button" aria-expanded="false" title="Show the full command"><code>${l.curl}</code></button><button class="icon-btn" type="button" data-copy="${l.curl}" aria-label="Copy the curl line">${I('copy')}</button></div>
-      <p class="why">The uploader replaces /path/to/file. Each file is public at <code>${l.public}</code>.</p>${l.temporary ? html`<p class="why">Signed with temporary keys: the link stops when they expire (${l.temporary}), even before its own expiry.</p>` : ''}`
-        : html`<p class="why">Regenerate signs a link for uploads under ${u.prefix} that works for 7 days. Each file is public at <code>${u.public}</code>.</p>`}`}`;
-}
 function renderDeploys() {
   const el = document.getElementById('view-deploys');
   const { chips } = tokens();
@@ -1014,7 +993,6 @@ function renderDeploys() {
       <tbody><tr data-id="sats:request"><td class="g g-ok">●<span class="sr">ok</span></td><td class="what"><button type="button">Refresh request</button></td><td class="d mono">${SATS.request ? SATS.request.id : 'none sent'}</td><td class="d mono"><time class="rel" datetime="${SATS.request?.at || ''}" data-empty="never"></time></td><td class="d num"></td><td class="d"></td>${ACT('sats:request')}</tr>
       ${SATS.satellites.map(x => { const st = SATSTATE(x), r = x.result || {}; return html`<tr data-id="sat:${x.host}"><td class="g g-${st}">${GLYPH[st]}<span class="sr">${x.state}</span></td><td class="what"><button type="button">${x.host}</button></td><td class="d mono">${x.state}${r.attempt > 1 ? ` · attempt ${r.attempt}` : ''}</td><td class="d mono"><time class="rel" datetime="${r.finished || r.started || ''}" data-empty="never"></time></td><td class="d num" data-k="exit">${r.exit ?? '—'}</td><td class="d mono">${x.state === 'unread' ? x.reason : r.step ? `${r.step}: ${r.line}` : '—'}</td><td class="act end"></td></tr>`; })}</tbody></table>
       ${SATS.satellites.length ? '' : html`<p class="empty">No satellite's repo-sync-follow job has reported a run yet.</p>`}`}
-    ${uploadSection()}
     <div class="sec-head"><h2 id="svc-h">Services on this Mac</h2><p class="tally">${hides(rows.length, SERVICES.length, 'service')}<span>launchd · ${hhmm(READ)} UTC</span></p></div>
     ${!DOC.services ? unknown('Services were not read', why('services'), 'sd services list')
       : html`<div class="filters toolbar-2">${filterBar(filterSeg('state', 'State', states, chips.state), text.q)}</div>
@@ -1158,15 +1136,6 @@ function selectRow(id, open) {
     const q = SATS?.request;
     h = html`<p class="kind">${I('rotate-ccw')} Refresh satellites</p><h2>Refresh satellites</h2><dl><dt>Last request</dt><dd>${q ? q.id : 'none sent'}</dd><dt>Sent</dt><dd><time class="rel" datetime="${q?.at || ''}" data-long data-empty="never"></time></dd></dl>
       <p class="why">Each other machine answers within five minutes, once its merges finish. A run stopped part way runs once more; a second stop is written as failed.</p>${act}`;
-  } else if (kind === 'upload') {
-    const u = UPLOAD; if (!u?.set_up) return;
-    const st = UPSTATE[u.link_state] || 'unknown', l = u.link;
-    h = html`<p class="kind"><span class="g-${st}">${GLYPH[st]}</span> Shared upload · ${upWords(u)}</p><h2>${u.prefix} upload link</h2>
-      <dl><dt>Bucket</dt><dd><a href="${u.console}" target="_blank" rel="noopener noreferrer">${u.bucket}</a> · ${u.region}</dd><dt>Prefix</dt><dd class="mono">${u.prefix}</dd>
-      <dt>Expires</dt><dd>${l ? html`<time class="rel" datetime="${l.expiry}" data-future data-long></time>` : '—'}</dd><dt>Signed</dt><dd>${l ? html`<time class="rel" datetime="${l.signed}" data-long></time>` : '—'}</dd>
-      <dt>Public URL</dt><dd class="mono">${l ? l.public : u.public}</dd><dt>Config</dt><dd class="mono">${u.config}</dd></dl>
-      ${u.link_reason ? html`<p class="why">${u.link_reason}.</p>` : ''}${u.link_state === 'current' ? html`<div class="cli fold"><button class="cli-line" type="button" aria-expanded="false" title="Show the full command"><code>${l.curl}</code></button><button class="icon-btn" type="button" data-copy="${l.curl}" aria-label="Copy the curl line">${I('copy')}</button></div>` : ''}
-      <p class="why">Regenerate replaces the link shown here. Links handed out before keep working until they expire; to stop them all, deactivate the uploader's access key in IAM.</p>${act}`;
   } else if (kind === 'sat') {
     const x = SATS?.satellites.find(y => y.host === key); if (!x) return;
     const st = SATSTATE(x), r = x.result || {};
