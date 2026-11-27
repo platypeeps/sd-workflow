@@ -1,12 +1,17 @@
 """One writing lifecycle, snapshot-bound reviews, and reversible cutover."""
 
+import argparse
 import hashlib
+import importlib
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -206,6 +211,173 @@ class SharedTransitions(WritingCase):
         self.assertEqual(state["item"]["ready_digest"], self.digest)
         self.assertIn("status: ready", self.index.read_text())
 
+    def index_hashes(self):
+        gates = json.loads(piece_state(self.db, self.item)["item"]["fields"])["writing_gates"]
+        return {name: gates[name].get("index_sha256") for name in ("fact-check", "adversarial")}
+
+    def attest(self, data=None):
+        """Stamp both reports with the draft digest and the index.md bytes their reviewer read."""
+        seen = hashlib.sha256(self.index.read_bytes() if data is None else data).hexdigest()
+        for name in ("fact-check", "adversarial"):
+            (self.folder / f"{name}.md").write_text(
+                f"<!-- reconciled-with-draft: {self.digest} on 2026-09-08 gen=0 index={seen} -->\nReport.\n")
+        return seen
+
+    def test_an_unattested_gate_certifies_no_index_bytes(self):
+        """sd:10719. A report that names no index bytes leaves the gate without index_sha256."""
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\n\nclaim."))
+        self.gates()
+        self.assertEqual(self.index_hashes(), {"fact-check": None, "adversarial": None})
+
+    def test_a_gate_refuses_a_layout_edit_after_the_attested_review(self):
+        """sd:10719. The digest ignores whitespace; a stamp for other index.md bytes is refused."""
+        self.attest()
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\n\nclaim."))
+        self.assertEqual(piece_state(self.db, self.item)["writing"]["gates"]["digest"], self.digest)
+        before = piece_state(self.db, self.item)
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes"):
+            self.gates()
+        self.assertEqual(piece_state(self.db, self.item), before)
+
+    def test_a_layout_edit_after_the_gates_refuses_publication(self):
+        """sd:10719. A gate bound to index bytes goes stale once they move, though the digest ignores whitespace."""
+        self.attest()
+        self.gates()
+        change_stage(self.db, self.item, "ready", who="operator")
+        self.assertTrue(readiness(self.db, self.item)["ok"])
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\n\nclaim."))
+        with self.assertRaisesRegex(WorkflowError, "adversarial index.md changed after its gate record"):
+            writing.preflight(self.db, self.item)
+
+    def test_a_malformed_index_attestation_is_refused(self):
+        (self.folder / "fact-check.md").write_text(
+            f"<!-- reconciled-with-draft: {self.digest} on 2026-09-08 gen=0 index=abc -->\nReport.\n")
+        with self.assertRaisesRegex(WorkflowError, "index"):
+            record_gate(self.db, self.item, "fact-check", verdict="pass", findings=[], reason="Reviewed", who="operator")
+
+    def test_an_attested_gate_binds_the_bytes_its_reviewer_read(self):
+        seen = self.attest()
+        self.gates()
+        self.assertEqual(self.index_hashes(), {"fact-check": seen, "adversarial": seen})
+
+    def test_the_packs_own_frontmatter_rewrites_carry_the_index_hash(self):
+        """sd:10719. A file-owned ready or metadata rewrite moves index.md bytes; the gate hash follows."""
+        self.attest()
+        self.gates()
+        change_stage(self.db, self.item, "ready", who="operator")
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+        update_piece_metadata(self.db, self.item, {"review_urls": {"gdocs": "https://example.test/d"}}, who="operator")
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+
+    def test_a_headline_edit_stales_the_gate_whoever_owns_the_piece(self):
+        """sd:10719. After cutover a title lives in the row, so no index.md byte moves: the gate must still go stale."""
+        for owner in ("file", "file-unattested", "row"):
+            with self.subTest(owner=owner):
+                if owner != "file-unattested":
+                    self.attest()
+                if owner == "row":
+                    self.cutover()
+                    self.attest()
+                self.gates()
+                self.assertEqual(readiness(self.db, self.item)["problems"], [])
+                before = self.index.read_bytes()
+                update_piece_metadata(self.db, self.item, {"title": f"Renamed under {owner}"}, who="operator")
+                if owner == "row":
+                    self.assertEqual(self.index.read_bytes(), before)
+                problems = readiness(self.db, self.item)["problems"]
+                for name in ("fact-check", "adversarial"):
+                    self.assertIn(f"{name} headline changed after its gate record; review it as shown", problems)
+                with self.assertRaisesRegex(WorkflowError, "headline changed"):
+                    change_stage(self.db, self.item, "ready", who="operator")
+                # The next owner starts from reports with no attestation.
+                (self.folder / "fact-check.md").write_text("Full claim ledger.\n")
+                (self.folder / "adversarial.md").write_text("Full adversarial report.\n")
+
+    def test_a_tip_keeps_its_own_approval_and_leaves_the_gate_current(self):
+        """sd:10719. A tip is a row with its own approval, attached to a ready piece: the piece's gates stand."""
+        for owner in ("file", "row"):
+            with self.subTest(owner=owner):
+                self.attest()
+                if owner == "row":
+                    self.cutover()
+                    self.attest()
+                self.gates()
+                update_piece_metadata(self.db, self.item, {"tip": f"A tip under {owner}"}, who="operator")
+                self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
+    def test_a_gate_recorded_before_the_headline_hash_still_passes(self):
+        self.gates()
+        fields = json.loads(piece_state(self.db, self.item)["item"]["fields"])
+        for gate in fields["writing_gates"].values():
+            del gate["title_sha256"]
+        writing.set_item_fields(self.db, self.item, fields=fields)
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
+    def test_after_cutover_a_gate_without_the_headline_hash_cannot_authorize(self):
+        """sd:10719. After cutover no index.md byte holds the headline: a legacy gate cannot say which it reviewed."""
+        self.gates()
+        self.cutover()
+        fields = json.loads(piece_state(self.db, self.item)["item"]["fields"])
+        for gate in fields["writing_gates"].values():
+            gate.pop("title_sha256")
+            gate.pop("index_sha256", None)
+        writing.set_item_fields(self.db, self.item, fields=fields)
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        problems = readiness(self.db, self.item)["problems"]
+        for name in ("fact-check", "adversarial"):
+            self.assertIn(f"{name} gate names no headline; record it again for the piece as shown", problems)
+        with self.assertRaisesRegex(WorkflowError, "names no headline"):
+            change_stage(self.db, self.item, "ready", who="operator")
+        self.gates()
+        self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
+    def test_an_unchanged_report_cannot_certify_a_headline_it_never_reviewed(self):
+        """sd:10719. Re-recording the same report after a rename would bind the new headline to the old review."""
+        for owner in ("file", "row"):
+            with self.subTest(owner=owner):
+                if owner == "row":
+                    self.cutover()
+                self.gates()
+                update_piece_metadata(self.db, self.item, {"title": f"Renamed under {owner}"}, who="operator")
+                with self.assertRaisesRegex(WorkflowError, "reviewed another headline"):
+                    self.gates()
+                self.assertIn("fact-check headline changed after its gate record; review it as shown",
+                              readiness(self.db, self.item)["problems"])
+                for name in ("fact-check", "adversarial"):
+                    (self.folder / f"{name}.md").write_text(f"Report reviewed as {owner}.\n")
+                self.gates()
+                self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
+    def test_cutover_keeps_a_passing_gate_current(self):
+        """sd:10719. Cutover drops status and published from index.md; the gate hash follows the pack's rewrite."""
+        self.attest()
+        self.gates()
+        self.assertTrue(readiness(self.db, self.item)["ok"])
+        self.cutover()
+        self.assertNotIn("status:", self.index.read_text())
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+        self.assertEqual(readiness(self.db, self.item)["problems"], [])
+
+    def test_a_gate_after_the_packs_rewrite_asks_for_a_fresh_review(self):
+        """sd:10719. A stamp names the bytes before a title rewrite: the gate refuses, never certifies, the new ones."""
+        self.attest()
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
+            self.gates()
+        self.attest()
+        self.gates()
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+
+    def test_a_rewrite_leaves_a_hash_for_other_bytes_alone(self):
+        """sd:10719. A gate hash for bytes edited by hand after the gate stays stale through a rewrite."""
+        self.attest()
+        self.gates()
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\nclaim."))
+        stale = self.index_hashes()
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        self.assertEqual(self.index_hashes(), stale)
+
     def test_ready_refuses_failed_or_unresolved_reviews(self):
         self.gates()
         record_gate(self.db, self.item, "adversarial", verdict="pass",
@@ -352,6 +524,17 @@ writing.cutover_pieces(c, sys.argv[2], expected_fingerprint=p['fingerprint'], wh
                                                  "published_urls": {"blog": "https://blog.example.com/live"}}, who="operator")
         renamed = update_piece_metadata(self.db, self.item, {"title": "Row-owned title"}, who="operator")
         self.assertEqual(renamed["item"]["title"], "Row-owned title")
+        # sd:10719. The gates answered for the old headline: publishing the new one needs them recorded again.
+        with self.assertRaisesRegex(WorkflowError, "headline changed after its gate record"):
+            change_stage(self.db, self.item, "published", confirmed=True, who="operator")
+        # The same reports cannot answer for the new headline: a fresh review writes new ones.
+        with self.assertRaisesRegex(WorkflowError, "reviewed another headline"):
+            self.gates()
+        for name in ("fact-check", "adversarial"):
+            report = self.folder / f"{name}.md"
+            report.write_text("Report on the row-owned title.\n")
+            before[report.relative_to(self.repo)] = report.read_bytes()
+        self.gates()
         change_stage(self.db, self.item, "published", confirmed=True, who="operator")
         after = {path.relative_to(self.repo): path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}
         self.assertEqual(after, before)
@@ -619,7 +802,9 @@ class ReviewCompanions(WritingCase):
     def run_review(self, report=REPORT):
         brief = adversarial_brief(self.db, self.item)
         return brief, record_adversarial(self.db, self.item, report, digest=brief["digest"],
-                                         record=brief["record"], generation=brief["generation"])
+                                         record=brief["record"], generation=brief["generation"],
+                                         index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
 
     def reconcile(self, artifact="adversarial"):
         return reconcile_companion(self.db, self.item, artifact, note="Each finding was checked against the revision.")
@@ -649,7 +834,8 @@ class ReviewCompanions(WritingCase):
         brief, result = self.run_review()
         text = (self.folder / "adversarial.md").read_text()
         lines = text.split("\n\n")
-        self.assertRegex(lines[0], rf"^<!-- reconciled-with-draft: {brief['digest']} on \d{{4}}-\d\d-\d\d gen=0 -->$")
+        self.assertRegex(lines[0], rf"^<!-- reconciled-with-draft: {brief['digest']} on \d{{4}}-\d\d-\d\d gen=0 "
+                                   rf"index={brief['index_sha256']} title={brief['title_sha256']} -->$")
         self.assertEqual(lines[1], brief["record"])
         self.assertIn("Findings are HYPOTHESES", lines[2])
         self.assertTrue(text.endswith(REPORT))
@@ -659,12 +845,233 @@ class ReviewCompanions(WritingCase):
         self.assertEqual(result["path"], f"content/{self.piece}/adversarial.md")
         self.assertEqual(self.companions()["adversarial"], "current")
 
+    def stamp_line(self):
+        return (self.folder / "adversarial.md").read_text().split("\n", 1)[0]
+
+    def attested_run(self, between=lambda: None):
+        brief = adversarial_brief(self.db, self.item)
+        between()
+        return brief, record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
+                                         generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
+
+    def test_a_run_attests_its_brief_index_bytes(self):
+        self.write_draft(SENTENCES)
+        brief, result = self.attested_run()
+        self.assertEqual(result["index_sha256"], hashlib.sha256(self.index.read_bytes()).hexdigest())
+        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} title={brief['title_sha256']} -->$")
+
+    def test_a_run_refuses_a_missing_or_malformed_index_hash(self):
+        self.write_draft(SENTENCES)
+        brief = adversarial_brief(self.db, self.item)
+        good = {"index_sha256": brief["index_sha256"], "title_sha256": brief["title_sha256"]}
+        for key in good:
+            for bad in (None, "abc", 5, good[key].upper()):
+                with self.subTest(key=key, bad=bad), self.assertRaisesRegex(WorkflowError, "brief"):
+                    record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
+                                       generation=brief["generation"], **{**good, key: bad})
+
+    def cli_run(self, during):
+        """Run `sd writing adversarial` with codex stubbed; `during(read)` edits disk, and `read()` is the reviewer
+        reading the draft path it was handed."""
+        with patch.object(sys, "path", [str(Path(__file__).resolve().parents[2] / "bin"), *sys.path]):
+            cli = importlib.import_module("sd_writing")
+        handed: dict = {}
+        read: dict[str, bytes] = {}
+
+        def render(brief):
+            handed.update(brief)
+            return "prompt"
+
+        def codex(root, prompt, **_):
+            self.prompt = prompt
+            during(lambda: read.setdefault("bytes", (Path(root) / handed["draft"]).read_bytes()))
+            return REPORT
+        args = argparse.Namespace(model=None, timeout=60, effort=None)
+        with patch.object(cli, "_render", render), patch.object(cli, "_codex", codex), \
+                redirect_stderr(io.StringIO()):
+            result = cli.adversarial(writing, self.db, self.item, args)
+        return result, read["bytes"]
+
+    def adversarial_gate(self, digest):
+        return record_gate(self.db, self.item, "adversarial", verdict="pass", findings=[], who="operator",
+                           reason="Reviewed full report", reviewed_digest=digest)
+
+    def test_a_run_attests_the_index_bytes_its_reviewer_read(self):
+        """sd:10719. A backup restored mid-review must not certify bytes the reviewer never read."""
+        self.write_draft(SENTENCES)
+        original, stat = self.index.read_bytes(), self.index.stat()
+
+        def relay_then_restore(read):
+            self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
+            read()
+            self.index.write_bytes(original)
+            os.utime(self.index, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        result, seen = self.cli_run(relay_then_restore)
+        self.assertEqual(result["index_sha256"], hashlib.sha256(seen).hexdigest())
+        self.adversarial_gate(result["digest"])
+        gate = json.loads(piece_state(self.db, self.item)["item"]["fields"])["writing_gates"]["adversarial"]
+        self.assertEqual(gate["index_sha256"], hashlib.sha256(seen).hexdigest())
+
+    def test_a_review_cannot_certify_a_headline_its_reviewer_never_saw(self):
+        """sd:10719. After cutover the headline is a row, not index.md bytes: the run shows it and attests it."""
+        self.write_draft(SENTENCES)
+        self.cutover()
+        update_piece_metadata(self.db, self.item, {"title": "Row headline: Über café"}, who="operator")
+        result, _ = self.cli_run(lambda read: (read(), update_piece_metadata(
+            self.db, self.item, {"title": "Renamed mid-review"}, who="operator")))
+        self.assertIn('"Row headline: Über café"', self.prompt)
+        self.assertFalse(result["current"])
+        with self.assertRaisesRegex(WorkflowError, "headline changed after the review"):
+            self.adversarial_gate(result["digest"])
+        result, _ = self.cli_run(lambda read: read())
+        self.assertIn('"Renamed mid-review"', self.prompt)
+        self.adversarial_gate(result["digest"])
+
+    def test_a_gate_refuses_a_run_report_that_names_no_headline(self):
+        """sd:10719. A run report that lost its `title=` would certify whatever headline the row holds."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.run_review()
+        report = self.folder / "adversarial.md"
+        report.write_text(re.sub(r" title=\S+", "", report.read_text(), count=1))
+        with self.assertRaisesRegex(WorkflowError, "names no headline"):
+            self.adversarial_gate(brief["digest"])
+
+    def test_certify_refuses_index_bytes_other_than_the_reviewer_read(self):
+        """sd:10719. A layout edit mid-review leaves disk bytes the reviewer did not read: certify refuses."""
+        self.write_draft(SENTENCES)
+        def read_then_relay(read):
+            read()
+            self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
+        result, seen = self.cli_run(read_then_relay)
+        # The prose is the one reviewed, the layout is not: neither the run nor the companion reads as current.
+        self.assertFalse(result["current"])
+        self.assertEqual(self.companions()["adversarial"], "stale")
+        self.assertNotEqual(hashlib.sha256(seen).hexdigest(), hashlib.sha256(self.index.read_bytes()).hexdigest())
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
+            self.adversarial_gate(result["digest"])
+
+    def test_a_reconcile_keeps_an_attestation_for_the_bytes_still_on_disk(self):
+        """sd:10719. Reconciling an unchanged file rewrites the stamp; the layout attestation survives."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.reconcile()
+        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} title={brief['title_sha256']} -->$")
+        self.assertEqual(self.companions()["adversarial"], "current")
+
+    def test_a_reconcile_after_a_layout_edit_cannot_clear_the_gate(self):
+        """sd:10719. A reconcile answers for prose: it keeps the run's attestation, so the gate still refuses."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
+        self.reconcile()
+        self.assertRegex(self.stamp_line(), rf" index={brief['index_sha256']} title={brief['title_sha256']} -->$")
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
+            record_gate(self.db, self.item, "adversarial", verdict="pass", findings=[], who="operator",
+                        reason="Reviewed full report", reviewed_digest=brief["digest"])
+
+    def restamp(self, change):
+        report = self.folder / "adversarial.md"
+        first, rest = report.read_text().split("\n", 1)
+        report.write_text(change(first) + "\n" + rest)
+
+    def test_a_reconcile_refuses_an_attestation_it_cannot_read(self):
+        """sd:10719. A malformed or repeated `index=` is refused, never dropped: a drop clears the gate."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        seen = brief["index_sha256"]
+        bare = f"<!-- reconciled-with-draft: {brief['digest']} on 2026-09-08 gen=0 -->"
+        for name, change in (("malformed", lambda line: line.replace(seen, seen[:-1])),
+                             ("upper", lambda line: line.replace(seen, seen.upper())),
+                             ("repeated", lambda line: line.replace(" -->", f" index={'0' * 64} -->")),
+                             ("two lines", lambda line: f"{line}\n{line}")):
+            with self.subTest(name):
+                self.attested_run()
+                self.restamp(change)
+                before = (self.folder / "adversarial.md").read_bytes()
+                with self.assertRaisesRegex(WorkflowError, "index stamp"):
+                    self.reconcile()
+                self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)
+        # An attestation on a second stamp line is kept, not lost behind a first line that has none.
+        self.attested_run()
+        self.restamp(lambda line: f"{bare}\n{line}")
+        self.reconcile()
+        self.assertRegex(self.stamp_line(), rf" index={seen} title=[0-9a-f]{{64}} -->$")
+
+    def test_a_gate_refuses_a_run_report_that_names_no_index_bytes(self):
+        """sd:10719. A report the pack's run wrote always attests; one that lost its `index=` certifies nothing."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.restamp(lambda line: line.replace(f" index={brief['index_sha256']}", ""))
+        before = piece_state(self.db, self.item)
+        with self.assertRaisesRegex(WorkflowError, "names no index.md bytes"):
+            self.adversarial_gate(brief["digest"])
+        self.assertEqual(piece_state(self.db, self.item), before)
+
+    def test_a_companion_reads_the_attestation_as_the_gate_does(self):
+        """sd:10719. Each report the gate refuses for its layout attestation reads as stale, never current."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.assertEqual(self.companions()["adversarial"], "current")
+        original = (self.folder / "adversarial.md").read_text()
+        cases = {"lost": lambda line: line.replace(f" index={brief['index_sha256']}", ""),
+                 "other bytes": lambda line: line.replace(brief["index_sha256"], "0" * 64),
+                 "two": lambda line: line.replace(" -->", f" index={brief['index_sha256']} -->"),
+                 "malformed": lambda line: line.replace(brief["index_sha256"], "abc"),
+                 "empty": lambda line: line.replace(brief["index_sha256"], "")}
+        for name, edit in cases.items():
+            with self.subTest(name):
+                (self.folder / "adversarial.md").write_text(original)
+                self.restamp(edit)
+                with self.assertRaises(WorkflowError):
+                    self.adversarial_gate(brief["digest"])
+                self.assertEqual(self.companions()["adversarial"], "stale")
+
+    def test_a_gate_refuses_a_stamp_with_two_index_hashes(self):
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.restamp(lambda line: line.replace(" -->", f" index={'0' * 64} -->"))
+        with self.assertRaisesRegex(WorkflowError, "index stamp"):
+            self.adversarial_gate(brief["digest"])
+
+    def test_a_reconcile_after_the_gate_leaves_the_gate_stale(self):
+        """sd:10719. The gate binds the report's bytes, so no reconcile changes what a recorded gate attests."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.adversarial_gate(brief["digest"])
+        self.reconcile()
+        self.assertIn("adversarial evidence or research changed after its gate record",
+                      readiness(self.db, self.item)["problems"])
+
+    def test_a_fresh_run_after_an_applied_fix_keeps_the_ledger(self):
+        """sd:10719. A one-sentence fix needs a fresh run for its layout; the run kept no earlier decision."""
+        self.write_draft(SENTENCES)
+        self.run_review()
+        revised = list(SENTENCES)
+        revised[0] = "Sentence 0 now hedges its claim about the fixture."
+        self.write_draft(revised)
+        reconcile_companion(self.db, self.item, "adversarial", note="Finding 1 resolved: sentence 0 hedged.")
+        brief, _ = self.run_review("# Second review\n\nDoes the central argument survive hostile reading: YES\n")
+        text = (self.folder / "adversarial.md").read_text()
+        self.assertIn("## Resolution ledger", text)
+        self.assertIn("Finding 1 resolved: sentence 0 hedged.", text)
+        self.assertIn("# Second review", text)
+        self.assertNotIn("1. A finding. CERTAIN", text)
+        self.assertEqual(self.companions()["adversarial"], "current")
+        self.adversarial_gate(brief["digest"])
+        self.assertNotIn("adversarial evidence or research changed after its gate record",
+                         readiness(self.db, self.item)["problems"])
+        # A second fresh run keeps the ledger once, not twice.
+        self.run_review("# Third review\n")
+        self.assertEqual((self.folder / "adversarial.md").read_text().count("Finding 1 resolved"), 1)
+
     def test_a_draft_changed_during_the_run_leaves_a_stale_report(self):
         self.write_draft(SENTENCES)
         brief = adversarial_brief(self.db, self.item)
         self.write_draft(SENTENCES[:-1])
         result = record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                                    generation=brief["generation"])
+                                    generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
         self.assertFalse(result["current"])
         self.assertEqual(self.companions()["adversarial"], "stale")
 
@@ -674,7 +1081,8 @@ class ReviewCompanions(WritingCase):
         brief = adversarial_brief(self.db, self.item)
         with self.assertRaisesRegex(WorkflowError, "no report"):
             record_adversarial(self.db, self.item, "  \n", digest=brief["digest"], record=brief["record"],
-                               generation=brief["generation"])
+                               generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
         self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)
 
     def test_companion_states_are_missing_unstamped_current_or_stale(self):
@@ -706,7 +1114,9 @@ class ReviewCompanions(WritingCase):
         self.assertIn("<!-- adversarial-reviewed: words=", text)
         self.assertIn("## Resolution ledger", text)
         self.assertTrue(text.endswith("Each finding was checked against the revision.\n"))
-        self.assertEqual(self.companions()["adversarial"], "current")
+        # The run attested other index.md bytes, and a reconcile keeps that attestation, so the report reads as
+        # stale, as the gate on it refuses: only a fresh run answers the edited file (sd:10719).
+        self.assertEqual(self.companions()["adversarial"], "stale")
         # 36 more words against the reconcile, 20%, but 48 against the run: 26% of 183.
         revised[1:5] = [s.replace("sourced", "revised") for s in revised[1:5]]
         self.write_draft(revised)
@@ -919,7 +1329,8 @@ class WorktreeCheckout(WritingCase):
         with checkout(str(self.repo), self.worktree):
             brief = adversarial_brief(self.db, self.item)
             record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                               generation=brief["generation"])
+                               generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         title_sha256=brief["title_sha256"])
         self.assertEqual(brief["root"], str(self.worktree.resolve()))
         self.assertIn(brief["record"], (self.worktree / "content" / self.piece / "adversarial.md").read_text())
         self.assertEqual((self.folder / "adversarial.md").read_bytes(), before)

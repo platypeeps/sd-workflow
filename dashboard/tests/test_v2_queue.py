@@ -174,6 +174,8 @@ class Lane:
                  "expected_head": self.merged, "branch": "main", "worktree": str(self.checkout),
                  "enqueued_on": ship.this_host(), "prepare_log": str(log), **extra}
         self.list(self.entries() + [entry])
+        # Each case's stub may answer adjudicate otherwise for the same entry; the page keeps the last (sd:10814).
+        queue_screen.forget()
         return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"] if row.get("item") == 14)
 
     def shot_entries(self):
@@ -989,6 +991,43 @@ class TheMove(Lane, BrowserSession):
                 self.assertIsNotNone(row["review"])
         self.assertIsNone(self.failed(enqueued_on="satellite-1")["held"])
 
+    def test_a_second_build_over_an_unchanged_failed_row_runs_no_adjudicate(self):
+        """sd:10814: a failed row's review moves only with its entry; a build asked adjudicate on every poll."""
+        first = self.failed()
+        self.log.write_text("")
+        again = next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                     if row.get("item") == 14)
+        self.assertEqual([c for c in self.calls() if "adjudicate" in c], [])
+        self.assertEqual(again["review"], first["review"])
+        log = Path(again["log"])
+        os.utime(log, ns=(log.stat().st_atime_ns, log.stat().st_mtime_ns + 1))  # a retry's new prepare log
+        queue_screen.document(self.connection, now=NOW)
+        self.assertEqual(len([c for c in self.calls() if "adjudicate" in c]), 1)
+
+    def test_an_adjudication_or_review_rerun_from_the_cli_reads_the_review_again(self):
+        """sd:10814 lead review: the kept fields outlived a CLI adjudication and a review run again at the same
+        head, so Retry and Reject stood on a review that had moved. Each writes a `ship` checkpoint."""
+        def build():
+            return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                        if row.get("item") == 14)
+
+        def adjudicated():
+            return [c for c in self.calls() if "adjudicate" in c]
+        self.assertIs(self.failed()["held"], False)
+        for key, env, want in (("ship-adjudication:" + "a" * 64, {"QUEUE_RECORDED": "7"}, ("review", True)),
+                               ("ship:" + "b" * 64, {"QUEUE_DIGEST": "f9"}, (None, None))):
+            with self.subTest(key=key[:20]):
+                self.log.write_text("")
+                with mock.patch.dict(os.environ, env):
+                    build()
+                    self.assertEqual(adjudicated(), [], "unchanged: kept")
+                    self.connection.execute("INSERT INTO state(kind, key, timestamp, body) "
+                                            "VALUES ('checkpoint', ?, ?, '{}')", (key, NOW))
+                    self.connection.commit()
+                    row = build()
+                self.assertEqual(len(adjudicated()), 1)
+                self.assertEqual(("review" if row["review"] else None, row["held"]), want)
+
     def test_a_review_run_again_at_the_same_head_offers_retry_not_reject(self):
         """sd:9966 lane review: the review at that head ran again with other findings; the prepare log still
         names the old ones, so Reject would rebut findings no longer there. Retry reads the live review."""
@@ -1469,8 +1508,8 @@ class RealLane(BrowserSession):
     """The pinned pack's `sd-ship lane` on a temporary lane root, seeded with `seeds()`.
 
     The pack keeps the queue in the hub database (pack sd:3282), so the entries go there through its own writer:
-    a `<lane>/queue/queue.json` is only an earlier version's file, which `lane list` imports by publishing each
-    pending head to `origin`. The checkout's origin names a GitHub repository, as every lane's must.
+    a `<lane>/queue/queue.json` is only an earlier version's file, which the runner or a writing verb imports by publishing each
+    pending head to `origin` (sd:10420). The checkout's origin names a GitHub repository, as every lane's must.
     """
 
     #: A move runs `lane list` and then the verb, each in a real `sd-ship` under the server's own bound; past both, the
@@ -1742,14 +1781,17 @@ class TheInProcessRead(RealLane):
         self.assertEqual(satellite["host"], "build-2")
         self.assertEqual(satellite, {**hub, "host": "build-2"})
 
-    def test_a_queue_file_an_earlier_version_left_is_read_by_lane_list(self):
-        # `lane list` imports an earlier version's queue file into the database once; the page lets it.
+    def test_a_queue_file_an_earlier_version_left_stays_for_the_runner(self):
+        # sd:10420: the runner or a writing verb imports that file; the page reads and leaves it.
         queue = Path(os.environ["SD_LANE_ROOT"]) / "system" / "lane" / "queue" / "queue.json"
-        queue.write_text(json.dumps({"entries": []}))
-        with mock.patch.object(queue_screen, "lane_list", wraps=queue_screen.lane_list) as listing:
+        queue.write_text(json.dumps({"entries": [{"item": 9, "status": "pending", "branch": "topic"}]}))
+        original = queue.read_bytes()
+        with mock.patch.object(queue_screen, "lane_list", side_effect=AssertionError("lane list ran")):
             lane = queue_screen.document(self.connection, now=NOW)["lanes"][0]
-        listing.assert_called_once_with(str(self.checkout))
         self.assertEqual(len(lane["rows"]), 6)
+        self.assertIn("sd:9", lane["legacy"])  # sd:10420 review: the next runner pass imports it, so the page says so
+        self.assertEqual((queue.read_bytes(), sorted(p.name for p in queue.parent.iterdir())),
+                         (original, ["queue.json"]))
 
     def test_without_the_packs_bin_lane_list_answers(self):
         with mock.patch.object(queue_screen, "pack_module", side_effect=ImportError("no bin")), \
@@ -1968,7 +2010,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
            "working": "working: live sessions, queued builds and lane gates; a building run counts in building only",
            "next": "next: queued in the lane, not started",
            "blocked": "blocked: stopped in the lane or a build until someone acts",
-           "suggested": "suggested: up to 9 items to do next: ready, due today or overdue, planned or unscheduled",
+           "suggested": "suggested: items to do next: ready, due today or overdue, planned or unscheduled",
            "parked": "parked: tasks set aside (Tasks, Parked); no other box counts them"}
 
     def test_each_box_says_its_count_and_what_it_counts_on_hover(self):
@@ -2042,13 +2084,45 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                             " R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;")
         self.assertNotIn("beta:false", out["R"]["before"])
         self.assertIn("beta:false", out["R"]["after"])
-        self.assertEqual(out["R"]["kids"].count("suggested"), 4, "all four, under the cap of nine (sd:8008)")
+        self.assertEqual(out["R"]["kids"].count("suggested"), 4, "all four (sd:10760: no cap)")
         self.assertIn("#60 Ready 60", out["R"]["html"])
         self.assertIn("#63 Ready 63", out["R"]["html"])
         self.assertEqual(out["urls"], [{"show": "suggested"}])
         self.assertIn('data-f="qshow" data-v="suggested" aria-pressed="true"', out["R"]["filters"])
         kept = self.run_view("R.repos = repos();", search="?show=suggested")
         self.assertIn("beta:false", kept["R"]["repos"])
+
+    def test_advisory_items_are_hidden_until_the_advisories_toggle_is_on(self):
+        # sd:10915: #61 is an advisory item; off (the row unset) its suggested row is gone, on it shows.
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [61], "row": None, "show": False, "error": ""}
+        out = self.run_view("open('system'); R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;",
+                            search="?show=suggested")
+        self.assertNotIn("#61 Ready 61", out["R"]["html"])
+        self.assertIn("#60 Ready 60", out["R"]["html"])
+        self.assertIn('data-f="qshow" data-v="advisory" aria-pressed="false"', out["R"]["filters"])
+        self.doc["advisories"].update(row="on", show=True)
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=suggested")
+        self.assertIn("#61 Ready 61", out["R"]["html"])
+
+    def test_the_advisories_toggle_posts_its_row_and_reads_today_again(self):
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [61], "row": None, "show": False, "error": ""}
+        answers = {"/api/settings/row": [200, {"key": "dashboard.queue_advisories", "value": "on", "was": None}]}
+        out = self.run_view("R.before = OUT.gets.length; press('advisory'); await flush(); await flush(); await flush();"
+                            " R.after = OUT.gets.slice(R.before); R.said = ELS['queue-said'].textContent;", answers=answers)
+        self.assertEqual([p[:2] for p in out["posts"]],
+                         [["/api/settings/row", {"key": "dashboard.queue_advisories", "value": "on", "before": None}]])
+        self.assertIn("/api/now", out["R"]["after"])
+        self.assertEqual(out["R"]["said"], "Advisory items show.")
+        self.assertEqual(out["urls"], [], "the toggle is the setting row, not a ?show= key")
+
+    def test_an_advisories_read_that_failed_hides_nothing_and_says_so(self):
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [], "row": None, "show": True,
+                                  "error": "database is locked"}
+        out = self.run_view("open('system'); R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;"
+                            " R.note = ELS['queue-note'].textContent;", search="?show=suggested")
+        self.assertIn("#61 Ready 61", out["R"]["html"])
+        self.assertNotIn('data-v="advisory"', out["R"]["filters"])
+        self.assertIn("Advisory items not read: database is locked", out["R"]["note"])
 
     def test_suggested_is_on_with_no_show_key_and_turned_off_stays_off_on_a_reload(self):
         # pack sd:7314 (operator request): no `show` key starts Suggested on. Turning every filter off writes `show=` empty,
@@ -2065,13 +2139,13 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                 self.assertIn('data-f="qshow" data-v="suggested" aria-pressed="false"', kept["R"]["filters"])
                 self.assertNotIn("beta:false", kept["R"]["repos"])
 
-    def test_a_repo_with_ten_suggested_items_draws_nine(self):
-        # sd:7869, sd:8008 (operator 2026-11-07): Suggested keeps at most nine items per repo, in sd-next's order.
+    def test_a_repo_with_ten_suggested_items_draws_all_ten(self):
+        # sd:10760 (operator 2026-11-25): Suggested draws every item per repo, in sd-next's order; it cut at nine (sd:8008).
         self.doc["queues"]["suggested"] = [{"id": n, "repo": "~/repos/example/system", "title": f"Next {n}", "status": "ready",
                                             "why": "ready", "due": None, "priority": None} for n in range(61, 71)]
         out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=suggested")
         drawn = re.findall(r'<tr class="child" data-type="suggested" data-item="(\d+)"', out["R"]["html"])
-        self.assertEqual(drawn, [str(n) for n in range(61, 70)])
+        self.assertEqual(drawn, [str(n) for n in range(61, 71)])
 
     def test_a_suggested_item_due_today_or_overdue_says_due_and_its_status(self):
         # pack sd:8238: an open item due today or before is suggested as `due`; its detail names the date, not ready.
@@ -2082,9 +2156,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                            out["R"]["html"], re.S)
         self.assertEqual(found, [("90", "due 2026-09-01 · P2 · planning")])
 
-    def test_suggested_is_sd_nexts_order_less_live_items_nine_per_repo_each_with_why(self):
+    def test_suggested_is_sd_nexts_order_less_live_items_each_with_why(self):
         # pack sd:7314: Suggested is what sd-next offers next, ranked server-side (sd_db.today.suggested): ready, then
-        # planned, then unscheduled. The view drops a live item and keeps the first nine per repo (sd:8008). Each detail says why;
+        # planned, then unscheduled. The view drops a live item and keeps the rest (sd:10760). Each detail says why;
         # a row that is not ready shows its status and offers no Build.
         def row(n, why, status, priority=None, due=None):
             return {"id": n, "repo": "~/repos/example/system", "title": f"Next {n}", "status": status, "why": why,
@@ -2444,6 +2518,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         none = self.run_view("R.tally = ELS['queue-tally'].html;")
         self.assertNotIn("parked", none["R"]["tally"], "no parked task, no tile")
 
+    def test_an_advisory_filed_after_the_now_read_stays_hidden_on_a_tasks_refresh(self):
+        """sd:10915 lane review: the hidden set came from /api/now's ids alone, so an advisory item a refresh of
+        /api/tasks brought in showed while the filter was off. The task row's own `advisory` flag hides it too."""
+        from sd_dashboard import tasks_screen
+        for title in ("Parked plain", "Parked advisory"):
+            made = self.item(title, kind="task", priority=4, repo=str(self.checkout))
+            self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
+            if title.endswith("advisory"):
+                self.connection.execute("UPDATE item SET source = 'task-ref', external_id = ? WHERE id = ?",
+                                        (f"advisory:sd:{made}", made))
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [], "row": None, "show": False, "error": ""}
+        answers = {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]}
+        out = self.run_view("R.tally = ELS['queue-tally'].html;", answers=answers)
+        self.assertIn(">1 parked</a>", out["R"]["tally"])
+
     def test_each_repo_row_has_a_parked_box_last_that_shows_its_parked_tasks(self):
         """sd:9247 (operator 2026-11-17): "add a per repo tile for the respective parked items like the other tiles
         ... as last one, and have it do the same filtering". The box counts the repo's parked tasks the tally counts
@@ -2543,6 +2632,26 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             return out["R"]["tiled"].split(f'data-type="parked" data-item="{item}"')[1].split("</tr>")[0]
         self.assertIn("blocked build · assignment 90 · build run ended", row(built))
         self.assertIn("lane failed at prepare · gate failed", row(made))
+
+    def test_a_hidden_advisory_parked_item_moves_none_of_its_rows_back_into_blocked(self):
+        """sd:10915 review: hiding advisories dropped a parked item from the parked set too, so its blocked build and
+        failed lane entry were Blocked rows again. Hidden, the item is no row at all and Blocked counts neither."""
+        built, _ = self.parked_answers(self.checkout)
+        made, answers = self.parked_answers(self.checkout)
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        asg = {"id": 90, "lead": 90, "item": built, "title": "Set aside", "repo": str(self.checkout),
+               "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
+               "cancel": {"allowed": True, "reason": ""}}
+        answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [built, made], "row": None,
+                                  "show": False, "error": ""}
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", answers=answers)
+        _, attrs, _ = self.repo_detail(out["R"]["html"], "system")
+        self.assertIn(" 2 blocked,", attrs, "the fixture's two blocked rows, not the hidden parked item's")
+        self.assertIn(" 0 parked", attrs)
+        self.assertNotIn('data-asg-row="90"', out["R"]["html"])
+        self.assertNotIn(f'data-id="entry:{self.checkout}:{made}"', out["R"]["html"])
 
     def test_a_parked_items_blocked_rows_keep_their_controls_on_its_parked_row(self):
         """Re-review of pack sd:9425: the Parked row took the blocked rows' reasons and dropped their controls, so a

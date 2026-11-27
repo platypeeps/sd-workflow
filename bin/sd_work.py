@@ -1254,7 +1254,7 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
                      for line in (asked["body"] or "").splitlines())
         if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:") and (
                 offers or getattr(args, "option", None) is not None):
-            if _is_batch(review, connection, args.item):
+            if _asks_in_batch(review, connection, args.item, args.answers):
                 return _rule_batch(review, workflow, connection, args, body, who, revision)
         ruling = body if getattr(args, "option", None) is None else _plain_ruling(review, asked["body"], args, body)
         ruled = workflow.add_item_note(connection, args.item, kind="decision", who=who,
@@ -1266,14 +1266,15 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
         return state
 
 
-def _is_batch(review: Any, connection: Any, item: int) -> bool:
-    """Whether `review.read` reads the item: a lane review files its findings with a `review:` ref
-    and no batch header (sd:10097), and such an item is answered as any other is."""
+def _asks_in_batch(review: Any, connection: Any, item: int, note: int) -> bool:
+    """Whether `note` is one of the questions `review.read` reads on the item. A lane review files its
+    findings with a `review:` ref and no batch header (sd:10097), and a question asked after a batch's
+    header count is no batch question (sd:10505): each is answered as on any other item."""
     try:
-        review.read(connection, item)
+        questions = review.read(connection, item)["questions"]
     except review.ReviewError:
         return False
-    return True
+    return any(held["note"] == note for held in questions)
 
 
 def _plain_ruling(review: Any, asked: str | None, args: argparse.Namespace, body: str) -> str:

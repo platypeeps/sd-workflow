@@ -728,6 +728,20 @@ class TaskCLI(unittest.TestCase):
                          ("decision", f"Ruling on note #{asked}: Confirm destructive taps only"))
         self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
 
+    def test_an_ordinary_question_on_a_review_batch_takes_the_linked_decision_path(self):
+        """sd:10505: a question asked on a batch after its header's count is no batch question;
+        it was sent to `review.rule`, which refused it with and without --option."""
+        item, _ = self.batch_question()
+        asked = self.question(item)
+        state = json.loads(self.call("task", "note", item, "Database rows", "--kind", "decision",
+                                     "--answers", asked, "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Database rows")
+        self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+        picked = self.question(item)
+        state = json.loads(self.call("task", "note", item, "Pack store", "--kind", "decision",
+                                     "--answers", picked, "--option", "pack store", "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{picked}: Pack store")
+
     def test_all_public_note_kinds_parse_and_persist_without_internal_kinds(self):
         self.assertEqual(set(NOTE_KINDS), {"comment", "followup", "question", "decision", "proposal"})
         state = json.loads(self.call("task", "add", "--priority", "3", "Parent task", "--json").stdout)

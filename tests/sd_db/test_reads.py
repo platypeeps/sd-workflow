@@ -839,3 +839,34 @@ class ReviewCosts(unittest.TestCase):
         found = reads.review_costs(self.db)
         self.assertEqual((found[lead_item]["lane"], found[lead_item]["rounds"], found[lead_item]["usd"]), (3, 5, 2.75))
         self.assertEqual((found[member]["lane"], found[member]["rounds"], found[member]["usd"]), (0, 2, 2.0))
+
+
+class TheReviewGeneration(unittest.TestCase):
+    """The queue page's review generation lives in `reads`, not `ship`:
+    `adjudicator_binding` hashes `sd_db/ship.py` byte for byte, so a
+    dashboard-only query there voids every recorded adjudication when the
+    pack updates (sd:10814)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        path = Path(self.tmp.name) / "sd.db"
+        initialise(path)
+        self.connection = connect(path)
+        self.addCleanup(self.connection.close)
+
+    def test_the_ship_library_holds_no_dashboard_read(self):
+        from sd_db import ship
+
+        self.assertFalse(hasattr(ship, "review_generation"))
+
+    def test_only_ship_and_adjudication_checkpoints_move_it(self):
+        self.assertEqual(reads.review_generation(self.connection), 0)
+        record_state(self.connection, "checkpoint", key="ship:aa", body={})
+        first = reads.review_generation(self.connection)
+        self.assertGreater(first, 0)
+        record_state(self.connection, "checkpoint", key="ship-review-no-item:bb", body={})
+        record_state(self.connection, "checkpoint", key="lane:cc", body={})
+        self.assertEqual(reads.review_generation(self.connection), first)
+        record_state(self.connection, "checkpoint", key="ship-adjudication:dd", body={})
+        self.assertGreater(reads.review_generation(self.connection), first)
