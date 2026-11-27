@@ -418,11 +418,11 @@ def check_body_lines(body: str, report: Report) -> None:
 
 
 def check_pr_privacy(body: str | None, report: Report, repo: pathlib.Path | None = None,
-                     lines: bool = True) -> None:
+                     measure: bool = True) -> None:
     """The body rule (sd:2999): a public pull request body matches no privacy pattern.
 
     `grep -E` matches, as `local-leak-guard` does, and a failure names line
-    numbers, never the text. `lines=False` (`--body-only`) skips the line limit:
+    numbers, never the text. `measure=False` (`--body-only`) skips the line limit:
     a foreign repository's body publishes without the lane, and `sd-ship`
     measures its own body first (pack sd:10220). A body with no pattern file, or an empty one, to
     check against fails: a fresh machine without the file would otherwise
@@ -431,7 +431,7 @@ def check_pr_privacy(body: str | None, report: Report, repo: pathlib.Path | None
     if body is None:
         report.warn("PR privacy: no --pr-body supplied, not run")
         return
-    if lines:
+    if measure:
         check_body_lines(body, report)
     remedy = "set sd.privacy_patterns, or write one ERE per line to that file"
     try:
@@ -712,7 +712,7 @@ def run(
             report.fail("--body-only", "needs --pr-body; the privacy rule reads it")
             return report
         report.warn("rules 1-4, 7: --body-only, not run")
-        check_pr_privacy(pr_body, report, repo, lines=False)
+        check_pr_privacy(pr_body, report, repo, measure=False)
         return report
     if keeps_work_local(repo, report):
         report.warn(f"rules 1-2, 7: mode: minimal keeps {work_dir} local; not run")
