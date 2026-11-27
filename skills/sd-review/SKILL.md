@@ -114,10 +114,10 @@ sd-review --scope branch > "$LOG/review-<item>-rN.log" 2>&1; echo "review exit $
 
 The chain adds no verb and no PR body check.
 
-### A repeating finding class
+### A blocking finding class
 
-Trigger: two findings of the same class in different rounds, or three blocking rounds in a row.
-Then stop single-finding fixes and run one class pass:
+Trigger: the first blocking round (sd:10903).
+Fix no single finding; run one class pass:
 
 1. Name the class.
 2. Enumerate every instance from the code, not from the findings.

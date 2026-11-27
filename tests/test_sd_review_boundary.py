@@ -1144,26 +1144,32 @@ class LineBudgetTests(unittest.TestCase):
         # its own function to keep `record_lead_review` under the branch
         # ceiling. Measured: `sd-review` is 3176 here.
         #
-        # 5146 -> 5045 is pack sd:10087: `bin/sd-review` -101. A prior
+        # 5146 -> 5149 is sd:10698: `bin/sd-review` +3 so plain output
+        # escapes what the stream cannot encode, and splits evidence at
+        # newlines alone, not at U+2028. A non-ASCII repro raised on an
+        # ASCII stdout before the status line. Measured: `sd-review` is
+        # 3179 here.
+        #
+        # 5149 -> 5048 is pack sd:10087: `bin/sd-review` -101. A prior
         # blocker clears only on each completed reader's `fixed` verdict
         # for its id (`carried`), so the prose matcher (`prior_evidence`),
         # the line map (`prior_at`, `moved_line`, `diff_lines`) and
-        # `instance_rows` are deleted. Measured: `sd-review` is 3075 here.
+        # `instance_rows` are deleted. Measured: `sd-review` is 3078 here.
         #
-        # 5045 -> 5081 is the review of build/sd-2205: `bin/sd-review` +36.
+        # 5048 -> 5084 is the review of build/sd-2205: `bin/sd-review` +36.
         # A failed reader's `open` verdict holds a blocker, and `followed`
         # moves each carried blocker through a rename so the next fix
-        # review reads its source. Measured: `sd-review` is 3111 here.
+        # review reads its source. Measured: `sd-review` is 3114 here.
         #
-        # 5081 -> 5099 is round 3 of build/sd-2205: `bin/sd-review` +18.
+        # 5084 -> 5102 is round 3 of build/sd-2205: `bin/sd-review` +18.
         # Degraded input holds a prior blocker: a malformed verdict reads
         # as `open` (`held_verdicts`), and `followed` chains each commit's
-        # renames. Measured: `sd-review` is 3129 here.
+        # renames. Measured: `sd-review` is 3132 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5099,
+            5102,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

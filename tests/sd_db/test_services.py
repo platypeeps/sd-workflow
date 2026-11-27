@@ -132,6 +132,22 @@ class Services(unittest.TestCase):
         self.assertEqual(self.db.total_changes, before)
         self.assertEqual(self.actions(), [])
 
+    def test_an_inventory_asks_print_disabled_once_and_a_control_read_asks_again(self):
+        """sd:10815: an inventory of 13 agents ran `launchctl print-disabled` 13 times; one read asks once."""
+        for n in range(3):
+            label = f"com.example.extra{n}"
+            (self.agents / f"{label}.plist").write_bytes(plistlib.dumps({**self.config, "Label": label}))
+            self.configs[f"{self.domain}/{label}"] = {**self.config, "Label": label}
+            self.runtime[f"{self.domain}/{label}"] = ["running", 120 + n, 0, 1]
+        result = inventory(self.db, backend=self.backend)
+        self.assertEqual(len(result["services"]), 4)
+        asked = lambda: [call for call in self.calls if call[1] == "print-disabled"]  # noqa: E731
+        self.assertEqual(asked(), [["/bin/launchctl", "print-disabled", self.domain]])
+        self.assertTrue(all(row["capabilities"]["restart"]["allowed"] for row in result["services"]))
+        self.disabled = True
+        self.assertEqual(self.state()["capabilities"]["restart"]["reason"], "service is disabled")
+        self.assertEqual(len(asked()), 2)
+
     @hub_only
     def test_stop_unloads_without_deleting_plist_and_start_bootstraps_then_kickstarts(self):
         original = self.plist.read_bytes()
