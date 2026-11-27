@@ -347,7 +347,7 @@
     // sd:10429: a Done the library refuses on a person's open followups (workflow.change_status, sd:10407) names each as
     // `resolve followup N`. REFUSED keeps that text by item, so Details show it with each followup's Resolve and Done,
     // resolve all, the dashboard's `sd task status N done --resolve-followups`. A landed close or a later Done clears it.
-    const REFUSED = {}, OPEN_FOLLOWUPS = /^item \d+ has open followups; /;
+    const REFUSED = {}, SHOWN = {}, OPEN_FOLLOWUPS = /^item \d+ has open followups; /;
     function waits(t, s, e) {
       if (s !== 'done') return;
       if (e && OPEN_FOLLOWUPS.test(e.message || '')) { REFUSED[t.id] = e.message; redrawDet(t.id); } else delete REFUSED[t.id];
@@ -361,10 +361,13 @@
       does: 'Moves the task to Done and resolves every open followup on it.',
       when: o => { const t = T(o); return t ? resolveAllOn(t) : 'the task is no longer listed'; },
       cli: o => rowOr(o, cliResolveAll),
-      consequence: o => { const t = T(o), ids = openFollowups(detOf(t)).map(n => n.id);
+      // The ids the confirm lists are the ids the write names (SHOWN), never those open as it leaves: the server
+      // refuses a person's followup the list does not name (server._done_resolving, review of sd:10429).
+      consequence: o => { const t = T(o), ids = openFollowups(detOf(t)).map(n => n.id); SHOWN[t.id] = ids;
         return `Resolves followup${ids.length === 1 ? '' : 's'} ${ids.join(', ')} and moves ${label(t)} to Done. Nothing reopens a resolved followup, so there is no Undo.`; },
-      run: o => { const t = must(o);
-        return landing(write(t.key, x => `/api/items/${x.id}/status`, { status: 'done', resolve_followups: true }, { seconds: WRITE_SECONDS, check: resolveAllOn })
+      run: o => { const t = must(o), ids = SHOWN[t.id]; delete SHOWN[t.id];
+        if (!ids || !ids.length) return Promise.reject(new Error('the followups to resolve were not shown; run Done, resolve all again'));
+        return landing(write(t.key, x => `/api/items/${x.id}/status`, { status: 'done', resolve_followups: ids }, { seconds: WRITE_SECONDS, check: resolveAllOn })
           .then(v => { delete REFUSED[t.id]; redrawDet(t.id); host.landed?.(t.key); return v; }),
           () => `${label(t)} → Done, followups resolved · ${cliResolveAll(t)}`); } };
     // The refusal in Details: its text, each open followup with its Resolve, and Done, resolve all.

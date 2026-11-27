@@ -1737,8 +1737,10 @@ shellRun(cmd('note.resolve'), C.get('note:{note}')); await flush();""", answer)
   : [200, {{ item: {{ id: {plan}, status: 'done', priority: 2, due: '2026-09-09', recurrence: null }}, notes: [], revision: 'b'.repeat(64) }}]"""
         out = self.run_page(f"""open({plan}); await flush(); R.before = ELS.details.html;
 shellRun(cmd('item.status.done'), C.get('{plan}')); await flush(); R.after = ELS.details.html;
+R.unshown = await cmd('item.done.resolve').run(C.get('{plan}')).then(() => 'ran', e => e.message);
 R.consequence = cmd('item.done.resolve').consequence(C.get('{plan}'));
 shellRun(cmd('item.done.resolve'), C.get('{plan}')); await flush();""", answer)
+        self.assertIn("not shown", out["R"]["unshown"])
         self.assertNotIn("Done waits on", out["R"]["before"])
         after = out["R"]["after"]
         self.assertIn("Done waits on 1 open followup", after)
@@ -1748,7 +1750,7 @@ shellRun(cmd('item.done.resolve'), C.get('{plan}')); await flush();""", answer)
         self.assertIn(f"Resolves followup {note} and moves", out["R"]["consequence"])
         self.assertEqual(out["confirms"], ["item.done.resolve"])
         sent = [{k: v for k, v in p[1].items() if k != "revision"} for p in out["posts"]]
-        self.assertEqual(sent, [{"status": "done"}, {"status": "done", "resolve_followups": True}])
+        self.assertEqual(sent, [{"status": "done"}, {"status": "done", "resolve_followups": [note]}])
         self.assertIn(f"sd task status {plan} done --resolve-followups", out["toasts"][-1][0])
 
     def owned_work(self):

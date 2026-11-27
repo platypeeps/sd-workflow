@@ -324,6 +324,32 @@ def capture_followup(connection, *, followup_of=None, who, **values):
         return workflow.item_state(connection, item)
 
 
+def _done_resolving(item, values, revision):
+    """Done, resolve all (sd:10429): the close and the followups its confirm showed, by note id.
+
+    A person's followup open when the write lands that the list does not name refuses the close and
+    resolves nothing: the confirm never showed it. One the list names that is resolved already is
+    left as it is. The machine's followups go with any done, as `workflow.change_status` decides.
+    """
+    named = values["resolve_followups"]
+    if (values["status"] != "done" or not isinstance(named, list) or not named
+            or any(type(note) is not int or not 1 <= note <= 9223372036854775807 for note in named)):
+        raise ValueError("resolve_followups is the list of followup note ids the confirm showed, with done only.")
+
+    def close(connection):
+        with workflow.transaction(connection):
+            state = workflow._checked_state(connection, item, revision)
+            unseen = [note["id"] for note in state["notes"] if note["kind"] == "followup" and not note["resolved_at"]
+                      and not workflow.machine_followup(note) and note["id"] not in named]
+            if unseen:
+                raise workflow.WorkflowError(
+                    "the confirm did not show " + ", ".join(f"followup {note}" for note in unseen)
+                    + "; nothing was resolved: read the item again and confirm Done, resolve all once more")
+            return workflow.change_status(connection, item, "done", reason=values.get("reason") or None,
+                                          followups=named, who="dashboard", expected_revision=revision)
+    return close
+
+
 def _acknowledge_report(connection, item, *, expected_revision):
     """The Reports page's Acknowledge: the ingest's own followup goes with the report, a person's refuses (sd:3533, sd:4755).
 
@@ -695,12 +721,10 @@ def action_route(path, payload, *, principal, operations_backend=None, services_
     if entity == "items" and suffix == "/status":
         if set(values) - {"status", "reason", "resolve_followups"} or "status" not in values:
             raise ValueError("A status and optional reason are required.")
-        # sd:10429: Done, resolve all closes the item and every open followup, as `--resolve-followups` does.
-        resolve = values.get("resolve_followups", False)
-        if type(resolve) is not bool or (resolve and values["status"] != "done"):
-            raise ValueError("resolve_followups is true or false, and true only with done.")
+        if "resolve_followups" in values:
+            return _done_resolving(number, values, revision)
         return lambda connection: workflow.change_status(connection, number,
-            values["status"], reason=values.get("reason") or None, resolve_followups=resolve, **options)
+            values["status"], reason=values.get("reason") or None, **options)
     if entity == "items" and suffix == "/notes":
         if set(values) - {"body", "kind"} or "body" not in values:
             raise ValueError("A note body and optional kind are required.")
