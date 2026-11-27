@@ -108,7 +108,7 @@ sd-review --scope branch > "$LOG/review-<item>-rN.log" 2>&1; echo "review exit $
 2. Run the line in the foreground, or as a background command that wakes the agent on exit.
    Never wait with `Monitor` or `sleep`: `Monitor` stops at 30 minutes and leaves the agent idle.
 3. Use this name and no other, so each round stays findable in the lane log folder.
-   To wait on lane items, run `sd-ship lane watch --item <id>`: a bare watch never exits.
+   To wait on lane items or their running builds, run `sd-ship lane watch --item <id>`: a bare watch never exits.
 4. Run no `sd gate check` before the review: the lane's prepare gate is the one full run (sd:5800).
    A pre-enqueue pass is reused only while main has not moved, so it doubles gate load.
 

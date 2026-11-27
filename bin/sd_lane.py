@@ -250,6 +250,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import dataclasses
+import datetime
 import fcntl
 import functools
 import hashlib
@@ -5093,22 +5094,103 @@ def watch_pause() -> None:
     time.sleep(WATCH_PAUSE)
 
 
-def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = print) -> int:
-    """Wait until each item's newest entry that is not cancelled ends; 0 when every one merged (sd:3565).
+#: A build assignment's statuses while it builds: the watch waits on them (sd:10908).
+BUILDING = ("queued", "running", "ending")
 
-    It reads the hub alone, through `queue`, resolved once: the merge may
-    remove the worktree it started in. One line per item as it ends; an item
-    with no such entry ends at once. A read the hub did not answer is no end:
-    it reads again after the pause, and a hub that refuses this build stops it.
+
+def delivering_entry(connection: Any, repository: str, item: int) -> dict[str, Any] | None:
+    """The newest entry not cancelled that delivers `item`: its own, or a bundle's that `closes` it.
+
+    A bundle's entry is keyed by its lead; each other member rides in
+    `closes`, so `newest_entry` alone found none for it (review of sd:10908).
     """
+    order = enqueue_order(connection, repository)
+    return max((row for row in stored(connection, repository) if row.get("status") != "cancelled"
+                and str(item) in {str(row.get("item")), *(str(number) for number in row.get("closes") or ())}),
+               key=lambda row: order.get(row["id"], 0), default=None)
+
+
+def newest_build(connection: Any, item: int) -> dict[str, Any] | None:
+    """`item`'s newest build assignment, its status, result and end, or None."""
+    row = connection.execute("SELECT status, result, ended FROM assignment WHERE item = ? AND scope = 'build' "
+                             "ORDER BY id DESC LIMIT 1", (item,)).fetchone()
+    return dict(row) if row else None
+
+
+def stamp_seconds(stamp: Any) -> float | None:
+    """A UTC stamp, `Z` or `+00:00`, as epoch seconds; None for one that does not read."""
+    try:
+        moment = datetime.datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+    return (moment if moment.tzinfo else moment.replace(tzinfo=datetime.UTC)).timestamp()
+
+
+def build_ended_last(build: dict[str, Any] | None, entry: dict[str, Any] | None) -> bool:
+    """Whether `build` ended short of the lane, blocked or cancelled, after `entry` was enqueued, or with none.
+
+    A build that ended `done` enqueued the entry, and a merged `deliver`
+    entry landed the item, whatever a build did after it; an
+    `associate-only` merge is an earlier pull request, so a build that
+    blocked after it still speaks. A stamp that does not
+    read leaves the entry to speak, as before builds were read. Stamps
+    hold whole seconds, so a build that ended in the second of the
+    enqueue speaks: the watch ends, not waits (review of sd:10908).
+    """
+    if build is None or build["status"] in (*BUILDING, "done"):
+        return False
+    if entry is None:
+        return True
+    if entry.get("status") == "merged" and entry.get("claim") == "deliver":
+        return False
+    ended, enqueued = stamp_seconds(build["ended"]), stamp_seconds(entry.get("enqueued_at"))
+    return ended is not None and enqueued is not None and ended >= enqueued
+
+
+def item_end(queue: Queue, item: int, entry: dict[str, Any] | None, build: dict[str, Any] | None,
+             write: Callable[[str], Any]) -> bool | None:
+    """None while `item`'s entry or build runs; else its one line written, and whether it merged."""
     require_sd_db()
     from sd_db.repos import item_ref  # noqa: PLC0415 - sd_db is required above
+    status, ref = (entry.get("status") if entry else "none"), item_ref(item, queue.repository)
+    if build and build["status"] in BUILDING:
+        return None
+    if build is not None and build_ended_last(build, entry):  # before a pending entry: review of sd:10908
+        reason = " ".join(str(build["result"] or "no reason recorded").split())
+        write(f"{ref} build {build['status']}: {reason}")
+        return False
+    if status in ("pending", "running"):
+        return None
+    if entry is None:
+        write(f"{ref} none: no lane entry that is not cancelled")
+    elif status == "merged":
+        write(f"{ref} merged at {str(entry.get('merge_commit') or '')[:12]}")
+        if said := reap(queue, entry):  # sd:6727
+            write(f"{ref} {said}")
+    else:
+        write(f"{ref} {status}: {entry.get('reason') or entry.get('code') or 'no reason recorded'}")
+    return status == "merged"
+
+
+def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = print) -> int:
+    """Wait until each item's build and newest entry that is not cancelled end; 0 when every one merged (sd:3565).
+
+    It reads the hub alone, through `queue`, resolved once: the merge may
+    remove the worktree it started in. One line per item as it ends. An item
+    whose newest build assignment is queued or running waits on it, entry or
+    none (sd:10908); one whose build blocked or was cancelled after its
+    newest entry, pending or not, or with none, names the build's result
+    and ends the whole watch at once; one with neither ends at once. A read the hub did not answer is no end: it reads
+    again after the pause, and a hub that refuses this build stops it.
+    """
+    require_sd_db()
 
     left, merged = list(dict.fromkeys(items)), True
     while True:
         try:
             newest = on_hub(queue, lambda connection: {
-                item: newest_entry(connection, queue.repository, item, skip=("cancelled",)) for item in left},
+                item: (delivering_entry(connection, queue.repository, item),
+                       newest_build(connection, item)) for item in left},
                 write=False)
         except BuildRefused:
             raise
@@ -5117,21 +5199,15 @@ def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = pr
                 raise
             write(f"hub unavailable: {error}; reading again")
             newest = {}
-        for item, entry in newest.items():
-            status = entry.get("status") if entry else "none"
-            if status in ("pending", "running"):
-                continue
-            if entry is None:
-                write(f"{item_ref(item, queue.repository)} none: no lane entry that is not cancelled")
-            elif status == "merged":
-                write(f"{item_ref(item, queue.repository)} merged at {str(entry.get('merge_commit') or '')[:12]}")
-                if said := reap(queue, entry):  # sd:6727
-                    write(f"{item_ref(item, queue.repository)} {said}")
-            else:
-                write(f"{item_ref(item, queue.repository)} {status}: "
-                      f"{entry.get('reason') or entry.get('code') or 'no reason recorded'}")
-            left.remove(item)
-            merged = merged and status == "merged"
+        blocked = False
+        for item, (entry, build) in newest.items():
+            ended = item_end(queue, item, entry, build, write)
+            blocked = blocked or (ended is False and build_ended_last(build, entry))
+            if ended is not None:
+                left.remove(item)
+                merged = merged and ended
+        if blocked:
+            return 1  # a blocked build needs the operator now, not after the others (review of sd:10908)
         if not left:
             return 0 if merged else 1
         watch_pause()
@@ -5215,8 +5291,9 @@ def add_lane_verbs(commands: Any) -> None:
     watcher = verbs.add_parser("watch", help="print each gate end a log under the lane root records, once")
     watcher.add_argument("--once", action="store_true", help="scan once and exit")
     watcher.add_argument("--item", type=int, action="append", dest="items",
-                         help=f"instead wait until this item's newest entry that is not cancelled ends, reading "
-                              f"every {WATCH_PAUSE}s; repeat it; exit 0 only when every one merged (sd:3565)")
+                         help=f"instead wait until this item's running build and newest entry that is not "
+                              f"cancelled end, reading every {WATCH_PAUSE}s; a blocked build ends it (sd:10908); "
+                              f"repeat it; exit 0 only when every one merged (sd:3565)")
 
 
 def lane_main(args: Any) -> int:

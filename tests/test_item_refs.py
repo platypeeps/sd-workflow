@@ -180,8 +180,8 @@ class ItemRefs(unittest.TestCase):
     def test_sd_ship_lane_watch(self) -> None:
         stuck, planned = self.made["stuck"], self.made["planned"]
         queue = types.SimpleNamespace(repository="example-owner/lib")
-        ended = {stuck: {"status": "failed", "reason": "a blocking finding"},
-                 planned: {"status": "merged", "merge_commit": "c0ffee" * 7}}
+        ended = {stuck: ({"status": "failed", "reason": "a blocking finding"}, None),
+                 planned: ({"status": "merged", "merge_commit": "c0ffee" * 7}, None)}
         lines: list[str] = []
         modes: list[bool] = []
 
