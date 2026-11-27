@@ -3758,16 +3758,36 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [c])
 
-    def test_a_listed_merge_whose_revert_matches_neither_side_reads_neither(self) -> None:
-        """Review of build/sd-1654 (sd_lane.py:1018): a revert listing the merge that also changed another
-        file matches neither side's patch, so it names no side to read and every citation stays: a missed
-        undo leaves an item to close by hand, a wrong one hides a surviving fix."""
+    def test_a_listed_merge_revert_that_changes_another_file_still_undoes_its_side(self) -> None:
+        """Last round, review of build/sd-1654 (sd_lane.py:1022): the side was picked by the revert's whole
+        patch, so a revert that also changed an unrelated file matched neither side, read none, and closed
+        the item whose fix it removed. Each side commit is read by the files the revert itself changed."""
         b, c, *_ = self.open
         tree, merge = self._side_merge("topic-no-side", b, c)
         git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
         (tree / "extra.txt").write_text("extra\n", encoding="utf-8")
         git(tree, "add", "extra.txt")
         git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_listed_merge_revert_that_undoes_part_of_a_side_commit_keeps_it(self) -> None:
+        """Class pass: a revert listing the merge that put back one of a side commit's two files left the
+        other in place, so the fix partly survives and its citation stays."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-part")
+        git(tree, "switch", "-q", "-c", "topic-part-side")
+        for name in ("one.txt", "two.txt"):
+            (tree / name).write_text("side\n", encoding="utf-8")
+        git(tree, "add", "-A")
+        git(tree, "commit", "-q", "-m", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-part")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: mainline\n\nCloses: sd:{b}")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-part-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "rm", "-q", "one.txt")
+        git(tree, "commit", "-q", "-m", f"revert: drop one\n\nReverted commits:\n\n- {merge} the merge\n")
         self.body.write_text("Words.\n", encoding="utf-8")
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(sorted(entry["closes"]), sorted([b, c]))
