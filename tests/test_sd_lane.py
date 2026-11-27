@@ -6606,6 +6606,30 @@ class Watch(Lane):
             code, lines = self.watch_items(self.repo, item)
         self.assertEqual((code, lines), (1, [f"pack sd:{item} build blocked: a fix round blocked"]))
 
+    def test_watch_item_reports_a_merge_over_a_build_cancelled_after_it(self) -> None:
+        """Review of sd:10908: a build cancelled after the merge made a landed item exit 1."""
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+            self.build(item, "cancelled", "the item merged", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (0, [f"pack sd:{one} merged at merged-{one}",
+                                             f"pack sd:{two} merged at merged-{two}"]))
+
+    def test_watch_item_names_a_build_blocked_in_the_second_of_the_enqueue(self) -> None:
+        """Review of sd:10908: stamps hold whole seconds; a tie waited on the pending entry."""
+        [item] = self.register_items(1)
+        with mock.patch.object(sd_lane, "stamp_now", return_value="2030-01-01T00:00:00Z"):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+        self.build(item, "blocked", "blocked that second", "2030-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (1, [f"pack sd:{item} build blocked: blocked that second"]))
+
     def test_watch_item_reads_again_after_a_hub_fault(self) -> None:
         """A read the hub did not answer is unknown, not an end."""
         sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")

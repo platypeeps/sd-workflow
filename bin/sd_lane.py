@@ -5129,15 +5129,20 @@ def stamp_seconds(stamp: Any) -> float | None:
 def build_ended_last(build: dict[str, Any] | None, entry: dict[str, Any] | None) -> bool:
     """Whether `build` ended short of the lane, blocked or cancelled, after `entry` was enqueued, or with none.
 
-    A build that ended `done` enqueued the entry; a stamp that does not
-    read leaves the entry to speak, as before builds were read.
+    A build that ended `done` enqueued the entry, and a merged entry
+    landed the work, whatever a build did after it; a stamp that does not
+    read leaves the entry to speak, as before builds were read. Stamps
+    hold whole seconds, so a build that ended in the second of the
+    enqueue speaks: the watch ends, not waits (review of sd:10908).
     """
     if build is None or build["status"] in (*BUILDING, "done"):
         return False
     if entry is None:
         return True
+    if entry.get("status") == "merged":
+        return False
     ended, enqueued = stamp_seconds(build["ended"]), stamp_seconds(entry.get("enqueued_at"))
-    return ended is not None and enqueued is not None and ended > enqueued
+    return ended is not None and enqueued is not None and ended >= enqueued
 
 
 def item_end(queue: Queue, item: int, entry: dict[str, Any] | None, build: dict[str, Any] | None,
