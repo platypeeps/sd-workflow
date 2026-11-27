@@ -372,7 +372,7 @@ class DispositionTests(unittest.TestCase):
             stream.write("example-ignored.txt\n")
         ignored = self.root / "example-ignored.txt"
         ignored.write_text("operator data")
-        tracked = fixture._git(self.root, "ls-files").split()[0]
+        tracked = fixture._git(self.root, "ls-files", "--deduplicate").split()[0]
         before = (self.root / tracked).read_bytes()
         script = ("import os, subprocess; open('example-ignored.txt', 'w').write('clobbered'); "
                   f"open({tracked!r}, 'w').write('clobbered'); subprocess.run(['git', 'checkout', '--', '.']); "
