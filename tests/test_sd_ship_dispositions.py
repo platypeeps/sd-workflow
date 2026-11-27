@@ -300,6 +300,15 @@ class DispositionTests(unittest.TestCase):
                   "    def test_x(self): pass\nunittest.main(argv=['t'])")
         self.rejected_proposal(self.with_test([sys.executable, "-c", script]))
 
+    def test_a_test_runs_with_the_gates_jev_guard(self):
+        """sd:10893 class pass: a rebuttal test gets the guards the gate's rerun gives its shards
+        (`runner_guards`), so no rebuttal test sends a live, metered Jev call (sd:2136)."""
+        root = self.root.resolve()
+        head = fixture._git(root, "rev-parse", "HEAD")
+        script = "import os, sys; sys.exit(os.environ.get('JEV_ENABLED') != '0')"
+        with patch.dict("os.environ", {"JEV_ENABLED": "1"}):
+            sd_ship_dispositions.reproduces(root, head, 1, [sys.executable, "-c", script])
+
     def test_a_test_reaches_no_code_in_the_live_checkout(self):
         """sd:10893 class pass: the test runs the head's code alone. An environment entry or an argv path
         naming the live checkout would load its uncommitted files and clear the finding against them."""

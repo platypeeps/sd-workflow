@@ -237,6 +237,7 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
     import sd_gate_cache  # noqa: PLC0415
     import sd_gate_run  # noqa: PLC0415
     import sd_lib  # noqa: PLC0415
+    import sd_ship_review  # noqa: PLC0415 -- it imports this module
 
     if any(names_root(root, arg) for arg in argv):
         raise Refusal(f"finding {index}: its test names a path in the live checkout; name it relative "
@@ -248,7 +249,8 @@ def reproduces(root: pathlib.Path, head: str, index: int, argv: list[str]) -> No
         except sd_gate_run.GateError as error:
             raise Refusal(f"finding {index}: no worktree of {head[:12]} for its test: {error}") from None
         try:
-            done = sd_lib.run_group(argv, cwd=tree, env=rebuttal_environment(root), timeout=TEST_TIMEOUT_SECONDS)
+            env = {**rebuttal_environment(root), **sd_ship_review.runner_guards(tree)}  # Jev off, as the gate's rerun
+            done = sd_lib.run_group(argv, cwd=tree, env=env, timeout=TEST_TIMEOUT_SECONDS)
         except sd_lib.GroupTimeout:
             raise Refusal(f"finding {index}: its test did not finish in {TEST_TIMEOUT_SECONDS} s; "
                           "a blocker stays open until its test passes") from None
