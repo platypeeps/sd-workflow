@@ -144,9 +144,10 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
         spanned = bool(ticks)  # in an open code span the `plain` rules rest
         rest, lazy = _continues(line, items, _runs_on(loose, commented, inline_at), plain, spanned,
                                 inline_at is not None)
-        if unclosed := _unclosed(inline_at, line, rest, (loose, len(items) < comment_depth), lazy):
+        if unclosed := _unclosed(inline_at, line, rest, loose, lazy):
             return rows, unclosed  # its paragraph ended before its `-->`: its `<!--` is text
-        commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
+        # A comment ends with the list item that holds it; an inline one closes on the line that ended it.
+        commented = commented and (inline_at is not None or len(items) >= comment_depth)
         _settle(rows, pending, None, ended=not commented)  # it ended with its list item, and no `-->`
         if fence and len(items) >= fence_depth:
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
@@ -170,7 +171,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
             if ticks and alone:
                 return rows, span_at  # a heading is one line: a span it opens ends with it
             inline_at = _inline_at(number, line, text, lazy, cut, (was, commented, paragraphs), inline_at)
-            text, shown, joins = _cut(line, text, lazy, cut, was, rows, pending)
+            text, shown, joins = _cut(line, text, lazy, cut, was, rows, pending, len(items))
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
         rows.append((number, kind, opened, len(items), text, line, spanned, shown))
@@ -199,11 +200,12 @@ def _inline_at(number: int, line: str, text: str, lazy: bool, cut: list[tuple[in
     return (number, cut[-1][0]) if cut[-1][0] > lead else None
 
 
-def _unclosed(inline_at: tuple[int, int] | None, line: str, rest: str, ended: tuple[bool, bool],
+def _unclosed(inline_at: tuple[int, int] | None, line: str, rest: str, ended: bool,
               lazy: bool) -> tuple[int, int] | None:
     """`inline_at` when `line` ends the paragraph its inline comment sits in before any `-->`. `ended`
-    says the row above stood alone, a heading, or the list item that held the comment ended."""
-    return inline_at if inline_at and _ends_comment_paragraph(line, rest, any(ended), lazy) else None
+    says the row above stood alone, a heading. A list item that ends on `line` ends it by a block that
+    interrupts a paragraph, or leaves the comment to close: a heading after its `-->` (`_continues`)."""
+    return inline_at if inline_at and _ends_comment_paragraph(line, rest, ended, lazy) else None
 
 
 def _ends_comment_paragraph(line: str, rest: str, ended: bool, lazy: bool) -> bool:
@@ -239,7 +241,7 @@ def _runs(line: str, cut: list[tuple[int, int]], was: bool = False) -> list[tupl
 
 
 def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool, rows: list,
-         pending: list[tuple[int, bool, str]]) -> tuple[str, str, int | None]:
+         pending: list[tuple[int, bool, str]], depth: int = 0) -> tuple[str, str, int | None]:
     """`text` and the whole `line` with the comments `cut` names read (`_less`). A comment open from an
     earlier line (`was`) that closes here settles the `_OPEN` waiting on it; one open past this line's
     end leaves its own, for the row `_blocks_once` appends next."""
@@ -247,15 +249,28 @@ def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool
     if was and runs and runs[0][0] == 0 and not runs[0][2]:
         # A comment that opened after a row's text keeps one paragraph line: what follows its `-->` is
         # read on that row (`_join`), so a qualifier after the close stays on the heading it qualifies.
-        opener = pending[0][0] if pending else None
-        if opener is not None and rows[opener][4].replace(_OPEN, "").strip() and line[runs[0][1]:].strip():
-            joins = opener
+        joins = _joins(rows, pending, line[runs[0][1]:], depth)
         _settle(rows, pending, line[runs[0][1]:runs[0][1] + 1])
     if runs and runs[-1][2]:  # only the last run on a line can be open past its end
         first = runs[-1][0]
         pending.append((len(rows), first > 0 and bool(re.match(r"\w", line[first - 1])), line[first:]))
     lead = len(line) - len(line.lstrip() if lazy else text.lstrip())  # where the line's own text starts
     return _less(line, text, lazy, runs), _less(line, line, False, runs, lead), joins
+
+
+def _joins(rows: list, pending: list[tuple[int, bool, str]], tail: str, depth: int) -> int | None:
+    """The row what follows a comment's `-->`, `tail`, is read on: the row the comment opened on, when
+    that row has text before the comment and `tail` has any. None when `tail` stands on its own line:
+    the list item the comment opened in ended on this line (`depth` differs), or `tail` is a heading
+    and that row an item that opens with a sha, where the sha read takes the row and the heading
+    would head nothing (pack sd:10090)."""
+    opener = pending[0][0] if pending else None
+    if opener is None or not tail.strip() or not rows[opener][4].replace(_OPEN, "").strip():
+        return None
+    _, _, opened, at, text, *_ = rows[opener]
+    if at != depth or (opened and _heading(tail).endswith(":") and _SHA_LED.match(text.strip())):
+        return None
+    return opener
 
 
 def _join(rows: list, at: int | None, pending: list[tuple[int, bool, str]]) -> None:
@@ -337,8 +352,11 @@ def _continues(line: str, items: list[int], paragraph: bool, plain: bool, spanne
     """
     ended = items.copy()
     rest = _item_text(line, ended, opens=False)
-    starts = _interrupts(rest) or (not inline and bool(
-        _ITEM_MARKER.match(rest) or (plain and not spanned and _heading(rest).endswith(":"))))
+    if inline:  # what follows the comment's `-->` on this line is outside it: a `plain` heading there heads
+        starts = _interrupts(rest) or (plain and _heading(rest.partition("-->")[2]).endswith(":"))
+    else:
+        starts = _interrupts(rest) or bool(
+            _ITEM_MARKER.match(rest) or (plain and not spanned and _heading(rest).endswith(":")))
     if paragraph and len(ended) < len(items) and not starts:
         return line.strip(), True
     items[:] = ended

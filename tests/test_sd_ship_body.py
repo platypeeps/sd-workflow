@@ -1030,6 +1030,38 @@ class CitedIdTests(unittest.TestCase):
                    (b + "0" * 33, "fix: two\n\nCloses: sd:3\n")]
         self.assertEqual(sd_ship_body.cited_ids("", commits), (2, 3))
 
+    def test_a_heading_after_a_comment_closes_is_not_joined_into_a_sha_item(self) -> None:
+        """Review of build/sd-1653 (pack sd:10090). A comment that opens in a sha item and closes on a
+        later line before a heading, `--> Kept:`: the join moved `Kept:` onto the sha's row, where the
+        sha read took the row and the heading was lost, so the retained commit under it lost its
+        `Closes:`. A heading after the close heads on its own, as the same line does with no comment:
+        indented less than the item it ends it, and inside the item it heads what nests there."""
+        a, c = "a" * 7, "c" * 7
+        for comment in ("<!--\n{i}2. example\n{i}-->", "<!-- x\n{i}-->", "<!--\n{i}text\n{i}more -->"):
+            for indent, nest in (("", ""), ("  ", "  ")):
+                for first, then in (("Reverted commits:", "Kept:"), ("Kept:", "Reverted commits:")):
+                    gone = f"{first}\n- {a} undo\n{indent}{then}\n{nest}- {c} retained\n"
+                    message = (f"{first}\n- {a} undo {comment.format(i=indent)} {then}\n"
+                               f"{nest}- {c} retained\n")
+                    with self.subTest(message=message):
+                        self.assertEqual(sd_ship_body._listed_undone(message),
+                                         sd_ship_body._listed_undone(gone))
+        listed = {
+            # The review's case.
+            f"Reverted commits:\n- {a} undo <!--\n2. example\n--> Kept:\n- {c} retained\n": [a],
+            # An item that opens with no sha: a line indented less than it ends it, as with no comment.
+            f"Kept:\n- note <!-- x\n--> Reverted commits:\n- {a} undo\n": [a],
+            # What follows the close is no heading: one line with the sha's, as before.
+            f"Reverted commits:\n- {a} undo <!-- x\n--> and more\n- {c} undo\n": [a, c],
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+        revert = f"revert: undo\n\nReverted commits:\n- {a} undo <!--\n2. example\n--> Kept:\n- {c} retained\n"
+        commits = [("d" * 40, revert), (a + "0" * 33, "fix: one\n\nCloses: sd:2\n"),
+                   (c + "0" * 33, "fix: two\n\nCloses: sd:3\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (3,))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")
