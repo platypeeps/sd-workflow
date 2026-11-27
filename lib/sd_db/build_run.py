@@ -227,7 +227,8 @@ Your final message is your report: the commits, the tests run with their result 
 ADJUDICATE = """A finding that rejects a review finding adds no commit; record its disposition instead, at the
 reviewed head: `sd-ship -C {worktree} adjudicate --item {item} --expected-head <HEAD> --json` prints the
 template; set each rejected row's `response_disposition` to `rebutted` and `reason` to the ruling's reason,
-then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
+and its `test` to the argv of a test for it that runs and passes at that head, one committed there or an inline
+`python3 -c` script: a failing one reproduces the finding, so fix it instead (sd:10893). Then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
 """
 
 # sd:10903: round 1 is a class pass too: single-finding fixes drew the same class again the next round.
@@ -2782,6 +2783,12 @@ class Supervisor:
         except (OSError, ValueError):
             answer = None
         if not isinstance(answer, dict) or answer.get("ok") is not True:
+            # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
+            # that file queued or ended at this head; the shared queue says whether that entry is this head, read
+            # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
+            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
+            if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
+                return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"
             return self.finish("blocked", f"sd-ship lane enqueue refused: {reason}; see {out}")
         return self.lane_done(answer, delivered)
