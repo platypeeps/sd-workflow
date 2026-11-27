@@ -926,6 +926,29 @@ def queues(connection: sqlite3.Connection, now: str) -> dict:
         return {"rows": [], "suggested": [], "error": str(failure) or "the queues could not be read"}
 
 
+#: sd:10915: an advisory item is a `task-ref` item whose ref starts with one of these, the weekly sweep's or a hand-filed one.
+ADVISORY_REFS = ("advisory-sweep:", "advisory:")
+#: The setting row that keeps the Queue view's Advisories toggle: `on` shows them; unset hides them (the operator's pick).
+ADVISORY_KEY = "dashboard.queue_advisories"
+ADVISORY_TEXT = ("Whether Today's Queue view lists advisory items, those whose ref starts advisory-sweep: or advisory: "
+                 "(sd:10915): on shows them; unset hides them. The view's Advisories toggle edits it too.")
+
+
+def advisories(connection: sqlite3.Connection) -> dict:
+    """The Queue view's advisory filter (sd:10915): `ids`, the open advisory items; `row`, the setting row the toggle
+    posts back as `before`; `show`, whether they show. A read that failed is `error`, and the page hides nothing."""
+    from sd_db import writes
+
+    try:
+        row = writes.read_settings(connection, [ADVISORY_KEY]).get(ADVISORY_KEY)
+        ids = sorted(found["id"] for ref in ADVISORY_REFS for found in reads.ref_items(connection, ref)
+                     if found["status"] != "done")
+    except (SdDbError, sqlite3.Error) as failure:
+        return {"key": ADVISORY_KEY, "ids": [], "row": None, "show": True,
+                "error": str(failure) or "the advisory items could not be read"}
+    return {"key": ADVISORY_KEY, "ids": ids, "row": row, "show": row == "on", "error": ""}
+
+
 def builders(connection: sqlite3.Connection, now: str) -> dict:
     """The builder runs a live row's and a run's Details read (sd:6003): each open headless build run
     (`sd_db.build`), oldest first, with its items,
@@ -1029,6 +1052,7 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
     default, and a lane read that failed is a dark `lane` row, as a dark collector is.
     `spend` is the spend line (sd:6031, `spend`): the last 24 hours and the 7-day trend from the cost table.
     `queues` is the Queues panel (pack sd:6946, `queues`): ready items, build queue and merge lane in one list.
+    `advisories` is the Queue view's advisory filter (sd:10915, `advisories`): the open advisory items and its row.
     `builders` is the builder runs Details read (sd:6003, `builders`): each open build run's items, stage, start and ETA.
     `digest` is Since yesterday (sd:6002, `digest`): merged per repo, failed with why and fix, questions waiting.
     The flaky heads (pack sd:7663, `flaky_rows`) are look rows in `needs`, a group of two or more; a lane read that failed,
@@ -1113,7 +1137,7 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
             "digest": digest(connection, now, rows=rows, lanes=queue.get("lanes") or [],
                              unread=digest_unread(sources, queue)),
             "spend": spend(connection, now),
-            "builders": builders(connection, now), "queues": queues(connection, now),
+            "builders": builders(connection, now), "queues": queues(connection, now), "advisories": advisories(connection),
             "attention": _attention(listed), **mail, **reported}
 
 

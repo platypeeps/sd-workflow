@@ -1320,6 +1320,7 @@ class Usage:
     spent: float
     held: float
     unbilled: float | None = None
+    areas: tuple[dict, ...] = ()
 
     def document(self) -> dict:
         """The plain shape both faces serialise; the JSON is the same bytes."""
@@ -1328,8 +1329,17 @@ class Usage:
             "bills": [asdict(bill) for bill in self.bills],
             "roles": list(self.roles), "bound": list(self.bound),
             "meter": list(self.meter), "spent": self.spent, "held": self.held,
-            "unbilled": self.unbilled,
+            "unbilled": self.unbilled, "areas": list(self.areas),
         }
+
+
+# The area a cost row is spent in (sd:10307), from its role and its
+# assignment's scope: a specification draft is an author run on a `draft`
+# assignment and is design, not coding. A row on no assignment keeps its
+# role's area.
+_AREA = ("CASE WHEN cost.role = 'reviewer' THEN 'review' "
+         "WHEN cost.role = 'author' AND assignment.scope = 'draft' THEN 'design' "
+         "WHEN cost.role = 'author' THEN 'coding' ELSE 'other' END")
 
 
 def month_of(month: str | None = None, *, now: str | None = None) -> str:
@@ -1453,9 +1463,25 @@ def _usage_reads(
         "AND window_minutes IS latest.window_minutes AND substr(timestamp, 1, 7) = ? "
         "ORDER BY timestamp DESC, id DESC LIMIT 1) ORDER BY provider, window_minutes",
         (month, month)).fetchall()
+    # Summed in SQL per bill, provider and role, as `roles` is, then folded
+    # here: one SQLite SUM across providers can pass 64-bit range and raise
+    # `integer overflow`, which took the whole report down (sd:10307 review).
+    areas: dict[str, dict] = {}
+    for row in connection.execute(
+        f"SELECT {_AREA} AS area, COUNT(*) AS calls, "
+        "COALESCE(SUM(CASE WHEN source IN ('run', 'bound') THEN usd END), 0.0) AS spent, "
+        "COALESCE(SUM(CASE WHEN source IN ('reserved', 'sending') THEN usd END), 0.0) AS held, "
+        "COALESCE(SUM(tokens_in), 0) AS tokens_in, COALESCE(SUM(tokens_out), 0) AS tokens_out "
+        "FROM cost LEFT JOIN assignment ON assignment.id = cost.assignment "
+        "WHERE source != 'meter' AND (source IN ('reserved', 'sending') "
+        "OR substr(cost.timestamp, 1, 7) = ?) GROUP BY area, cost.bill, cost.provider, cost.role",
+            (month,)):
+        total = areas.setdefault(row["area"], dict.fromkeys(("calls", "spent", "held", "tokens_in", "tokens_out"), 0))
+        for key in total:
+            total[key] += row[key]
     return Usage(
         month=month, days=days, today=today, bills=tuple(bills),
-        roles=tuple(dict(row) for row in roles), bound=tuple(dict(row) for row in bound),
+        roles=tuple(dict(row) for row in roles), areas=tuple({"area": name, **areas[name]} for name in sorted(areas)), bound=tuple(dict(row) for row in bound),
         meter=tuple(dict(row) for row in meter),
         spent=round(sum(bill.spent for bill in bills) + (unbilled or 0.0), 6),
         held=round(sum(bill.held for bill in bills), 6), unbilled=unbilled,
@@ -1705,10 +1731,24 @@ __all__ += ["build_runs", "item_lane_entries", "lane_delivered", "lane_entries",
 
 
 def ref_items(connection: sqlite3.Connection, prefix: str) -> list[sqlite3.Row]:
-    """The `external_id` and `status` of each `task-ref` item whose ref starts with `prefix` (sd:9505, the sweep)."""
+    """The `id`, `external_id` and `status` of each `task-ref` item whose ref starts with `prefix` (sd:9505, the
+    sweep; sd:10915, the Queue view's advisory filter)."""
     return connection.execute(
-        "SELECT external_id, status FROM item WHERE source IS 'task-ref' AND substr(external_id, 1, ?) IS ?"
+        "SELECT id, external_id, status FROM item WHERE source IS 'task-ref' AND substr(external_id, 1, ?) IS ?"
         " ORDER BY id", (len(prefix), prefix)).fetchall()
 
 
 __all__ += ["ref_items"]
+
+
+def review_generation(connection: sqlite3.Connection) -> int:
+    """The newest `ship:` or `ship-adjudication:` checkpoint's id, 0 for none: a review saved, run again or
+    adjudicated moves it, so a reader that kept a review's answer knows to read it again (sd:10814).
+    Not in `ship`: `adjudicator_binding` hashes that file, so a read there voids adjudications."""
+    row = connection.execute("SELECT max(id) FROM state WHERE kind = 'checkpoint' AND (key >= 'ship:' "
+                             "AND key < 'ship;' OR key >= 'ship-adjudication:' "
+                             "AND key < 'ship-adjudication;')").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+__all__ += ["review_generation"]

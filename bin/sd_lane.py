@@ -74,7 +74,9 @@ repository has no lane. The lane folder, `<lane root>/<repository>/lane/`,
 keeps this machine's logs and runner lock, and under `review/` each review
 `sd-ship prepare` finished but the hub has not yet recorded (sd:3340). The lane root is `SD_LANE_ROOT`,
 else `sd.lane_root`, else `$XDG_STATE_HOME/sd/lanes`. A `queue/queue.json` an
-earlier version left there is imported once (`import_file_queue`).
+earlier version left there is imported once (`import_file_queue`), by the
+runner or a verb that writes the queue; `lane list` leaves it in place, so a
+view changes no ref, file or row (sd:10420).
 
 Another host runs an entry only from a commit on `origin`, so enqueue,
 retry and the import of a pending entry publish its head first, by
@@ -250,6 +252,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import dataclasses
+import datetime
 import fcntl
 import functools
 import hashlib
@@ -855,7 +858,20 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         on_hub(queue, lambda connection: refuse_teammate(connection, entry))  # the whole set
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
-    return add_entry(queue, entry)
+    return add_entry(queue, entry, (lambda entries: refuse_ran(entries, item, head)) if expected_head else None)
+
+
+def refuse_ran(entries: list[dict[str, Any]], item: int, head: str) -> None:
+    """Refuse an `--expected-head` enqueue of a head an imported entry ended (sd:10420): the lane ran that
+    delivery under an earlier version. Read in the enqueue's own transaction, so an import by the runner at any
+    point before the write counts; a caller's earlier `lane list` cannot (a build's recovery). An entry the
+    import itself failed, `no_body` or `no_branch`, never ran: its reason says to enqueue it again."""
+    for row in entries:
+        if (row.get("item") == item and row.get("expected_head") == head and row.get("imported_from")
+                and row.get("status") not in ("pending", "cancelled")
+                and row.get("code") not in ("no_body", "no_branch")):
+            raise LaneError(f"sd:{item} at {head} already ran in this lane: an earlier version's queue ended it "
+                            f"{row.get('status')}; `sd-ship lane retry {item}` runs it again")
 
 
 def refuse_teammate(connection: Any, entry: dict[str, Any]) -> None:
@@ -1898,6 +1914,70 @@ def import_file_queue(root: pathlib.Path, queue: Queue, *, runner_locked: bool =
     if bodies.is_dir() and any(bodies.iterdir()):
         drop_imported_bodies(queue)
     return report
+
+
+def legacy_pending(path: pathlib.Path, present: set[str]) -> list[int] | str | None:
+    """The items an earlier version's queue file holds pending that its import has still to write, read with no
+    lock and no write (sd:10420): an entry whose import id is in `present`, the shared queue's ids, is written
+    already, as the import itself skips it. Or why the file cannot be read, which the import also stops on;
+    None with no file. A reader shows or refuses on this; only the import says what a file entry becomes."""
+    unwritten = legacy_unwritten(path, present)
+    if not isinstance(unwritten, list):
+        return unwritten
+    return [entry["item"] for entry in unwritten if entry.get("status") == "pending"]
+
+
+def legacy_unwritten(path: pathlib.Path, present: set[str]) -> list[dict[str, Any]] | str | None:
+    """The file's entries with an integer item that its import has still to write (`legacy_pending`)."""
+    try:
+        old = json.loads(path.read_text(encoding="utf-8")).get("entries")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, AttributeError) as error:
+        return f"cannot read {path}: {error}"
+    if not isinstance(old, list):
+        return f"{path} holds no entry list"
+    host = this_host()
+    return [entry for entry in old if isinstance(entry, dict)
+            and isinstance(entry.get("item"), int) and not isinstance(entry.get("item"), bool)
+            and import_id(host, path, entry) not in present]
+
+
+def legacy_ran(queue: Queue, path: pathlib.Path, item: int, head: str | None) -> str | None:
+    """The status an earlier version's queue file ended `item` at `head` with, its import not written yet; None
+    when it holds no such entry. An enqueue of that head would run a delivery the lane already ran (sd:10420)."""
+    if not head:
+        return None
+    unwritten = legacy_unwritten(path, {str(row.get("id")) for row in read_queue(queue)})
+    if not isinstance(unwritten, list):  # no file, or one the import stops on: it writes nothing
+        return None
+    ended = [str(entry.get("status")) for entry in unwritten
+             if entry["item"] == item and entry.get("expected_head") == head
+             and entry.get("status") not in ("pending", "cancelled")]
+    return ended[-1] if ended else None
+
+
+def legacy_waiting(path: pathlib.Path, present: set[str]) -> str | None:
+    """What `lane list` and the Queue page say of an earlier version's queue file not imported yet; None when
+    there is no file. It names what waits and stands in for no entry: a caller acts on the shared queue alone."""
+    pending = legacy_pending(path, present)
+    if pending is None:
+        return None
+    if isinstance(pending, str):
+        return f"an earlier version's queue file is not imported: {pending}"
+    items = ", ".join(f"sd:{item}" for item in pending) or "no pending entry"
+    return f"an earlier version's queue file, {path}, waits for the next `lane run` to import it: {items}"
+
+
+def file_holds(queue: Queue, path: pathlib.Path, item: int) -> bool:
+    """Whether a writer on `item` would miss a file entry: the file holds it pending, its import has not written
+    it, and the shared queue has no pending or running entry for it, which the import would cancel as a
+    duplicate. An unreadable file holds nothing a runner can claim, so it blocks no writer (sd:10420)."""
+    rows = read_queue(queue)
+    pending = legacy_pending(path, {str(row.get("id")) for row in rows})
+    if not isinstance(pending, list) or item not in pending:
+        return False
+    return not any(row.get("item") == item and row.get("status") in ("pending", "running") for row in rows)
 
 
 def import_locked(root: pathlib.Path, queue: Queue, path: pathlib.Path) -> dict[str, Any]:
@@ -3070,21 +3150,23 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
     """
     token, landed = secrets.token_hex(16), [row for row in answer.get("ran", []) if row.get("status") == "merged"]
     try:
-        taken = update(queue, lambda entries: take_owed(entries, token))
+        taken, unsettled = update(queue, lambda entries: (take_owed(entries, token), owes_settle(entries)))
     except LaneError as error:  # unknown: a claim may have landed, which the next run takes once this pid is gone
         if not landed:
             return answer
         return {**answer, "post_merge": (f"make post-merge not run: the owed entries could not be claimed ({error}); "
                                          "the next run runs it")[:1200]}
+    main = sd_lib.main_worktree_root(root).resolve()
     if not taken:
-        return answer
+        # A pass whose settle did not land, or a run that died before it: settled now, the target not run again.
+        settled = settle_post_merge(queue, main, None) if unsettled else None
+        return {**answer, "post_merge": settled} if settled else answer
     # This run's last landing, else the newest owed entry's, says whether a branch checkout moved.
     last = (landed or sorted(taken, key=lambda row: str(row.get("finished_at") or "")))[-1]
-    main = sd_lib.main_worktree_root(root).resolve()
-    ran = make_post_merge(main, environ, str(last.get("fast_forward") or ""))
+    ran, passed_at = run_post_merge(main, environ, str(last.get("fast_forward") or ""))
     retry = (ran or "").startswith(NOT_STARTED)
     try:
-        update(queue, lambda entries: record_post_merge(entries, token, ran, retry))
+        update(queue, lambda entries: record_post_merge(entries, token, ran, retry, passed_at))
     except LaneError as error:
         if ran is not None:
             ran = (f"{ran}; its result could not be recorded ({error}), so a later run may run the target "
@@ -3093,7 +3175,118 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
         return answer
     # Its first try noted a target that did not start; a retry notes only a run.
     noted = [row for row in taken if not retry or row["item"] in {merged.get("item") for merged in landed}]
-    return {**answer, "post_merge": note_post_merge(noted, ran, main)}
+    ran = note_post_merge(noted, ran, main)
+    return {**answer, "post_merge": settle_post_merge(queue, main, ran) or ran}
+
+
+def head_commit(main: pathlib.Path) -> str | None:
+    """The whole commit id `main` has checked out, or None when git cannot say."""
+    done = publish_git(main, "rev-parse", "--verify", "HEAD")
+    head = done.stdout.strip() if done is not None and done.returncode == 0 else ""
+    return head if FULL_COMMIT.fullmatch(head) else None
+
+
+def run_post_merge(main: pathlib.Path, environ: dict[str, str], moved: str) -> tuple[str | None, str | None]:
+    """`(ran, commit)`: what `make_post_merge` answered, and the commit a pass ran at, else None.
+
+    That commit is recorded with the result, and the followups the pass answers are settled against
+    it, by this run or, if that write is lost, by the next (sd:10407). HEAD is read before the
+    target: one git cannot read does not start it, so a pass always has a commit, and no rerun is
+    owed that could fail and drop what the pass answered (sd:10529). After a pass, HEAD again,
+    or the start when git cannot say: the target moves `main` only forward."""
+    start = head_commit(main)
+    if start is None:
+        return f"{NOT_STARTED[1]} in {main}: its commit could not be read", None
+    ran = make_post_merge(main, environ, moved)
+    if ran is None or not ran.startswith(POST_MERGE_PASSED):
+        return ran, None
+    return ran, head_commit(main) or start
+
+
+#: A whole commit id, as a settle mark and a followup's stamp hold it.
+FULL_COMMIT = re.compile(r"[0-9a-f]{40,64}")
+
+
+def unsettled(row: dict[str, Any]) -> str | None:
+    """The commit a recorded pass on `row` ran at whose followups are not settled yet, or None.
+
+    Stored data: a mark that is no whole commit id settles nothing and is left alone."""
+    mark = row.get("post_merge")
+    if not isinstance(mark, dict) or not isinstance(mark.get("settle"), str):
+        return None
+    return mark["settle"] if FULL_COMMIT.fullmatch(mark["settle"]) else None
+
+
+def owes_settle(entries: list[dict[str, Any]]) -> bool:
+    return any(unsettled(row) for row in entries)
+
+
+def settle_post_merge(queue: Queue, main: pathlib.Path, ran: str | None) -> str | None:
+    """`ran`, after each recorded pass resolved the open `Post-merge:` followups it covers (sd:10407).
+
+    Each entry a pass settled carries the commit it ran at (`unsettled`). Three steps: a read
+    of the marks and the followups they owe, git with no hub lock held (sd:10529 review: a slow
+    git under `BEGIN IMMEDIATE` held every hub writer), then one hub transaction that resolves
+    the followups whose merge that commit holds and clears each mark still as it was read. A
+    mark set meanwhile is a newer pass, left for its own settle; a followup filed meanwhile is
+    not one git answered, so it stays open and its pass keeps its mark: the next run asks git
+    and settles it. A failed write leaves the marks for the next run,
+    which settles without running the target again. A pass at an older pin answers no newer
+    failure. A git that cannot answer is unknown, not a no: nothing resolves and no mark is
+    cleared on a guess. None when there was nothing to say; the merge stands either way.
+    """
+    def pass_holds(commit: str, head: str) -> bool:
+        # No such object here is a known no: it is in no commit's history. Any other git failure is
+        # unknown, and `read_git` raises it, so nothing resolves and the marks stay (sd:10407).
+        if read_git(main, "cat-file", "-e", commit, ok=(0, 1)).returncode:
+            return False
+        return read_git(main, "merge-base", "--is-ancestor", commit, head, ok=(0, 1)).returncode == 0
+
+    def heads_of(connection: Any) -> dict[str, list[int]]:
+        heads: dict[str, list[int]] = {}
+        for row in stored(connection, queue.repository):
+            if head := unsettled(row):
+                heads.setdefault(head, []).append(row["item"])
+        return heads
+
+    def read_owed(connection: Any) -> tuple[dict[Any, str], dict[str, list[int]], dict[str, set[str]]]:
+        sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+        from sd_db import workflow  # noqa: PLC0415
+        marks = {row["id"]: head for row in stored(connection, queue.repository) if (head := unsettled(row))}
+        heads = heads_of(connection)
+        return marks, heads, {head: {commit for _, commit in workflow.post_merge_owed(connection, items)}
+                              for head, items in heads.items()}
+
+    def resolve_covered(connection: Any, marks: dict[Any, str], heads: dict[str, list[int]],
+                        held: dict[tuple[str, str], bool]) -> list[int]:
+        sd_lib.import_sd_db()
+        from sd_db import workflow  # noqa: PLC0415
+        resolved: list[int] = []
+        unchecked = set()  # a followup filed while git ran has no answer: its pass keeps its mark for the next run
+        for head, items in sorted(heads.items()):  # the passes as read: a mark set meanwhile awaits its own
+            if any((commit, head) not in held for _, commit in workflow.post_merge_owed(connection, items)):
+                unchecked.add(head)
+            resolved += workflow.resolve_post_merge(connection, items,
+                                                    lambda commit, head=head: held.get((commit, head), False))
+        for row in stored(connection, queue.repository):
+            if row["id"] in marks and unsettled(row) == marks[row["id"]] and marks[row["id"]] not in unchecked:
+                row["post_merge"] = {key: value for key, value in row["post_merge"].items() if key != "settle"}
+                store(connection, queue.repository, row)
+        return resolved
+
+    try:
+        marks, heads, owed = on_hub(queue, read_owed, write=False)
+        if not marks:
+            return ran
+        held = {(commit, head): pass_holds(commit, head) for head, commits in owed.items() for commit in sorted(commits)}
+        resolved = on_hub(queue, lambda connection: resolve_covered(connection, marks, heads, held))
+    except LaneError as error:
+        said = f"earlier post-merge followups stay open: {error}"
+    else:
+        if not resolved:
+            return ran
+        said = f"resolved earlier post-merge followups {', '.join(f'#{note}' for note in resolved)}"
+    return (f"{ran}; {said}" if ran else said)[:1200]
 
 
 def release_chain(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer: dict[str, Any]) -> dict[str, Any]:
@@ -3222,12 +3415,30 @@ def release_ruling(queue: Queue, item: int, main: pathlib.Path) -> Callable[[str
     return ruling
 
 
+#: How `make_post_merge` answers a target that passed.
+POST_MERGE_PASSED = "make post-merge passed"
+
+
+def post_merge_stamp(row: dict[str, Any]) -> str:
+    """The followup's last line naming the merge it reports, which `sd_db.workflow.stamped_merge` reads.
+
+    Only a pass that holds that commit answers it (sd:10407). A row without a full commit says so:
+    its merge is unknown, so no pass resolves it, and the last line stays the lane's own, never the
+    tail of the target's output."""
+    merged = row.get("merge_commit")
+    if isinstance(merged, str) and FULL_COMMIT.fullmatch(merged):
+        return f"\nMerged at {merged}"
+    return "\nMerge commit not recorded: no pass resolves this, resolve it by hand"
+
+
 def note_post_merge(rows: list[dict[str, Any]], ran: str, main: pathlib.Path) -> str:
-    """Note each row's item with `ran`, a comment when the target passed, else a followup; `ran` with any failure."""
-    kind = "comment" if ran.startswith("make post-merge passed") else "followup"
+    """Note each row's item with `ran`, a comment when the target passed, else a followup naming its merge;
+    `ran` with any failure."""
+    kind = "comment" if ran.startswith(POST_MERGE_PASSED) else "followup"
     for row in rows:
         try:
-            written = default_note(row["item"], f"Post-merge: {ran}", main, kind)
+            stamp = post_merge_stamp(row) if kind == "followup" else ""
+            written = default_note(row["item"], f"Post-merge: {ran}{stamp}", main, kind)
         except Exception as error:  # noqa: BLE001 -- the merge stands; the answer keeps what the note could not
             written = f"failed: {type(error).__name__}: {error}"
         if written != "written":
@@ -3256,15 +3467,18 @@ def take_owed(entries: list[dict[str, Any]], token: str) -> list[dict[str, Any]]
     return taken
 
 
-def record_post_merge(entries: list[dict[str, Any]], token: str, ran: str | None, retry: bool) -> None:
+def record_post_merge(entries: list[dict[str, Any]], token: str, ran: str | None, retry: bool,
+                      passed_at: str | None = None) -> None:
     """Settle each target `token` claimed with what `make_post_merge` answered; None is a Makefile without the rule.
 
     A target that did not start (`retry`) is owed again: an unread Makefile is unknown, not "ran".
+    A pass records `passed_at`, the commit it ran at, as the followups `settle_post_merge` still owes.
     """
     for row in entries:
         mark = row.get("post_merge")
         if isinstance(mark, dict) and mark.get("token") == token:
-            row["post_merge"] = POST_MERGE_OWED if retry else {"ran": ran or "no post-merge rule", "at": stamp_now()}
+            row["post_merge"] = POST_MERGE_OWED if retry else {"ran": ran or "no post-merge rule", "at": stamp_now(),
+                                                              **({"settle": passed_at} if passed_at else {})}
 
 
 def origin_tip(tree: pathlib.Path) -> str | None:
@@ -3337,7 +3551,7 @@ def make_post_merge(main: pathlib.Path, environ: dict[str, str], moved: str) -> 
         except OSError as error:
             return f"make post-merge did not start in {main}: {error}"
     if done.returncode == 0:
-        return f"make post-merge passed in {main}"
+        return f"{POST_MERGE_PASSED} in {main}"
     # Both tails, labelled: a `[step]` line always fills stderr, so a refusal on stdout was dropped (sd:4047).
     streams = (("stderr", done.stderr or ""), ("stdout", done.stdout or ""))
     tails = "; ".join(f"{name}: {text.strip()[-300:]}" for name, text in streams if text.strip())
@@ -4962,22 +5176,103 @@ def watch_pause() -> None:
     time.sleep(WATCH_PAUSE)
 
 
-def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = print) -> int:
-    """Wait until each item's newest entry that is not cancelled ends; 0 when every one merged (sd:3565).
+#: A build assignment's statuses while it builds: the watch waits on them (sd:10908).
+BUILDING = ("queued", "running", "ending")
 
-    It reads the hub alone, through `queue`, resolved once: the merge may
-    remove the worktree it started in. One line per item as it ends; an item
-    with no such entry ends at once. A read the hub did not answer is no end:
-    it reads again after the pause, and a hub that refuses this build stops it.
+
+def delivering_entry(connection: Any, repository: str, item: int) -> dict[str, Any] | None:
+    """The newest entry not cancelled that delivers `item`: its own, or a bundle's that `closes` it.
+
+    A bundle's entry is keyed by its lead; each other member rides in
+    `closes`, so `newest_entry` alone found none for it (review of sd:10908).
     """
+    order = enqueue_order(connection, repository)
+    return max((row for row in stored(connection, repository) if row.get("status") != "cancelled"
+                and str(item) in {str(row.get("item")), *(str(number) for number in row.get("closes") or ())}),
+               key=lambda row: order.get(row["id"], 0), default=None)
+
+
+def newest_build(connection: Any, item: int) -> dict[str, Any] | None:
+    """`item`'s newest build assignment, its status, result and end, or None."""
+    row = connection.execute("SELECT status, result, ended FROM assignment WHERE item = ? AND scope = 'build' "
+                             "ORDER BY id DESC LIMIT 1", (item,)).fetchone()
+    return dict(row) if row else None
+
+
+def stamp_seconds(stamp: Any) -> float | None:
+    """A UTC stamp, `Z` or `+00:00`, as epoch seconds; None for one that does not read."""
+    try:
+        moment = datetime.datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+    return (moment if moment.tzinfo else moment.replace(tzinfo=datetime.UTC)).timestamp()
+
+
+def build_ended_last(build: dict[str, Any] | None, entry: dict[str, Any] | None) -> bool:
+    """Whether `build` ended short of the lane, blocked or cancelled, after `entry` was enqueued, or with none.
+
+    A build that ended `done` enqueued the entry, and a merged `deliver`
+    entry landed the item, whatever a build did after it; an
+    `associate-only` merge is an earlier pull request, so a build that
+    blocked after it still speaks. A stamp that does not
+    read leaves the entry to speak, as before builds were read. Stamps
+    hold whole seconds, so a build that ended in the second of the
+    enqueue speaks: the watch ends, not waits (review of sd:10908).
+    """
+    if build is None or build["status"] in (*BUILDING, "done"):
+        return False
+    if entry is None:
+        return True
+    if entry.get("status") == "merged" and entry.get("claim") == "deliver":
+        return False
+    ended, enqueued = stamp_seconds(build["ended"]), stamp_seconds(entry.get("enqueued_at"))
+    return ended is not None and enqueued is not None and ended >= enqueued
+
+
+def item_end(queue: Queue, item: int, entry: dict[str, Any] | None, build: dict[str, Any] | None,
+             write: Callable[[str], Any]) -> bool | None:
+    """None while `item`'s entry or build runs; else its one line written, and whether it merged."""
     require_sd_db()
     from sd_db.repos import item_ref  # noqa: PLC0415 - sd_db is required above
+    status, ref = (entry.get("status") if entry else "none"), item_ref(item, queue.repository)
+    if build and build["status"] in BUILDING:
+        return None
+    if build is not None and build_ended_last(build, entry):  # before a pending entry: review of sd:10908
+        reason = " ".join(str(build["result"] or "no reason recorded").split())
+        write(f"{ref} build {build['status']}: {reason}")
+        return False
+    if status in ("pending", "running"):
+        return None
+    if entry is None:
+        write(f"{ref} none: no lane entry that is not cancelled")
+    elif status == "merged":
+        write(f"{ref} merged at {str(entry.get('merge_commit') or '')[:12]}")
+        if said := reap(queue, entry):  # sd:6727
+            write(f"{ref} {said}")
+    else:
+        write(f"{ref} {status}: {entry.get('reason') or entry.get('code') or 'no reason recorded'}")
+    return status == "merged"
+
+
+def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = print) -> int:
+    """Wait until each item's build and newest entry that is not cancelled end; 0 when every one merged (sd:3565).
+
+    It reads the hub alone, through `queue`, resolved once: the merge may
+    remove the worktree it started in. One line per item as it ends. An item
+    whose newest build assignment is queued or running waits on it, entry or
+    none (sd:10908); one whose build blocked or was cancelled after its
+    newest entry, pending or not, or with none, names the build's result
+    and ends the whole watch at once; one with neither ends at once. A read the hub did not answer is no end: it reads
+    again after the pause, and a hub that refuses this build stops it.
+    """
+    require_sd_db()
 
     left, merged = list(dict.fromkeys(items)), True
     while True:
         try:
             newest = on_hub(queue, lambda connection: {
-                item: newest_entry(connection, queue.repository, item, skip=("cancelled",)) for item in left},
+                item: (delivering_entry(connection, queue.repository, item),
+                       newest_build(connection, item)) for item in left},
                 write=False)
         except BuildRefused:
             raise
@@ -4986,21 +5281,15 @@ def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = pr
                 raise
             write(f"hub unavailable: {error}; reading again")
             newest = {}
-        for item, entry in newest.items():
-            status = entry.get("status") if entry else "none"
-            if status in ("pending", "running"):
-                continue
-            if entry is None:
-                write(f"{item_ref(item, queue.repository)} none: no lane entry that is not cancelled")
-            elif status == "merged":
-                write(f"{item_ref(item, queue.repository)} merged at {str(entry.get('merge_commit') or '')[:12]}")
-                if said := reap(queue, entry):  # sd:6727
-                    write(f"{item_ref(item, queue.repository)} {said}")
-            else:
-                write(f"{item_ref(item, queue.repository)} {status}: "
-                      f"{entry.get('reason') or entry.get('code') or 'no reason recorded'}")
-            left.remove(item)
-            merged = merged and status == "merged"
+        blocked = False
+        for item, (entry, build) in newest.items():
+            ended = item_end(queue, item, entry, build, write)
+            blocked = blocked or (ended is False and build_ended_last(build, entry))
+            if ended is not None:
+                left.remove(item)
+                merged = merged and ended
+        if blocked:
+            return 1  # a blocked build needs the operator now, not after the others (review of sd:10908)
         if not left:
             return 0 if merged else 1
         watch_pause()
@@ -5084,8 +5373,9 @@ def add_lane_verbs(commands: Any) -> None:
     watcher = verbs.add_parser("watch", help="print each gate end a log under the lane root records, once")
     watcher.add_argument("--once", action="store_true", help="scan once and exit")
     watcher.add_argument("--item", type=int, action="append", dest="items",
-                         help=f"instead wait until this item's newest entry that is not cancelled ends, reading "
-                              f"every {WATCH_PAUSE}s; repeat it; exit 0 only when every one merged (sd:3565)")
+                         help=f"instead wait until this item's running build and newest entry that is not "
+                              f"cancelled end, reading every {WATCH_PAUSE}s; a blocked build ends it (sd:10908); "
+                              f"repeat it; exit 0 only when every one merged (sd:3565)")
 
 
 def lane_main(args: Any) -> int:
@@ -5103,7 +5393,8 @@ def lane_main(args: Any) -> int:
             return watch_items(queue_for(root, environ), args.items)
         if args.lane_command == "prune":
             return lane_prune(root, environ, dry_run=args.dry_run, as_json=args.json)
-        imported = {} if args.lane_command == "run" else import_file_queue(root, queue_for(root, environ))
+        if args.lane_command not in ("run", "list"):  # a view stays read-only; a writer reaches file entries (sd:10420)
+            import_for_writer(root, environ, args)
         if args.lane_command == "enqueue":
             result: Any = enqueue_entry(root, args.items[0], args.title, args.body_file, environ,
                                         expected_head=args.expected_head, manual=args.manual, claim=args.claim,
@@ -5117,7 +5408,8 @@ def lane_main(args: Any) -> int:
             result = {"queue": str(queue_path(root, environ)), "revision": queue_revision(entries),
                       "entries": [{**shown(row), "enqueue_seq": order[row["id"]], "round": rounds[row["id"]]}
                                   for row in entries],
-                      **({"import": imported} if imported else {})}
+                      **({"legacy": said} if (said := legacy_waiting(
+                          queue_path(root, environ), {str(row.get("id")) for row in entries})) else {})}
         elif args.lane_command == "retry":
             result = retry(root, args.item, environ, manual=args.manual, expected_head=args.expected_head)
         elif args.lane_command == "cancel":
@@ -5134,6 +5426,26 @@ def lane_main(args: Any) -> int:
         print(json.dumps({"ok": False, **refusal(error)}, indent=2, sort_keys=True))
         return 3
     return succeed(shown(result))
+
+
+def import_for_writer(root: pathlib.Path, environ: dict[str, str], args: Any) -> None:
+    """Import the file queue before a writing verb, or refuse when it stays and holds its item (sd:10420).
+
+    `enqueue` misses nothing: it adds the live entry, and the import then cancels the file's as a duplicate.
+    An enqueue of an `--expected-head` the file ended refuses, imported or not: the lane ran that delivery.
+    """
+    verb = args.lane_command
+    item, head = (args.items[0], args.expected_head) if verb == "enqueue" else (args.item, None)
+    queue = queue_for(root, environ)
+    ran = legacy_ran(queue, queue_path(root, environ), item, head) if verb == "enqueue" else None
+    imported = import_file_queue(root, queue)
+    if ran:
+        raise LaneError(f"sd:{item} at {head} already ran in this lane: an earlier version's queue file ended it "
+                        f"{ran}; `sd-ship lane retry {item}` runs it again")
+    not_done = imported.get("stopped") or imported.get("skipped")  # its entries are not in the queue yet
+    if not_done and verb != "enqueue" and file_holds(queue, queue_path(root, environ), item):
+        raise LaneError(f"{queue_path(root, environ)}, an earlier version's queue, is not imported: {not_done}; "
+                        f"it holds sd:{item} pending, which `lane {verb}` would miss, so run it again once it is")
 
 
 def run_deadline(args: Any) -> float | None:

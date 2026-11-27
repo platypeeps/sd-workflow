@@ -7,6 +7,7 @@ Diagnostic output that cannot prove the loaded identity permits no control.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import re
 import sqlite3
 import stat
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -65,6 +67,16 @@ class ServiceBackend:
         self.system_daemons = Path(system_daemons) if system_daemons is not None else Path("/Library/LaunchDaemons")
         self.uid = os.getuid() if uid is None else uid
         self.runner = runner or _run
+        #: domain -> `print-disabled`'s overrides, or None: set only on a copy `one_read` makes (sd:10815).
+        self._overrides: dict | None = None
+        self._overrides_lock = threading.Lock()
+
+    def one_read(self):
+        """A copy of this backend that asks `launchctl print-disabled` once per domain: an inventory ran it once per
+        service, 13 times a read. Only an inventory uses it; a control inspects afresh, since it acts on the answer."""
+        copied = copy.copy(self)
+        copied._overrides, copied._overrides_lock = {}, threading.Lock()
+        return copied
 
     def names(self):
         result = []
@@ -141,8 +153,20 @@ class ServiceBackend:
     def _disabled(self, installed):
         if installed["scope"] != "user":
             return None
+        domain = installed["domain"]
+        if self._overrides is None:
+            overrides = self._read_overrides(domain)
+        else:
+            with self._overrides_lock:  # the inventory's threads wait on the first ask, never send a second
+                if domain not in self._overrides:
+                    self._overrides[domain] = self._read_overrides(domain)
+                overrides = self._overrides[domain]
+        return None if overrides is None else overrides.get(installed["label"], installed["_disabled"])
+
+    def _read_overrides(self, domain):
+        """`launchctl print-disabled`'s label -> disabled map for `domain`, or None when it did not answer whole."""
         try:
-            result = self.runner(["/bin/launchctl", "print-disabled", installed["domain"]])
+            result = self.runner(["/bin/launchctl", "print-disabled", domain])
             lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             if result.returncode or not lines or lines[0] != "disabled services = {" or lines[-1] != "}":
                 return None
@@ -152,7 +176,7 @@ class ServiceBackend:
                 if not match or match[1] in overrides:
                     return None
                 overrides[match[1]] = match[2] == "disabled"
-            return overrides.get(installed["label"], installed["_disabled"])
+            return overrides
         except (OSError, subprocess.SubprocessError, UnicodeError):
             return None
 
@@ -316,7 +340,9 @@ def inventory(connection: sqlite3.Connection, *, backend=None) -> dict:
     backend = backend or ServiceBackend()
     rows = []
     names = backend.names()
-    for identifier, observed in zip(names, _inspect_all(backend, names), strict=True):
+    # A test's backend may have no `one_read`; it inspects as before.
+    reader = backend.one_read() if hasattr(backend, "one_read") else backend
+    for identifier, observed in zip(names, _inspect_all(reader, names), strict=True):
         if observed is not None:  # A plist can disappear between enumeration and inspection.
             rows.append(_service_state(connection, identifier, backend, observed=observed)[0])
     return {"services": rows, "revision": _digest(rows)}

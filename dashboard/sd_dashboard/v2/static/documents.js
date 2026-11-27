@@ -9,7 +9,7 @@ const shq = s => `'${String(s ?? '').replace(/'/g, "'\\''")}'`; // shell-safe: s
 const shPath = p => (p.startsWith('~/') ? `~/${shq(p.slice(2))}` : shq(p)); // ~ stays outside the quotes, so the shell expands it
 // The tab carries the list's count (sd:5524); the panel is the list's section, view-documents. Books (sd:6260) reads its
 // own document when it first shows; learning.js draws it.
-window.PAGE_VIEWS = [{ id: 'documents', label: 'Documents' }, { id: 'books', label: 'Books', api: '/api/documents/books' },
+window.PAGE_VIEWS = [{ id: 'documents', label: 'Documents' }, { id: 'books', label: 'Books and courses', api: '/api/documents/books' },
   { id: 'videos', label: 'Videos', api: '/api/documents/videos' }];
 // sd:6260: Books shares #details, so this list draws Details only while its view shows, and again when it shows again.
 const onDocs = () => (window.shell?.view?.current?.() || 'documents') === 'documents';

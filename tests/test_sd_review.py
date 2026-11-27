@@ -900,6 +900,27 @@ class PipelineTests(ReviewFixture):
                                                 "                <b>Traceback</b>\\x1b[31m: exit 1"])
         self.assertNotIn("hidden advice", stream.getvalue())
 
+    def test_plain_evidence_keeps_unicode_separators_and_survives_a_narrow_stream(self) -> None:
+        """sd:10698. `splitlines` cut a quoted repro at U+2028, so the printed command was not the one
+        given; and a printable non-ASCII line raised on an ASCII stdout before the status line."""
+        root = self.make_repo()
+        self.prepare(root)
+        evidence = "printf 'a b' | python3 src.py\ncafé exit 1"
+        payload = json.dumps({"findings": [
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad",
+             "family": "correctness", "evidence": evidence}]})
+        runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""), "codex": sd_review.Completed(0, payload, "")})
+        result = self.run_review(root, runner)
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="ascii", newline="\n")
+        sd_review.render(result, stream)
+        stream.flush()
+        lines = raw.getvalue().decode("ascii").splitlines()
+        at = lines.index("      bad")
+        self.assertEqual(lines[at + 1:at + 3], ["      evidence: printf 'a\\u2028b' | python3 src.py",
+                                                "                caf\\xe9 exit 1"])
+        self.assertEqual(lines[-1], "sd-review: blocking")
+
     def test_an_unmanaged_repository_gets_the_review_and_no_gate(self) -> None:
         """pack sd:5953. Every gate road refuses an unmanaged repository: sd-check,
         the worktree gate and a receipt. The review runs alone; the check is not

@@ -615,7 +615,7 @@ class SharedReview:
     def check_review(self, head: str, *, refresh_adjudication: bool = False, run_gate: bool = False) -> dict | None:
         report = self.review_inputs(head)
         if report["status"] == "blocking":
-            clearance = sd_ship_dispositions.accepted(self, head)
+            clearance = sd_ship_dispositions.accepted(self, head, run_tests=run_gate)  # a read runs no test (sd:10893)
             if (report.get("check") or {}).get("status") == GATE_NOT_RUN:
                 self.adjudicated_gate(head, run=run_gate)
             if not refresh_adjudication and self.state.get("review_clearance") != clearance:

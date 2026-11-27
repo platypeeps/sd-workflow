@@ -40,7 +40,9 @@ by the ownership rule the write uses.
 Markdown, because the vault's whole value is that a note is editable, linkable
 and searchable in place. The file carries a frontmatter block naming the source
 repo, the source path and the revision, so a reader who finds the note knows
-which checkout owns it — and knows the note is not the place to edit.
+which checkout owns it — and knows the note is not the place to edit. The body
+is that revision's bytes, not a later working-tree edit; a file no commit holds
+is written from disk with `revision: uncommitted`.
 
 This is a local filesystem write, so a render performs it directly. It needs no
 connector, no credential and no drain, which is what lets the primary copy be

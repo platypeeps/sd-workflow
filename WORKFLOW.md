@@ -433,7 +433,7 @@ Gates and reviews:
   each step, the state it moved, the failure, the recovery and the test.
   A parser, a journal, or event and protocol matching needs one too: a parser without one took nine rounds (sd:9584).
   A build refuses to start review on a branch whose `docs/work` design.md lacks one, in it or the body (sd:9770).
-- **A repeating finding starts a class pass.** The trigger is two findings of one class in different rounds, or three blocking rounds in a row.
+- **The first blocking round starts a class pass** (sd:10903): the fix of round 1 already covers every instance.
   Name the class, list every instance from the code rather than the findings, add each to the failure table,
   and fix each row that lacks a recovery or a test, fail-first. Record the trigger in `sd task note`. Split the pull request if the table shows it does too much.
   A class pass fixes the class within the change's own scope; a new reader, audit or entry kind becomes its own item:
@@ -457,6 +457,7 @@ The merge lane:
 - **`lane cancel <item>` clears a prepared entry merged by hand** (sd:5743), once a `merged` ship receipt of the item holds its head.
   It also clears the item's newest failed or skipped entries, back to its last merged or prepared one (pack sd:5838): their work landed in another bundle.
 - **Keep one `sd-ship lane watch --item A --item B ...` naming every item the lead has in that lane.**
+  It also waits on each item's queued or running build, and ends on one that blocks, naming its result (sd:10908): one watch covers a build and its lane entry.
   Restart it after each enqueue, after an sd outage and after any exit whose output lacks `ok: true`:
   a bare `lane watch` never exits, and a hub build mismatch ends a watch with `ok: false` (`hub_unavailable`).
 - **Stop an item's queued ship before its builder merges main.** Run `sd-ship lane cancel <item>`: the ship merges in the same worktree, and its abort can discard the builder's merge.
@@ -691,6 +692,8 @@ The reserved `sd` namespace declares these settings:
   machine, 1 to 16. Absence reads 6 (sd:8158, sd:9891); the load guard still holds builds back. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
   1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
+- `sd.overload_fallback`: `1` lets the hub build an overloaded satellite's fresh queued builds of a
+  repository checked out there (sd:8991). Absence or `0` leaves them for the satellite (sd:10823). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.
   Below 90% CPU busy, averaged over at least the last minute and over the last few seconds, load1 and load5 read busy times cores instead (sd:9946).
   Absence is no load condition (sd:2607). `SD_GATE_LOAD_MAX` overrides it for one run. It grants nothing.

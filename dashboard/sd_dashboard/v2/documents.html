@@ -7,7 +7,7 @@
   Pin, Hide and Tag write the workflow database's view state through POST /api/documents/view (sd:3428), and so do Rename
   root and Hide root (sd:3986). Nothing here is sample data.
   Books (sd:6260) and Videos (sd:6261) are views beside the list: /api/documents/books and /api/documents/videos
-  (learning_screen: the vault's learning rows whose content-type is book or article, or youtube or video, or whose title
+  (learning_screen: the vault's learning rows whose content-type is book, article or course, or youtube or video, or whose title
   is "YYYY-MM-DD - YouTube - <channel> - <title>"), each read when its view first shows, drawn by learning.js into the
   one Details pane. The search field above filters the shown view; the facets are the Documents list's and hide while
   another view shows.
@@ -79,7 +79,7 @@
     <section id="view-books" aria-labelledby="books-h">
       <div id="state-books" hidden></div>
       <div class="sec-head">
-        <h2 id="books-h">Books and articles <button class="help" type="button" aria-label="Help: Books and articles" data-help="<b>The vault's Learning base.</b> Each row is a learning note whose content-type is book or article. Its read state is the row's stage: to read, reading, done or dropped. Open item moves it in Tasks; Add files a new row.">
+        <h2 id="books-h">Books and courses <button class="help" type="button" aria-label="Help: Books and courses" data-help="<b>The vault's Learning base.</b> Each row is a learning note whose content-type is book, article or course; the Kind tiles narrow to one. Its read state is the row's stage: to read, reading, done or dropped. Open item moves it in Tasks; Add files a new row.">
           <svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button></h2>
         <p class="tally" id="books-tally"></p>
         <div class="tools"><button class="btn quiet" type="button" data-cmd="book.add" data-obj="books">Add book…</button></div>

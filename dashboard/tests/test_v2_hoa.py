@@ -51,7 +51,7 @@ ANALOG = "date,samples,aquifer_ft_min,aquifer_ft_mean,aquifer_ft_max,tank_ft_min
 PUMP = "date,a2_starts,a2_runtime_hours,a2_gallons,a2_flow_gpm_running,a2_gallons_metered,hours_reported\n" + "".join(
     f"2026-08-{d:02d},{d % 3},{10 + d / 10:.1f},{90000 + d},60,,24\n" for d in range(1, 32)) + "2026-09-04,0,16.9,91119,60,,24\n"
 ALARMS = ("datetime,kind,event,notified,minutes\n"
-          "2026-07-01 08:00:00,other,A2 VSD Alarm,N,4\n"          # older than 30 days before the newest row: not carried
+          "2026-07-01 08:00:00,other,A2 VSD Alarm,N,4\n"          # older than 30 days before today: not carried
           "2026-08-20 09:00:00,generator,Generator Running,N,15\n"
           "2026-09-01 10:00:00,other,A2 VSD Alarm,N,3\n"
           "2026-09-01 10:30:00,other,A2 VSD Normal,,0\n"
@@ -220,7 +220,7 @@ class TheDocument(Fixture):
                          (48, "2026-07-20", "2026-09-05", "2026-09-04"))
         # sd:10589: the oldest daily feed dates the export, so the pump file's day-old lag shows.
         self.assertEqual((m["latest"], m["age_days"], m["state"], m["stale"]), ("2026-09-04", 2, "current", False))
-        # 30 days back from the newest alarm: the July row is gone, oldest first.
+        # 30 days back from today: the July row is gone, oldest first (sd:10599).
         self.assertEqual([a["event"] for a in m["alarms"]], ["Generator Running", "A2 VSD Alarm", "A2 VSD Normal", "Tank Low Alarm"])
         self.assertEqual(m["alarms_today"], {"count": None, "reason": "the export ends 2026-09-05", "acked": 0})
 
@@ -252,6 +252,34 @@ class TheDocument(Fixture):
                            "2026-09-06 02:00:00,generator,Generator Running,N,15\n")
         checkout(self.hoa, alarms=alarms)
         self.assertEqual(self.doc()["mission"]["alarms_today"], {"count": 1, "reason": "", "acked": 0})
+
+    def in_denver(self, now: str) -> dict:
+        """The document read at `now` on a machine in a zone west of UTC."""
+        import time
+
+        with mock.patch.dict(os.environ, {"TZ": "America/Denver"}):
+            time.tzset()
+            try:
+                return hoa_screen.document(self.connection, now=now, jobs=self.jobs)
+            finally:
+                self.addCleanup(time.tzset)
+
+    def test_today_is_the_hoas_calendar_date_not_utcs(self):
+        """sd:10599: 03:00 UTC on 2026-09-07 is still 2026-09-06 locally: that day's alarms are today's, and
+        due days and the export's age count from it."""
+        alarms = ALARMS + "2026-09-06 18:00:00,other,Tank Low Alarm,N,5\n"
+        checkout(self.hoa, alarms=alarms)
+        doc = self.in_denver("2026-09-07T03:00:00Z")
+        self.assertEqual(doc["mission"]["alarms_today"], {"count": 1, "reason": "", "acked": 0})
+        # The oldest daily feed ends 2026-09-04 (sd:10589): 2 local days, not UTC's 3.
+        self.assertEqual(doc["mission"]["age_days"], 2)
+        self.assertEqual({r["id"]: r["due_days"] for r in doc["items"]["rows"]}[self.late], -5)
+
+    def test_the_alarm_window_is_the_last_30_calendar_days_not_30_before_the_newest_row(self):
+        """sd:10599: an export that stopped weeks ago carried a month of alarms as if current; the window
+        ends today, so an alarm older than 30 days before today is not carried."""
+        m = hoa_screen.document(self.connection, now="2026-10-01T12:00:00Z")["mission"]
+        self.assertEqual([a["event"] for a in m["alarms"]], ["A2 VSD Alarm", "A2 VSD Normal", "Tank Low Alarm"])
 
     def test_a_file_that_does_not_parse_is_its_error_and_the_rest_still_answer(self):
         checkout(self.hoa, pump="date,a2_starts\n2026-09-01,1\n", alarms=None, assets="{not json")
@@ -718,6 +746,28 @@ shellRun(cmd('item.email'), OBJ.get('{self.late}')); await flush();""", doc)
         for part in ("<h2>Paint the pump house</h2>", '<dl class="fields">', f"<dd>#{self.task}</dd>", '<select id="det-status" class="fld">',
                      "2026-09-20 · in 14 days", f'href="/tasks?row={self.task}">Open on Tasks</a>', "from /api/hoa."):
             self.assertIn(part, r["det"])
+
+    def test_a_tasks_details_show_its_latest_decision_above_the_fields(self):
+        """sd:10600: the filing evidence came after every editable field; the latest decision now sits under
+        the title, its markup inert, and an item with no decision shows none."""
+        notes = [{"id": 3, "kind": "decision", "body": "Hire the first painter", "at": "2026-09-01T10:00:00Z"},
+                 {"id": 9, "kind": "decision", "body": "Use the <b>second</b> painter's quote", "at": "2026-09-03T10:00:00Z"},
+                 {"id": 12, "kind": "comment", "body": "Asked for a date", "at": "2026-09-04T10:00:00Z"}]
+        detail = {"item": {"id": self.task, "body": None}, "notes": notes, "history": [], "assignments": [],
+                  "documents": [], "revision": "e" * 64}
+        pre = (f"ANSWER = (path, body) => path === '/api/hoa' ? [STATUS, DOC] : path === '/api/tasks/{self.task}' "
+               f"? [200, {json.dumps(detail)}] : [404, {{ error: 'no answer' }}];")
+        click = f"ELS['ob-body'].listeners.click[0]({{ target: {{ closest: s => s === 'tr[data-id]' ? {{ dataset: {{ id: '{self.task}' }} }} : null }} }}); "
+        det = self.run_page(click + "await flush(); await flush(); R.det = ELS.details.html;", pre=pre)["R"]["det"]
+        head = det[:det.index('<dl class="fields">')]
+        self.assertIn("Use the &lt;b&gt;second&lt;/b&gt; painter&#39;s quote", head)
+        self.assertLess(head.index("<h2>Paint the pump house</h2>"), head.index("Use the &lt;b&gt;second"))
+        self.assertNotIn("Hire the first painter", head)
+        self.assertNotIn("Asked for a date", head)
+        detail["notes"] = notes[2:]
+        pre = pre.replace(json.dumps({**detail, "notes": notes}), json.dumps(detail))
+        det = self.run_page(click + "await flush(); await flush(); R.det = ELS.details.html;", pre=pre)["R"]["det"]
+        self.assertNotIn("decision", det[:det.index('<dl class="fields">')].lower())
 
     def test_one_followup_one_task_and_one_blocked_task_show_and_kind_narrows(self):
         kind = "ELS['ob-kinds'].listeners.click[0]({ target: { closest: s => s === 'button[data-kind]' ? { dataset: { kind: 'K' } } : null } }); "
@@ -1256,6 +1306,7 @@ class TheAcknowledgeRoute(BrowserSession):
         self.addCleanup(tmp.cleanup)
         hoa = checkout(Path(tmp.name) / "hoa")
         self.repo(str(hoa))
+        self.enterContext(mock.patch.object(server.Dashboard, "clock", staticmethod(lambda: NOW)))  # window: sd:10599
         status, _, body = self.post("/api/hoa/alarm", {"key": "hoa-alarm/2026-09-05 06:00:00 Tank High Alarm", "acked": True})
         self.assertEqual(status, 409)
         self.assertTrue(body["reload"])
@@ -1270,6 +1321,7 @@ class TheAcknowledgeRoute(BrowserSession):
         self.addCleanup(tmp.cleanup)
         hoa = checkout(Path(tmp.name) / "hoa")
         self.repo(str(hoa))
+        self.enterContext(mock.patch.object(server.Dashboard, "clock", staticmethod(lambda: NOW)))  # window: sd:10599
         gone = "hoa-alarm/2026-09-05 06:00:00 Tank High Alarm"
         status, _, body = self.post("/api/hoa/alarms", {"keys": [gone], "acked": True})
         self.assertEqual(status, 409)

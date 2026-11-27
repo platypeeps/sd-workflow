@@ -784,6 +784,15 @@ class DropRound16(Repo):
         build.end(self.db, first["id"], "blocked", "fixture")
         build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
         build.retry(self.db, lead, who="operator")
+        # The dropped item's own build was queued at the drop. A Retry a second later ranks behind it, as on a
+        # loaded gate (sd:10743), so pin that order rather than leave it to the clock, and let that build end first.
+        self.db.execute("UPDATE assignment SET queued_at = '2000-01-01T00:00:00+00:00' WHERE item = ? AND status = 'queued'",
+                        (items[1],))
+        alone = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, alone["id"])["members"]], [items[1]])
+        build.write(self.db, alone["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, alone["id"], "blocked", "fixture")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
         again = self.claim()
         self.assertEqual(again["assignment"], lead)
         supervisor = build_run.Supervisor(self.db, again["id"], tools=mock.Mock(), log_root=self.root / "logs",
