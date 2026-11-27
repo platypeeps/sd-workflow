@@ -4201,246 +4201,79 @@ def sd_quote(argv):
     return shlex.join(argv)
 
 
-class CargoClean(Case):
-    """sd:10384: a build that ends blocked or done runs `cargo clean` in the Rust worktree it keeps."""
+class TargetSize(Case):
+    """sd:10384: a run that ends blocked or done notes the size of the Rust `target/` its kept worktree holds.
+
+    Ruling #91707 on #89515 dropped the automatic `cargo clean`: no file test tells a capture under
+    `target/debug/` from cargo's output, and the lane may still hold the worktree, so the run deletes nothing.
+    """
 
     def setUp(self):
         super().setUp()
         self.press()
         self.work = Path(self.bundle["work_path"])
-        self.cargo_log = self.root / "cargo.log"
-        script = self.root / "tools" / "cargo.py"
-        script.write_text("import json, shutil, sys\n"
-                          f"open({str(self.cargo_log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                          f"open({str(self.root / 'cargo.env')!r}, 'w').write("
-                          "__import__('os').environ.get('CARGO_BUILD_BUILD_DIR', ''))\n"
-                          "shutil.rmtree(sys.argv[sys.argv.index('--target-dir') + 1])\n"
-                          "sys.exit(int(__import__('os').environ.get('FAKE_CARGO_EXIT', '0')))\n")
-        self.tools.cargo = [sys.executable, str(script)]
 
-    def rust(self, ignored=True):
-        """The run's worktree, a real one, holding a `Cargo.toml` and a `target/` git ignores unless told not to."""
+    def rust(self):
+        """The run's worktree, holding a `Cargo.toml`, cargo's output and a capture under `target/debug/`."""
         support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
-        if ignored:
-            exclude(self.work, "target/\n")
+        exclude(self.work, "target/\n")
         (self.work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
-        (self.work / "target" / "debug").mkdir(parents=True)
-        (self.work / "target" / "debug" / "big.rlib").write_bytes(b"x" * 64)
-        (self.work / "target" / "CACHEDIR.TAG").write_text(build_run.CACHE_TAG + "\n# cargo's\n")
-        (self.work / "target" / ".rustc_info.json").write_text("{}")
-
-    def assert_kept(self, outcome="blocked"):
-        self.supervisor().finish(outcome, "fixture end")
-        self.assertEqual(self.cargo_calls(), [])
-        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
+        (self.work / "target" / "debug" / "deps").mkdir(parents=True)
+        (self.work / "target" / "debug" / "deps" / "big.rlib").write_bytes(b"x" * 4096)
+        (self.work / "target" / "debug" / "repro.log").write_text("capture")
+        (self.work / "target" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
 
     def notes(self):
         return [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
 
-    def test_a_target_without_cargos_cache_tag_is_kept(self):
-        """Class pass, build/sd-1798: an ignored `target/` cargo did not tag as its cache is not proven output."""
+    def sized(self):
+        return [body for body in self.notes() if "target/" in body and "cargo clean" in body]
+
+    def capture_survives(self, outcome):
+        """Ruling #83955: target/debug/repro.log stays; the lead gets a note naming the size and the cleanup."""
         self.rust()
-        (self.work / "target" / "CACHEDIR.TAG").unlink()
-        self.assert_kept()
+        self.assertEqual(self.supervisor().finish(outcome, "fixture end")["outcome"], outcome)
+        self.assertEqual((self.work / "target" / "debug" / "repro.log").read_text(), "capture")
+        self.assertTrue((self.work / "target" / "debug" / "deps" / "big.rlib").is_file())
+        sized = self.sized()
+        self.assertTrue(sized and all("GiB" in body and str(self.work) in body for body in sized), self.notes())
 
-    def test_a_tag_that_is_a_link_or_not_the_signature_is_kept(self):
+    def test_a_capture_survives_a_blocked_run_and_the_size_is_noted(self):
+        self.capture_survives("blocked")
+
+    def test_a_capture_survives_a_done_run_and_the_size_is_noted(self):
+        self.capture_survives("done")
+
+    def test_a_replayed_end_notes_once(self):
         self.rust()
-        tag = self.work / "target" / "CACHEDIR.TAG"
-        tag.write_text("Signature: not-the-one\n")
-        self.assert_kept()
-        tag.unlink()
-        (self.root / "tag").write_text(build_run.CACHE_TAG + "\n")
-        tag.symlink_to(self.root / "tag")
-        self.assert_kept()
+        supervisor = self.supervisor()
+        supervisor.note_target()
+        supervisor.note_target()
+        self.assertEqual(len(self.sized()), 1, self.notes())
 
-    def test_a_file_cargo_did_not_write_beside_the_tag_is_kept_with_a_note(self):
-        """Class pass: an uncommitted file in an ignored `target/` stays, and the note says why nothing was freed."""
+    def test_cancelled_and_timed_out_note_nothing(self):
         self.rust()
-        (self.work / "target" / "notes.txt").write_text("mine")
-        self.assert_kept("done")
-        self.assertTrue(any("target/notes.txt" in body and "cargo clean" in body for body in self.notes()), self.notes())
+        for outcome in ("cancelled", "timed_out"):
+            self.supervisor().finish(outcome, "fixture end")
+        self.assertEqual(self.sized(), [])
 
-    def test_a_worktree_on_another_branch_is_kept(self):
-        """Class pass: `guarded` blocks a worktree off its branch; what it holds is not this run's."""
-        self.rust()
-        support.git(self.work, "checkout", "-q", "-b", "other-work")
-        self.assert_kept()
-
-    def test_a_folder_inside_another_checkout_is_kept(self):
-        """Class pass: `git worktree add` failed onto a plain folder; an outer checkout's ignore rule proves nothing."""
-        outer = self.work.parent
-        outer.mkdir(parents=True)
-        support.git(outer, "init", "-q", "-b", self.bundle["branch"])
-        (outer / ".git" / "info").mkdir(exist_ok=True)
-        (outer / ".git" / "info" / "exclude").write_text("target/\n")
-        self.work.mkdir()
-        (self.work / "Cargo.toml").write_text("")
-        (self.work / "target" / "debug").mkdir(parents=True)
-        (self.work / "target" / "debug" / "big.rlib").write_bytes(b"x")
-        (self.work / "target" / "CACHEDIR.TAG").write_text(build_run.CACHE_TAG + "\n")
-        self.assert_kept()
-
-    def test_a_branch_a_split_holds_or_has_not_read_is_kept(self):
-        """Class pass: `split_first` blocks a branch that may carry a left item's work, ignored files included."""
-        self.rust()
-        for state in ("unread", "held"):
-            with mock.patch.object(build, "split", return_value=state):
-                self.assert_kept()
-
-    def test_the_clean_pins_cargos_build_dir_to_the_target(self):
-        """Class pass: `cargo clean` also empties `build.build-dir`, which config may put outside the worktree."""
-        self.rust()
-        self.env["CARGO_BUILD_BUILD_DIR"] = str(self.root / "shared-build")
-        self.supervisor().finish("blocked", "fixture block")
-        self.assertEqual((self.root / "cargo.env").read_text(), str(self.work / "target"))
-
-    def cargo_calls(self):
-        return [json.loads(line) for line in self.cargo_log.read_text().splitlines()] if self.cargo_log.exists() else []
-
-    def test_blocked_cleans_the_target(self):
-        self.rust()
-        self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
-        self.assertEqual(self.cargo_calls(), [["clean", "--offline", "--manifest-path", str(self.work / "Cargo.toml"),
-                                               "--target-dir", str(self.work / "target")]])
-        self.assertFalse((self.work / "target").exists())
-        self.assertTrue((self.work / "Cargo.toml").is_file())
-
-    def test_done_cleans_the_target(self):
-        self.rust()
-        self.assertEqual(self.supervisor().finish("done", "worktree kept: not clean")["outcome"], "done")
-        self.assertEqual(len(self.cargo_calls()), 1)
-
-    def test_cancelled_cleans_nothing(self):
-        self.rust()
-        self.supervisor().finish("cancelled", "operator")
-        self.assertEqual(self.cargo_calls(), [])
-
-    def test_no_rust_no_target_or_a_linked_target_runs_nothing(self):
+    def test_no_rust_no_target_a_linked_target_or_no_worktree_notes_nothing(self):
+        self.supervisor().note_target()  # no worktree
         support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
-        exclude(self.work, "target\n")
-        (self.work / "Cargo.toml").write_text("")  # no target/ yet
+        self.supervisor().note_target()  # no Cargo.toml
+        (self.work / "Cargo.toml").write_text("")
+        self.supervisor().note_target()  # no target/
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
-        (elsewhere / "keep.txt").write_text("keep")
         (self.work / "target").symlink_to(elsewhere)
-        self.supervisor().finish("blocked", "fixture block")
-        self.assertEqual(self.cargo_calls(), [])
-        self.assertTrue((elsewhere / "keep.txt").is_file())
+        self.supervisor().note_target()  # a linked target/ is someone else's
+        self.assertEqual(self.sized(), [])
 
-    def test_a_removed_worktree_runs_nothing(self):
-        self.supervisor().finish("done", "worktree removed")
-        self.assertEqual(self.cargo_calls(), [])
-
-    def test_a_failed_clean_notes_and_still_ends(self):
+    def test_an_unread_size_still_notes_and_the_run_ends(self):
         self.rust()
-        self.env["FAKE_CARGO_EXIT"] = "3"
-        self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
-        notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
-        self.assertTrue(any("cargo clean" in body and "exit 3" in body for body in notes), notes)
-
-    def test_an_untracked_target_git_does_not_ignore_is_kept(self):
-        """Review of build/sd-1798: a `target/` git does not ignore is uncommitted work the run keeps."""
-        self.rust(ignored=False)
-        self.supervisor().finish("done", "worktree kept: not clean")
-        self.assertEqual(self.cargo_calls(), [])
-        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
-
-    def test_a_tracked_file_under_target_is_kept(self):
-        """Review of build/sd-1798: a committed file under `target/` would read deleted after a clean."""
-        self.rust()
-        support.git(self.work, "add", "-f", "target/debug/big.rlib")
-        support.git(self.work, "-c", "commit.gpgsign=false", "commit", "-qm", "fix: tracked")
-        self.supervisor().finish("blocked", "fixture block")
-        self.assertEqual(self.cargo_calls(), [])
-        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
-
-    def test_a_worktree_a_live_session_holds_is_kept(self):
-        """Review of build/sd-1798: another session may be building in it; its output stays."""
-        self.rust()
-        sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
-                      found=sessions.worktrees([str(self.work)]))
-        self.supervisor().finish("blocked", "fixture block")
-        self.assertEqual(self.cargo_calls(), [])
-        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
-
-    def test_a_builder_group_still_alive_is_kept_with_a_note(self):
-        """Review of build/sd-1798: a Survivor ends the run blocked while the child's group still runs."""
-        self.rust()
-        build.write(self.db, self.bundle["id"], builder_pgid=4242)
-        self.supervisor(probe=GoneProbe(alive=True, group=True)).finish("blocked", "group 4242 survived")
-        self.assertEqual(self.cargo_calls(), [])
-        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
-        self.assertTrue(any("4242" in body and "cargo clean" in body for body in self.notes()), self.notes())
-        build.write(self.db, self.bundle["id"], builder_pgid=4243)
-        self.supervisor(probe=GoneProbe(alive=None, group=None)).finish("blocked", "group unread")
-        self.assertEqual(self.cargo_calls(), [], "an unread group keeps target/ too")
-
-    def survive(self, supervisor, said="process group 4250 (checks) still had a process after SIGKILL"):
-        def walked():
-            raise build_run.Survivor(said)
-        supervisor.walked = walked
-        return supervisor.ended()
-
-    def test_a_survivor_in_any_group_keeps_the_target_with_a_note(self):
-        """Class pass 2, build/sd-1798: a repository check that outlives SIGKILL runs in a group of its own
-        (`sd gate run`), not the recorded builder group; the end it causes cleans nothing."""
-        self.rust()
-        self.assertEqual(self.survive(self.supervisor())["outcome"], "blocked")
-        self.assertEqual(self.cargo_calls(), [])
-        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
-        self.assertTrue(any("4250" in body and "cargo clean" in body for body in self.notes()), self.notes())
-
-    def test_a_survivors_end_replayed_by_the_next_image_keeps_the_target(self):
-        """Class pass 2: the end waits through a hub fault and an exec in place; the next image must not clean."""
-        self.rust()
-        first = self.supervisor()
-        with mock.patch.object(build, "end", side_effect=sqlite3.OperationalError("database is locked")):
-            with self.assertRaises(sqlite3.OperationalError):
-                self.survive(first)
-        with mock.patch.dict(os.environ, {build_run.RESUME_ENV: json.dumps(first.state())}):
-            second = self.supervisor()
-        self.assertEqual(second.finish(*second.ending[:2])["outcome"], "blocked")
-        self.assertEqual(self.cargo_calls(), [])
-
-    def test_a_recorded_descendant_group_still_alive_is_kept(self):
-        """Class pass 2: a group the last child's descendants ran in, still alive or unread, may build."""
-        self.rust()
-        for answer in (True, None):
-            supervisor = self.supervisor(probe=GoneProbe(alive=False, group=answer))
-            supervisor.groups = {4251: "Sat Oct 24 09:00:00 2026"}
-            supervisor.finish("blocked", "fixture block")
-            self.assertEqual(self.cargo_calls(), [], answer)
-        self.assertTrue(any("4251" in body for body in self.notes()), self.notes())
-
-    def test_a_target_the_lane_may_hold_is_kept_with_a_note(self):
-        """Review of build/sd-1798: an enqueue that wrote its entry and then refused, or a cancel after it,
-        ends the run blocked while the lane still prepares in the worktree; an unread lane may hold it too."""
-        self.rust()
-        lane = self.plans / "lane.json"
-        for status in ("pending", "running"):
-            lane.write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": status, "enqueue_seq": 1}]))
-            self.supervisor().finish("blocked", "sd-ship lane enqueue refused: no JSON answer")
-            self.assertEqual(self.cargo_calls(), [], status)
-        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
-        self.assertTrue(any("lane entry e1" in body and "cargo clean" in body for body in self.notes()), self.notes())
-        lane.unlink()
-        self.plan(sd_ship=["unread"])
-        self.supervisor().finish("blocked", "a cancel was asked after the lane entry was written")
-        self.assertEqual(self.cargo_calls(), [], "an unread lane keeps target/")
-
-    def test_a_target_whose_lane_entry_merged_or_ended_is_cleaned(self):
-        self.rust()
-        (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "merged",
-                                                           "enqueue_seq": 1}]))
-        self.supervisor().finish("done", "worktree kept: not clean")
-        self.assertEqual(len(self.cargo_calls()), 1)
-
-    def test_a_missing_cargo_notes_and_still_ends(self):
-        self.rust()
-        self.tools.cargo = [str(self.root / "no-such-cargo")]
-        self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
-        notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
-        self.assertTrue(any("cargo clean" in body for body in notes), notes)
+        with mock.patch.object(build_run, "target_kib", side_effect=subprocess.TimeoutExpired(["du"], 300)):
+            self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
+        self.assertTrue(any("size unread" in body for body in self.sized()), self.notes())
 
 
 class Tick(Case):

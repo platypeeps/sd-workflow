@@ -72,13 +72,6 @@ from .writes import add_note, create_item, now, record_cost, record_state
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
-#: `cargo clean`'s bound: under `build.STALE_SECONDS`, as the supervisor beats no heartbeat while it runs.
-CLEAN_SECONDS = 300
-#: The first line of the `CACHEDIR.TAG` cargo writes in a target folder: the folder is a cache, rebuilt at will.
-CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55"
-#: The files cargo itself writes at the top of a target folder; any other file there is someone's, and stays.
-CARGO_FILES = frozenset({"CACHEDIR.TAG", ".rustc_info.json", ".rustdoc_fingerprint.json",
-                         ".future-incompat-report.json"})
 #: Reviews with blockers before the class pass and park: 2, so a park comes after 3
 #: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
 REVIEW_ROUNDS = 2
@@ -434,8 +427,6 @@ class Tools:
     #: pre-push hook the repository has, since an unmanaged one normally has none (review of pack sd:7868).
     guard: list[str] = field(default_factory=lambda: ["sh", str(system_checkout() / "local-leak-guard" / "leak-guard.sh"),
                                                       "scan"])
-    #: `cargo clean` in a Rust worktree a blocked or done run keeps (sd:10384).
-    cargo: list[str] = field(default_factory=lambda: ["cargo"])
 
 
 def judge(lines: list[str], *, session: str | None = None) -> dict:
@@ -1199,6 +1190,13 @@ def _checks_environ(env: dict) -> dict:
     return {**env, "GITHUB_TOKEN": env["GITHUB_PERSONAL_ACCESS_TOKEN"]}
 
 
+def target_kib(target: Path) -> int:
+    """`du -sk` of `target`, bounded: the supervisor beats no heartbeat while it runs."""
+    out = subprocess.run(["du", "-sk", str(target)], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                         timeout=build.STALE_SECONDS // 2, check=True).stdout
+    return int(out.split()[0])
+
+
 class Supervisor:
     """One run's supervisor: `run()` walks its steps and returns how it ended."""
 
@@ -1261,7 +1259,6 @@ class Supervisor:
         self.last: dict | None = None
         self.held: dict | None = None
         self.ending: tuple | None = None
-        self.survived: str | None = None
         self.marks: set[str] = set()
         self.unknown: dict[str, str] = {}
         self.hub_down = False
@@ -1277,7 +1274,6 @@ class Supervisor:
         self.last = self.held = state.get("child")
         self.reviewed = state.get("reviewed")
         self.ending = tuple(state["ending"]) if state.get("ending") else None
-        self.survived = state.get("survived") or None
         self.marks = set(state.get("marks") or ())
         self.unknown = dict(state.get("unknown") or {})
         groups = state.get("groups")
@@ -1289,8 +1285,7 @@ class Supervisor:
         if last is not None and last["exit"] is None:
             last["left"] = max(self.deadline - time.monotonic(), 0.0)
         return {"run": self.ident, "pid": os.getpid(), "child": last, "groups": self.groups, "reviewed": self.reviewed,
-                "ending": self.ending, "survived": self.survived, "marks": sorted(self.marks), "unknown": self.unknown,
-                "root": str(self.log_root)}
+                "ending": self.ending, "marks": sorted(self.marks), "unknown": self.unknown, "root": str(self.log_root)}
 
     def fault_seen(self, fault: Exception) -> None:
         if not self.hub_down:
@@ -1439,7 +1434,6 @@ class Supervisor:
         except TimedOut:
             return self.finish("timed_out", f"a child ran past {self.timeout:g} s; its group was ended")
         except Survivor as survivor:
-            self.survived = str(survivor)  # kept with the end: `clean_target` deletes nothing under a live process
             return self.finish("blocked", str(survivor))
         except Unread as unread:
             # An unknown result: no write, so the reap finds the run lost and retries it once.
@@ -1485,97 +1479,29 @@ class Supervisor:
     def finish(self, outcome: str, detail: str, *, question: str | None = None) -> dict:
         self.ending = (outcome, detail, question)  # kept: a hub fault here must not lose how the run ended
         if outcome in ("blocked", "done"):
-            self.clean_target()
+            self.note_target()
         ended = build.end(self.db, self.ident, outcome, detail, question=question)
         return ended or {"run": self.ident, "outcome": None, "why": "the run ended or moved before its last write"}
 
     def fresh(self) -> dict:
         return build.run(self.db, self.ident)
 
-    def clean_target(self) -> None:
-        """`cargo clean` of the worktree's own `target/` (sd:10384): a kept Rust worktree held up to 106 GiB.
+    def note_target(self) -> None:
+        """A note on the lead naming the size of the kept worktree's Rust `target/` (sd:10384: one held 106 GiB).
 
-        It deletes only what `disposable` proves is cargo's rebuildable output in this run's own worktree.
-        `--target-dir` names the folder and `CARGO_BUILD_BUILD_DIR` pins cargo's build folder to it, so a
-        `CARGO_TARGET_DIR` or cargo config elsewhere is untouched. Idempotent: a replay of the end runs it again
-        on an empty or gone folder. A failure is noted on the lead and the run still ends: the commits are kept.
+        It deletes nothing (ruling #91707 on #89515): no file test tells a capture under `target/debug/` from
+        cargo's output, and the lane may still hold the worktree. One note per run: a replayed end adds none.
         """
         manifest, target = self.work / "Cargo.toml", self.work / "target"
-        kept = self.disposable(manifest, target)
-        if kept is not None:
-            if kept:
-                self.note(self.lead, f"Build run {self.ident}: no cargo clean in {self.work}, its target/ is kept: {kept}")
-            return
-        argv = [*self.tools.cargo, "clean", "--offline", "--manifest-path", str(manifest), "--target-dir", str(target)]
-        try:
-            self.logs.mkdir(parents=True, exist_ok=True)
-            with open(self.out("cargo-clean"), "ab") as sink:
-                code = subprocess.run(argv, cwd=self.work, stdin=subprocess.DEVNULL, stdout=sink,
-                                      stderr=subprocess.STDOUT, timeout=CLEAN_SECONDS,
-                                      env={**self.env, "CARGO_BUILD_BUILD_DIR": str(target)}).returncode
-            why = None if code == 0 else f"exit {code}"
-        except (OSError, subprocess.TimeoutExpired) as fault:
-            why = f"{type(fault).__name__}: {fault}"
-        if why:
-            self.note(self.lead, f"Build run {self.ident}: cargo clean in {self.work} failed ({why}); "
-                                 f"see {self.out('cargo-clean')}")
-
-    def disposable(self, manifest: Path, target: Path) -> str | None:
-        """None when `target` is proven cargo's cache in this run's own worktree; else why it stays, "" for a
-        folder that is no cargo target of ours at all (class pass, review of build/sd-1798).
-
-        The folder: a real one, never a link, beside a top-level `Cargo.toml`, carrying cargo's own `CACHEDIR.TAG`
-        (by that tag's rule all below it is rebuilt at will), ignored by git with no tracked file below, and with
-        no top-level file but the ones cargo writes there (`CARGO_FILES`). The worktree: its own checkout root, on
-        the run's branch (`guarded`), no split holding or unread on it (`split_first` counts ignored files as a
-        left item's work), and no live session but this run's builder in it. An unread git keeps it. The run's
-        own processes: no `Survivor` ended it, and no group of its last child reads alive or unread. The lane:
-        no entry of the run's items that has not merged or ended, and an unread lane keeps it.
-        """
         if not manifest.is_file() or target.is_symlink() or not target.is_dir():
-            return ""
-        tag = target / "CACHEDIR.TAG"
+            return
         try:
-            if tag.is_symlink() or not tag.is_file() or tag.read_text("utf-8", "replace").split("\n")[0] != CACHE_TAG:
-                return ""
-            stray = sorted(entry.name for entry in target.iterdir()
-                           if (entry.is_symlink() or not entry.is_dir()) and entry.name not in CARGO_FILES)
-        except OSError:
-            return ""
-        git = [*self.tools.git, "-C", str(self.work)]
-        try:
-            top = _read([*git, "rev-parse", "--show-toplevel"], env=self.env).rstrip("\n")
-            if not top or Path(top).resolve() != self.work.resolve():
-                return ""
-            if _read([*git, "branch", "--show-current"], env=self.env).strip() != self.row["branch"]:
-                return ""
-            _read([*git, "check-ignore", "-q", "--", "target/"], env=self.env)  # exit 1, not ignored: Unread
-            if _read([*git, "ls-files", "-z", "--", "target"], env=self.env):
-                return ""
-        except Unread:
-            return ""
-        if build.split(self.db, self.row["assignment"]) not in ("", "clear"):
-            return ""
-        if self.survived:  # whichever group it was: the child's, or one a check ran in (`sd gate run`)
-            return self.survived
-        row = self.fresh()
-        # The child's recorded group and each its descendants ran in: alive, or one no read answers, may build.
-        for pgid in (row["builder_pgid"], *sorted(self.groups or ())):
-            if pgid and self.probe.group(pgid) is not False:
-                return f"process group {pgid} of the run's last child may still run"
-        # An enqueue that wrote its entry, then refused or saw a cancel, ends blocked while the lane prepares here.
-        try:
-            entry = lane_entry(self.tools.ship, self.work, [self.lead, *self.others], env=self.env)
-        except Unread as unread:
-            return f"the lane gave no answer ({unread}), so it may hold the worktree"
-        if entry is not None and entry.get("status") not in ("merged", *LANE_ENDED):
-            return f"lane entry {entry.get('id')} is {entry.get('status')} and may build in it"
-        own = row["session_id"]
-        if sessions.holders(self.db, str(self.work), machine=this_host(), exclude=(own,) if own else ()):
-            return ""
-        if stray:
-            return f"cargo did not write target/{stray[0]}" + (f" and {len(stray) - 1} more" if stray[1:] else "")
-        return None
+            size = f"{target_kib(target) / 2**20:.1f} GiB"
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError) as fault:
+            size = f"size unread ({type(fault).__name__})"
+        body = (f"Build run {self.ident}: its kept worktree {self.work} holds a Rust target/ of {size}; "
+                f"run cargo clean there once nothing needs its build output")
+        self.once("target-size", lambda: add_note(self.db, self.lead, "comment", body))
 
     def enter(self, step: str, **fields) -> None:
         if self.fresh()["cancel_requested"] and step in build.CANCELLABLE:
