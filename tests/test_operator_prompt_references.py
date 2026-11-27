@@ -195,6 +195,15 @@ class OpenPrSweep(unittest.TestCase):
         self.assertIn("equals the PR's head branch exactly", text)
         self.assertIn("as a whole word", text)
 
+    def test_the_item_lookup_reads_parked_items_too(self):
+        """`sd store items` hides parked items; a lookup without the
+        `--parked` read misses the PR's item and takes another hit."""
+        searches = [c for c in prescribed_commands(self.text())
+                    if parse(c)[1] == ["store", "items"] and "--grep" in c]
+        self.assertTrue(any("--parked" not in c for c in searches), searches)
+        self.assertTrue(any("--parked" in c for c in searches), searches)
+        self.assertIn("merge their hits by item id", self.text())
+
 
 class ReviewRoundFixes(unittest.TestCase):
     def test_a_plain_trigger_reaches_a_skill_the_model_may_load(self):

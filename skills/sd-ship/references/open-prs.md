@@ -9,7 +9,10 @@ Budget: about 30 minutes. Follow `skills/_shared/references/decide-ask-record.md
    A branch name matches only inside one repo, so a fork's branch never names a lane entry, item or worktree here.
 2. For each PR, find what holds it: a failed `sd/local-gate`, open review findings, a merge conflict, or a lane entry.
    Its item is the one item whose note names the PR's full URL as a whole word:
-   search with `sd store items --belongs-to <checkout> --grep "<PR URL>"`, then read each hit with `sd task show N`.
+   search with `sd store items --belongs-to <checkout> --grep "<PR URL>"` and `sd store items --belongs-to <checkout> --parked --grep "<PR URL>"`,
+   merge their hits by item id, then read each hit with `sd task show N`.
+   The first read hides parked items, so either read alone can miss the PR's item and leave another hit as the one item.
+   A read that fails: report the PR and act on nothing there.
    No item, or more than one: report the PR and act on nothing there.
    A lane entry never names the item: it holds a branch and a head, no PR number, and the lane keeps old entries,
    so a PR that replaced another on the same branch and commit would take the old one's item.
