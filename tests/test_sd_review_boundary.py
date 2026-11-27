@@ -1208,33 +1208,45 @@ class LineBudgetTests(unittest.TestCase):
         # +1, a docstring line: `_rebuts` tests the saved evidence beside
         # every `open` citation. Measured: `sd-review` is 3231.
         #
-        # 5201 -> 5218 is sd:10892: `bin/sd-review` +17 for the `base`
+        # 5201 -> 5263 is sd:10918: a rebuttal follows its line through a
+        # `-U0` diff (`followed_line`, `lines_now`) instead of lapsing on any
+        # edit to its file, matches a reworded repeat at its exact line,
+        # and holds a cited repeat when its test passed. Measured:
+        # `sd-review` is 3293.
+        #
+        # 5263 -> 5268 is the build/sd-2233 review: `is_rebutted` takes a
+        # `verdict` mode, so a test holds a cited repeat only in its
+        # recorded words and never outweighs a reader's `open`. Measured:
+        # `sd-review` is 3298.
+        #
+        # 5268 -> 5285 is sd:10892: `bin/sd-review` +17 for the `base`
         # finding key, its prompt ask, the `dispose` leg that posts a
         # defect the merge base already has as advisory, and `_bad_enum`,
         # which keeps `_finding_error` under the complexity ceiling.
-        # Measured: `sd-review` is 3248.
+        # Measured: `sd-review` is 3315.
         #
-        # 5218 -> 5233 is the sd:10892 class pass: `bin/sd-review` +15 so
+        # 5285 -> 5300 is the sd:10892 class pass: `bin/sd-review` +15 so
         # the `base` question names the default branch's merge base by
         # commit (`Subject.main_base`, `base_ask`), never the diff's own
         # base, and only a review that asked it downgrades a `has`.
-        # Measured: `sd-review` is 3263.
+        # Measured: `sd-review` is 3330.
         #
-        # 5233 -> 5256 is the sd:10892 last round: `bin/sd-review` +23 for
+        # 5300 -> 5323 is the sd:10892 last round: `bin/sd-review` +23 for
         # `base_check`, so a reader's `base: has` downgrades only from a
         # reader of the checkout and only where git shows every named
         # place untouched since the main merge base. Measured:
-        # `sd-review` is 3286.
+        # `sd-review` is 3353.
         #
-        # 5256 -> 5264 is sd:10892 round 4: `bin/sd-review` +8 so a merged
+        # 5323 -> 5331 is sd:10892 round 4: `bin/sd-review` +8 so a merged
         # finding downgrades only when every reader's copy holds, and only
         # a diff from the main merge base is asked or judged (`_judged`).
-        # Measured: `sd-review` is 3294.
+        # Measured: `sd-review` is 3361,
+        # after the merge of origin/main (sd:10918, build/sd-2233).
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5264,
+            5331,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
