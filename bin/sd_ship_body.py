@@ -867,14 +867,26 @@ def refuse_unconventional_title(title: str) -> None:
                                   "such as `fix(lane): ...`, then enqueue again.")
 
 
-def docs_lint(root: pathlib.Path, body: str, base: str) -> list[str]:
+#: The pull request author whose body, like its commits, is exempt from the line limit (sd:8191).
+DEPENDABOT = "dependabot[bot]"
+#: The lint's body line failure (`sd-docs-lint` check_pr_privacy); `docs_lint` judges it itself.
+_BODY_LINE = re.compile(r"pull request body: line \d+ is \d+ characters \(limit \d+\)")
+
+
+def docs_lint(root: pathlib.Path, body: str, base: str, foreign: bool = False) -> list[str]:
     """Prepare's `sd-docs-lint` of `root`, with `body` as `--pr-body`; the warnings it leaves.
 
     Run from the repository root with no `--work-dir`, and with Jev off.
     A failure is judged against `origin/<base>` (`lint_against_base`), so
     only what the branch introduces refuses. Lane enqueue runs the same
     lint, so a lint failure refuses in seconds there (sd:5989).
+
+    A body line over `LINE_LIMIT` refuses here as `line_too_long`, with its
+    remedy, not as a retryable lint failure; a `foreign` body, one Dependabot
+    wrote, is exempt as its commits are (pack sd:10220).
     """
+    if not foreign:
+        refuse_long_lines("", body, ())
     lint = ["env", "JEV_SD_DOCS_LINT=0", sys.executable, str(BIN / "sd-docs-lint")]
     if not (root / "docs/work").is_dir():
         lint.append("--body-only")
@@ -954,7 +966,8 @@ def lint_against_base(root: pathlib.Path, argv: list[str], base: str) -> list[st
     rule ran, and the head's answer stands. A failure is matched by its whole
     line, so one the branch moved to another line counts as introduced.
     """
-    head = lint_failures(root, argv)
+    # Judged by `docs_lint` itself (pack sd:10220).
+    head = [failure for failure in lint_failures(root, argv) if not _BODY_LINE.fullmatch(failure)]
     known: list[str] = []
     if head and "--body-only" not in argv:
         at = argv.index("--pr-body") if "--pr-body" in argv else len(argv)

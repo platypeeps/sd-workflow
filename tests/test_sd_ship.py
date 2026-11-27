@@ -148,7 +148,7 @@ class ShipDouble(GitHubDouble):
 
     def _pull(self, pull):
         head = getattr(pull, "merged_head", None) or pull.head_sha(self.remote)
-        return {"number": pull.number, "title": pull.title, "body": pull.body,
+        return {"number": pull.number, "title": pull.title, "body": pull.body, "user": {"login": pull.author},
                 "state": "closed" if pull.state == "MERGED" else pull.state.lower(),
                 "merged": pull.state == "MERGED", "draft": pull.draft,
                 "html_url": f"https://github.com/{self.remote.slug}/pull/{pull.number}",
