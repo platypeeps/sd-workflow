@@ -3792,6 +3792,36 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(sorted(entry["closes"]), sorted([b, c]))
 
+    def test_a_listed_merge_revert_keeps_a_mainline_fix_in_a_file_both_sides_edited(self) -> None:
+        """Ruling round, review of build/sd-1654 (sd_lane.py:1060): both sides added to one existing file,
+        the merge was reverted `-m 1`, and a later commit moved the surviving mainline function out. The
+        revert changed the shared file, so the mainline commit was read and its citation dropped. A revert
+        whose patch undoes one side exactly reads that side alone."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-shared")
+        shared = tree / "shared.txt"
+        shared.write_text("".join(f"line {n}\n" for n in range(20)), encoding="utf-8")
+        git(tree, "add", "shared.txt")
+        git(tree, "commit", "-q", "-m", "chore: the shared file")
+        before = shared.read_text(encoding="utf-8")
+        git(tree, "switch", "-q", "-c", "topic-shared-side")
+        shared.write_text(before + "side function\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-shared")
+        shared.write_text("mainline function\n" + before, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-shared-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        shared.write_text(before, encoding="utf-8")
+        (tree / "moved.txt").write_text("mainline function\n", encoding="utf-8")
+        git(tree, "add", "-A")
+        git(tree, "commit", "-q", "-m", "refactor: keep the guard in moved.txt")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open

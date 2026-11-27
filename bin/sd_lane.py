@@ -1027,10 +1027,35 @@ def listed_sides(worktree: pathlib.Path, commits: list[tuple[str, str]]) -> dict
             named = [sha for sha, _ in commits if sha.startswith(prefix)]
             # ponytail: the first two parents; an octopus merge's further sides are not read, so they keep
             # their citations. Read `^@` against the octopus merge base if one ever lists such a merge.
-            listed = publish_git(worktree, "rev-list", f"{named[0]}^1...{named[0]}^2") if len(named) == 1 else None
+            if len(named) != 1:
+                continue
+            # A revert whose patch undoes one side exactly kept the other: that side alone is read, or a kept
+            # commit that shares a file with the undone side loses its citation once its fix moves (ruling
+            # round, review of build/sd-1654). Any other revert reads both, each commit by the revert's files.
+            undid = _patch_id(worktree, f"{revert}^", revert)
+            kept = next((parent for parent in (1, 2)
+                         if undid and _patch_id(worktree, named[0], f"{named[0]}^{parent}") == undid), None)
+            span = (f"{named[0]}^{3 - kept}", f"^{named[0]}^{kept}") if kept else (f"{named[0]}^1...{named[0]}^2",)
+            listed = publish_git(worktree, "rev-list", *span)
             for sha in listed.stdout.split() if listed and listed.returncode == 0 else ():
                 sides.setdefault(sha, set()).update(_changed(worktree, revert))
     return sides
+
+
+def _patch_id(worktree: pathlib.Path, old: str, new: str) -> str:
+    """The stable patch id of `git diff old new`, or "" for an empty diff or a failed read. Bytes, not text: a
+    file that is not UTF-8 must not fail the read."""
+    env = sd_lib.without_fsmonitor(os.environ)
+    try:
+        diff = subprocess.run(["git", "diff", "--no-ext-diff", "--no-color", old, new], cwd=worktree,
+                              capture_output=True, timeout=PUBLISH_SECONDS, check=False, env=env)
+        if diff.returncode != 0 or not diff.stdout:
+            return ""
+        found = subprocess.run(["git", "patch-id", "--stable"], cwd=worktree, input=diff.stdout,
+                               capture_output=True, timeout=PUBLISH_SECONDS, check=False, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return found.stdout.split(b" ", 1)[0].decode("ascii", "replace") if found.returncode == 0 else ""
 
 
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
