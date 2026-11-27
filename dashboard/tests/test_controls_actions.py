@@ -557,6 +557,21 @@ class ItemStatusOnly(BrowserSession):
         self.assertIn(f"resolve followup {note}", json.dumps(answer))
         self.assertEqual(workflow.item_state(self.connection, item)["item"]["status"], "planning")
 
+    def test_done_resolve_all_closes_the_item_and_its_followups(self):
+        """sd:10429: Done, resolve all posts `resolve_followups`; only a boolean with done is taken."""
+        item = self.item("Close me too", kind="task")
+        note = add_note(self.connection, item, "followup", "Ask example.test")
+        self.connection.commit()
+        revision = Fields(self.status_form(item)).fields["revision"]["value"]
+        for bad in ({"status": "ready", "resolve_followups": True}, {"status": "done", "resolve_followups": "yes"}):
+            status, _, _ = self.post(f"/api/items/{item}/status", {"revision": revision, **bad})
+            self.assertEqual(status, 400, bad)
+        status, _, state = self.post(f"/api/items/{item}/status",
+                                     {"revision": revision, "status": "done", "resolve_followups": True})
+        self.assertEqual((status, state["item"]["status"]), (200, "done"))
+        (followup,) = [n for n in state["notes"] if n["id"] == note]
+        self.assertIsNotNone(followup["resolved_at"])
+
     def test_a_followup_with_a_queued_assignment_shows_the_hint_and_no_select(self):
         """The queued run owns the status, not the details. A task with a
         queued assignment keeps its `Save details` form for the same reason:

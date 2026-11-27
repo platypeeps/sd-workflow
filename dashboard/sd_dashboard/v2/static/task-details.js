@@ -315,7 +315,7 @@
       when: o => { const t = T(o); return t ? moveOn(s, t) : 'the task is no longer listed'; },
       cli: o => rowOr(o, t => cliMove(t, s)),
       run: o => { const t = must(o); let from = t.status;
-        return landing(moveTo(t.key, s, { sent: r => { from = r.status; }, check: r => moveOn(s, r) }).then(v => { host.landed?.(t.key); return v; }),
+        return landing(moveTo(t.key, s, { sent: r => { from = r.status; }, check: r => moveOn(s, r) }).then(v => { host.landed?.(t.key); return v; }, e => { waits(t, s, e); throw e; }),
           () => `${label(t)} ${slabel(from)} → ${name} · ${cliMove(t, s)}`, v => moveTo(t.key, from, { rev: v.revision })); },
       undo: undoOf,
     }]));
@@ -344,6 +344,38 @@
           : `the series ended: ${v?.next_occurrence_reason || 'no next occurrence was made'}`;
         return landing(moveTo(t.key, 'done', { sent: r => { from = r.status; }, check: completeOn, wait: true }),
           v => `${label(t)} ${slabel(from)} → Done · ${next(v)} · ${cliMove(t, 'done')}`); } };
+    // sd:10429: a Done the library refuses on a person's open followups (workflow.change_status, sd:10407) names each as
+    // `resolve followup N`. REFUSED keeps that text by item, so Details show it with each followup's Resolve and Done,
+    // resolve all, the dashboard's `sd task status N done --resolve-followups`. A landed close or a later Done clears it.
+    const REFUSED = {}, OPEN_FOLLOWUPS = /^item \d+ has open followups; /;
+    function waits(t, s, e) {
+      if (s !== 'done') return;
+      if (e && OPEN_FOLLOWUPS.test(e.message || '')) { REFUSED[t.id] = e.message; redrawDet(t.id); } else delete REFUSED[t.id];
+    }
+    const openFollowups = d => d ? d.notes.filter(n => n.kind === 'followup' && !n.resolved) : [];
+    const resolveAllOn = t => { if (repeats(t)) return 'it repeats: resolve each followup, then Done → next occurrence';
+      const d = detOf(t), L = legal(t, 'done'); if (!L.ok) return L.reason;
+      return !d ? 'its followups were not read for this row' : openFollowups(d).length ? true : 'it has no open followup; Status → Done closes it'; };
+    const cliResolveAll = t => `${cliMove(t, 'done')} --resolve-followups`;
+    const DONE_RESOLVE = { id: 'item.done.resolve', on: 'item', label: 'Done, resolve all', risk: 'confirm', executes: true,
+      does: 'Moves the task to Done and resolves every open followup on it.',
+      when: o => { const t = T(o); return t ? resolveAllOn(t) : 'the task is no longer listed'; },
+      cli: o => rowOr(o, cliResolveAll),
+      consequence: o => { const t = T(o), ids = openFollowups(detOf(t)).map(n => n.id);
+        return `Resolves followup${ids.length === 1 ? '' : 's'} ${ids.join(', ')} and moves ${label(t)} to Done. Nothing reopens a resolved followup, so there is no Undo.`; },
+      run: o => { const t = must(o);
+        return landing(write(t.key, x => `/api/items/${x.id}/status`, { status: 'done', resolve_followups: true }, { seconds: WRITE_SECONDS, check: resolveAllOn })
+          .then(v => { delete REFUSED[t.id]; redrawDet(t.id); host.landed?.(t.key); return v; }),
+          () => `${label(t)} → Done, followups resolved · ${cliResolveAll(t)}`); } };
+    // The refusal in Details: its text, each open followup with its Resolve, and Done, resolve all.
+    function doneWaits(t) {
+      const why = REFUSED[t.id], open = openFollowups(detOf(t));
+      if (!why || t.status === 'done' || !open.length) return '';
+      return html`<section class="done-waits" aria-live="polite"><h3>Done waits on ${plural(open.length, 'open followup')}</h3>
+        <p class="why">${why}</p>
+        <ol class="rec">${open.map(n => html`<li data-note="${String(n.id)}"><span><b>followup ${String(n.id)}</b> ${n.body}</span>${C.rowActions('note:' + n.id)}</li>`)}</ol>
+        <div class="actions"><button class="btn risky" type="button" data-cmd="${DONE_RESOLVE.id}" data-obj="${t.key}">${DONE_RESOLVE.label}</button></div></section>`;
+    }
     // An edit's Undo sets back the fields it changed (`keep`, the row's names), as they were when the edit was sent, at the
     // revision the edit answered. A field the row does not carry (the description) takes `before(row)`, read then too.
     // `check` asks as the edit leaves whether it still changes anything: a second one queued
@@ -360,7 +392,7 @@
     // to do, so those stay off its Act bar (`bar: false`); 1-5, e, m, the ⋯ menu, the palette and the bulk bar still run them.
     // sd:6687: Status → and Edit → P leave the row ⋯ menu too (`menu: false`); keys 1-5, the palette and bulk keep them.
     C.register(
-      ...Object.values(STATUS_CMD), COMPLETE,
+      ...Object.values(STATUS_CMD), COMPLETE, DONE_RESOLVE,
       // Edit sets priority and due date in one dialog. Its save carries the Undo, so the shell's own feedback stays safe.
       { id: 'item.edit', on: 'item', label: 'Edit', key: 'e', risk: 'safe', icon: 'pen-line', bar: false,
         does: 'Opens a form to change the priority and due date.',
@@ -583,6 +615,7 @@
       put(el, html`<div class="kind"><span class="label">${t.kind}</span><span class="tag real">observed</span></div>
         <h2>${t.title}</h2>
         ${host.note?.(t, detOf(t)) || ''}
+        ${doneWaits(t)}
         <dl class="fields">
           <dt>Id${hint('Id', 'The item\'s number in the workflow database; every sd command names the item by it.')}</dt><dd>#${t.id}</dd>
           <dt><label for="det-title">Title</label>${hint('Title', 'The name lists, the board and briefs show for this item.')}</dt><dd><input id="det-title" class="fld" value="${t.title}" required${dis}></dd>

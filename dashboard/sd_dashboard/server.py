@@ -693,10 +693,14 @@ def action_route(path, payload, *, principal, operations_backend=None, services_
                                    if _base_kind(connection, number) else
                                    workflow.edit_item(connection, number, values, **options))
     if entity == "items" and suffix == "/status":
-        if set(values) - {"status", "reason"} or "status" not in values:
+        if set(values) - {"status", "reason", "resolve_followups"} or "status" not in values:
             raise ValueError("A status and optional reason are required.")
+        # sd:10429: Done, resolve all closes the item and every open followup, as `--resolve-followups` does.
+        resolve = values.get("resolve_followups", False)
+        if type(resolve) is not bool or (resolve and values["status"] != "done"):
+            raise ValueError("resolve_followups is true or false, and true only with done.")
         return lambda connection: workflow.change_status(connection, number,
-            values["status"], reason=values.get("reason") or None, **options)
+            values["status"], reason=values.get("reason") or None, resolve_followups=resolve, **options)
     if entity == "items" and suffix == "/notes":
         if set(values) - {"body", "kind"} or "body" not in values:
             raise ValueError("A note body and optional kind are required.")
