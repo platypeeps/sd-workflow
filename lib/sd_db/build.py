@@ -2899,6 +2899,60 @@ def branch_run(connection, branch: str) -> dict | None:
     return dict(found) if found else None
 
 
+def _last_builds(connection, ids: Collection[int], items: Collection[int]) -> dict[int, dict]:
+    """Each of `items`' newest build run outside the assignments `ids`, by the bundle it rode in, keyed by item: an
+    assignment that never ran (a press cancelled before its claim) hides no earlier build (lane review of
+    build/sd-1808), nor does a run that ended before its builder ran (`step` still `claimed` or `worktree`): it
+    built nothing, so the earlier run holds the item's newest work (lane review at 992ef580). A run from before
+    `step` was kept (NULL) counts as built."""
+    marks = ", ".join("?" for _ in ids)
+    found = {item: connection.execute(
+        f"SELECT runner_run.id, runner_run.outcome FROM runner_run JOIN assignment "
+        f"ON assignment.id = runner_run.assignment OR assignment.parent = runner_run.assignment "
+        f"WHERE assignment.item = ? AND assignment.scope = ? AND assignment.id NOT IN ({marks}) "
+        f"AND COALESCE(runner_run.step, '') NOT IN ('claimed', 'worktree') "
+        f"ORDER BY runner_run.created_at DESC, runner_run.run DESC, runner_run.rowid DESC LIMIT 1",
+        (item, SCOPE, *ids)).fetchone() for item in items}
+    return {item: dict(row) for item, row in found.items() if row}
+
+
+def lane_failed_start(connection, lead: int) -> dict | None:
+    """Where a new bundle under assignment `lead` starts when its items were last built in a bundle whose lane entry
+    failed: that run's `branch` and its `detail` (sd:10379). An item
+    moved back to ready and built again is a fresh press with a new branch, which from origin/main dropped the
+    failed bundle's commits. None, so main, unless exactly one lane-failed run that some item last rode in had
+    every item it built in this bundle: its commits cite them, and a missing one would not deliver. An item never
+    built, or last built elsewhere, rides along: it cites nothing on that branch (lane review of build/sd-1808).
+    That run must be the last build of each item it built, too: an item built again since has newer work on
+    another branch, and the failed branch holds only its older commits (lane review at 992ef580)."""
+    # A member cancelled out of this bundle (`ALONE`) is not selected: it neither builds nor delivers here.
+    bundle = connection.execute(f"SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+                                f"AND {_in_group()}", (lead, lead, SCOPE)).fetchall()
+    ids, items = {row["id"] for row in bundle}, {row["item"] for row in bundle}
+    last = _last_builds(connection, ids, items)
+    runs = {row["id"] for row in last.values() if row["outcome"] == "lane_failed"}
+    whole = [failed for failed in (run(connection, ident) for ident in sorted(runs))
+             if all(member["item"] in items and last.get(member["item"], {}).get("id") == failed["id"]
+                    for member in failed["members"])]
+    if len(whole) != 1:
+        return None
+    failed = whole[0]
+    return {"run": failed["id"], "branch": failed["branch"], "detail": failed["detail"] or "", "items": items}
+
+
+def outside_rebuild(connection, lead: int, cited: Collection[int]) -> list[int]:
+    """Of `cited`, the items outside the bundle under `lead` when it builds again an item whose last bundle failed
+    in the lane; [] for any other bundle. Its branch may start at that bundle's head (`lane_failed_start`) and so
+    hold its trailers, and the lane's merge closes every open item one cites. Read from history alone, each row of
+    the bundle counted, so a member that leaves mid-run turns no check off (class pass of build/sd-1808)."""
+    bundle = connection.execute("SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
+                                (lead, lead, SCOPE)).fetchall()
+    ids, items = [row["id"] for row in bundle], {row["item"] for row in bundle}
+    if any(last["outcome"] == "lane_failed" for last in _last_builds(connection, ids, items).values()):
+        return sorted(set(cited) - items)
+    return []
+
+
 def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
     """Whether Fix on a failed lane entry (pack sd:8584) takes build run `run`: its bundle's members to send back, and
     the lane entry's key and body to hand back. Fix's state on the page and its press both read this one check.
@@ -2955,6 +3009,28 @@ def _hand_back(connection, key: str, entry: dict, run: str, *, who: str, by: str
                         f"{entry.get('reason') or 'no reason kept'}"[:2000])
     connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
                        (key, stamp, json.dumps(entry, sort_keys=True)))
+
+
+def take_over(connection, failed: dict, run: str) -> str:
+    """Build run `run` starts its branch at the failed bundle `failed`'s tip (`lane_failed_start`), so it owns that
+    work now: the failed lane entry is handed back (`_hand_back`), as Fix does. Its head may stay unchanged, and the
+    lane refuses a head an imported entry ended (`sd_lane.refuse_ran`) but not a cancelled one; nor does a Retry
+    of the old entry deliver the same commits beside the rebuild (lead review of build/sd-1808). Only the entry the
+    failed run recorded is handed back, as the conflict rebuild checks: a newer one on that branch (a lane Retry)
+    is an attempt this build never read. Answers "" once handed back, or why not: one already handed back by an
+    earlier try of this start, another entry, or a lane not read, writes nothing, and the enqueue then names
+    any refusal."""
+    named = LANE_ENTRY.match(failed["detail"] or "")
+    ident = named.group(1) if named else None
+    with transaction(connection):
+        try:
+            key, entry = _lane_entry(connection, failed["branch"], ident, actor="the rebuild")
+            if ident is not None and entry.get("id") != ident:
+                raise BuildRefused(f"branch {failed['branch']}'s newest lane entry is {entry.get('id')}, not {ident}")
+        except BuildRefused as refused:
+            return str(refused)
+        _hand_back(connection, key, entry, run, who="build", by="a rebuild", stamp=clock())
+    return ""
 
 
 def _lane_entry(connection, branch: str, ident: str | None = None, *, actor: str = "Fix") -> tuple[str, dict]:

@@ -480,7 +480,7 @@ def _print_rows(rows: list[dict[str, Any]], *, moved: bool = False, today: str |
 
 
 def _emit(value: Any, *, machine: bool, moved: bool = False, following: Any = None,
-          audit: bool = False, audited: Any = None) -> None:
+          audit: bool = False, audited: Any = None, reviews: dict | None = None) -> None:
     _name_refs(value)
     if machine:
         print(json.dumps(value, ensure_ascii=False))
@@ -493,7 +493,16 @@ def _emit(value: Any, *, machine: bool, moved: bool = False, following: Any = No
         _occurrence_line(value, following)
     if isinstance(value, dict):
         _print_notes(value, None if audit else audited)
+        if reviews:
+            print(_reviews_line(reviews))
         print(f"revision: {value['revision']}")
+
+
+def _reviews_line(row: dict) -> str:
+    """The item's review rounds and their cost, `reads.review_costs`'s totals (sd:10401)."""
+    return (f"reviews: {row['rounds']} rounds ({row['blocking']} blocking, {row['clean']} clean build, "
+            f"{row['lane']} lane) over {row['runs']} build runs · tokens {row['tokens_in']:,} in, "
+            f"{row['tokens_out']:,} out · ${row['usd']:.2f} API-equivalent")
 
 
 def _print_notes(value: dict[str, Any], audited: Any) -> None:
@@ -1398,12 +1407,15 @@ def run(args: argparse.Namespace) -> int:
         # thing `_emit` cannot read off the result: a row that already sat in
         # the destination looks the same afterwards as one that just moved.
         # `following` is the row a recurring completion created, if any.
-        moved, following, dedupe = False, None, None
+        moved, following, dedupe, reviews = False, None, None, None
         result: Any
         if action == "items":
             result = _items(sd_db, workflow, args, connection)
         elif action == "item":
             result = workflow.item_state(connection, args.item)
+            if not args.json:  # human output only: the JSON stays the row's state, as `task edit` prints it
+                from sd_db import reads
+                reviews = reads.review_costs(connection, [args.item]).get(args.item)
         elif action == "add":
             result, dedupe = _add(sd_db, workflow, args, connection, who)
         elif action == "edit" and getattr(args, "experiment", None):
@@ -1429,7 +1441,7 @@ def run(args: argparse.Namespace) -> int:
         else:
             raise WorkRefusal(f"unknown workflow operation: {action}")
         _emit(result, machine=args.json, moved=moved, following=following,
-              audit=getattr(args, "audit", False), audited=workflow.is_audit_note)
+              audit=getattr(args, "audit", False), audited=workflow.is_audit_note, reviews=reviews)
         _dedupe(dedupe)
         return 0
     except sd_db.SdDbError as error:
