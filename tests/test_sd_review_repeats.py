@@ -408,6 +408,24 @@ class ReproRuleTests(unittest.TestCase):
         sd_review.finish_review(asked, [answer], ["fake"], repro=True, on_base=lambda _row: True)
         self.assertEqual(asked["status"], "advisory")
 
+    def test_a_has_downgrades_only_when_every_merged_copy_holds(self) -> None:
+        """sd:10892 round 4: `distinct_findings` merges one finding two readers report and keeps the
+        first reader's `backend`. A patch-only reader's copy, or a `lacks` copy, keeps it blocking."""
+        result = {"severity_floor": "high", "requested_reviews": 2}
+        def answer(backend: str, base: str) -> Any:
+            return sd_review.Outcome(backend, sd_review.FINDINGS,
+                                     (finding(REPRO, base=base, instances=["src.py:1"]),), "", (), ())
+        reads = lambda row: row.get("backend") == "local"  # noqa: E731
+        for label, outcomes, status in (
+                ("both read the checkout", [answer("local", "has"), answer("local", "has")], "advisory"),
+                ("a patch-only copy", [answer("local", "has"), answer("remote", "has")], "blocking"),
+                ("a patch-only copy first", [answer("remote", "has"), answer("local", "has")], "blocking"),
+                ("a lacks copy", [answer("local", "has"), answer("local", "lacks")], "blocking")):
+            with self.subTest(label):
+                done = sd_review.finish_review(dict(result), outcomes, [o.backend for o in outcomes],
+                                               repro=True, on_base=reads)
+                self.assertEqual(done["status"], status)
+
     def test_a_defect_the_change_causes_still_blocks(self) -> None:
         """sd:10892: `lacks`, an older answer without `base`, or a value not exactly `has` still blocks."""
         for base in ("lacks", None, "Has", " has", 3, []):

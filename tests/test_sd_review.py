@@ -1195,14 +1195,16 @@ class PipelineTests(ReviewFixture):
         prior = self._topic_commit(root, "first.py")
         self._topic_commit(root, "second.py")
         self.prepare(root)
-        for subject in (sd_review.resolve_subject(root, "worktree"), sd_review.resolve_subject(root, "branch"),
-                        sd_review.resolve_subject(root, "branch", base=prior)):
-            with self.subTest(scope=subject.scope, base=subject.base):
+        branch = sd_review.resolve_subject(root, "branch")
+        self.assertEqual(branch.main_base, main)
+        self.assertIn(sd_review.base_ask(branch), sd_review.build_prompt(branch, False, ""))
+        self.assertIn(main, sd_review.base_ask(branch))
+        self.assertNotIn(prior, sd_review.base_ask(branch))
+        for subject in (sd_review.resolve_subject(root, "worktree"), sd_review.resolve_subject(root, "branch", base=prior)):
+            with self.subTest(scope=subject.scope, base=subject.base):  # round 4: its diff is not on main_base
                 self.assertEqual(subject.main_base, main)
-                prompt = sd_review.build_prompt(subject, False, "")
-                self.assertIn(sd_review.base_ask(subject), prompt)
-                self.assertIn(main, sd_review.base_ask(subject))
-                self.assertNotIn(prior, sd_review.base_ask(subject))
+                self.assertEqual(sd_review.base_ask(subject), "")
+                self.assertNotIn("base says", sd_review.build_prompt(subject, False, ""))
 
     def test_no_base_question_without_a_main_merge_base(self) -> None:
         """Planning, or a repository with no default branch to measure from, asks nothing, so a
@@ -1245,16 +1247,16 @@ class PipelineTests(ReviewFixture):
                  ("an instance with no line", row(instances=["lib.py"]), False),
                  ("a path outside the repository", row(path="../lib.py"), False),
                  ("a path that is an option", row(path="--output=x"), False))
-        for subject in (sd_review.resolve_subject(root, "branch"), sd_review.resolve_subject(root, "branch", base=prior)):
-            check = sd_review.base_check(root, subject, {"local"})
-            for label, finding, held in cases:
-                with self.subTest(label, base=subject.base):
-                    self.assertIs(check(finding), held)
-        worktree = sd_review.base_check(root, sd_review.resolve_subject(root, "worktree"), {"local"})
-        self.assertIs(worktree(row()), True)
-        self.assertIs(worktree(row(line=5)), False, "an uncommitted edit touched it")
-        self.assertIs(worktree(row(path="loose.py", line=1)), False, "untracked: not on main")
-        self.assertIs(worktree(row(line=2)), False)
+        check = sd_review.base_check(root, sd_review.resolve_subject(root, "branch"), {"local"})
+        for label, finding, held in cases:
+            with self.subTest(label):
+                self.assertIs(check(finding), held)
+        # round 4: a reader whose diff is against another base (a fix pass's `--base`, the worktree's
+        # HEAD) judged the defect on that diff, not on the main merge base: nothing holds.
+        for subject in (sd_review.resolve_subject(root, "branch", base=prior), sd_review.resolve_subject(root, "worktree")):
+            with self.subTest(base=subject.base):
+                self.assertNotEqual(subject.base, subject.main_base)
+                self.assertIs(sd_review.base_check(root, subject, {"local"})(row()), False)
         self.assertFalse((root / "x").exists())
 
     def test_no_has_answer_holds_without_a_main_merge_base(self) -> None:

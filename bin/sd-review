@@ -363,20 +363,25 @@ def _main_base(root: pathlib.Path) -> str:
         return ""
 
 
+def _judged(subject: Subject) -> bool:
+    """Whether the reader's diff starts at the main merge base: a fix pass's `--base` or the worktree's HEAD
+    shows another diff, so a `has` there was judged on it, not on main (sd:10892 round 4)."""
+    return bool(subject.main_base) and subject.base == subject.main_base
+
+
 def base_ask(subject: Subject) -> str:
-    """The `base` question, against the default branch's merge base by commit, never the diff's own base: a
-    fix pass's `--base` or the worktree's HEAD is a branch commit (sd:10892 review). "" with none."""
+    """The `base` question, naming the main merge base by commit; "" when `_judged` fails (sd:10892)."""
     return (f" base says whether commit {subject.main_base}, the merge base with the default branch, has the same "
             "defect; read it there, and answer lacks if you cannot: "
-            + "; ".join(f"{name}: {why}" for name, why in BASES.items()) + ".") if subject.main_base else ""
+            + "; ".join(f"{name}: {why}" for name, why in BASES.items()) + ".") if _judged(subject) else ""
 
 
 def base_check(root: pathlib.Path, subject: Subject, readers: set[str]) -> Callable[[Mapping[str, Any]], bool]:
     """Whether a finding's `base: has` holds: a claim, so git decides (sd:10892 last round). It holds only from
     one of `readers`, who read the checkout (a patch shows no named commit), and only when every place it names
-    is a line of a file the main merge base holds that nothing since, committed or not, touched. A deleted
-    line counts as touching the lines beside it. Git failing, or no merge base, holds nothing."""
-    spec = subject.main_base if subject.head == "worktree" else f"{subject.main_base}..{subject.head}"
+    is a line of a file the main merge base holds that nothing since touched. A deleted line counts as
+    touching the lines beside it. Git failing, or a diff not from the main merge base, holds nothing."""
+    spec = f"{subject.main_base}..{subject.head}"
     def _untouched(place: str) -> bool:
         path, _, line = place.rpartition(":")
         if not path or re.fullmatch(r"[0-9]+", line) is None or sd_lib.git_output(["cat-file", "-e", f"{subject.main_base}:{path}"], root) is None:
@@ -386,7 +391,7 @@ def base_check(root: pathlib.Path, subject: Subject, readers: set[str]) -> Calla
             int(start) <= int(line) <= int(start) + (int(count or 1) or 2) - 1  # `,0`: a deletion, both sides
             for start, count in re.findall(r"^@@ -[0-9,]+ \+([0-9]+)(?:,([0-9]+))? @@", diff, re.M))
     def _holds(row: Mapping[str, Any]) -> bool:
-        return bool(subject.main_base) and row.get("backend") in readers and all(
+        return _judged(subject) and row.get("backend") in readers and all(
             _untouched(place) for place in (f"{row.get('path')}:{row.get('line')}", *_instances(row.get("instances"))))
     return _holds
 
@@ -2942,8 +2947,11 @@ def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed:
                   on_base: Callable[[Mapping[str, Any]], bool] | None = None) -> dict[str, Any]:
     """Keep every distinct finding, once, and every prior blocker `carried` holds; only complete answers count
     toward required depth."""
-    collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    fresh = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior, on_base=on_base)
+    copies = [dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings]
+    collected = sd_lib.distinct_findings(copies)
+    def _every_copy(row: Mapping[str, Any]) -> bool:  # a merged row keeps one backend: each copy's reader must hold (sd:10892 round 4)
+        return on_base is not None and on_base(row) and all(on_base(c) for c in copies if sd_lib.finding_key(c) == sd_lib.finding_key(row))
+    fresh = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior, on_base=_every_copy)
     disposed = fresh + carried(prior, outcomes, rebutted)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []

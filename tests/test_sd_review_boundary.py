@@ -1225,11 +1225,16 @@ class LineBudgetTests(unittest.TestCase):
         # reader of the checkout and only where git shows every named
         # place untouched since the main merge base. Measured:
         # `sd-review` is 3286.
+        #
+        # 5256 -> 5264 is sd:10892 round 4: `bin/sd-review` +8 so a merged
+        # finding downgrades only when every reader's copy holds, and only
+        # a diff from the main merge base is asked or judged (`_judged`).
+        # Measured: `sd-review` is 3294.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5256,
+            5264,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
