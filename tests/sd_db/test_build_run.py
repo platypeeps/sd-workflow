@@ -4227,7 +4227,22 @@ class TargetSize(Case):
         return [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
 
     def sized(self):
-        return [body for body in self.notes() if "target/" in body and "cargo clean" in body]
+        return [body for body in self.notes() if "Rust target/" in body]
+
+    def test_the_note_warns_that_a_clean_deletes_what_target_holds(self):
+        """Review of build/sd-1798: the note advised `cargo clean`, which deletes a capture saved under
+        `target/` too; on both paths, measured and unread, it says so and asks to move such files first."""
+        self.rust()
+        self.supervisor().note_target()
+        with mock.patch.object(build_run, "target_kib", side_effect=OSError("du")):
+            supervisor = self.supervisor()
+            supervisor.marks.clear()
+            supervisor.note_target()
+        self.assertEqual(len(self.sized()), 2, self.notes())
+        for body in self.sized():
+            self.assertNotIn("run cargo clean there", body)
+            self.assertIn("deletes every file in it", body)
+            self.assertIn("move out any file you keep first", body)
 
     def capture_survives(self, outcome):
         """Ruling #83955: target/debug/repro.log stays; the lead gets a note naming the size and the cleanup."""

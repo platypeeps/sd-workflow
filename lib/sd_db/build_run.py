@@ -1499,8 +1499,9 @@ class Supervisor:
             size = f"{target_kib(target) / 2**20:.1f} GiB"
         except (OSError, ValueError, IndexError, subprocess.SubprocessError) as fault:
             size = f"size unread ({type(fault).__name__})"
-        body = (f"Build run {self.ident}: its kept worktree {self.work} holds a Rust target/ of {size}; "
-                f"run cargo clean there once nothing needs its build output")
+        body = (f"Build run {self.ident}: its kept worktree {self.work} holds a Rust target/ of {size}, "
+                f"not cleaned: cargo clean deletes every file in it, a capture saved there too, "
+                f"so move out any file you keep first")
         self.once("target-size", lambda: add_note(self.db, self.lead, "comment", body))
 
     def enter(self, step: str, **fields) -> None:
