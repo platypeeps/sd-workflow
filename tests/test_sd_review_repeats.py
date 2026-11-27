@@ -68,12 +68,14 @@ class RepeatFixture(ReviewFixture):
 
     def adjudication(self, *rows: tuple[str, str, str], branch: str = BRANCH, repository: str = REPOSITORY,
                      head: Any = "", days: float = 0.5, prefix: str = "ship-adjudication:", key: str = "k",
-                     line: Any = 3, instances: Any = None) -> None:
+                     line: Any = 3, instances: Any = None, ruled: str | None = None) -> None:
         """One `sd-ship adjudicate` record: each (summary, disposition, reason) a blocking finding's answer,
-        at the reviewed head unless `head` names another."""
+        at the reviewed head unless `head` names another; `ruled`: a build ruling's, judging that evidence."""
         findings = [{"index": index, "finding_digest": "0" * 64, "response_disposition": answer, "reason": reason,
                      "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "instances": instances or [f"bin/tool.py:{line}"], "summary": summary,
-                                     "family": "correctness", "disposition": "blocking"}}
+                                     "family": "correctness", "disposition": "blocking",
+                                     **({} if ruled is None else {"evidence": ruled})},
+                     **({} if ruled is None else {"ruled": True})}
                     for index, (summary, answer, reason) in enumerate(rows, 1)]
         bindings = {"repository": repository, "branch": branch, "head": head if head != "" else self.head}
         self.write_row(f"{prefix}{key}", {"decision": "accepted", "proposal": {
@@ -1137,6 +1139,27 @@ class RepeatRuleTests(unittest.TestCase):
         long = sd_review.parse_findings(json.dumps({"findings": [row(evidence="x" * 50_000)]}))
         assert long is not None
         self.assertEqual(len(long.findings[0]["evidence"]), sd_review.EVIDENCE_CHARS)
+        # Review of sd:10286 (bin/sd-review:1799): two repros that share the kept prefix stay two, or a
+        # ruling on one holds back the other in the build and the lane alike.
+        shared = "python3 t.py --input " + "a" * 2000
+        cut = [sd_review.parse_findings(json.dumps({"findings": [row(evidence=shared + tail)]})) for tail in "12"]
+        self.assertNotEqual(*(answer.findings[0]["evidence"] for answer in cut if answer is not None))
+        self.assertEqual({len(answer.findings[0]["evidence"]) for answer in cut if answer is not None},
+                         {sd_review.EVIDENCE_CHARS})
+        # Class pass 5 (bin/sd-review:1248): a literal citation of a cut evidence's stored form is another
+        # text than the one it was cut from, so it reads as another repro.
+        assert cut[0] is not None
+        stored = cut[0].findings[0]["evidence"]
+        literal = sd_review.parse_findings(json.dumps({"findings": [row(evidence=stored)]}))
+        assert literal is not None
+        self.assertNotEqual(literal.findings[0]["evidence"], stored)
+        # Class pass 6 (bin/sd-review:1247): a saved ruling may hold a form an earlier release cut, with
+        # a 12-digit digest; a literal citation of it is no copy of the text behind it either.
+        for old in ("python3 t.py --input aaaa... sha256:0123456789ab", "x... sha256:" + "f" * 16):
+            with self.subTest(old=old):
+                cited = sd_review.parse_findings(json.dumps({"findings": [row(evidence=old)]}))
+                assert cited is not None
+                self.assertNotEqual(cited.findings[0]["evidence"], old)
         nested = sd_review.parse_findings(json.dumps({"findings": [row(evidence={"command": {"argv": ["git"]}})]}))
         assert nested is not None
         self.assertEqual(sd_review.dispose(nested.findings, "high", self.REBUTTED)[0]["disposition"], "advisory")
@@ -1287,6 +1310,14 @@ def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 
         for path, summary, answer, *rest in rows for at in [(*rest, line)[0]]]}})
 
 
+def ruled_body(summary: str = "defect", evidence: Any = REPRO, ruled: Any = True) -> str:
+    """An adjudication body as a build's ruling round writes it: the judged evidence kept, the row marked."""
+    body = json.loads(adjudicated(("src.py", summary, "rebutted")))
+    body["proposal"]["findings"][0]["ruled"] = ruled
+    body["proposal"]["findings"][0]["raw_finding"]["evidence"] = evidence
+    return json.dumps(body)
+
+
 def listed(*bodies: str) -> list[Any]:
     """The rebuttals in `bodies`, newest first, as the prompt lists them."""
     return sd_review.rebuttals([(body,) for body in bodies], {ON_BRANCH}.__contains__, lambda _head, _path: True)
@@ -1318,6 +1349,85 @@ class RebuttalIdentityTests(unittest.TestCase):
         parked = adjudicated(("src.py", "defect", "parked"))
         self.assertEqual(gate([row()], parked, rebutted), ["blocking"])
         self.assertEqual(gate([row()], rebutted, parked), ["advisory"])
+
+    def test_a_ruling_rebuttal_holds_back_a_cited_repeat(self) -> None:
+        """Review of sd:10286 (build_run.py:2199): a build's ruling round rejected the blocker and its
+        evidence, so the cited repeat it clears posts as advice here too. An `sd-ship adjudicate` rebuttal
+        still holds back only an uncited repeat.
+
+        Class pass 4 (bin/sd-review:1791): only the evidence the ruling judged, as its rebuttal records it.
+        A fresh reproduction at the same place blocks, as does any when the rebuttal records none."""
+        plain = adjudicated(("src.py", "defect", "rebutted"))
+        cited = row(evidence=REPRO)
+        self.assertEqual(gate([cited], plain), ["blocking"])
+        self.assertEqual(gate([cited], ruled_body()), ["advisory"])
+        # Night triage (bin/sd-review:1801): the build clears only the exact evidence, so a repro that
+        # differs in case or spacing is a fresh one here too: `-k ABC` is not `-k abc`.
+        for fresh in (" " + REPRO.upper() + "\n", REPRO.upper(), REPRO.replace(" ", "  ", 1)):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(gate([row(evidence=fresh)], ruled_body()), ["blocking"], "folded")
+        self.assertEqual(gate([row()], ruled_body()), ["advisory"], "an uncited repeat holds as ever")
+        self.assertEqual(gate([row(evidence="python3 t.py --empty: IndexError")], ruled_body()), ["blocking"],
+                         "a fresh reproduction was held back")
+        self.assertEqual(gate([row(summary="another defect", evidence=REPRO)], ruled_body()), ["blocking"])
+        for evidence in (None, "", 7, [REPRO]):
+            with self.subTest(recorded=evidence):
+                self.assertEqual(gate([cited], ruled_body(evidence=evidence)), ["blocking"])
+        for value in ("true", 1, None):
+            with self.subTest(ruled=value):
+                self.assertEqual(gate([cited], ruled_body(ruled=value)), ["blocking"], "only a literal true")
+
+    def test_a_ruling_holds_no_uncited_repeat_of_another_saved_repro(self) -> None:
+        """Review of sd:10286 (bin/sd-review:1823, :1827, :1842): an uncited repeat carries the repro the
+        prior review saved at its place. A ruling judged one repro; another saved there blocks, keeps its
+        evidence, and the prior blocker is no rebutted place. The saved ruled repro still holds."""
+        fresh = "python3 t.py --empty: IndexError"
+        prior = [dict(row(evidence=fresh), disposition="blocking")]
+        disposed = sd_review.dispose([row()], "high", listed(ruled_body()), prior=prior)
+        self.assertEqual([(r["disposition"], r.get("evidence")) for r in disposed], [("blocking", fresh)])
+        same = [dict(row(evidence=REPRO), disposition="blocking")]
+        disposed = sd_review.dispose([row()], "high", listed(ruled_body()), prior=same)
+        self.assertEqual([r["disposition"] for r in disposed], ["advisory"])
+
+    def test_a_ruling_holds_no_uncited_repeat_beside_another_saved_blocker(self) -> None:
+        """Class pass 7 (bin/sd-review:1820, :1842): the saved repro was found by the prior blocker's words,
+        so one in other words at the ruled place let the uncited repeat through. A ruling holds an uncited
+        repeat only when every blocker the prior review saved at or beside its place is the claim it judged:
+        the ruled repro, or the ruled words with none. Any other saved there blocks, fail closed."""
+        fresh = "python3 t.py --empty: IndexError"
+        def held(*saved: dict[str, Any]) -> list[str]:
+            prior = [dict(old, disposition="blocking") for old in saved]
+            return [r["disposition"] for r in sd_review.dispose([row()], "high", listed(ruled_body()), prior=prior)]
+        for name, old in (("other words, another repro", row(summary="crash on empty input", evidence=fresh)),
+                          ("other words, no repro", row(summary="crash on empty input")),
+                          ("other words, a line beside", row(summary="crash on empty input", evidence=fresh,
+                                                             line=1 + sd_review.SHIFT_LINES)),
+                          ("other words, no line", row(summary="crash on empty input", evidence=fresh, line=None)),
+                          ("the ruled words, another repro", row(evidence=fresh))):
+            with self.subTest(name):
+                self.assertEqual(held(old), ["blocking"])
+        for name, old in (("the ruled repro in other words", row(summary="crash on empty input", evidence=REPRO)),
+                          ("the ruled words, no repro", row()), ("another file", row(path="other.py", evidence=fresh)),
+                          ("a line far off", row(summary="crash", evidence=fresh, line=2 + sd_review.SHIFT_LINES))):
+            with self.subTest(name):
+                self.assertEqual(held(old), ["advisory"])
+        self.assertEqual(held(), ["advisory"])
+
+    def test_every_ruling_rebuttal_holds_past_the_prompts_cap(self) -> None:
+        """Class pass 4 (build_run.py:2199): a build clears each exact repeat its ruling round ruled, however
+        many; the prompt's cap listed ten rebuttals, so the lane blocked the eleventh. A ruling's hold reads
+        the recorded evidence, not what the reviewer was shown, so the cap does not bound it. The cap still
+        bounds the prompt, and an `sd-ship adjudicate` rebuttal past it."""
+        count = sd_review.REBUTTED_LINES + 3
+        bodies = [ruled_body(summary=f"claim {index}") for index in range(count)]
+        self.assertEqual(gate([row(summary=f"claim {index}", evidence=REPRO) for index in range(count)], *bodies),
+                         ["advisory"] * count)
+        self.assertEqual(gate([row(summary=f"claim {index}") for index in range(count)], *bodies),
+                         ["advisory"] * count, "an uncited repeat of a ruling past the cap")
+        self.assertEqual(sd_review.rebuttal_section(listed(*bodies)).count("\n- "), sd_review.REBUTTED_LINES)
+        changed = sd_review.rebuttals([(bodies[0],)], {ON_BRANCH}.__contains__, lambda _head, _path: False)
+        self.assertEqual(sd_review.dispose([row(summary="claim 0", evidence=REPRO)], "high", changed)[0]["disposition"],
+                         "blocking", "a ruling whose file changed since still held")
 
     def test_only_an_accepted_adjudication_rebuts(self) -> None:
         for decision in ("rejected", "", "proposed"):
@@ -1498,6 +1608,40 @@ class RebuttalScopeTests(RepeatFixture):
                 seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
                                                    self.environment())
                 self.assertEqual([entry.text for entry in seen if entry.listed], [])
+
+    def test_a_ruling_lapses_on_any_later_change_of_the_branch(self) -> None:
+        """Review of sd:10286 (bin/sd-review:919): a ruling judged the code at its head; a later commit to a
+        file it does not name (a new caller) can make the crash reachable, yet the ruling held its cited
+        repeat. A ruling holds only while the branch has no change of its own since its head."""
+        self.adjudication(("lane claim", "rebutted", "x"), ruled="the repro")
+        def ruled(scope: str) -> list[Any]:
+            seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                               self.environment())
+            return [entry.ruled for entry in seen]
+        self.assertEqual(ruled("branch"), ["the repro"])
+        (self.root / "caller.py").write_text("import tool\n", encoding="utf-8")
+        self.assertEqual(ruled("worktree"), [None], "an uncommitted caller kept the ruling")
+        self.commit("add", "caller.py")
+        self.commit("a new caller")
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                self.assertEqual(ruled(scope), [None], "a later commit kept the ruling")
+
+    def test_a_ruling_lapses_on_a_catch_up_merge(self) -> None:
+        """Class pass 5 on sd:10286 (bin/sd-review:872): the base's own commits can add the caller too. A
+        ruling holds only at the tree it judged, and a lapsed one is no listed rebuttal either."""
+        self.adjudication(("lane claim", "rebutted", "x"), ruled="the repro")
+        self.commit("checkout", "--quiet", "-")
+        (self.root / "caller.py").write_text("import tool\n", encoding="utf-8")
+        self.commit("add", "caller.py")
+        self.commit("a caller on the base")
+        self.commit("checkout", "--quiet", BRANCH)
+        self.commit("merge", "--quiet", "--no-edit", "-")
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                                   self.environment())
+                self.assertEqual([(entry.ruled, entry.listed) for entry in seen], [(None, False)])
 
     def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))
