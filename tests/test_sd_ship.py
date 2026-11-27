@@ -55,6 +55,9 @@ loader.exec_module(ship)
 #: The *Development / Code, before merge* cap. Read from the module that
 #: owns it, so these fixtures follow the row instead of restating it.
 CAP = importlib.import_module("sd_ship_history").AUTOMATIC_CODE_REVIEW_PASSES
+#: A clean answer clears each prior blocker by id (sd:10087); an id no blocker has is ignored.
+FIXED_VERDICTS = [{"id": f"B{n}", "verdict": "fixed", "evidence": "src.py:1 fixed"} for n in range(1, 61)]
+FIXED_SCRIPT = "[{'id': 'B%d' % n, 'verdict': 'fixed', 'evidence': 'src.py:1 fixed'} for n in range(1, 61)]"
 sd_ship_review = importlib.import_module("sd_ship_review")
 
 
@@ -435,7 +438,7 @@ class ShipCase(unittest.TestCase):
         transport.write_text(git_transport(real_git, self.remote.path, self.remote_url))
         transport.chmod(0o755)
         provider = self.programs / "review-fixture"
-        provider.write_text("#!/usr/bin/env python3\nimport json\nprint(json.dumps({'type':'result','subtype':'success','structured_output':{'findings':[]}}))\n")
+        provider.write_text("#!/usr/bin/env python3\nimport json\nprint(json.dumps({'type':'result','subtype':'success','structured_output':{'findings':[],'verdicts':" + FIXED_SCRIPT + "}}))\n")
         provider.chmod(0o755)
         registry = self.database.parent / "providers.yaml"
         registry.write_text(f"""bills:
@@ -992,6 +995,7 @@ roles:
         (self.root / "src.py").write_text("value = 2\n")
         _git(self.root, "commit", "-qam", "correct value\n\nAuthored-with: human")
         payload["structured_output"]["findings"] = []
+        payload["structured_output"]["verdicts"] = FIXED_VERDICTS
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
 
     def test_a_fix_after_a_reviewed_lane_catch_up_verifies_only_the_fix(self):
@@ -1188,6 +1192,7 @@ roles:
         (self.root / "src.py").write_text("value = 5\n")
         _git(self.root, "commit", "-qam", "second fix\n\nAuthored-with: human")
         payload["structured_output"]["findings"] = []
+        payload["structured_output"]["verdicts"] = FIXED_VERDICTS
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         self.assertEqual(self.prepare("--catch-up")["phase"], "ready_to_send")
         head = _git(self.root, "rev-parse", "HEAD")
@@ -4825,6 +4830,7 @@ roles:
         _git(self.root, "add", "src.py")
         _git(self.root, "commit", "-m", "correct value\n\nAuthored-with: human")
         payload["structured_output"]["findings"] = []
+        payload["structured_output"]["verdicts"] = FIXED_VERDICTS
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         prepared = self.prepare()
         state = self.operation().state
@@ -4881,6 +4887,7 @@ roles:
         _git(self.root, "reset", "--soft", reviewed)
         _git(self.root, "commit", "-m", "correct value\n\nAuthored-with: human")
         payload["structured_output"]["findings"] = []
+        payload["structured_output"]["verdicts"] = FIXED_VERDICTS
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         self.prepare()
         self.assertEqual(self.operation().state["passes"][1]["report"]["subject"]["base"], reviewed)
@@ -4927,6 +4934,7 @@ roles:
                         "the reset stays, as the second option")
         self.assertIn("only edited a commit message", said)
         payload["structured_output"]["findings"] = []
+        payload["structured_output"]["verdicts"] = FIXED_VERDICTS
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         prepared = self.prepare("--restart-review", "privacy amend dropped a flagged path")
         self.assertEqual(prepared["reviewed_head"], amended)
@@ -4955,6 +4963,7 @@ roles:
         reviewed, amended, payload, program = self.amend_after_a_blocking_review()
         self.drop_from_the_object_store(reviewed)
         payload["structured_output"]["findings"] = []
+        payload["structured_output"]["verdicts"] = FIXED_VERDICTS
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         prepared = self.prepare("--restart-review", "the reviewed head was pruned")
         self.assertEqual(prepared["reviewed_head"], amended)
@@ -5008,7 +5017,7 @@ roles:
         (self.programs / "review-fixture").write_text(
             "#!/usr/bin/env python3\nimport json, pathlib\n"
             f"pathlib.Path({str(calls)!r}).open('a').write('call\\n')\n"
-            "print(json.dumps({'type':'result','subtype':'success','structured_output':{'findings':[]}}))\n")
+            "print(json.dumps({'type':'result','subtype':'success','structured_output':{'findings':[],'verdicts':" + FIXED_SCRIPT + "}}))\n")
         _git(self.root, "checkout", "-q", "-b", "repair", "origin/main")
         _git(self.root, "commit", "--allow-empty", "-m", "repair\n\nAuthored-with: human")
         self.item = create_item(self.connection, kind="work", title="repair", status="in_progress",
@@ -5036,7 +5045,7 @@ roles:
         (self.programs / "review-fixture").write_text(
             "#!/usr/bin/env python3\nimport json, pathlib\n"
             f"pathlib.Path({str(calls)!r}).open('a').write('call\\n')\n"
-            "print(json.dumps({'type':'result','subtype':'success','structured_output':{'findings':[]}}))\n")
+            "print(json.dumps({'type':'result','subtype':'success','structured_output':{'findings':[],'verdicts':" + FIXED_SCRIPT + "}}))\n")
         if policy:
             self.declare_review(json.loads(policy))
         self.remote.commit_on("main", "gate\n\nAuthored-with: human", files={"Makefile": f"check:\n\t@{check}\n"})
@@ -5309,6 +5318,47 @@ roles:
             review.record_lead_review(self.root, args, {**result, "status": "clean"}, dict(os.environ))
         self.assertIn("sd-review: the clean pass was not recorded for lane prepare: OSError: disk full",
                       said.getvalue())
+
+    def test_an_unrecorded_pass_names_the_one_condition_that_failed(self):
+        """sd:10380: one refusal covered five conditions, so a lane host's missing receipt named no cause."""
+        self.tiered_branch({"src.py": "value = 2\n"})
+        review = ship.sd_lib.sibling("sd_review_lead_record", "sd-review")
+        args = review.build_parser().parse_args(["--scope", "branch"])
+        head = _git(self.root, "rev-parse", "HEAD")
+        binding = review.sd_lib.lead_review_binding(self.root)
+        result = {"status": "clean", "requested_reviews": 1, "completed_reviews": 1, "covers_from": head,
+                  "subject": {"base": head, "head": head}, "binding": binding}
+
+        def said(changes: dict, *patches) -> str:
+            with contextlib.ExitStack() as stack:
+                for target, name, value in patches:
+                    stack.enter_context(patch.object(target, name, value))
+                out = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                review.record_lead_review(self.root, args, {**result, **changes}, dict(os.environ))
+            self.assertIsNone(self.lead_record(), changes or patches)
+            return out.getvalue()
+
+        cases = [
+            ("moved", said({"subject": {"base": head, "head": "0" * 40}}),
+             f"HEAD moved from {'0' * 12} to {head[:12]}"),
+            ("no origin", said({}, (review.sd_lib, "github_head", lambda root: None)),
+             "origin is not one github.com repository, or HEAD does not read"),
+            ("unread binding", said({}, (review.sd_lib, "lead_review_binding", lambda root: None)),
+             "the review binding does not read"),
+            ("binding moved", said({"binding": {**binding, "tools": "0" * 40}}),
+             "the review binding changed during the review: tools"),
+            ("no database", said({}, (review.sd_lib, "import_sd_db",
+                                      lambda: SimpleNamespace(module=None, problem="absent"))),
+             "the workflow database module does not import: absent"),
+            ("short", said({"review_shortfall": {"requested": 2, "eligible": 1}}),
+             "the review fell short of its policy: 1 of 1 requested reviews completed"),
+        ]
+        _git(self.root, "checkout", "-q", "--detach")
+        cases.append(("detached", said({}), "HEAD is on no branch"))
+        _git(self.root, "checkout", "-q", "tiered")
+        for name, text, reason in cases:
+            with self.subTest(name):
+                self.assertIn(f"not recorded for lane prepare: Refusal: {reason}", text)
 
     def test_a_build_s_passing_verify_round_is_recorded_from_the_fork(self):
         """Pack sd:9769 with sd:9767: a build's later round verifies over the delta, after a full round 1; its
@@ -5712,7 +5762,7 @@ roles:
         provider.write_text("#!/usr/bin/env python3\nimport pathlib,sys\n"
                            "work=pathlib.Path(sys.argv[sys.argv.index('--add-dir')+1])\n"
                            f"pathlib.Path({str(captured)!r}).write_text((work/'review-subject.md').read_text())\n"
-                           "print('{\"type\":\"result\",\"subtype\":\"success\",\"structured_output\":{\"findings\":[]}}')\n")
+                           "import json\nprint(json.dumps({'type':'result','subtype':'success','structured_output':{'findings':[],'verdicts':" + FIXED_SCRIPT + "}}))\n")
         self.additional()
         state = self.operation().state
         self.assertEqual(state["passes"][:CAP], prior)
@@ -6246,7 +6296,7 @@ roles:
                 if elapsed > timeout:
                     raise ship.ReviewTimeout({"kind": "watchdog_expired", "allowed_seconds": timeout})
                 trace.append("check" if check else "provider")
-                payload = {} if check else {"type": "result", "subtype": "success", "structured_output": {"findings": []}}
+                payload = {} if check else {"type": "result", "subtype": "success", "structured_output": {"findings": [], "verdicts": FIXED_VERDICTS}}
                 return sd_review.Completed(0, json.dumps(payload), "")
             report = sd_review.review(root, args, logical_runner, self.environment)
             return subprocess.CompletedProcess(argv, sd_review.STATUS_EXIT.get(report["status"], 0), json.dumps(report), "")
