@@ -67,7 +67,7 @@ Every run decides, asks, records and reports as `references/decide-ask-record.md
 
 - `references/triage.md`: "triage" (every stalled item, then builds) and "park review" (its parked items alone).
 - `references/health.md`: "health check" (this machine's health and open findings).
-- `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout: "check open PRs" (every open pull request and the lane action); sd-ship is operator-invoked only, so this skill routes the plain ask.
+- `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout: "check open PRs" (every open pull request, what holds it and its next step); sd-ship is operator-invoked only, so this skill routes the plain ask.
 - `references/open-threads.md`: "open threads" or "collect followups" (this session's unfiled threads, filed and ruled).
 
 ## Never
