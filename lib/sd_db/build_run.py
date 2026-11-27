@@ -40,6 +40,7 @@ The hub's tick and each satellite's act only on their own lanes' runs
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import functools
 import glob
 import hashlib
@@ -632,14 +633,106 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
     return done.stdout
 
 
-def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
+def kept_files(git: Collection[str], work: str, *, env: dict | None = None,
+               generated: Collection[str] = ()) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go.
+
+    `generated` (sd:10752) is the paths the repository declares its tools write: an ignored file one names
+    is no kept line. This only reads. `git worktree remove` is the one delete, so a declared file goes with
+    its tree or not at all: a tree git refuses (locked, a submodule) or a later check keeps loses nothing.
+    A line git quotes, or an ignored folder git lists whole, is never a declared file.
+    """
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
-    return "\n".join(line for line in lines.splitlines() if line.strip() and not (
+    # `split`, not `splitlines`: git ends a line at "\n" alone, and U+2028 in a name is part of it.
+    return "\n".join(line for line in lines.split("\n") if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
-        line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+        line.startswith("!! ") and (DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1]) or (
+            not line.startswith('!! "') and not line.endswith("/") and _declared(line[3:], generated)))))
+
+
+#: What a worktree's folder is named while it is being removed: beside it, so the move is one rename.
+ASIDE = ".sd-removing"
+
+
+def put_back(git: Collection[str], repo: str, work: str, *, env: dict | None = None) -> None:
+    """Have the worktree at `work` both on disk and in git's record, whichever a removal left elsewhere.
+
+    A removal moves the tree to `work + ASIDE`, and a move is two writes: the folder's rename, and git's
+    record of where the tree is. A killed `git worktree move`, or a killed run of this, leaves them at any
+    of four pairs, so neither is read from the other: the folder is renamed back when it is aside, and
+    `git worktree repair` then sets the record from the folder, a no-op when it is right already.
+    Each step is safe to repeat, so a pass killed anywhere here is finished by the next one.
+    `Unread` when either fails: the tree stays where it is, and the next pass asks again.
+    """
+    aside = work + ASIDE
+    if Path(aside, ".git").is_file() and not os.path.lexists(work):
+        try:
+            os.rename(aside, work)
+        except OSError as error:
+            raise Unread(f"{aside} could not be moved back: {error}") from None
+    if Path(work, ".git").is_file():  # a worktree, not a clone: its record may still name the aside path
+        _read([*git, "-C", repo, "worktree", "repair", work], env=env)
+
+
+def holds_on(connection, work: str, *, exclude: tuple[str, ...] = ()) -> str:
+    """Why a session keeps `work`, by either name the tree goes by: `work`, or `work + ASIDE` while it is
+    being removed; "" when none does. A beat names the path its hook found, which a move can outdate."""
+    return sessions.describe([*sessions.holders(connection, work, machine=this_host(), exclude=exclude),
+                              *sessions.holders(connection, work + ASIDE, machine=this_host(), exclude=exclude)])
+
+
+def remove_unheld(connection, git: Collection[str], repo: str, work: str, *, exclude: tuple[str, ...] = (),
+                  generated: Collection[str] = (), env: dict | None = None) -> str:
+    """`git worktree remove` `work` unless a session holds it or it is not clean: "" when removed, else why not.
+
+    The hold check and the delete are one step only under a lock, and no lock lasts a slow delete: a hub
+    closes a satellite's transaction silent for `serve.IDLE_TIMEOUT`. So the lock covers a rename alone:
+
+    1. In one write transaction the hold is read and `git worktree move` renames the tree to `work + ASIDE`.
+       A session registers a tree with a write (`sessions.beat`) and finds it by its `.git` file
+       (`sessions.worktree_of`): a beat before the move is seen, one after it finds no tree at `work`.
+       The commit must succeed: a lost lock proves no hold, so the tree is put back and the error raised.
+    2. Aside, the hold, under both names, and `kept_files` are read again: a file or a session that reached
+       the tree while the caller's checks ran is seen now, as is a beat whose hook found the tree at `work`
+       before the move and committed after it. Either puts the tree back.
+    3. `git worktree remove` deletes it. A refusal puts the tree back and raises `Unread`.
+
+    A crash after 1 leaves the tree aside; `put_back` restores it on the next pass. A path already at
+    `work + ASIDE` keeps the tree: git would move it inside. git refuses to move a
+    locked tree or one with a submodule, as it refuses to remove one: `Unread`, and nothing moved.
+    """
+    aside = work + ASIDE
+    if os.path.lexists(aside):  # git would move the tree into it, under its own name, where none looks
+        return f"{aside} is in the way"
+    try:
+        with transaction(connection):
+            holds = holds_on(connection, work, exclude=exclude)
+            if holds:
+                return holds
+            _read([*git, "-C", repo, "worktree", "move", work, aside], env=env)
+        # ponytail: a beat whose hook found `work` before the move but commits only after this read is
+        # missed; closing that needs a lock over the delete, which no hub transaction lasts.
+        holds = holds_on(connection, work, exclude=exclude)
+        dirty = holds or kept_files(git, aside, env=env, generated=generated).split("\n")[0]
+        if not dirty:
+            _read([*git, "-C", repo, "worktree", "remove", aside], env=env)
+        return dirty
+    finally:  # whatever moved, even by a move that failed after its rename; a removed tree leaves none
+        put_back(git, repo, work, env=env)
+
+
+def _declared(path: str, patterns: Collection[str]) -> bool:
+    """Whether `path`, as git names it from the root, is one `patterns` declares (`repos.generated_problems`):
+    name by name, so `*` never crosses a `/`; a pattern ending in `/` takes every path under that folder."""
+    names = path.split("/")
+    for pattern in patterns:
+        wanted = pattern.removesuffix("/").split("/")
+        if (len(names) > len(wanted) if pattern.endswith("/") else len(names) == len(wanted)) and all(
+                fnmatch.fnmatchcase(name, want) for name, want in zip(names[:len(wanted)], wanted, strict=True)):
+            return True
+    return False
 
 
 def ruleable(row: dict) -> bool:
@@ -1043,7 +1136,8 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
     may land the same items; the lane squash-merges, so the branch reads
     unpushed forever (pack sd:6909). Kept: an unreleased run on the path, an
     item of any run on it not done, a dirty or unread worktree, one holding an
-    ignored or untracked file outside a `DISPOSABLE` cache, a locked one, a
+    ignored or untracked file outside a `DISPOSABLE` cache that its repository
+    does not declare generated (sd:10752, `kept_files`), a locked one, a
     live session other than a builder's. The paths removed.
 
     An item marked done is no proof its commits landed: a squash merge leaves
@@ -1075,16 +1169,23 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
             entry["lead"] = row["item"]
     removed = []
     for work, entry in paths_.items():
-        if entry["keep"] or not Path(work).is_dir():
+        if entry["keep"]:
             continue
+        repo = str(paths.expand(entry["repo"]))
         try:
-            if kept_files(git, work):
+            put_back(git, repo, work)  # a sweep that died mid-removal left the tree aside
+        except Unread:
+            continue
+        if not Path(work).is_dir():
+            continue
+        if holds_on(connection, work, exclude=tuple(filter(None, entry["sessions"]))):
+            continue
+        generated = repos.generated_paths(connection, repo)
+        try:
+            if kept_files(git, work, generated=generated):
                 continue
         except Unread:
             continue
-        if sessions.holders(connection, work, machine=this_host(), exclude=tuple(filter(None, entry["sessions"]))):
-            continue
-        repo = str(paths.expand(entry["repo"]))
         kept = f"refs/sd-swept/{entry['branch']}"
         try:
             head = _read([*git, "-C", work, "rev-parse", "--verify", "HEAD"]).strip()
@@ -1094,7 +1195,9 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
         except Unread:
             continue
         try:
-            _read([*git, "-C", repo, "worktree", "remove", work])
+            if remove_unheld(connection, git, repo, work, exclude=tuple(filter(None, entry["sessions"])),
+                             generated=generated):
+                continue  # a session or a file came while the checks ran: the tree stays, its head at `kept`
         except Unread:
             continue
         removed.append(work)
@@ -3292,27 +3395,40 @@ class Supervisor:
 
     def cleaning(self) -> dict:
         self.enter("cleaning")
+        try:  # a run that died mid-removal left the tree aside
+            put_back(self.tools.git, str(self.repo), str(self.work), env=self.env)
+        except Unread as unread:
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is aside ({unread})")
+            return self.finish("done", f"worktree {self.work} kept: aside")
         if not self.work.is_dir():
             return self.finish("done", f"worktree {self.work} was already removed")
+        # A session other than this run's builder works in it (pack sd:6024): it stays, and keeps every file.
+        own = self.fresh()["session_id"]
+        holds = holds_on(self.db, str(self.work), exclude=(own,) if own else ())
+        if holds:
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: {holds}")
+            return self.finish("done", f"worktree {self.work} kept: {holds}")
+        generated = repos.generated_paths(self.db, self.repo)
         try:
-            dirty = kept_files(self.tools.git, str(self.work), env=self.env)
+            # sd:10752: a file the repository declares its tools write keeps no tree; any other file does.
+            dirty = kept_files(self.tools.git, str(self.work), env=self.env, generated=generated)
         except Unread as unread:
             dirty = f"unread: {unread}"
         if dirty:
-            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is not clean "
-                                 f"({dirty.splitlines()[0]})")
+            first = dirty.split("\n")[0]
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is not clean ({first})")
             return self.finish("done", f"worktree {self.work} kept: not clean")
-        # A session other than this run's builder works in it (pack sd:6024): it stays.
-        own = self.fresh()["session_id"]
-        held = sessions.describe(sessions.holders(self.db, str(self.work), machine=this_host(),
-                                                  exclude=(own,) if own else ()))
+        try:
+            # The hold and the clean check read above went stale meanwhile: both are read again with the remove.
+            held = remove_unheld(self.db, self.tools.git, str(self.repo), str(self.work),
+                                 exclude=(own,) if own else (), generated=generated, env=self.env)
+        except Unread as unread:
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed "
+                                 f"({unread})")
+            return self.finish("done", f"worktree {self.work} kept: removal failed")
         if held:
             self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: {held}")
             return self.finish("done", f"worktree {self.work} kept: {held}")
-        if self.child([*self.tools.git, "-C", str(self.repo), "worktree", "remove", str(self.work)], cwd=self.repo,
-                      name="cleaning") != 0:
-            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed")
-            return self.finish("done", f"worktree {self.work} kept: removal failed")
         return self.finish("done", f"worktree {self.work} removed")
 
     # ------------------------------------------------------------ helpers

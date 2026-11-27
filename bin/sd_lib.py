@@ -1376,8 +1376,8 @@ def repo_ci(connection: Any, root: pathlib.Path | str) -> str:
 
 #: The kinds a repository row declares (sd:5109), the library's `repos.DECLARATION_KINDS`:
 #: the first four each the object a `.github/sd-<kind>.json` file held before migration 37;
-#: `policy` the repository's rules for agents (sd:6715).
-DECLARATION_KINDS = ("review", "gate_reuse", "check_scope", "status", "experiment", "policy")
+#: `policy` the repository's rules for agents (sd:6715); `generated` the paths its tools write (sd:10752).
+DECLARATION_KINDS = ("review", "gate_reuse", "check_scope", "status", "experiment", "policy", "generated")
 
 
 def repo_declaration(root: pathlib.Path | str, kind: str, environ: Mapping[str, str] | None = None) -> Any:
@@ -1445,13 +1445,13 @@ def declaration_problems(kind: str, value: Any) -> list[str]:
         return []
     if kind == "status":
         return parse_acknowledgements(value)[1]
-    if kind == "experiment":
-        # The dashboard writes this kind through the library, so the library holds its one check.
+    if kind in ("experiment", "generated"):
+        # The library holds these kinds' one check: the dashboard and the worktree cleanup read it there.
         if import_sd_db().module is None:
             return [f"{where} is checked by the workflow library, which is not importable"]
         from sd_db import repos  # noqa: PLC0415 - this commit's lib (sd:3278)
 
-        return repos.experiment_problems(value)
+        return (repos.experiment_problems if kind == "experiment" else repos.generated_problems)(value)
     if kind == "policy":
         return sibling("sd_repo_policy", "sd_repo_policy.py").problems(value)
     return [f"{kind!r} is not a declaration kind; expected {', '.join(DECLARATION_KINDS)}"]
