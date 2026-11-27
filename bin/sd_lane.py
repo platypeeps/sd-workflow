@@ -5565,9 +5565,20 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
     finally:
         # sd:9923: `sd-ship reconcile` runs in a held merge's worktree. A run that answered no row (a stop, an
         # interrupt) may have merged with its delivery pending, so the worktree stays: the next claim reuses it.
-        done = ran[0] is not None and not ran[0].get("delivery_pending")
-        if tree is not None and found.get("made") and done:
+        if tree is not None and found.get("made") and ran[0] is not None and not delivery_owed(ran[0], entry):
             drop_lane_worktree(sd_lib.main_worktree_root(root), tree, found.get("branch_made"), made=True)
+
+
+def delivery_owed(row: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """Whether the run's `row` leaves `entry`'s delivery owed, so its lane worktree stays (sd:9923).
+
+    A merge whose delivery is pending, or an entry not merged whose train
+    may have landed (`kept_landed`'s rule): only a reconcile ends either.
+    """
+    if row.get("delivery_pending"):
+        return True
+    return row.get("status") != "merged" and (train_marked(entry) or train_may_have_landed(row)
+                                              or TRAIN_LANDED in row)
 
 
 def unknown_checkout(queue: Queue, entry: dict[str, Any], token: str,

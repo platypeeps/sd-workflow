@@ -6624,6 +6624,26 @@ class AnyHost(SharedQueue):
         self.assertEqual((self.entries()[0]["status"], self.entries()[0].get("delivery_pending")), ("merged", True))
         self.assertTrue(self.made().exists())
 
+    def test_a_lane_worktree_is_kept_when_its_train_may_have_landed(self) -> None:
+        """Review of sd:9923: the retry of an entry whose train may have landed removed the lane worktree,
+        though only a reconcile ends that entry: a prepare's `train_landed` refusal, and a row the lane
+        marked `train_landed` that fails another way."""
+        self.enqueued_elsewhere(1, "topic", "work")
+        self.answers[(1, "prepare")] = {"ok": False, "phase": "prepare", "passes_spent": 0,
+                                        "error": "this member's train may be in origin/main",
+                                        "workflow": {"blocker": {"code": "train_landed", "retryable": True}}}
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(self.entries()[0]["status"], "pending")
+        self.assertTrue(self.made().exists())
+
+    def test_a_lane_worktree_is_kept_when_a_landed_train_entry_fails(self) -> None:
+        self.enqueued_elsewhere(1, "topic", "work")
+        sd_lane.update(self.store(), lambda rows: rows[0].update({sd_lane.TRAIN_LANDED: "sd-train/abc"}))
+        self.answers[(1, "prepare")] = {"ok": False, "phase": "prepare", "error": "review blocked"}
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(self.entries()[0]["status"], "pending")
+        self.assertTrue(self.made().exists())
+
     def test_a_lane_worktree_is_kept_when_the_run_stops_after_a_held_merge(self) -> None:
         """Class pass of sd:9923: a hub stop after the merge returned no row, and the worktree went."""
         self.enqueued_elsewhere(1, "topic", "work")
