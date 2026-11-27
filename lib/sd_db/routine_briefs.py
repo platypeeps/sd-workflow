@@ -275,8 +275,12 @@ def _answer(connection: sqlite3.Connection, item: int, result: str) -> dict[str,
     return {"result": result, "item": item, "stem": row["title"], **json.loads(row["fields"])["brief"]}
 
 
+#: How many briefs `sd reports brief list` prints; past it the verb says more exist (sd:10638).
+LIST_LIMIT = 200
+
+
 def rows(connection: sqlite3.Connection, *, series: str | None = None, since: str | None = None,
-         limit: int = 200) -> list[dict[str, Any]]:
+         limit: int = LIST_LIMIT) -> list[dict[str, Any]]:
     """Briefs newest first, by day then first filing, without their text: what a list or a page shows."""
     query = ("SELECT id, title, repo, created_at, updated_at, fields FROM item WHERE source = ? AND kind = 'report'")
     values: list[Any] = [SOURCE]
