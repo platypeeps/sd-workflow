@@ -118,6 +118,8 @@ OPTIONAL_FINDING_KEYS = frozenset({"evidence", "instances", "trigger"})
 #: The most of one finding's evidence a report keeps, and the note an uncited repeat of a rebuttal gets (pack sd:9270).
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
+#: A cited repeat of a blocker a build's ruling round rejected or filed (sd:10286).
+RULED_NOTE = "[downgraded: repeats a blocker a build ruling rejected]"
 #: What a reader puts in `evidence`, and the note a finding without it gets (pack sd:9867, note #70162).
 EVIDENCE_ASK = ("a failing input and its path:line route, showing a failure this change causes in code "
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
@@ -787,8 +789,11 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...]]]]:
-    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances) per accepted finding; malformed: none."""
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str | None]]]:
+    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, ruled) per accepted
+    finding; malformed: none. `ruled`: the evidence a build's ruling round judged, as recorded, "" for none, when
+    that round wrote the row (sd:10286); None from `sd-ship adjudicate`, which cannot mark one. Never folded: the
+    build clears only the exact evidence, and `-k ABC` is another repro than `-k abc` (night triage, sd:10286)."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -798,7 +803,8 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
     bindings = proposal.get("bindings") if isinstance(proposal, dict) else None
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
-         tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()))
+         tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()),
+         (raw["evidence"] if isinstance(raw.get("evidence"), str) else "") if row.get("ruled") is True else None)
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -824,6 +830,7 @@ class Rebuttal(NamedTuple):
     text: str
     reason: str
     instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
+    ruled: str | None = None  # the evidence a build's ruling judged: a repeat citing it, or none, holds (sd:10286)
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
@@ -855,11 +862,13 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
 
     def unchanged(receipt: str, path: Any) -> bool:
         """No change to `path` since the receipt's head, the worktree included at worktree scope; hold on doubt:
-        a failed diff is a change."""
+        a failed diff is a change. `path` None: no change to any file, as a ruling needs: it judged that tree,
+        and a catch-up merge can add the caller as a branch commit can (class pass 5, sd:10286)."""
         reads = [["diff", "--quiet", receipt, span[0]]] if subject.scope != "worktree" else [
             ["diff", "--quiet", receipt], ["ls-files", "--others", "--exclude-standard"]]
-        return isinstance(path, str) and all(sd_lib.git_output(["--literal-pathspecs", *args, "--", path], root) == ""
-                                             for args in reads)
+        return (path is None or isinstance(path, str)) and all(
+            sd_lib.git_output(["--literal-pathspecs", *args, *([] if path is None else ["--", path])], root) == ""
+            for args in reads)
     return rebuttals(rows, span[2].__contains__, unchanged)
 
 
@@ -871,7 +880,7 @@ def _folded(value: Any) -> str:
 
 def summary_key(summary: Any) -> str:
     """The whole summary, case and whitespace folded, the repeat note dropped; the path is compared as recorded."""
-    return _folded(str(summary).replace(REPEAT_NOTE, "") if isinstance(summary, str) else summary)
+    return _folded(str(summary).replace(REPEAT_NOTE, "").replace(RULED_NOTE, "") if isinstance(summary, str) else summary)
 
 
 def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any, instances: Any = ()) -> Rebuttal | None:
@@ -891,23 +900,30 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     """Every disposition in adjudication bodies newest first, from receipts `on_branch`. A rebuttal is listed when
     it is the newest record at its place and its file is `unchanged` since its receipt, up to `REBUTTED_LINES`;
     the prompt shows exactly those, and the gate holds back a finding only when the newest record at its exact
-    place is one of them.
+    place is one of them. A ruling's record (`ruled`) keeps its mark past that cap while it is the newest at its
+    place and its files are unchanged: its hold reads the recorded evidence, not what the reviewer was shown,
+    and a build clears every exact repeat it ruled (class pass 4, sd:10286).
 
     The lane's own blockers (`LANE_PATHS`) are never recorded: a later truncated review must still block."""
     records = [Rebuttal(head, path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
                         _bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
-                        _bounded(reason, REBUTTED_REASON_CHARS), instances)
+                        _bounded(reason, REBUTTED_REASON_CHARS), instances, ruled)
                for body, *_rest in rows for head, found in [_adjudicated(body)]
                if isinstance(head, str) and on_branch(head)
-               for path, summary, line, disposition, reason, instances in found
+               for path, summary, line, disposition, reason, instances, ruled in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
     shown = 0
     for index, record in enumerate(records):
-        own = (record.listed and shown < REBUTTED_LINES and recorded_at(records, record.path, record.summary,
-                                                                        record.line) is record
-               and all(unchanged(record.head, path) for path in (record.path, *(re.sub(r":\d+$", "", entry) for entry in record.instances))))
+        valid = (record.listed and (shown < REBUTTED_LINES or record.ruled is not None)
+                 and recorded_at(records, record.path, record.summary, record.line) is record
+                 # A ruling judged the tree at its head: any change since, to a file it names or not (a new
+                 # caller, from a branch commit or a catch-up merge), lapses it whole (class pass 5, sd:10286).
+                 and all(unchanged(record.head, path) for path in (
+                     *(() if record.ruled is None else (None,)), record.path,
+                     *(re.sub(r":\d+$", "", entry) for entry in record.instances))))
+        own = valid and shown < REBUTTED_LINES
         shown += own
-        records[index] = record._replace(listed=own)
+        records[index] = record._replace(listed=own, ruled=record.ruled if valid else None)
     return records
 
 
@@ -1219,10 +1235,21 @@ def agy_answer(result: Completed, expected: str | None) -> tuple[Completed, Pars
     return result, parse_findings(json.dumps(raw)) if isinstance(raw, dict) else None
 
 
+#: How a cut `evidence` ends: the digest of the whole text, at any length a release wrote (12 before
+#: class pass 5): a saved ruling keeps the form it was cut in.
+CUT_EVIDENCE = re.compile(r"\.\.\. sha256:[0-9a-f]+\Z")
+
+
 def _evidence(value: Any) -> str:
-    """A finding's `evidence`, stripped and bounded; anything but a string is none (pack sd:9270)."""
+    """A finding's `evidence`, stripped and bounded; anything but a string is none (pack sd:9270). A cut one
+    ends in the digest of the whole: two repros that share the kept prefix stay two, so a ruling on one holds
+    back no other (review of sd:10286). A text that already ends as a cut one does is cut again: a literal
+    citation of a stored form is no copy of the text behind it (class pass 5)."""
     text = value.strip() if isinstance(value, str) else ""
-    return text if len(text) <= EVIDENCE_CHARS else text[:EVIDENCE_CHARS - 3].rstrip() + "..."
+    if len(text) <= EVIDENCE_CHARS and not CUT_EVIDENCE.search(text):
+        return text
+    mark = f"... sha256:{hashlib.sha256(text.encode('utf-8', 'replace')).hexdigest()}"
+    return text[:EVIDENCE_CHARS - len(mark)] + mark
 
 
 def _instances(value: Any) -> list[str]:
@@ -1782,13 +1809,31 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     An uncited repeat of a `prior` report's blocker, not rebutted, still blocks and keeps any evidence it stored.
     """
 
-    threshold = BLOCKING_ORDER[floor]
+    threshold, saved = BLOCKING_ORDER[floor], instance_rows(*prior)
     def _floor(row: Mapping[str, Any]) -> bool:
         return 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold
-    def _rebutted(row: Mapping[str, Any]) -> bool:  # the newest record at every place it names is a listed rebuttal
-        return getattr(recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances")), "listed", False)
+    def _rebutted(row: Mapping[str, Any], cited: str | None = None) -> bool:  # the newest record at every place it names is a listed rebuttal
+        record = recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances"))
+        # Or a build's ruling: it holds an uncited repeat, and one citing the evidence it judged, never a fresh
+        # reproduction; a build clears exactly those, or it enqueues what blocks here (class pass 4, sd:10286).
+        ruled = getattr(record, "ruled", None)
+        if ruled is None:
+            return cited is None and getattr(record, "listed", False)
+        # An uncited one holds only when each blocker the prior review saved at or beside its place is the claim
+        # the ruling judged: its repro, or its words with none. A closed test, whatever the saved one's words or
+        # line; any other saved there blocks (class pass 7, sd:10286).
+        def _judged(old: Mapping[str, Any]) -> bool:
+            kept = old.get("evidence") if isinstance(old.get("evidence"), str) and old["evidence"].strip() else None
+            return kept == ruled if kept is not None else summary_key(old.get("summary")) == summary_key(row.get("summary"))
+        def _beside(old: Mapping[str, Any], at: Mapping[str, Any]) -> bool:
+            mine, theirs = old.get("line"), at.get("line")
+            return _place(old.get("path")) == _place(at.get("path")) and (
+                type(mine) is not int or type(theirs) is not int or abs(mine - theirs) <= SHIFT_LINES)
+        return cited == ruled if cited is not None else all(
+            _judged(old) for old in saved if old.get("disposition") == "blocking" and any(_beside(old, at) for at in instance_rows(row)))
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
-        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row)
+        evidence = row.get("evidence")
+        return _floor(row) and _rebutted(row, evidence if isinstance(evidence, str) and evidence.strip() else None)
     def _synthetic(row: Mapping[str, Any]) -> bool:  # a repro nothing real carries, not the lane's own (sd:10288, note #77932)
         return repro and _floor(row) and row.get("trigger") == "synthetic" and str(row.get("path") or "").strip() not in LANE_PATHS
     def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
@@ -1806,13 +1851,19 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     prior, disposed = [*map(_prior, instance_rows(*prior))], []
     for finding in findings:
         record, blocking = dict(finding), _floor(finding)
-        note = REPEAT_NOTE if _repeat(finding) else _downgrade(record) if blocking else None
+        evidence = record.get("evidence")
+        note = (RULED_NOTE if isinstance(evidence, str) and evidence.strip() else REPEAT_NOTE) if _repeat(finding) \
+            else _downgrade(record) if blocking else None
         if note:
             blocking = False
             record["summary"] = f"{str(record.get('summary') or '').strip()} {note}".strip()
         record["disposition"] = "blocking" if blocking else "advisory"
         disposed.append(record)
     return disposed
+
+
+def _place(path: Any) -> str:
+    return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
 
 
 def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any], findings: Sequence[Any] = ()) -> str | None:
@@ -1824,9 +1875,6 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     A match is the same file, as `repo_spelling` spells it, the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8). Failing that,
     the same file and `summary_key` within `ECHO_LINES`, when no finding repeats that blocker at its own line."""
-    def _place(path: Any) -> str:
-        return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
-
     def _file(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
         mine, theirs = _place(new.get("path")), _place(old.get("path"))
         return bool(mine) and mine == theirs  # one spelling (`repo_spelling`), never a suffix: /elsewhere/src.py
@@ -2869,7 +2917,8 @@ def workstation_lane_is_reachable(result: Mapping[str, Any]) -> bool:
 
 
 def render(result: Mapping[str, Any], stream: TextIO) -> None:
-    write = stream.write
+    code = getattr(stream, "encoding", None) or "utf-8"  # sd:10698: escape what the stream cannot encode
+    write = lambda text: stream.write(text.encode(code, "backslashreplace").decode(code))  # noqa: E731
     if result.get("operation") == "provider_preflight":
         write(f"Provider preflight: {result['status']}; {result['probe_calls']} probe call(s), no branch review.\n")
         for outcome in result["outcomes"]:
@@ -2985,7 +3034,9 @@ def render(result: Mapping[str, Any], stream: TextIO) -> None:
                 f"      {finding['summary']}\n"
             )
             # pack sd:10235: a blocker's repro for the lead; escaped (a reader wrote it), spaces kept (note #77417).
-            for index, line in enumerate(str(finding.get("evidence") or "").splitlines() if finding["disposition"] == "blocking" else ()):
+            # Newlines alone: `splitlines` also cut at U+2028 inside a quoted repro (sd:10698).
+            evidence = str(finding.get("evidence") or "").rstrip("\r\n") if finding["disposition"] == "blocking" else ""
+            for index, line in enumerate(re.split(r"\r?\n", evidence) if evidence else ()):
                 write(f"      {'evidence:' if index == 0 else ' ' * 9} {for_note(line, EVIDENCE_CHARS, spaced=True)}\n")
     remaining = result.get("remaining") or []
     if remaining:
@@ -3105,6 +3156,26 @@ def recorded_base(root: pathlib.Path, result: dict[str, Any], head: str, verifie
     return str(result["covers_from"])
 
 
+def unrecorded_reason(result: dict[str, Any], head: str, current: str, branch: str,
+                      imported: Any, binding: dict | None) -> str | None:
+    """The first condition that keeps a passing review from its lane receipt (sd:10380): one reason each,
+    so a lane host's missing receipt names its cause. `binding` must be the review's own, read again now."""
+    short, reviewed = result.get("review_shortfall"), result.get("binding") or {}
+    requested, completed = result.get("requested_reviews", 0), result.get("completed_reviews", 0)
+    moved = sorted(k for k in set(binding or {}) | set(reviewed) if (binding or {}).get(k) != reviewed.get(k))
+    for failed, reason in (
+            (not 1 <= requested <= completed or short, f"the review fell short of its policy: {completed} of "
+             f"{requested} requested reviews completed{', shortfall ' + json.dumps(short) if short else ''}"),
+            (not current, "origin is not one github.com repository, or HEAD does not read"),
+            (current != head, f"HEAD moved from {head[:12]} to {current[:12]}"), (not branch, "HEAD is on no branch"),
+            (imported.module is None, f"the workflow database module does not import: {imported.problem}"),
+            (binding is None, "the review binding does not read"),
+            (moved, f"the review binding changed during the review: {', '.join(moved)}")):
+        if failed:
+            return reason
+    return None
+
+
 def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dict[str, Any],
                        env: Mapping[str, str]) -> None:
     """Record a passing plain `--scope branch` review of HEAD, so lane prepare can skip its own (sd:5988).
@@ -3115,16 +3186,16 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
     status = result.get("status")
     verified = bool(getattr(args, "verify_report", None) and getattr(args, "base", None))
     if (args.scope != "branch" or status not in ("clean", "advisory") or any(
-            getattr(args, name, None) for name in UNRECORDED_OPTIONS if not (verified and name in ("base", "verify_report")))
-            or not 1 <= result.get("requested_reviews", 0) <= result.get("completed_reviews", 0) or result.get("review_shortfall")):
+            getattr(args, name, None) for name in UNRECORDED_OPTIONS if not (verified and name in ("base", "verify_report")))):
         return
-    head = result["subject"]["head"]
     try:
+        head = result["subject"]["head"]
         owner, name, current = sd_lib.github_head(root) or ("", "", "")
-        branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root)
-        binding, library = sd_lib.lead_review_binding(root), sd_lib.import_sd_db().module
-        if current != head or not branch or not (None is not binding == result.get("binding")) or library is None:  # read, and the review's own
-            raise Refusal("HEAD moved, is on no branch or no GitHub origin, or the binding changed or the database does not read")
+        branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root) or ""
+        imported, binding = sd_lib.import_sd_db(), sd_lib.lead_review_binding(root)
+        library = imported.module
+        if reason := unrecorded_reason(result, head, current, branch, imported, binding):
+            raise Refusal(reason)
         base = recorded_base(root, result, head, verified)
         copilot = (result.get("remote_reviews") or {}).get("copilot") or {}
         with contextlib.closing(library.connect(args.database or library.default_path(env.get("HOME")))) as connection:

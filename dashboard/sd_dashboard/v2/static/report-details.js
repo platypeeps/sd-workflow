@@ -29,7 +29,7 @@
     M.rows = (doc.reports || []).map(r => {
       // build: attention is the report's own fields.attention, not a match on its title.
       const attn = r.attention, open = r.status !== 'done';
-      return { id: 'r' + r.id, n: r.id, job: r.job || 'unknown job', what: r.title, at: r.at, open, attn,
+      return { id: 'r' + r.id, n: r.id, job: r.job || 'unknown job', what: r.title, at: r.at, day: r.day || r.at.slice(0, 10), open, attn,
         act: open && attn, s: open ? (attn ? 'warning' : 'queued') : 'ok',
         detail: [r.basis, r.exit != null && !/^job exited/.test(r.basis || '') ? 'exit ' + r.exit : '', r.repeats ? `${r.repeats.count} runs` : ''].filter(Boolean).join(' · '), source: r };
     });

@@ -5310,6 +5310,47 @@ roles:
         self.assertIn("sd-review: the clean pass was not recorded for lane prepare: OSError: disk full",
                       said.getvalue())
 
+    def test_an_unrecorded_pass_names_the_one_condition_that_failed(self):
+        """sd:10380: one refusal covered five conditions, so a lane host's missing receipt named no cause."""
+        self.tiered_branch({"src.py": "value = 2\n"})
+        review = ship.sd_lib.sibling("sd_review_lead_record", "sd-review")
+        args = review.build_parser().parse_args(["--scope", "branch"])
+        head = _git(self.root, "rev-parse", "HEAD")
+        binding = review.sd_lib.lead_review_binding(self.root)
+        result = {"status": "clean", "requested_reviews": 1, "completed_reviews": 1, "covers_from": head,
+                  "subject": {"base": head, "head": head}, "binding": binding}
+
+        def said(changes: dict, *patches) -> str:
+            with contextlib.ExitStack() as stack:
+                for target, name, value in patches:
+                    stack.enter_context(patch.object(target, name, value))
+                out = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                review.record_lead_review(self.root, args, {**result, **changes}, dict(os.environ))
+            self.assertIsNone(self.lead_record(), changes or patches)
+            return out.getvalue()
+
+        cases = [
+            ("moved", said({"subject": {"base": head, "head": "0" * 40}}),
+             f"HEAD moved from {'0' * 12} to {head[:12]}"),
+            ("no origin", said({}, (review.sd_lib, "github_head", lambda root: None)),
+             "origin is not one github.com repository, or HEAD does not read"),
+            ("unread binding", said({}, (review.sd_lib, "lead_review_binding", lambda root: None)),
+             "the review binding does not read"),
+            ("binding moved", said({"binding": {**binding, "tools": "0" * 40}}),
+             "the review binding changed during the review: tools"),
+            ("no database", said({}, (review.sd_lib, "import_sd_db",
+                                      lambda: SimpleNamespace(module=None, problem="absent"))),
+             "the workflow database module does not import: absent"),
+            ("short", said({"review_shortfall": {"requested": 2, "eligible": 1}}),
+             "the review fell short of its policy: 1 of 1 requested reviews completed"),
+        ]
+        _git(self.root, "checkout", "-q", "--detach")
+        cases.append(("detached", said({}), "HEAD is on no branch"))
+        _git(self.root, "checkout", "-q", "tiered")
+        for name, text, reason in cases:
+            with self.subTest(name):
+                self.assertIn(f"not recorded for lane prepare: Refusal: {reason}", text)
+
     def test_a_build_s_passing_verify_round_is_recorded_from_the_fork(self):
         """Pack sd:9769 with sd:9767: a build's later round verifies over the delta, after a full round 1; its
         pass stands for the branch, recorded from the fork from origin/main, so the lane reuses it."""

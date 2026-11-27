@@ -446,16 +446,8 @@ class Tree:
         return {rel: text for rel, text in texts.items() if text is not None}
 
 
-def _git_show(root: pathlib.Path, spec: str) -> str | None:
-    """`git show` without the strip `git_output` applies: file bytes are the diff."""
-    import subprocess  # noqa: PLC0415 - one call site
-
-    try:
-        done = subprocess.run(["git", "-C", str(root), "show", spec], capture_output=True,  # nosec B603 B607
-                              text=True, timeout=sd_lib.GIT_TIMEOUT_SECONDS, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return done.stdout if done.returncode == 0 else None
+#: The unstripped `git show`: file bytes are the diff.
+_git_show = sd_lib.git_show
 
 
 def configured_owners() -> tuple[str, ...]:

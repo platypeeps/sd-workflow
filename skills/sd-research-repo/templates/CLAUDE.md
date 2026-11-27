@@ -81,9 +81,10 @@ was rejected and why. A review that found nothing says what it checked.
 
 ## Publishing — local by default, mirrors on request
 
-`sd-research-kit render` publishes every overview, map, brief, report, and survey twice.
-Both copies are local: Markdown in the Obsidian vault, HTML on the dashboard's Documents
-tab. That is the whole of publication for most documents. `90-scratch/` is not published.
+`sd-research-kit render` publishes every overview, map, brief, report, and survey as HTML
+on the dashboard's Documents tab. A document whose `research.conf.py` entry carries
+`obsidian=dict()` also gets a Markdown copy in the Obsidian vault; the vault's own repo
+writes every entry. Both copies are local. `90-scratch/` is not published.
 
 **Do not publish research as an artifact.**
 

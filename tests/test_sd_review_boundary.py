@@ -1135,11 +1135,35 @@ class LineBudgetTests(unittest.TestCase):
         # The lead read a blocker with no repro and reran with `--json`;
         # the escape reuses `for_note`, so the three lines are a comment,
         # the loop and its write. Measured: `sd-review` is 3156 here.
+        #
+        # 5126 -> 5146 is sd:10380: `bin/sd-review` +20 for
+        # `unrecorded_reason`, so a pass that records no lane receipt
+        # names the one condition that failed, and a reader shortfall
+        # says so instead of nothing. One refusal covered five
+        # conditions, so a lane host's miss named no cause; the table is
+        # its own function to keep `record_lead_review` under the branch
+        # ceiling. Measured: `sd-review` is 3176 here.
+        #
+        # 5146 -> 5149 is sd:10698: `bin/sd-review` +3 so plain output
+        # escapes what the stream cannot encode, and splits evidence at
+        # newlines alone, not at U+2028. A non-ASCII repro raised on an
+        # ASCII stdout before the status line. Measured: `sd-review` is
+        # 3179 here.
+        #
+        # 5149 -> 5183 is sd:10286: `bin/sd-review` +34 so a build's
+        # ruling holds back only the repeat it judged: a citation of
+        # other evidence, a lapsed ruling or a cut text's literal
+        # stored form blocks. Measured: `sd-review` is 3213 here.
+        #
+        # 5183 -> 5197 is the sd:10286 class pass: `bin/sd-review` +14
+        # so a ruling holds an uncited repeat only when each blocker
+        # the prior review saved beside it is the claim it judged, a
+        # closed test in `dispose`. Measured: `sd-review` is 3227 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5126,
+            5197,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

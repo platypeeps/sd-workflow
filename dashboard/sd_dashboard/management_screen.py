@@ -59,6 +59,7 @@ Regenerate (`upload_link.regenerate`), which signs a new upload link and writes 
 
 from __future__ import annotations
 
+import copy
 import functools
 import importlib.util
 import json
@@ -543,6 +544,24 @@ def _claude(read, connection, now: str, claude) -> dict:
     return out
 
 
+def _once_per_area(read):
+    """`read`, asked once per fleet area for one document: Git, Sessions and Claude each collected the fleet, 5.4 s
+    a read under load (sd:10815). Every later ask gets a copy of the first answer, or its failure again."""
+    kept: dict = {}
+
+    def answer(area):
+        if area not in kept:
+            try:
+                kept[area] = (True, read(area))
+            except Exception as failure:  # noqa: BLE001 - each section that asks gets the same failure
+                kept[area] = (False, failure)
+        ok, value = kept[area]
+        if not ok:
+            raise value
+        return copy.deepcopy(value)
+    return answer
+
+
 def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None, services=None, claude=None) -> dict:
     """Every source the page reads, and the reason for each one that could not be read.
 
@@ -550,7 +569,7 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
     `services` are the operations and services backends, the launchd ones
     by default; `claude` is `claude_sessions.document`.
     """
-    read = fleet or fleet_module.collect
+    read = _once_per_area(fleet or fleet_module.collect)
     out: dict = {"read": now, "sources": {}}
     for source, collect in (("repos", lambda: _repos(connection)),
                             ("pulls", lambda: _pulls(connection)),

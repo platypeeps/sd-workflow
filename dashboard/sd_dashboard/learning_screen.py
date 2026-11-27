@@ -6,9 +6,9 @@ the `sdw.learning` kind). Nothing here writes: a row's stage and kind stay as th
 
 **Which rows.** A row moved to a view (`fields.document-type`, pack sd:6262) is in that view and no other, whatever
 its content type: `sd-db records documents` moves it, and it then leaves Tasks and Today. Of the rest, Books are the
-rows whose `content-type` is `book` or `article`. Videos are the rows whose `content-type` is `youtube` or `video`, and
-any learning row titled `YYYY-MM-DD - YouTube - <channel> - <title>`, the name the vault's video notes carry. Other
-learning rows (courses) are in neither.
+rows whose `content-type` is `book`, `article` or `course` (sd:10634: a course had no view). Videos are the rows whose
+`content-type` is `youtube` or `video`, and any learning row titled `YYYY-MM-DD - YouTube - <channel> - <title>`, the
+name the vault's video notes carry. Other learning rows are in neither.
 
 **What one row says.** A book: its title, its author or source (the `author` list, else the `publisher`, else the
 URL's host), its URL and its read state. A video: its title less the dated prefix, its channel (the `channel` field,
@@ -33,12 +33,15 @@ import urllib.parse
 from sd_db.reads import document_view
 from sd_db.records import VIDEO_TITLE
 
-__all__ = ["CATEGORIES", "READ", "WATCHED", "books", "videos"]
+__all__ = ["BOOK_KINDS", "CATEGORIES", "READ", "WATCHED", "books", "videos"]
 
 #: The learning stages in a book's words: to read, reading, done.
 READ = {"queued": "to read", "in-progress": "reading", "done": "done", "dropped": "dropped"}
 #: The learning stages in a video's words.
 WATCHED = {"queued": "to watch", "in-progress": "watching", "done": "watched", "dropped": "dropped"}
+
+#: The content types the Books view lists; the page offers each as a Kind tile, so a course is one press away.
+BOOK_KINDS = ("book", "article", "course")
 
 #: Each view's categories, in the order its tiles show (pack sd:7669).
 CATEGORIES = {
@@ -97,19 +100,19 @@ def _base(row, words, names) -> dict:
 
 
 def books(connection, *, now: str) -> dict:
-    """`/api/documents/books`: the book and article rows, in the store's order; the page sorts them."""
+    """`/api/documents/books`: the book, article and course rows, in the store's order; the page sorts them."""
     out = []
     for row in _rows(connection):
         fields = row["fields"]
         kind = _text(fields.get("content-type")).lower()
-        if not _in_view(row, "books", kind in ("book", "article")):
+        if not _in_view(row, "books", kind in BOOK_KINDS):
             continue
         item = _base(row, READ, CATEGORIES["books"])
         item.update(kind=kind, by=_text(fields.get("author")) or _text(fields.get("publisher")) or item["host"],
                     subtitle=_text(fields.get("subtitle")), published=_text(fields.get("published-date")),
                     pages=_text(fields.get("total-pages")), isbn=_text(fields.get("isbn")))
         out.append(item)
-    return {"read": now, "categories": list(CATEGORIES["books"]), "rows": out}
+    return {"read": now, "categories": list(CATEGORIES["books"]), "kinds": list(BOOK_KINDS), "rows": out}
 
 
 def videos(connection, *, now: str) -> dict:
