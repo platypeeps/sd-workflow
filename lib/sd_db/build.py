@@ -1335,13 +1335,23 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                                "would be a fresh build, with no builder to send it to")
         queued = []
         for lead in leads:
+            ended = queue_state(connection, lead)["status"]
             built = retry(connection, lead, who=who, finding=finding, only=parts[lead])["queued"]
             # Every selected item is built or the press refuses, read from what Retry queued, not predicted: its
             # split (`_inside`) frees only the members the lead waits on, each that waits on nothing, or parks a
             # member that waits on bundle work (class pass, review of build/sd-1742). The lead alone is excused:
             # a Build of it frees what it waits on, as Retry of its row does. The refusal undoes Retry's writes.
             lead_item = queue_state(connection, lead)["item"]
-            for item in sorted(named[lead] - {entry["item"] for entry in built} - {lead_item}):
+            # A Retry that freed only what the lead waits on leaves the lead and its other members ended, together:
+            # a selected one of those builds with the lead's next Retry, once that work is done, so the press goes
+            # ahead and says so on the item (lane review of build/sd-1654, build.py:1327).
+            waits = {member["item"] for member in _members(connection, lead, ended)} if built and queue_state(
+                connection, lead)["status"] == ended else set()
+            for item in sorted(named[lead] & waits - {lead_item}):
+                add_note(connection, item, "comment",
+                         f"Build by {who} built sd:{', sd:'.join(str(entry['item']) for entry in built)} first: "
+                         f"its lead sd:{lead_item} waits on that work; Build sd:{item} again once it is done")
+            for item in sorted(named[lead] - {entry["item"] for entry in built} - {lead_item} - waits):
                 names = ", ".join(f"sd:{entry['item']}" for entry in built) or "no item now"
                 raise BuildRefused(f"sd:{item} would stay unbuilt: a Retry of its bundle builds only {names}; "
                                    f"Build its lead sd:{lead_item} alone first, then Build sd:{item}")

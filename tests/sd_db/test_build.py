@@ -2007,36 +2007,36 @@ class ReapThree(Case):
         build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
         return row
 
-    def test_build_of_a_member_the_retry_skips_is_refused_while_the_lead_waits_on_another(self):
-        """Review of build/sd-1742 (build.py:2089): the lead waits on one member, and Build presses another that
-        did not move. Retry frees only the member the lead waits on and leaves the pressed one ended, so Build
-        reported success with the selected item unbuilt. It refuses, naming what to build first, and writes
-        nothing."""
+    def test_build_of_a_member_the_retry_skips_builds_what_the_lead_waits_on(self):
+        """Lane review of build/sd-1654 (build.py:1327): the lead waits on one member, and Build presses another
+        that did not move. The press refused, though Retry building what the lead waits on is the only step
+        toward the pressed item. It builds that member, keeps the lead and the pressed item ended together, and
+        says so on the pressed item (review of build/sd-1742: not silently)."""
         from sd_db.workflow import edit_item
         row = self._ended()
         lead, ahead, member = self.items
         edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
-        members = [one["id"] for one in build.run(self.db, row["id"])["members"]]
-        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt.*only sd:{ahead}"):
-            build.queue_again(self.db, [member], who="operator")
-        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", one) for one in members],
-                         ["blocked"] * 3, "the refused press wrote")
+        queued = build.queue_again(self.db, [member], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [ahead])
+        self.assertEqual(self._blocked(row)[::2], ["blocked"] * 2, "the lead and the pressed item left their bundle")
+        notes = [one[0] for one in self.db.execute("SELECT body FROM note WHERE item = ?", (member,))]
+        self.assertTrue(any(f"its lead sd:{lead} waits on that work" in note for note in notes), notes)
 
     def _blocked(self, row):
         return [self.count("SELECT status FROM assignment WHERE id = ?", one["id"])
                 for one in build.run(self.db, row["id"])["members"]]
 
-    def test_build_of_the_lead_and_a_member_its_retry_skips_is_refused(self):
-        """Class pass, review of build/sd-1742 (build.py:1228): every selected item is built or the press
-        refuses. The lead waits on one member; the selection names the whole bundle. Retry builds only the
-        member the lead waits on, and naming the lead excused the third, which stayed ended."""
+    def test_build_of_the_whole_bundle_builds_what_the_lead_waits_on(self):
+        """Lane review of build/sd-1654 (build.py:1327): the selection names the whole bundle and the lead
+        waits on one member. Retry builds that member; the press refused for the third, which waits with the
+        lead for the next Retry."""
         from sd_db.workflow import edit_item
         row = self._ended()
         lead, ahead, member = self.items
         edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
-        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt"):
-            build.queue_again(self.db, [lead, ahead, member], who="operator")
-        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
+        queued = build.queue_again(self.db, [lead, ahead, member], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [ahead])
+        self.assertEqual(self._blocked(row)[::2], ["blocked"] * 2)
 
     def test_build_of_the_lead_and_a_member_that_waits_on_it_is_refused(self):
         """Class pass (build.py:1231): the selection names the lead and a member that waits on it. Retry parks
@@ -2568,16 +2568,15 @@ class CancelParks(Case):
     def test_build_refuses_a_member_the_retry_it_reads_leaves_unbuilt(self):
         """Lane review of build/sd-1654 (build.py:1182): blocked bundle A, B, C whose lead A waits on B. Build C
         read the bundle, whose Retry frees B alone, and dropped C from the press: B queued, C stayed blocked, and
-        nothing said so. A member the Retry leaves unbuilt, here or parked as waiting on another bundle item,
-        refuses the press before it writes."""
+        nothing said so. A member the Retry parks as waiting on another bundle item refuses the press before it
+        writes; one that waits with the lead for its next Retry goes ahead with a note (ReapThree, build.py:1327)."""
         from sd_db.workflow import edit_item
         items, old = self.blocked_bundle()
         edit_item(self.db, items[0], {"blocked_by": [items[1]]}, who="operator")
         # Named with its lead, C is a part whose Retry refuses the waiting lead: that refusal writes nothing too.
-        for named, said in (([items[2]], f"sd:{items[2]} would stay unbuilt"), (items[::2], "waits on")):
-            with self.subTest(named=named), self.assertRaisesRegex(build.BuildRefused, said):
-                build.queue_again(self.db, named, who="operator")
-            self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
+        with self.assertRaisesRegex(build.BuildRefused, "waits on"):
+            build.queue_again(self.db, items[::2], who="operator")
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
         edit_item(self.db, items[0], {"blocked_by": []}, who="operator")
         edit_item(self.db, items[2], {"blocked_by": [items[0]]}, who="operator")
         with self.assertRaisesRegex(build.BuildRefused, f"sd:{items[2]} would stay unbuilt"):
