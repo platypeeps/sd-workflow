@@ -4509,11 +4509,12 @@ def reclaim_dead(entries: list[dict[str, Any]], stops: dict[str, Any] | None = N
 def settled_outcome(row: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
     """`outcome` without its pending delivery when `sd-ship reconcile` already delivered that merge (sd:9923).
 
-    `delivery_settled` marked the running row with the delivered commit
+    `delivery_settled` marked the running row with each delivered commit
     before this outcome, an answer from before the reconcile, was written.
     """
-    commit = row.get("delivery_settled")
-    if not (outcome.get("delivery_pending") and commit and outcome.get("merge_commit") == commit):
+    settled = row.get("delivery_settled") or []
+    settled = [settled] if isinstance(settled, str) else settled  # a mark an older version wrote
+    if not (outcome.get("delivery_pending") and outcome.get("merge_commit") in settled):
         return outcome
     kept = {key: value for key, value in outcome.items() if key not in ("delivery_pending", "code")}
     return {**kept, "reason": "merged; delivered by sd-ship reconcile"}
@@ -6041,8 +6042,8 @@ def delivery_settled(root: pathlib.Path, item: int, commit: str, environ: dict[s
     """Clear `delivery_pending` on `item`'s rows merged at `commit`, which `sd-ship reconcile` delivered.
 
     How many rows it cleared. Another merge of the item keeps its own
-    pending delivery. A running row has no outcome yet: it takes the mark
-    `delivery_settled`, and the outcome write drops a pending delivery of
+    pending delivery. A running row has no outcome yet: `commit` joins its
+    `delivery_settled` list, and the outcome write drops a pending delivery of
     that same commit (`settled_outcome`), so a reconcile that ran before
     the runner's record is not undone by it. A checkout whose origin names
     no GitHub repository has no lane. A second call writes nothing.
@@ -6055,8 +6056,10 @@ def delivery_settled(root: pathlib.Path, item: int, commit: str, environ: dict[s
         for row in entries:
             if row.get("item") != item:
                 continue
-            if row.get("status") == "running":
-                row["delivery_settled"] = commit
+            if row.get("status") == "running":  # keyed by commit: an older merge's reconcile adds, never replaces
+                marks = row.get("delivery_settled") or []
+                marks = [marks] if isinstance(marks, str) else marks
+                row["delivery_settled"] = marks if commit in marks else [*marks, commit]
             elif row.get("status") == "merged" and row.get("merge_commit") == commit and row.get("delivery_pending"):
                 row.pop("delivery_pending")
                 row.pop("code", None)

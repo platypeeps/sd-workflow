@@ -3474,6 +3474,23 @@ class Landing(Lane):
         entry = self.entries()[0]
         self.assertTrue(sd_lane.merge_delivered(entry), entry)
 
+    def test_an_older_prs_reconcile_keeps_the_running_entrys_confirmation(self) -> None:
+        """Review of sd:9923: a reconcile of an older merge overwrote the running row's mark, so the
+        runner's stale answer for the delivered merge read pending again."""
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            answer = self.ship(argv, log)
+            if argv[2] == "merge":
+                sd_lane.delivery_settled(tree, 1, "c0ffee" * 6 + "c0ff", self.environ)
+                sd_lane.delivery_settled(tree, 1, "d" * 40, self.environ)  # an older pull request's merge
+            return answer
+        self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
+        self.drain(ship)
+        entry = self.entries()[0]
+        self.assertTrue(sd_lane.merge_delivered(entry), entry)
+
     def test_a_reconcile_of_another_merge_leaves_the_runners_record_pending(self) -> None:
         tree, head = self.topic()
         self.merge_lands(tree, 1, head)
