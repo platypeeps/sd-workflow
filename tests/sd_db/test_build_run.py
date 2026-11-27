@@ -1904,13 +1904,13 @@ class Supervise(Case):
                 self.setUp()
                 ended = self.ruling_round(text, after=("blocking2",))
                 self.assertEqual(ended["outcome"], "blocked", ended)
-                # sd:10913: no file at all ends the run before the review; one that does not read parks after it.
+                # sd:10913: no file at all ends the run before the review; sd:10914: so does one that does not
+                # rule every blocker, as the review after it may omit one.
                 self.assertIn("the ruling round wrote no rulings file" if name == "no file" else
-                              f"{build_run.REVIEW_ROUNDS + 2} review rounds left blockers", self.latest()["detail"])
+                              "do not rule every blocker", self.latest()["detail"])
+                self.assertEqual(len(self.calls("sd-review")), build_run.REVIEW_ROUNDS + 1)
+                self.assertFalse(self.supervisor().rulings_applied())
                 self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
-                said = [body for (body,) in self.db.execute(
-                    "SELECT body FROM note WHERE item = ? AND body LIKE '%ruling round''s rulings at%'", (self.items[0],))]
-                self.assertEqual(len(said), 0 if name == "no file" else 1, said)
 
     def test_a_ruling_round_that_writes_no_rulings_file_delivers_nothing(self):
         """sd:10913: the ruling round wrote no rulings file and the review after it omitted the blockers. The
@@ -1921,6 +1921,44 @@ class Supervise(Case):
         self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
         self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the missing rulings")
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_rulings_file_that_leaves_a_blocker_unruled_delivers_nothing(self):
+        """sd:10914: a rulings file that ruled blocker 1 alone read as applied; the review after it omitted
+        blocker 2 and the run delivered it unruled, and the lane reuses that pass (sd:10919). Each blocker
+        needs a ruling that reads: else the run ends blocked before that review, none applied, no mark."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round([{"blocker": 1, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("no single ruling for blocker(s) 2", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the unruled blocker")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+        again = self.supervisor()
+        self.assertFalse(again.rulings_applied(), "a round with an unruled blocker reads as applied")
+        # A later walk reads the same file and stays blocked: the mark is never written around it.
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(again.ruled(head))
+        self.assertEqual(again.ending[0], "blocked")
+        self.assertFalse(again.rulings_applied())
+
+    def test_rulings_for_round_blockers_that_do_not_read_apply_nothing(self):
+        """sd:10914, class pass: a round file lost or not JSON reads as no blocker, so an empty rulings list
+        ruled them all. The round's blockers must read, else nothing applies and no mark is written."""
+        for name, text in {"no round file": None, "not json": "{", "empty list": "[]"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.ruling_round([], after=("clean",))
+                again = self.supervisor()
+                again.round_file.unlink(missing_ok=True)
+                if text is not None:
+                    again.round_file.write_text(text)
+                again.rulings.write_text("[]")
+                head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+                self.assertIsNotNone(again.ruled(head))
+                self.assertEqual(again.ending[0], "blocked")
+                self.assertIn("the round's blockers did not read", again.ending[1])
+                self.assertFalse(again.rulings_applied())
 
     def test_applied_rulings_walked_again_review_as_usual(self):
         """sd:10913: a later walk at the same count, the applied rulings file gone, is no missing file."""

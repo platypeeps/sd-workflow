@@ -2363,8 +2363,10 @@ class Supervisor:
         adjudicate` reads, and no blocker names a bundle member. So each ruling is a note on the lead;
         a reject or file is a rebuttal in the record `sd-review` reads for this branch, bound to `head`, the
         head after the round's last commit; a file is an item too. An `ask` ends the run with the question on
-        every member, so none is delivered around it. No file, or a blocker with no ruling that reads, changes
-        nothing for that blocker: the review finds it again and the run parks.
+        every member, so none is delivered around it. No file, a blocker with no ruling that reads, or round
+        blockers that do not read apply nothing and end the run blocked before the review: that review may
+        omit an unruled blocker, and the lane reuses its pass (sd:10914, sd:10919). The applied mark is
+        written only past that check, so no caller reads a partial round as applied.
         A blocker that is no review finding (an enqueue check, a failed gate: line "-") takes no rebuttal: no
         review reads one for it."""
         if not self.rulings.exists():
@@ -2377,9 +2379,15 @@ class Supervisor:
                                           f"blockers stand unruled: {' '.join(self.summary(self.round_blockers()).split())}")
         blockers = self.round_blockers()
         found, unread = self.read_rulings(len(blockers))
+        if not blockers:  # a ruling round follows a blocking round: none that read is a round file lost
+            unread = "the round's blockers did not read"
         if unread:
-            self.note(self.lead, f"Build run {self.ident}: the ruling round's rulings at {head[:12]}: {unread}; "
-                                 f"each such blocker stays a blocker")
+            # Fail closed (sd:10914): apply no ruling and write no mark, so a later walk reads the same file and
+            # ends the same way; the review after it may omit the unruled blocker and the lane reuses its pass.
+            # The blocked end notes the lead with this detail.
+            return self.finish("blocked", f"the ruling round's rulings at {head[:12]} do not rule every blocker "
+                                          f"({unread}), so none is applied: "
+                                          f"{' '.join(self.summary(blockers).split()) if blockers else 'no blocker read'}")
         repository = self.github()
         delta = self.branch_delta(head, head) if found else {}
         changed = None if delta is None else delta.keys()
