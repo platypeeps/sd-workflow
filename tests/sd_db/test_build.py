@@ -790,8 +790,10 @@ class DesignRulings(Case):
             "SELECT result FROM assignment WHERE scope = ? AND item IN (?, ?) ORDER BY id", (build.SCOPE, code, item))]
         self.assertTrue(all(f"waits on design question note #{asked}" in (result or "") for result in results),
                         results)
-        with self.assertRaisesRegex(build.BuildRefused, "waits on design question"):
-            build.retry(self.db, bundle["assignment"], who="operator")
+        # sd:10819: a Retry leaves the design out, parked, while its reopened question waits.
+        queued = build.retry(self.db, bundle["assignment"], who="operator")["queued"]
+        self.assertEqual([row["item"] for row in queued], [code])
+        self.assertIsNotNone(item_state(self.db, item)["item"]["parked_at"])
 
     def test_a_p1_design_rides_an_ordinary_code_bundle(self):
         """Review of sd:10096: a P1 row joined only a P1 lead of its area, and a ride never leads, so a P1
@@ -2161,6 +2163,35 @@ class Park(Case):
         for tail in ("", "sd:4,sd:5", "sd:4, and more", "sd:4; sd:5", "sd:x", "sd:4, "):
             self.assertFalse(build.asked(row, build._blocked(row, build.ASKED + tail)), tail)
         self.assertFalse(build.asked(row, "quoted: " + build._blocked(row, build.ASKED + "sd:4")))
+
+    def test_a_retry_leaves_out_a_member_whose_question_waits(self):
+        """sd:10819: a bundle Retry queued again a member whose question still waited on the operator, so its
+        builder skipped it once more. It leaves the bundle, ready and parked; an answered one rides again."""
+        for answered in (False, True):
+            with self.subTest(answered=answered):
+                self.setUp()
+                build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+                build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+                asked = add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
+                if answered:
+                    add_note(self.db, self.items[1], "decision", f"Ruling on note #{asked}: A")
+                lead, child = (m["id"] for m in build.run(self.db, self.bundle["id"])["members"])
+                queued = build.retry(self.db, lead, who="operator")["queued"]
+                self.assertEqual([row["item"] for row in queued], self.items if answered else self.items[:1])
+                self.assertEqual(runner.queue_state(self.db, child)["status"], "queued" if answered else "cancelled")
+                self.assertEqual((self.statuses(self.items), self.parked()),
+                                 (["ready", "ready"], [False, not answered]))
+
+    def test_a_retry_parks_a_member_its_lead_waits_on_while_its_question_waits(self):
+        """sd:10819, the `ahead` path: a member the lead waits on leaves to build fresh, but not while its
+        question waits: it stays ready and parked, queued by no one."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        workflow.edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
+        lead = build.run(self.db, self.bundle["id"])["members"][0]["id"]
+        self.assertEqual(build.retry(self.db, lead, who="operator")["queued"], [])
+        self.assertEqual((self.statuses(self.items)[1], self.parked()[1]), ("ready", True))
 
     def test_a_run_that_ends_done_parks_nothing(self):
         build.end(self.db, self.bundle["id"], "done", "the lane merged it")

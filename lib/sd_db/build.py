@@ -917,11 +917,19 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                 names = ", ".join("sd:" + str(member["item"]) for member in ahead)
                 raise BuildRefused(f"Retry refused: its lead sd:{current['item']} waits on {names}, which would "
                                    "build fresh; send the finding once they are done")
-            free = _free(connection, ahead, who=who, run=ran, lead=current["item"])
+            asked = _asked(connection, ahead)  # leaves parked, not queued fresh: its question waits (sd:10819)
+            _leave(connection, [member for member in ahead if member["item"] in asked], who=who, run=ran, parked=True,
+                   note=f"left its bundle: its lead sd:{current['item']} waits on it, and its question waits on "
+                        "the operator")
+            free = _free(connection, [member for member in ahead if member["item"] not in asked], who=who, run=ran,
+                         lead=current["item"])
             fresh = queue(connection, free, who=who) if free else []
             return {"run": ran, "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
                                                  for row in fresh]}
-        members = [member for member in members if member not in behind]
+        # A member whose question still waits on the operator leaves this Retry, parked, as `behind` does: its
+        # builder would only skip it again (sd:10819). The lead stays: its worktree holds the bundle's work.
+        asked = _asked(connection, [member for member in members if member["item"] != current["item"]])
+        members = [member for member in members if member not in behind and member["item"] not in asked]
         kept = {member["id"] for member in members}
         for member in [member for member in built if member["id"] not in kept]:
             owns = _current(connection, member)  # read before this row's own write below
@@ -932,9 +940,11 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
             if member["item"] in items and items[member["item"]]["status"] == "blocked":
                 transition(connection, member["item"], "ready", who=who,
                            reason=f"left out of a Retry of build run {ran}")
+            why = (f"its question note #{asked[member['item']]} waits on the operator" if member["item"] in asked
+                   else "named other items")
             park(connection, member["item"], ("ready",), stamp,
                  f"Build assignment {member['id']} left its bundle: a Retry of build run {ran} by {who} "
-                 f"named other items; item parked; Build it to build it fresh")
+                 f"{why}; item parked; Build it to build it fresh")
         newer = [member for member in members if not _current(connection, member)]
         if newer:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
@@ -1452,11 +1462,19 @@ def _retry_takes(connection, lead: int, status: str) -> bool:
     if not members or not all(_current(connection, member) for member in members):
         return False
     ahead, behind = _inside(connection, row["item"], members)
+    asked = _asked(connection, [member for member in members if member["item"] != row["item"]])
     riding = aboard(connection, [member["item"] for member in members if member not in behind])
     return bool(ahead) or all(
         _press_refusal(connection, connection.execute(_REPO, (member["item"],)).fetchone(), lead=lead,
                        riding=riding) is None
-        for member in members if member not in behind)
+        for member in members if member not in behind and member["item"] not in asked)
+
+
+def _asked(connection, members: list[dict]) -> dict[int, int]:
+    """The note id of each member item's question that still waits on the operator, whenever asked (sd:10819):
+    Retry leaves such a member out, parked."""
+    return {member["item"]: found["id"] for member in members
+            if (found := open_question(connection, [member["item"]], "", pending=True))}
 
 
 def eligible(connection, *, now: str | None = None) -> list[dict]:
