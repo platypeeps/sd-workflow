@@ -3689,6 +3689,24 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [c])
 
+    def test_a_revert_that_keeps_a_review_fix_in_another_file_leaves_its_citation(self) -> None:
+        """Lane review of build/sd-1654 (sd_lane.py:1006): a review fix cited only by its `Lane review fix`
+        line, then a later revert that put its file back and kept the fix in another file. The file check
+        read every cited commit under any later revert, so it dropped the citation. A review fix line is
+        read that way only on a side commit of a merge a revert lists (pack sd:10108)."""
+        b, *_ = self.open
+        tree, _ = self.committed("topic-moved-fix")
+        (tree / "a.txt").write_text("fix\n", encoding="utf-8")
+        git(tree, "add", "a.txt")
+        git(tree, "commit", "-q", "-m", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        (tree / "a.txt").unlink()
+        (tree / "b.txt").write_text("fix\n", encoding="utf-8")
+        git(tree, "add", "-A")
+        git(tree, "commit", "-q", "-m", "revert: move the guard\n\nThe guard lives in b.txt now.")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open

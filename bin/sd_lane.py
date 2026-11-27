@@ -1004,22 +1004,42 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
             (chunk.strip("\n").partition("\x1f") for chunk in raw.split("\x1e")) if sha.strip()]
 
 
+def listed_sides(worktree: pathlib.Path, commits: list[tuple[str, str]]) -> set[str]:
+    """The side commits of each merge a hand-written revert in `commits` lists (pack sd:10108): both sides since
+    the merge base, since the list names no mainline (`-m 1` or `-m 2`). A listed commit that is no merge, or an
+    ambiguous prefix (git refuses one), reads nothing; so does a failed read."""
+    import sd_ship_body  # noqa: PLC0415
+    sides: set[str] = set()
+    for _, message in commits:
+        if not sd_ship_body.REVERT_SUBJECT.match(message):
+            continue
+        for prefix in sd_ship_body._listed_undone(message):  # noqa: SLF001
+            named = [sha for sha, _ in commits if sha.startswith(prefix)]
+            listed = publish_git(worktree, "rev-list", f"{named[0]}^1...{named[0]}^2") if len(named) == 1 else None
+            sides |= set(listed.stdout.split()) if listed and listed.returncode == 0 else set()
+    return sides
+
+
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """`commits` (newest first) less each cited one a later hand-written revert undid (sd:8373).
 
     A `revert:` commit that names no sha escapes `sd_ship_body.kept_commits`:
     system sd:8242 closed though the branch undid its commit and fixes. A
-    commit that cites an item, by a `Closes:` trailer or a `Lane review
-    fix` line, counts as undone when a later commit's subject is a revert
-    and the files it changed read at `head` as before it: a listed merge
-    leaves its side commits here, and one cited only by a review fix line
-    closed its item (pack sd:10108). A read that fails keeps the commit,
-    as before this check.
+    commit with a `Closes:` line counts as undone when a later commit's
+    subject is a revert and the files it changed read at `head` as before
+    it. So does a side commit of a merge a revert lists, which cites its
+    item only by a `Lane review fix` line: the list names no mainline, so
+    this check decides each side (pack sd:10108). A review fix line on
+    any other commit is not read so: a later revert that keeps the fix in
+    another file left its item open (review of build/sd-1654). A read
+    that fails keeps the commit, as before this check.
     """
     import sd_ship_body  # noqa: PLC0415
+    sides = listed_sides(worktree, commits)
     kept = []
     for index, (sha, message) in enumerate(commits):
-        if sd_ship_body.cited_ids("", [(sha, message)]) and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
+        cites = "Closes:" in message or (sha in sides and sd_ship_body.cited_ids("", [(sha, message)]))
+        if cites and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
             files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
             names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
