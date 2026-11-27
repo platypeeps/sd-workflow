@@ -1252,14 +1252,14 @@ class LineBudgetTests(unittest.TestCase):
         # of the lead's review holds a repeat of the evidence it rejected.
         # Measured: `sd-review` is 3387.
         #
-        # 5357 -> 5365 is the sd:10926 class pass: +8 so a lead rebuttal
-        # holds exactly the evidence it rejected, tested or on a retry.
-        # Measured: `sd-review` is 3395.
+        # 5357 -> 5369 is the sd:10926 class passes: +12 so a lead rebuttal
+        # holds exactly the evidence it rejected, tested or on a retry,
+        # compared in the stored form. Measured: `sd-review` is 3399.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5365,
+            5369,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

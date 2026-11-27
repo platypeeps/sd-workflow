@@ -1164,6 +1164,45 @@ class RebuttalIdentityTests(unittest.TestCase):
         self.assertEqual(sd_review.carried([dict(row(line=40), disposition="blocking")], [], seen), [],
                          "an uncited prior blocker in the rejection's words still holds")
 
+    def lead_kept(self, stored: str, opened: str, saved: str | None = None) -> list[str]:
+        """What `carried` keeps of one prior blocker, `opened` a reader's `open`, against a lead rejection of `stored`."""
+        body = self.lead_body()
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = stored
+        prior = [dict(row(line=40, evidence=stored if saved is None else saved), disposition="blocking")]
+        answer = sd_review.Outcome("codex", sd_review.FINDINGS, (), "", (), (), verdicts=(
+            {"id": "B1", "verdict": "open", "evidence": opened},))
+        return [r["disposition"] for r in sd_review.carried(prior, [answer], listed(json.dumps(body)))]
+
+    def test_a_lead_rejection_of_two_reproductions_holds_a_repeat_of_one(self) -> None:
+        """sd:10926 last class pass (bin/sd-review:2009): two readers' evidence is stored one per line
+        (`distinct_findings`), so a retry citing one of them matched no whole string and blocked. Each cited
+        line must be one the lead rejected; a line it never saw is fresh and blocks."""
+        one, two = "pytest tests/a.py: 1 failed", "pytest tests/b.py: 1 failed"
+        body = self.lead_body()
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = f"{one}\n{two}"
+        lead = json.dumps(body)
+        for cited in (one, two, f"{two}\n{one}", f" {one} \n\n"):
+            with self.subTest(cited=cited):
+                self.assertEqual(gate([row(line=40, evidence=cited)], lead), ["advisory"])
+                self.assertEqual(self.lead_kept(f"{one}\n{two}", cited), [])
+        for cited in ("pytest tests/c.py: 1 failed", f"{one}\npytest tests/c.py: 1 failed", "pytest tests/a.py"):
+            with self.subTest(cited=cited):
+                self.assertEqual(gate([row(line=40, evidence=cited)], lead), ["blocking"])
+                self.assertEqual(self.lead_kept(f"{one}\n{two}", cited), ["blocking"])
+        self.assertEqual(self.lead_kept(one, one, saved=f"{one}\n{two}"), ["blocking"], "a saved line it never saw")
+
+    def test_a_lead_rejection_holds_an_uncut_repeat_of_evidence_stored_cut(self) -> None:
+        """sd:10926 last class pass (bin/sd-review:2025, :2120): a finding's evidence is stored cut with the
+        digest of the whole (`_evidence`), an `open` verdict's is not, so a reader repeating a long traceback
+        whole kept the blocker. The citation is cut the same way first; another long text has another digest."""
+        whole = "python3 t.py: " + "x" * 1500
+        stored = sd_review._evidence(whole)
+        self.assertNotEqual(stored, whole)
+        self.assertEqual(self.lead_kept(stored, whole), [])
+        self.assertEqual(self.lead_kept(stored, f"  {whole}\n"), [])
+        self.assertEqual(self.lead_kept(stored, whole + "y"), ["blocking"])
+        self.assertEqual(self.lead_kept(f"{REPRO}\n{stored}", whole), [], "one of two, stored cut")
+
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
         for summary in ("value is wrong", " VALUE is\nwrong ", f"Value is wrong {sd_review.REPEAT_NOTE}"):

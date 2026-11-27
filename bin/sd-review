@@ -2002,11 +2002,15 @@ def _place(path: Any) -> str:
 
 def lead_holds(lead: Rebuttal, record: Rebuttal | None, row: Mapping[str, Any], cited: str | None, *, verdict: bool) -> bool:
     """sd:10926 class pass: a lead's rejection holds only the evidence it rejected, a prior blocker's saved one too, in any
-    words until a change reaches its line (`lines_now`), whatever test it names; an uncited repeat holds as `record`."""
+    words until a change reaches its line (`lines_now`), whatever test it names; an uncited repeat holds as `record`.
+    Both sides in the stored form (last pass): an `open`'s text cut as a finding's is (`_evidence`), and each cited
+    line one the lead saw, as readers' repros are stored one per line (`distinct_findings`).
+    ponytail: by line, so a part of one rejected repro holds too; `carried`'s plain cut past the cap matches none and blocks."""
+    def _lines(text: str | None) -> set[str]:
+        return {line.strip() for line in (text or "").splitlines() if line.strip()}
     saved = row.get("evidence") if verdict and isinstance(row.get("evidence"), str) and row["evidence"].strip() else None
-    said = cited if cited is not None else saved
-    return getattr(record, "listed", False) if said is None else bool(
-        (lead.lead or "").strip()) and said.strip() == str(lead.lead).strip() and lead.listed
+    said = saved if cited is None else _evidence(cited) if verdict else cited
+    return getattr(record, "listed", False) if said is None else bool(_lines(said)) and _lines(said) <= _lines(lead.lead) and lead.listed
 
 
 def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], cited: str | None = None,
