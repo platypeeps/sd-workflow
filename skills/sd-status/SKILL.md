@@ -1,6 +1,6 @@
 ---
 name: sd-status
-description: Read-only derived status for the repository you are standing in — is anything wrong, what is pending, what is next — with branch-protection enforcement gaps named.
+description: Read-only derived status for the repository you are standing in — is anything wrong, what is pending, what is next — with branch-protection enforcement gaps named; `/sd-status deep` runs a two-hour deep analysis instead.
 disable-model-invocation: true
 ---
 
@@ -29,6 +29,9 @@ When the deliverable is a finished document, apply
 vault and the dashboard's Documents tab by default, and reaches an
 outward destination — Notion, Google Drive — only where the user designated that
 document for it.
+
+Invoked as `/sd-status deep`, follow `references/deep.md` instead of running `bin/sd-status`: a review-only deep analysis of this repo that files its top findings as items.
+It decides, asks, records and reports as `references/decide-ask-record.md` says.
 
 ## The seventeen sections, in output order
 
@@ -295,7 +298,7 @@ same breath.
 - **Never consume the handoff packet from here.** The `resumable handoffs`
   section reads it; only `sd-handoff-restore` or `sd-handoff --show` consumes
   it. Reading status must never eat a pending packet.
-- **Never write, anywhere.** No cache, no index row, no state file, no id
+- **Never write, anywhere**, outside a `/sd-status deep` run, which records items and a report as its reference says. No cache, no index row, no state file, no id
   ledger. If you want a fact recorded, that is a different command.
 - **Never point it at another repository**, and never loop it over checkouts to
   rebuild the fleet view that was deliberately removed.

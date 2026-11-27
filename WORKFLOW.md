@@ -433,7 +433,7 @@ Gates and reviews:
   each step, the state it moved, the failure, the recovery and the test.
   A parser, a journal, or event and protocol matching needs one too: a parser without one took nine rounds (sd:9584).
   A build refuses to start review on a branch whose `docs/work` design.md lacks one, in it or the body (sd:9770).
-- **A repeating finding starts a class pass.** The trigger is two findings of one class in different rounds, or three blocking rounds in a row.
+- **The first blocking round starts a class pass** (sd:10903): the fix of round 1 already covers every instance.
   Name the class, list every instance from the code rather than the findings, add each to the failure table,
   and fix each row that lacks a recovery or a test, fail-first. Record the trigger in `sd task note`. Split the pull request if the table shows it does too much.
   A class pass fixes the class within the change's own scope; a new reader, audit or entry kind becomes its own item:
