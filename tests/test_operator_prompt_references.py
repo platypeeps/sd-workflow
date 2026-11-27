@@ -156,7 +156,7 @@ class OpenPrSweep(unittest.TestCase):
 
     def test_an_item_with_two_open_prs_is_reported_only(self):
         text = self.text()
-        guard = text.index("resolve to one item: report each and act on none")
+        guard = text.index("share an item: report each and act on none")
         self.assertLess(guard, text.index("4. Act on the rest"))
 
     def test_each_note_names_its_pr(self):
@@ -175,7 +175,6 @@ class OpenPrSweep(unittest.TestCase):
         text = self.text()
         self.assertNotIn("Its item is the lane entry's `item`", text)
         self.assertIn("A lane entry never names the item", text)
-        self.assertIn("as a whole word", text)
 
     def test_an_entry_on_the_branch_at_any_head_blocks_the_enqueue(self):
         """A catch-up push moves the head past a failed entry's; it is still this branch's."""
@@ -190,7 +189,7 @@ class OpenPrSweep(unittest.TestCase):
         """The item's failed entry on another branch is not this PR's to pass by."""
         text = self.text()
         enqueue = text.index("- Enqueue a PR")
-        self.assertIn("no entry of item N but `merged` ones", text[enqueue:enqueue + 300])
+        self.assertIn("no entry of any of its items but `merged` ones", text[enqueue:enqueue + 300])
 
     def test_a_failed_entry_is_reported_with_its_own_fields(self):
         """The operator, not a head match, decides whether the entry is this PR's."""
@@ -201,7 +200,7 @@ class OpenPrSweep(unittest.TestCase):
 
     def test_a_running_entry_is_read_by_branch_or_item(self):
         text = self.text()
-        self.assertIn("an entry on its branch or of its item is `pending` or `running`", text)
+        self.assertIn("an entry on its branch or of any of its items is `pending` or `running`", text)
 
     def test_a_stacked_pr_is_reported_not_queued(self):
         """A squash merge of a parent strands each PR whose base is its branch."""
@@ -211,19 +210,43 @@ class OpenPrSweep(unittest.TestCase):
         self.assertLess(text.index("another open PR's base is this PR's head branch"), enqueue)
         self.assertLess(text.index("its base is not the repo's default branch"), enqueue)
 
-    def test_item_is_matched_exactly(self):
-        text = self.text()
-        self.assertIn("equals the PR's head branch exactly", text)
-        self.assertIn("as a whole word", text)
+    # Class pass 3 (sd:10803), identity by mention: any note, title or body can name a PR's URL, so a
+    # mention never names the item a note or an enqueue writes to. The build that made the branch does.
 
-    def test_the_item_lookup_reads_parked_items_too(self):
-        """`sd store items` hides parked items; a lookup without the
-        `--parked` read misses the PR's item and takes another hit."""
-        searches = [c for c in prescribed_commands(self.text())
-                    if parse(c)[1] == ["store", "items"] and "--grep" in c]
-        self.assertTrue(any("--parked" not in c for c in searches), searches)
-        self.assertTrue(any("--parked" in c for c in searches), searches)
-        self.assertIn("merge their hits by item id", self.text())
+    def test_items_come_from_the_build_not_a_mention(self):
+        """A followup quoting the PR URL made its own item the one hit,
+        and the enqueue then delivered it."""
+        text = self.text()
+        act = text.index("4. Act on the rest")
+        self.assertLess(text.index("head branch is `build/sd-<A>` exactly, `<A>` digits only"), act)
+        self.assertLess(text.index("each row's `item` whose `build_run` equals that one"), act)
+        self.assertNotIn("whose note names the PR's full URL", text)
+        searches = [c for c in prescribed_commands(text) if parse(c)[1] == ["store", "items"]]
+        self.assertEqual(searches, [])
+
+    def test_every_write_names_the_builds_items(self):
+        """Each item-keyed write takes N or its items from the build."""
+        text = self.text()
+        self.assertIn("`N` is the lead's item", text)
+        enqueue = [c for c in prescribed_commands(text) if "lane enqueue" in c]
+        self.assertEqual(len(enqueue), 1, enqueue)
+        self.assertIn("--item N --item <each other item>", enqueue[0])
+
+    # Class pass 3, shell expansion: a PR title, URL or review finding is text others wrote. In double
+    # quotes the shell expands `$(...)`, backticks and `$NAME` in it before the CLI reads it.
+
+    def test_no_external_value_sits_in_double_quotes(self):
+        for command in prescribed_commands(self.text()):
+            with self.subTest(command=command):
+                self.assertNotRegex(command, r'"[^"]*<[^>]+>[^"]*"')
+
+    def test_the_unquoted_head_is_checked_first(self):
+        """`--expected-head <head>` goes bare: only hex is safe there."""
+        text = self.text()
+        self.assertLess(text.index("not 40 hex characters"), text.index("2. For each PR"))
+
+    def test_the_quoting_rule_is_stated(self):
+        self.assertIn("written as `'\\''`", self.text())
 
 
 class ReviewRoundFixes(unittest.TestCase):
@@ -547,7 +570,7 @@ class PrescribedCommandsMatchTheCli(unittest.TestCase):
             for command in prescribed_commands(text):
                 if "--kind decision" in command:
                     with self.subTest(path=path, command=command):
-                        self.assertRegex(command, r'note N "<[^>]+>" --kind decision')
+                        self.assertRegex(command, r'note N (["\'])<[^>]+>\1 --kind decision')
 
     def test_no_reference_looks_a_ref_up_by_wildcard(self):
         """`sd store items --ref` matches one exact reference; `--grep` reads the body."""
