@@ -44,6 +44,7 @@ import functools
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -202,6 +203,8 @@ Rules:
   `git commit -m` or `git commit -F <file inside the worktree>`; add new commits and never amend.
 - The dispatcher owns every item's status: never run `sd task status`, never push, never open a pull request.
 - Write a test that fails before each fix, then make it pass; skip no test.
+- Start no test run on more threads than `$CARGO_BUILD_JOBS`, which the dispatcher sets from the machine's
+  load: `cargo -j`, `pytest -n`, Unity's `-job-worker-count`. Builders' own runs drove the load to 104.
 - Run tests in the foreground, focused on the modules you touch, 10 minutes or less: give each Bash call
   `timeout: 600000` and never `run_in_background`. Past its timeout (120 s by default) a call moves to
   the background, and no exit wakes you (sd:9183). The lane runs the full gate.
@@ -954,10 +957,13 @@ def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> l
     return [name for name, path in zip(UNFINISHED, paths, strict=True) if Path(work, path).exists()]
 
 
-def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None) -> dict | None:
+def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, branch: str | None = None,
+               env: dict | None = None) -> dict | None:
     """The newest lane entry of any of `items` by enqueue order, from `sd-ship lane list`; None when there is none.
 
-    Any member: the entry's item is the first member the branch delivers.
+    Any member: the entry's item is the first member the branch delivers. With `branch`, only that branch's
+    entries: a rebuild of a lane-failed bundle shares its items, and can share its head, with the failed
+    branch's entry (review of build/sd-1808). A row that names no branch, an earlier version's import, counts.
     """
     try:
         answer = json.loads(_read([*ship, "-C", str(cwd), "lane", "list"], env=env))
@@ -966,7 +972,8 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env:
     entries = answer.get("entries") if isinstance(answer, dict) and answer.get("ok") else None
     if not isinstance(entries, list):
         raise Unread("sd-ship lane list gave no entries")
-    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items]
+    mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items
+            and (branch is None or not row.get("branch") or row.get("branch") == branch)]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
 
 
@@ -1383,6 +1390,64 @@ def _environ(environ: dict | None, ident: str) -> dict:
     return env
 
 
+#: The test thread counts a builder's child gets at its cap (sd:10393): the gate's own (`CPU_VARIABLES`), pytest-xdist's
+#: `-n auto`, and the pack's `run-tests.sh` workers. Unity reads none, so the brief names its flag.
+THREAD_VARIABLES = ("PYTEST_XDIST_AUTO_NUM_WORKERS", "TEST_WORKERS")
+
+
+@functools.cache
+def _gate_slots():
+    """`bin/sd_gate_slots.py`, stdlib only, as the gate itself reads its thread caps."""
+    import importlib.util  # noqa: PLC0415 - only a builder's spawn needs it
+    spec = importlib.util.spec_from_file_location("sd_gate_slots", PACK / "bin" / "sd_gate_slots.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@functools.cache
+def _ship_body():
+    """`bin/sd_ship_body.py`, the lane's own reader of a body's `Refs:` lines; it imports its `bin/` siblings."""
+    import importlib  # noqa: PLC0415 - only a delivery needs it
+    if str(PACK / "bin") not in sys.path:
+        sys.path.append(str(PACK / "bin"))
+    return importlib.import_module("sd_ship_body")
+
+
+def with_refs(body: str, items: Collection[int]) -> str | None:
+    """`body` with `Refs:` lines for each of `items` no live one names yet, or None when an added line would
+    name nothing (an unclosed fence or comment). Only a live line counts (ruling on sd:10379), and each added
+    line keeps to the lane's line limit, or enqueue refuses the body (review of build/sd-1808)."""
+    ship = _ship_body()
+    missing = [item for item in dict.fromkeys(items) if item not in ship.referenced_ids(body)]
+    if not missing:
+        return body
+    lines = ["Refs:"]
+    for item in missing:
+        if len(f"{lines[-1]} sd:{item}") > ship.LINE_LIMIT:
+            lines.append("Refs:")
+        lines[-1] += f" sd:{item}"
+    body = body.rstrip("\n") + "\n\n" + "\n".join(lines) + "\n"
+    return body if set(missing) <= ship.referenced_ids(body) else None
+
+
+def thread_cap(env: dict, *, load: float | None, cores: int | None = None) -> int:
+    """How many test threads one builder's child may start (sd:10393): no more than a gate holder's share of the
+    cores, nor than the cores the five-minute `load` leaves idle, and at least one. On 2026-11-24 builders' own
+    `cargo`, Unity and pytest runs, each on every core, drove the load to 104 on 16 cores while the gates kept to
+    their caps. An unread `load` caps at the share alone."""
+    gate = _gate_slots()
+    cores = cores or os.cpu_count() or 1
+    try:
+        slots = gate.configured(env, gate.machine_settings(env)["gate_slots"])[0]
+    except ValueError:  # a bad count caps no gate either
+        slots = 0
+    share = gate.cpu_share(slots, cores) if slots > 0 else cores
+    idle = cores if load is None or not math.isfinite(load) else int(cores - load)
+    return max(1, min(share, idle))
+
+
 def _checks_environ(env: dict) -> dict:
     """A repo's own checks may fetch private release assets with GITHUB_TOKEN (sd:8506). Only they get it
     from the PAT: elsewhere gh and its credential helper would act as the PAT, not the gh login (sd:8515)."""
@@ -1435,6 +1500,7 @@ class Supervisor:
         self.blockers: list[dict] = []
         self.last_beat = 0.0
         self.env = _environ(environ, ident)
+        self.own_env = dict(self.env)  # before `threads` caps it: each spawn caps from this again
         # Claude Code's own OTel, where the machine turns it on, names the run
         # by these (pack sd:6943); the switch and endpoint are system sd:6944's.
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
@@ -1693,7 +1759,10 @@ class Supervisor:
         self.enter("worktree")
         branch = self.row["branch"]
         if self.work.is_dir():
-            return self.guarded() or "building"
+            if held := self.guarded():
+                return held
+            self.take_over()
+            return "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1701,10 +1770,63 @@ class Supervisor:
             _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], env=self.env)
             argv = ["worktree", "add", str(self.work), branch]
         except Unread:
-            argv = ["worktree", "add", "-b", branch, str(self.work), self.base()]
+            start = self.start_point()
+            if start is None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
+                why = self.start_refused or "did not read here"
+                self.once("start", lambda: add_note(
+                    self.db, self.lead, "comment", f"Build run {self.ident}: {failed['branch']}, whose lane entry "
+                    f"failed, {why}, so {branch} starts from {self.base()} without its commits"))
+            argv = ["worktree", "add", "-b", branch, str(self.work), start or self.base()]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
-        return self.split_first() or "building"
+        if held := self.split_first():
+            return held
+        self.take_over()
+        return "building"
+
+    def take_over(self) -> None:
+        """Hand back the failed lane entry whose tip this branch holds (`build.take_over`), once the worktree exists:
+        a failed `git worktree add` leaves the entry as it was, for its Retry or Fix. A try that made the worktree
+        and stopped finds it on the next try's kept-worktree path, and an entry already handed back writes nothing
+        (lead review of build/sd-1808). A tip not read, or not in this branch, hands nothing back."""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None:
+            return
+        try:
+            tip = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env).strip()
+            _read([*self.tools.git, "-C", str(self.work), "merge-base", "--is-ancestor", tip, "HEAD"], env=self.env)
+        except Unread:
+            return
+        build.take_over(self.db, failed, self.ident)
+
+    def start_point(self) -> str | None:
+        """The commit a new branch starts from when its items' last bundle failed in the lane: the failed branch's
+        local tip as the operator left it, not the entry's head or a pushed copy, which can hold commits the
+        operator removed (sd:10379); None, so the base, when there is none or it does not read. None too when its
+        commits close an item this bundle does not hold, one the failed entry kept open: the lane's merge closes
+        every open item a trailer cites, so it would close one no one selected (review of build/sd-1808);
+        `start_refused` says which."""
+        self.start_refused = ""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None:
+            return None
+        try:
+            tip = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env).strip()
+        except Unread:
+            return None
+        if not tip:
+            return None
+        cited = self.cited(self.repo, self.base(), tip, "")
+        if cited is None:
+            self.start_refused = "has commits whose trailers did not read"
+            return None
+        if outside := sorted(set(cited) - set(failed["items"])):
+            self.start_refused = ("has commits that close " + ", ".join(f"sd:{item}" for item in outside)
+                                  + ", outside this bundle")
+            return None
+        return tip
 
     def guarded(self) -> dict | None:
         """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on
@@ -2890,17 +3012,32 @@ class Supervisor:
                                           f"{', '.join(f'sd:{item}' for item in delivered)}, and a design ships "
                                           f"with code; settle what held the code items, then Retry")
         # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
-        if asked:
+        # A rebuild of a lane-failed bundle can hold that bundle's trailers (`start_point`), and the start read
+        # them once: one a revert hid there, revived since, would close an item no one selected. Read again
+        # here, each outside the bundle stays open (class pass of build/sd-1808).
+        outside = build.outside_rebuild(self.db, self.row["assignment"], cited)
+        if outside:
+            self.once("outside", lambda: add_note(
+                self.db, self.lead, "comment", f"Build run {self.ident}: {self.row['branch']} has commits that "
+                f"close {', '.join(f'sd:{item}' for item in outside)}, outside this bundle; a `Refs:` line in the "
+                f"body keeps each open"))
+        if asked or outside:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
-            refs = f"Refs: {' '.join(f'sd:{item}' for item in asked)}"
-            if refs not in body.splitlines():
-                body = body.rstrip("\n") + f"\n\n{refs}\n"
+            kept = with_refs(body, [*asked, *outside])
+            if kept is None:
+                return self.finish("blocked", f"the body at {self.body} ends inside a code fence or a comment, "
+                                              f"so no `Refs:` line added after it keeps an item open; close it, "
+                                              f"then Retry")
+            if kept != body:
+                body = kept
                 self.body.write_text(body, encoding="utf-8")
         if not delivered:
             return self.finish("blocked", "the branch delivers no item: no commit has a `Closes: sd:N` trailer "
                                           "for one of the run's items")
         if not unmanaged:
-            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
+            # Only this run's branch's entry is its own (`lane_entry`): a rebuild that starts at a failed
+            # bundle's head (`start_point`) shares that head with the old failed entry (review of build/sd-1808).
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
         try:
@@ -2939,7 +3076,7 @@ class Supervisor:
             # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
             # that file queued or ended at this head; the shared queue says whether that entry is this head, read
             # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
-            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"
@@ -3159,7 +3296,16 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items) + self.designs(items), "checklist": self.checklist(), "denied": self.denied()}
+                "findings": self.started() + self.findings(items) + self.designs(items), "checklist": self.checklist(),
+                "denied": self.denied()}
+
+    def started(self) -> str:
+        """The brief's line for a branch started from a failed lane entry (`start_point`, sd:10379); "" otherwise."""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None or self.start_point() is None:
+            return ""
+        return (f"\nThe branch starts from {failed['branch']}, whose lane entry failed: its commits are these items'\n"
+                f"earlier work, so build on them and fix what the lane said: {failed['detail'][:1500]}\n")
 
     def designs(self, items: list[int]) -> str:
         """The design and rulings of each design item in `items` (sd:10096); "" for none."""
@@ -3238,6 +3384,7 @@ class Supervisor:
                 "--model", model or self.row["model"] or build.OPUS, *(["--effort", effort] if effort else [])]
         if session:
             argv += ["--resume", session]
+        self.env.update(self.threads())  # read again at each spawn: the load moves over a run
         offset = self.start_offset(role)
         before = self.read_head()
         self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset, role=role)
@@ -3338,6 +3485,16 @@ class Supervisor:
         except Unread as unread:
             return f"the worktree was not read: {unread}"
         return "" if ahead.strip().isdigit() and int(ahead) > 0 else f"the builder left no commit on {self.row['branch']}"
+
+    def threads(self) -> dict[str, str]:
+        """The thread counts a builder's child starts with, each at most `thread_cap` now; a lower one the
+        dispatcher's own environment set wins, as the gate's does (sd:10393)."""
+        try:
+            load: float | None = os.getloadavg()[1]
+        except OSError:
+            load = None
+        cap, gate = thread_cap(self.own_env, load=load), _gate_slots()
+        return {name: gate.thread_cap(self.own_env.get(name), cap) for name in (*gate.CPU_VARIABLES, *THREAD_VARIABLES)}
 
     def base(self) -> str:
         try:
@@ -3635,6 +3792,7 @@ class DraftSupervisor(Supervisor):
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
         self.env = _environ(environ, ident)
+        self.own_env = dict(self.env)  # before `threads` caps it: each spawn caps from this again
         self.reviewed: str | None = None
         self.take_resume(settle_seconds)
 

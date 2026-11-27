@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -70,7 +71,9 @@ FAKE = textwrap.dedent('''
     role, plans = Path(sys.argv[0]).stem, Path(os.environ["FAKE_PLANS"])
     with open(plans / "calls.jsonl", "a") as log:
         log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd(),
-                             "run": os.environ.get("SD_BUILD_RUN")}) + "\\n")
+                             "run": os.environ.get("SD_BUILD_RUN"),
+                             "jobs": os.environ.get("CARGO_BUILD_JOBS"),
+                             "xdist": os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS")}) + "\\n")
     plan = plans / f"{role}.json"
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
@@ -364,6 +367,17 @@ FAKE = textwrap.dedent('''
         if any(row["item"] == items[0] and row.get("id", "").startswith("import-") and row["status"] != "cancelled"
                and row["expected_head"] == argv[argv.index("--expected-head") + 1] for row in entries):
             print(json.dumps({"ok": False, "error": f"sd:{items[0]} at this head already ran in this lane"}))
+            sys.exit(3)
+        import sqlite3  # the lane's own guard, over each entry as the shared queue stores it now (a hand-back)
+        stored = sqlite3.connect(os.environ["FAKE_DB"])
+        def now(row):
+            newest = stored.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                    "LIMIT 1", (f"lane:v1:example/repo:{row.get('id')}",)).fetchone()
+            return {**row, "status": json.loads(newest[0]).get("status")} if newest else row
+        try:
+            sd_lane.refuse_ran([now(row) for row in entries], items[0], argv[argv.index("--expected-head") + 1])
+        except sd_lane.LaneError as error:
+            print(json.dumps({"ok": False, "error": str(error)}))
             sys.exit(3)
         entry = {"id": f"e{len(entries) + 1}", "item": items[0], "status": "pending", "enqueue_seq": len(entries) + 1,
                  "expected_head": argv[argv.index("--expected-head") + 1]}
@@ -817,6 +831,21 @@ class Supervise(Case):
         self.assertEqual(found and found["id"], "e1")
         self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [5], env=self.env))
 
+    def test_the_lane_entry_is_read_on_the_runs_branch_alone(self):
+        """Review of build/sd-1808: a rebuild shares items, and can share a head, with the failed branch's entry;
+        the newest entry of the items was taken whatever its branch. A row with no branch, an earlier version's
+        import, still counts."""
+        (self.plans / "lane.json").write_text(json.dumps([
+            {"id": "e1", "item": 7, "status": "failed", "enqueue_seq": 1, "branch": "build/sd-2"},
+            {"id": "e2", "item": 7, "status": "failed", "enqueue_seq": 2, "branch": "build/sd-1"}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-2", env=self.env)
+        self.assertEqual(found and found["id"], "e1")
+        self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env))
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e3", "item": 7, "status": "merged",
+                                                           "enqueue_seq": 1}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env)
+        self.assertEqual(found and found["id"], "e3")
+
     def test_an_unread_delivery_writes_nothing(self):
         """`cited` None (the commits were not read) is unknown: no enqueue, no outcome; the reap retries."""
         self.press()
@@ -1012,6 +1041,49 @@ class Supervise(Case):
         self.assertIn("Write no file outside the worktree", prompt)
         self.assertIn("never amend", prompt)
         self.assertIn("Bash(git commit -F:*)", argv[argv.index("--allowedTools"):argv.index("--permission-mode")])
+
+    def test_a_builders_child_runs_its_tests_on_capped_threads(self):
+        """sd:10393: a builder's cargo, pytest and Unity runs took every core; its child now starts with the cap,
+        and a lower count the dispatcher's own environment set wins, as it does for a gate holder."""
+        gate = build_run._gate_slots()
+        for name in (*gate.CPU_VARIABLES, *build_run.THREAD_VARIABLES, "CI", "GITHUB_ACTIONS"):
+            self.env.pop(name, None)  # a gate holder runs this test with its own caps set: none may reach it
+        self.env.update(SD_GATE_SLOTS="1", TEST_WORKERS="1", XDG_CONFIG_HOME=str(self.root / "no-config"))
+        self.press()
+        self.plan(claude=["pass"])
+        supervisor = self.supervisor()
+        with mock.patch("os.getloadavg", return_value=(0.0, 0.0, 0.0)), mock.patch("os.cpu_count", return_value=16):
+            supervisor.run()
+        call = self.calls("claude")[0]
+        self.assertEqual((call["jobs"], call["xdist"]), ("16", "16"), "one slot: a gate's share is every core")
+        self.assertEqual(supervisor.env["TEST_WORKERS"], "1", "the lower count set wins")
+        prompt = call["argv"][call["argv"].index("-p") + 1]
+        self.assertIn("$CARGO_BUILD_JOBS", prompt)
+        with mock.patch("os.getloadavg", return_value=(30.0, 13.0, 9.0)), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["CARGO_BUILD_JOBS"], "3", "the load leaves 3 cores idle")
+        with mock.patch("os.getloadavg", side_effect=OSError), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["NEXTEST_TEST_THREADS"], "16", "an unread load caps at the share")
+
+    def test_the_thread_cap_takes_the_lower_of_the_gate_share_and_the_idle_cores(self):
+        """sd:10393: at most a gate holder's share of the cores, at most the cores the load leaves idle, at least 1."""
+        for slots, load, cap in (("4", 2.0, 4), ("4", 14.0, 2), ("4", 104.0, 1), ("4", None, 4),
+                                 ("4", math.nan, 4), ("4", math.inf, 4), ("0", 2.0, 14), ("bad", 0.0, 16),
+                                 ("20", 0.0, 1)):
+            with self.subTest(slots=slots, load=load):
+                env = {"SD_GATE_SLOTS": slots, "XDG_CONFIG_HOME": str(self.root / "no-config")}
+                self.assertEqual(build_run.thread_cap(env, load=load, cores=16), cap)
+
+    def test_the_thread_cap_reads_the_machine_setting_from_the_environment_it_is_given(self):
+        """Review of build/sd-1808: the cap's inputs come from the environment handed in, never the host's: the
+        variable first, then CI, then `sd.gate_slots` in that environment's config."""
+        home = self.root / "config"
+        (home / "sd-ai-command-pack").mkdir(parents=True)
+        (home / "sd-ai-command-pack" / "config.json").write_text(
+            json.dumps({"config": {"sd": {"gate_slots": "8"}}}), encoding="utf-8")
+        env = {"XDG_CONFIG_HOME": str(home)}
+        self.assertEqual(build_run.thread_cap(env, load=0.0, cores=16), 2)
+        self.assertEqual(build_run.thread_cap({**env, "SD_GATE_SLOTS": "4"}, load=0.0, cores=16), 4)
+        self.assertEqual(build_run.thread_cap({**env, "CI": "1"}, load=0.0, cores=16), 16, "CI caps no gate")
 
     def test_a_success_line_passes_whatever_the_exit_code(self):
         self.press()
@@ -4613,7 +4685,8 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "pending",
-                                                           "enqueue_seq": 1, "expected_head": head}]))
+                                                           "enqueue_seq": 1, "expected_head": head,
+                                                           "branch": self.bundle["branch"]}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
@@ -5631,6 +5704,341 @@ class Tick(Case):
         build.queue_again(self.db, self.items, who="operator", finding="pin the fixture clock")
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
+
+    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
+                                   outsider=None, left_out=False, reverted=None, rebundled=False,
+                                   other_failed=False, claimed=False, newer=False, imported=False,
+                                   retried=False, jammed=False, made=False):
+        """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
+        builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
+        run = self.enqueued(2)
+        support.git(self.repo, "checkout", "-q", "-b", run["branch"])
+        (self.repo / "work.txt").write_text("the bundle's work\n", encoding="utf-8")
+        support.git(self.repo, "add", "work.txt")
+        trailers = "".join(f"\nCloses: sd:{item}" for item in self.items) if closes else ""
+        if outsider is not None:  # a trailer for an item outside the bundle, kept open by the failed entry
+            trailers += f"\nCloses: sd:{outsider}"
+        support.git(self.repo, "commit", "-qm", f"feat: the bundle's work\n{trailers}")
+        if reverted is not None:  # a commit that closes an item outside the bundle, reverted on the failed branch
+            (self.repo / "other.txt").write_text("another item's work\n", encoding="utf-8")
+            support.git(self.repo, "add", "other.txt")
+            support.git(self.repo, "commit", "-qm", f"feat: another item's work\n\nCloses: sd:{reverted}")
+            support.git(self.repo, "revert", "--no-edit", "HEAD")
+        head = support.git(self.repo, "rev-parse", "HEAD")
+        support.git(self.repo, "checkout", "-q", "main")
+        self.failed_branch = run["branch"]
+        if lost:  # the failed branch is gone and its entry names a commit this checkout lacks
+            support.git(self.repo, "branch", "-D", run["branch"])
+            head = "0" * 40
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red", "expected_head": head,
+                                       **({"imported_from": "queue.json"} if imported else {})}
+        self.tick()
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        if trimmed:  # the operator drops the failed branch's commit after the failure; the entry still names it
+            support.git(self.repo, "branch", "-f", run["branch"], f"{head}~1")
+            head = support.git(self.repo, "rev-parse", run["branch"])
+        rebuild = self.items[:count]
+        self.db.execute(f"UPDATE item SET status = 'ready' WHERE id IN ({', '.join('?' for _ in rebuild)})",
+                        rebuild)
+        queued = build.queue_again(self.db, rebuild, who="operator")
+        self.assertNotIn(run["assignment"], [entry["id"] for entry in queued], "a fresh press, not Fix")
+        if rebundled:  # that press is cancelled before a claim and pressed again: a bundle that never ran
+            self.db.execute(f"UPDATE assignment SET status = 'cancelled' WHERE id IN "
+                            f"({', '.join('?' for _ in queued)})", [entry["id"] for entry in queued])
+            build.queue(self.db, rebuild, who="operator")
+        if claimed:  # that press is claimed and cancelled before its builder ran: a run that built nothing
+            first = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+            assert first is not None
+            self.assertEqual(build.run(self.db, first["id"])["step"], "claimed")
+            self.assertIsNotNone(build.end(self.db, first["id"], "cancelled", "fixture: cancelled at its claim"))
+            with self.db:  # as the reap releases it once its groups read gone
+                stamp = build.clock()
+                self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (stamp, first["id"]))
+                self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, first["id"]))
+                for item in rebuild:
+                    build.unpark(self.db, item)
+            build.queue(self.db, rebuild, who="operator")
+        if newer:  # the lead was built since in a bundle of its own, which ran its builder and ended blocked
+            with self.db:
+                ran = self.db.execute("INSERT INTO assignment (item, role, status, lane, scope, run_count) "
+                                      "VALUES (?, 'author', 'blocked', 'parallel', ?, 1)",
+                                      (self.items[0], build.SCOPE)).lastrowid
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "step, outcome, released_at, created_at, updated_at) VALUES ('newer', ?, 1, ?, "
+                    "'build/sd-newer', 'fixture', '', '', 'building', 'blocked', '2999-01-01T00:00:00Z', "
+                    "'2999-01-01T00:00:00Z', '2999-01-01T00:00:00Z')", (ran, str(self.repo)))
+        if extra:  # an unrelated item, never built, queued beside them: the claim bundles it in
+            fresh = create_item(self.db, kind="task", title="Unrelated", repo=str(self.repo), status="ready")
+            if other_failed:  # its own bundle, with an item left out here, failed in the lane before
+                gone = create_item(self.db, kind="task", title="Left behind", repo=str(self.repo), status="ready")
+                build.queue(self.db, [fresh, gone], who="operator")
+                lead = self.db.execute("SELECT id FROM assignment WHERE item = ?", (fresh,)).fetchone()[0]
+                self.db.execute("UPDATE assignment SET status = 'done', parent = ? WHERE item = ?", (lead, gone))
+                self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (lead,))
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "outcome, released_at, created_at, updated_at) VALUES ('other', ?, 1, ?, 'build/sd-other', "
+                    "'fixture', '', '', 'lane_failed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', "
+                    "'2026-01-01T00:00:00Z')", (lead, str(self.repo)))
+                self.assertEqual(len(build.run(self.db, "other")["members"]), 2)
+            build.queue(self.db, [fresh], who="operator")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.assertNotEqual(self.bundle["branch"], run["branch"])
+        if left_out:  # a member cancelled out of the new bundle before its worktree: not selected
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+        if retried:  # a lane Retry of the failed entry since, on the same branch, which failed too
+            self.store({"id": "e2", "item": self.items[0], "status": "failed", "reason": "gate red again",
+                        "expected_head": head}, self.failed_branch)
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        if jammed:  # a file where the worktree goes: `git worktree add` fails
+            Path(self.bundle["work_path"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.bundle["work_path"]).write_text("in the way\n", encoding="utf-8")
+            self.assertEqual(supervisor.worktree().get("outcome"), "blocked")
+            return head, supervisor
+        if made:  # an earlier try of this start made the worktree, then stopped before anything else
+            support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], self.bundle["work_path"],
+                        support.git(self.repo, "rev-parse", self.failed_branch))
+        self.assertEqual(supervisor.worktree(), "building")
+        return head, supervisor
+
+    def test_a_fresh_build_after_a_lane_failure_starts_from_the_failed_head(self):
+        """sd:10379: it started from origin/main and dropped the bundle's commits; it starts from the branch tip."""
+        head, supervisor = self.rebuilt_after_lane_failure(2)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+        self.assertIn("gate red", supervisor.brief()["findings"])
+
+    def test_a_fresh_build_starts_from_the_failed_branch_as_the_operator_left_it(self):
+        """Review of build/sd-1808: it preferred the entry's head, so a commit the operator removed from the failed
+        branch came back. It starts from the branch's tip now."""
+        head, _ = self.rebuilt_after_lane_failure(2, trimmed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_fresh_build_at_the_failed_head_enters_the_lane_again(self):
+        """Review of build/sd-1808: the rebuilt branch starts at the failed head, so the old failed entry matched
+        its head, and the run took it as its own enqueue: it ended lane_failed again, never in the lane. Only an
+        entry of this run's branch is its own."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual([(row["status"], row["expected_head"]) for row in entries],
+                         [("failed", head), ("pending", head)])
+
+    def test_an_unchanged_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Lead review of build/sd-1808: an earlier version's entry failed head H on a flaky gate; the rebuild
+        started at H and changed nothing. The lane's guard (`sd_lane.refuse_ran`) refused H as already run, and
+        the recovery reads only this run's branch, so the run blocked. The rebuild that starts at the failed head
+        hands that entry back, as Fix does, and the same head enters the lane again."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
+        # A second try of the same start (a crash before its worktree) finds it handed back and writes nothing.
+        before = self.stored("e1")
+        failed = build.lane_failed_start(self.db, self.bundle["assignment"])
+        assert failed is not None
+        self.assertIn("cancelled", build.take_over(self.db, failed, self.bundle["id"]))
+        self.assertEqual(self.stored("e1"), before)
+
+    def test_a_rebuild_hands_back_only_the_entry_its_failed_run_recorded(self):
+        """Lead review of build/sd-1808: a lane Retry of the failed entry e1 queued e2 on the same branch, which
+        failed too, and the rebuild handed back e2, an attempt its failed run never read. Only the recorded
+        entry is handed back; another newest entry is left as it is."""
+        self.rebuilt_after_lane_failure(2, retried=True)
+        self.assertEqual(self.stored("e2")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e2"))
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_failed_worktree_add_hands_nothing_back(self):
+        """Lead review of build/sd-1808: the hand-back ran before `git worktree add`; the add failed, and the
+        failed entry was cancelled with no checkout to replace it, so Retry of it was refused. It runs after."""
+        self.rebuilt_after_lane_failure(2, jammed=True)
+        self.assertEqual(self.stored("e1")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_resumed_start_with_its_worktree_made_hands_the_entry_back(self):
+        """Lead review of build/sd-1808: a try that made the worktree and stopped before the hand-back left the
+        entry failed; the next try finds the worktree and hands it back then."""
+        self.rebuilt_after_lane_failure(2, made=True)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
+
+    def test_a_changed_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Class pass of the lead review of build/sd-1808: a rebuild that moved the head past the imported
+        entry's enters the lane as a new head, the old entry handed back."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        work = Path(self.bundle["work_path"])
+        (work / "fix.txt").write_text("the gate's fix\n", encoding="utf-8")
+        support.git(work, "add", "fix.txt")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", "fix: the gate's fix")
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual(entries[-1]["expected_head"], support.git(work, "rev-parse", "HEAD"))
+        self.assertNotEqual(entries[-1]["expected_head"], head)
+
+    def test_a_refused_rebuild_enqueue_never_adopts_the_failed_branchs_entry(self):
+        """Review of build/sd-1808: the enqueue refused, and its recovery took the newest entry at this head as the
+        run's own, the failed branch's included. Only an entry of this run's branch is its own: the run blocks."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "pending", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("already queued in this lane", ended["blocked"])
+
+    def test_a_rebuilt_failed_bundle_with_an_unrelated_item_beside_it_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: an item never built, bundled in with the whole failed bundle, sent the
+        branch to main and dropped the bundle's commits. Its commits cite only items this bundle holds."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, extra=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3, "the unrelated item rides along")
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+
+    def test_a_rebuild_bundled_afresh_twice_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: a press cancelled before its claim left each item a newer assignment that
+        never ran, so the read found no lane-failed build and the branch started from main. The newest build
+        that ran is the one that counts."""
+        head, _ = self.rebuilt_after_lane_failure(2, rebundled=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_rebuild_claimed_and_cancelled_before_its_builder_keeps_the_failed_head(self):
+        """Lane review of build/sd-1808: a fresh bundle of a whole failed bundle, claimed and cancelled before its
+        builder ran, left each item a newer run that built nothing, and the next fresh bundle started from main
+        without the failed bundle's commits. A run that never reached its builder hides no failed bundle."""
+        head, _ = self.rebuilt_after_lane_failure(2, claimed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(build.outside_rebuild(self.db, self.bundle["assignment"], [99999]), [99999],
+                         "the delivery keeps a citation outside the bundle open as well")
+
+    def test_a_failed_bundle_whose_item_was_built_since_starts_from_main(self):
+        """Lane review of build/sd-1808: the lead was built again after its bundle failed in the lane; the other
+        member's last build named the failed bundle, so the fresh bundle started there, from the lead's older
+        commits. A failed bundle sets the start only when it is the last build of every item it built."""
+        head, _ = self.rebuilt_after_lane_failure(2, newer=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        self.assertNotEqual(head, support.git(self.repo, "rev-parse", "main"))
+
+    def test_a_rebuild_beside_an_item_of_another_failed_bundle_starts_from_the_whole_one(self):
+        """Lane review of build/sd-1808: an item whose own earlier bundle failed in the lane, bundled in with a
+        whole failed bundle, named two runs, and the branch started from main. The whole one wins."""
+        head, _ = self.rebuilt_after_lane_failure(2, extra=True, other_failed=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_failed_branch_that_closes_an_item_outside_the_bundle_starts_from_main(self):
+        """Review of build/sd-1808: the failed branch's commit closes an open item this bundle does not hold, one the
+        failed entry kept open; its merge would close it unselected. It starts from main and says why."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True, outsider=kept)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in body for body in notes), notes)
+
+    def test_a_member_that_leaves_mid_run_turns_no_delivery_check_off(self):
+        """Class pass of build/sd-1808: the delivery's read of the rebuild is history alone, so a member cancelled
+        out since the start (`lane_failed_start` then answers None) still leaves the outside citation open."""
+        self.test_a_citation_revived_after_the_start_stays_open_at_delivery(leaves=True)
+
+    def test_a_citation_revived_after_the_start_stays_open_at_delivery(self, leaves=False):
+        """Class pass of build/sd-1808: the start read the failed branch's citations once. One a revert hid there
+        came back when the rebuild reverted the revert, and the merge would close an item no one selected. The
+        delivery reads them again and keeps each outside the bundle open with a `Refs:` line."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head, "the hidden citation passes the start")
+        support.git(work, "revert", "--no-edit", "HEAD")
+        if leaves:
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+            self.assertIsNone(build.lane_failed_start(self.db, self.bundle["assignment"]))
+        self.write_pr()
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertIn(f"Refs: sd:{kept}", body.splitlines())
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in note and "outside" in note for note in notes), notes)
+
+    def test_a_fenced_refs_line_keeps_no_outside_citation_open(self):
+        """Ruling on sd:10379: a `Refs:` line inside a code fence names nothing (`sd_ship_body.referenced_ids`),
+        so the delivery still adds a live one for a citation outside the bundle."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        support.git(Path(self.bundle["work_path"]), "revert", "--no-edit", "HEAD")
+        self.write_pr(body=f"## Summary\n\nx\n\n## Test plan\n\n```\nRefs: sd:{kept}\n```\n")
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertTrue(body.endswith(f"```\n\nRefs: sd:{kept}\n"), body)
+
+    def test_the_refs_lines_a_delivery_adds_pass_the_lane_line_check(self):
+        """Review of build/sd-1808: one `Refs:` line for many items ran past the lane's 72 characters, and
+        enqueue refused the body. Each added line keeps to the limit, and together they name every item."""
+        ship = build_run._ship_body()
+        items = list(range(10001, 10013))
+        body = build_run.with_refs("## Summary\n\nx\n", items)
+        assert body is not None
+        self.assertEqual(ship.long_lines(body), [])
+        self.assertEqual(ship.referenced_ids(body), set(items))
+        self.assertEqual(build_run.with_refs(body, items), body, "a second pass adds nothing")
+
+    def test_a_body_left_in_an_open_fence_gets_no_dead_refs_line(self):
+        """Review of build/sd-1808: a line added after an unclosed fence names nothing, so the merge would close
+        the item. The helper answers None; the delivery blocks rather than enqueue."""
+        self.assertIsNone(build_run.with_refs("## Summary\n\n```\nx\n", [10001]))
+
+    def test_a_member_cancelled_out_of_the_new_bundle_sends_it_to_main(self):
+        """Review of build/sd-1808: the bundle read counted a member cancelled out of it (`ALONE`) as selected."""
+        head, _ = self.rebuilt_after_lane_failure(2, left_out=True)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
+        """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""
+        head, supervisor = self.rebuilt_after_lane_failure(1)
+        work = Path(self.bundle["work_path"])
+        self.assertNotEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+
+    def test_a_failed_branch_that_does_not_read_starts_from_main_and_says_so(self):
+        """sd:10379: a fallback to main is no silent loss of the bundle's commits: a note on the lead says why."""
+        self.rebuilt_after_lane_failure(2, lost=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any("did not read here" in body for body in notes), notes)
 
     def reopened_dependency(self):
         """The bundle's lead waits on an item reopened since its build: the dependency is open again."""
