@@ -734,6 +734,29 @@ class PriorVerdictTests(unittest.TestCase):
         rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
         self.assertEqual(verified(answer("one"), rebutted=rebutted)["status"], "clean")
 
+    def test_a_rebuttal_holds_no_open_verdict_that_cites_a_fresh_repro(self) -> None:
+        """Review of build/sd-2205 (bin/sd-review:1969), the class: a saved judgment erased fresh evidence.
+        A reader's `open` with evidence is a citation, as a finding's is in `dispose`: a plain rebuttal holds
+        only an uncited `open`, and a build's ruling only one citing the evidence it judged."""
+        plain = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
+        body = json.loads(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
+        body["proposal"]["findings"][0].update(ruled=True)
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        ruled = listed(json.dumps(body))
+        fresh = "python3 t.py --empty: IndexError"
+        for label, rebutted, verdicts, status in (
+                ("plain, open with a fresh repro", plain, [verdict("open", fresh)], "blocking"),
+                ("plain, open with no evidence", plain, [verdict("open", "")], "clean"),
+                ("plain, open for no listed id", plain, [verdict("open", fresh, id="B7")], "blocking"),
+                ("ruled, open with a fresh repro", ruled, [verdict("open", fresh)], "blocking"),
+                ("ruled, open citing the judged repro", ruled, [verdict("open", REPRO)], "clean"),
+                ("ruled, silence", ruled, [], "clean")):
+            with self.subTest(label):
+                self.assertEqual(verified(answer("one", verdicts=verdicts), rebutted=rebutted)["status"], status)
+        failed = answer("one", verdicts=[verdict("open", fresh)], status=sd_review.UNAVAILABLE)
+        [row] = verified(failed, answer("two", verdicts=[verdict()]), rebutted=plain)["findings"]
+        self.assertIn(fresh, row["evidence"])
+
     def test_the_carried_row_keeps_its_place_and_adds_the_open_evidence(self) -> None:
         [row] = verified(answer("one", verdicts=[verdict("open", "python3 t.py: still 2")]))["findings"]
         self.assertEqual({key: row[key] for key in ("path", "line", "summary", "disposition", "evidence")},

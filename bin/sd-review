@@ -1953,20 +1953,24 @@ def prior_listing(previous: Mapping[str, Any], blockers: Sequence[Mapping[str, A
 
 
 def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome], rebutted: Sequence[Rebuttal]) -> list[dict[str, Any]]:
-    """Each prior blocker no listed rebuttal answers, unless every completed answer returned `fixed` for its id
+    """Each prior blocker no listed rebuttal holds, unless every completed answer returned `fixed` for its id
     with evidence and no answer, failed or not, said `open` (pack sd:10087; a fallback's `fixed` must not clear
     what a failed reader found open): silence, a paraphrase, a nearby repeat or an `open` keeps it blocking, at
     its stored place, with its stored evidence and each `open` answer's. With no completed answer nothing
-    clears: every blocker is carried, so an interrupted pass's report, a resume's input, keeps it (build/sd-2205)."""
+    clears: every blocker is carried, so an interrupted pass's report, a resume's input, keeps it (build/sd-2205).
+    An `open` with evidence is a citation: a rebuttal holds it only as `dispose` holds a cited repeat."""
     answered = [row for row in outcomes if row.status in (CLEAN, FINDINGS)]
     names = {f"B{index + 1}" for index in range(len(prior))}
     def _said(row: Outcome, name: str) -> list[dict[str, Any]]:  # an `open` naming no listed blocker holds every one
         return [given for given in row.verdicts if (key := given["id"].strip().upper()) == name or key not in names and given["verdict"] == "open"]
+    def _rebuts(old: Mapping[str, Any], opened: Sequence[Any]) -> bool:  # each `open` evidence read as a citation
+        cites = [text.strip() for text in opened if isinstance(text, str) and text.strip()] or [None]
+        return all(is_rebutted(rebutted, old, text, prior) for text in cites)
     kept = []
     for index, old in enumerate(prior):
         name = f"B{index + 1}"
         opened = [given["evidence"] for row in outcomes for given in _said(row, name) if given["verdict"] == "open"]
-        if is_rebutted(rebutted, old, saved=prior) or answered and not opened and all(_said(row, name) and all(
+        if _rebuts(old, opened) or answered and not opened and all(_said(row, name) and all(
                 given["verdict"] == "fixed" and given["evidence"].strip() for given in _said(row, name)) for row in answered):
             continue
         notes = list(dict.fromkeys(text.strip() for text in (old.get("evidence"), *opened) if isinstance(text, str) and text.strip()))

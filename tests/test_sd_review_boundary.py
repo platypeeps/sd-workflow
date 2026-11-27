@@ -1198,11 +1198,16 @@ class LineBudgetTests(unittest.TestCase):
         # ruling check moves to `is_rebutted`, which `dispose` and
         # `carried` share, so a ruling clears a carried blocker only when
         # it judged that blocker's repro. Measured: `sd-review` is 3226.
+        #
+        # 5196 -> 5200 is round 6 of build/sd-2205: `bin/sd-review` +4 so
+        # a reader's `open` evidence is a citation a rebuttal holds only
+        # as `dispose` holds a cited repeat (`_rebuts`, kept out of `carried`
+        # for its complexity ceiling). Measured: `sd-review` is 3230.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5196,
+            5200,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
