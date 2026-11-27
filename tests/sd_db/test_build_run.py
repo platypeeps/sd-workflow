@@ -5321,6 +5321,10 @@ class Tick(Case):
         beat = self.db.execute("SELECT * FROM state WHERE kind = 'heartbeat' AND key = ?",
                                (build_run.HEARTBEAT,)).fetchone()
         self.assertIsNotNone(beat)
+        # sd:10934: the beat names the sd_db build the tick loaded, so the hub can tell a mismatch from a loss.
+        from sd_db import remote
+
+        self.assertEqual(json.loads(beat["body"])["build"], remote.build_digest())
         build.register(self.db, result["claimed"][0], pid=os.getpid(), pgid=os.getpgrp(),
                        start=build.Probe.started(os.getpid()))
         again = self.tick()
