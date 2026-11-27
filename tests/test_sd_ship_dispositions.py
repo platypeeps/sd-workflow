@@ -118,6 +118,27 @@ class DispositionTests(unittest.TestCase):
         forged = dict(proposal, findings=[dict(proposal["findings"][0], lead=True)])
         self.rejected_proposal(forged)
 
+    def test_a_lead_review_is_answered_past_an_incomplete_ship_pass_and_never_parked(self):
+        """sd:10926 ruling round. A prepare that failed with no valid receipt keeps its reserved pass at the
+        head: it is no review, so the lead's still answers. And `parked` clears nothing in the lead's store,
+        which `sd-review` reads for rebuttals alone: the template offers `rebutted`, and a parked row refuses."""
+        from sd_db.writes import record_state
+        operation = self.operation()
+        self.head = fixture._git(self.root, "rev-parse", "HEAD")
+        self.proposal_file = self.directory / "dispositions.json"
+        blocker = {"path": "src.py", "line": 1, "severity": "high", "summary": "fixture lead finding",
+                   "family": "correctness", "evidence": "python3 src.py: Traceback", "disposition": "blocking"}
+        record_state(self.connection, "checkpoint", key=ship.sd_lib.lead_review_key(operation.repository, operation.branch),
+                     body={"repository": operation.repository, "branch": operation.branch, "head": self.head,
+                           "status": "blocking", "findings": [blocker]})
+        operation.save(passes=[{"head": self.head, "execution_error": {"code": "invalid_receipt"}, "exit_code": 1}])
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        template = json.loads(result.stdout)["proposal"]
+        self.assertEqual([row["response_disposition"] for row in template["findings"]], ["rebutted"])
+        template["findings"][0].update(response_disposition="parked", reason="a risk the lead accepts")
+        self.rejected_proposal(template)
+
     def test_a_blocking_refusal_names_the_head_its_review_saw(self):
         """sd:9966 review: prepare's catch-up moves the head past the queued one, and adjudicate takes only the
         reviewed head, so the answer names it for Reject and enqueue."""

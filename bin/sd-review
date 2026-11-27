@@ -1036,6 +1036,8 @@ def lines_now(record: Rebuttal, unchanged: Callable[[str, Any], bool],
     at its head: any change since, to a file it names or not (a new caller, from a branch commit or a catch-up
     merge), lapses it whole (class pass 5, sd:10286). No `line_now`: a line holds while its file is unchanged."""
     follow = line_now or (lambda head, path, line: line if unchanged(head, path) else None)
+    if record.lead and not unchanged(record.head, None):  # its cited hold judged that tree, as a ruling does (sd:10926)
+        record = record._replace(lead="")
     lapsed = record._replace(listed=False)
     places = [(record.path, record.line), *(instance_place(entry) or (entry, None) for entry in record.instances)]
     if record.ruled is not None:

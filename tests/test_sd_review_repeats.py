@@ -1113,6 +1113,21 @@ class RebuttalIdentityTests(unittest.TestCase):
                          "a lead finding with no evidence holds no cited repeat")
         self.assertEqual(gate([row(summary="other words", line=40)], json.dumps(body)), ["advisory"])
 
+    def test_a_lead_rejection_holds_no_cited_repeat_once_the_tree_changed(self) -> None:
+        """sd:10926 ruling round: the lead rejected a crash no caller reached; a later commit in another file
+        added the caller, and the same citation was held. As a build's ruling, the hold of a cited repeat
+        judged the tree at its head: any change since ends it. An uncited repeat still follows its line."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted"), line=40))
+        body["proposal"]["bindings"]["source"] = "lead-review"
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = REPRO
+        moved = sd_review.rebuttals([(json.dumps(body),)], {ON_BRANCH}.__contains__,
+                                    lambda _head, path: path is not None)  # another file changed
+        def held(**extra: Any) -> list[str]:
+            return [record["disposition"] for record in sd_review.dispose([row(line=40, **extra)], "high", moved)]
+        self.assertEqual(held(evidence=REPRO), ["blocking"])
+        self.assertEqual(held(), ["advisory"])
+        self.assertEqual(gate([row(line=40, evidence=REPRO)], json.dumps(body)), ["advisory"], "an unchanged tree")
+
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
         for summary in ("value is wrong", " VALUE is\nwrong ", f"Value is wrong {sd_review.REPEAT_NOTE}"):

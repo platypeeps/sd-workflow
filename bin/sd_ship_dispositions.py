@@ -85,7 +85,9 @@ def lead_context(operation: Any, head: str) -> tuple[dict, list[dict]] | None:
     import sd_lib  # noqa: PLC0415
 
     passes = operation.history.native(operation.state)
-    if passes and (passes[-1].get("head") == head or operation.state.get("reviewed_head") == head):
+    # A reserved pass a failed prepare left has no report: it is no review of `head` (ruling round, sd:10926).
+    if passes and (operation.state.get("reviewed_head") == head or (
+            passes[-1].get("head") == head and isinstance(passes[-1].get("report"), dict))):
         return None
     found = operation.connection.execute(
         "SELECT body FROM state WHERE id = (SELECT MAX(id) FROM state WHERE kind = 'checkpoint' AND key = ?)",
@@ -101,6 +103,14 @@ def lead_context(operation: Any, head: str) -> tuple[dict, list[dict]] | None:
         (row for row in record["findings"] if isinstance(row, dict) and row.get("disposition") == "blocking"), 1)]
     return ({"repository": operation.repository, "branch": operation.branch, "head": head,
              "source": sd_lib.LEAD_REVIEW_SOURCE, "lead_review_digest": digest(record)}, rows) if rows else None
+
+
+def choices(bindings: dict) -> tuple[str, ...]:
+    """The dispositions a proposal may give: a lead review's takes a rebuttal alone, as nothing reads a parked
+    row in its store and the finding would block again (ruling round, sd:10926)."""
+    import sd_lib  # noqa: PLC0415
+
+    return DISPOSITIONS[:1] if bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE else DISPOSITIONS
 
 
 def recorded_key(operation: Any, bindings: dict) -> str:
@@ -207,9 +217,9 @@ def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool = Fals
         if (not isinstance(row, dict) or set(row) - {"test"} != set(identity) | {"response_disposition", "reason"}
                 or type(row.get("index")) is not int or digest({name: row.get(name) for name in identity}) != digest(identity)):
             raise Refusal("disposition finding indices, raw findings or digests changed")
-        if row["response_disposition"] not in DISPOSITIONS:
-            raise Refusal("only a rebuttal or a parked risk can clear a blocker: response_disposition "
-                          f"is 'rebutted' or 'parked', not {row['response_disposition']!r}")
+        if row["response_disposition"] not in choices(bindings):
+            raise Refusal("only a rebuttal or a parked risk can clear a blocker: response_disposition is "
+                          f"{' or '.join(map(repr, choices(bindings)))}, not {row['response_disposition']!r}")
         text(row["reason"], "reason")
     tests = [test_argv(row.get("test")) for row in rows]
     if run_tests:
@@ -347,7 +357,7 @@ def adjudicate(operation: Any) -> dict:
     bindings, rows = context(operation, args.expected_head)
     if args.dispositions_file is None:
         proposal = {"schema_version": 1, "bindings": bindings,
-                    "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="", test=[]) for row in rows]}
+                    "findings": [dict(row, response_disposition="|".join(choices(bindings)), reason="", test=[]) for row in rows]}
         # sd:9966: the dispositions this review already holds, which a filled template replaces whole.
         revision, value = operation.store.read(operation.connection, recorded_key(operation, bindings))
         held = (revision and value.get("decision") == "accepted"
