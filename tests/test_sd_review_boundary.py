@@ -1183,11 +1183,26 @@ class LineBudgetTests(unittest.TestCase):
         # evidence does not push out a reader's new `open` evidence, and
         # `replaced` hides a deleted file's new source only when no other
         # blocker lives at the path. Measured: `sd-review` is 3169 here.
+        #
+        # 5149 -> 5183 is sd:10286: `bin/sd-review` +34 so a build's
+        # ruling holds back only the repeat it judged: a citation of
+        # other evidence, a lapsed ruling or a cut text's literal
+        # stored form blocks. Measured: `sd-review` is 3213 here.
+        #
+        # 5183 -> 5197 is the sd:10286 class pass: `bin/sd-review` +14
+        # so a ruling holds an uncited repeat only when each blocker
+        # the prior review saved beside it is the claim it judged, a
+        # closed test in `dispose`. Measured: `sd-review` is 3227 here.
+        #
+        # 5139 -> 5196 is the merge of sd:10286 into build/sd-2205: its
+        # ruling check moves to `is_rebutted`, which `dispose` and
+        # `carried` share, so a ruling clears a carried blocker only when
+        # it judged that blocker's repro. Measured: `sd-review` is 3226.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5139,
+            5196,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
