@@ -130,8 +130,6 @@ EVIDENCE_ASK = ("a failing input and its path:line route, showing a failure this
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 TRIGGER_ASK = "trigger says where that input comes from: " + "; ".join(f"{name}: {why}" for name, why in TRIGGERS.items()) + "."
 SYNTHETIC_NOTE = "[advisory: no caller or recorded data carries the failing input]"
-BASE_ASK = ("base says whether the merge base (origin/main) has the same defect; check it there before you "
-            "answer: " + "; ".join(f"{name}: {why}" for name, why in BASES.items()) + ".")
 ON_BASE_NOTE = "[advisory: the merge base already has this defect; file it for the repo]"
 #: How far from a ruled place a prior blocker the ruling did not judge still blocks its uncited repeat (sd:10286).
 SHIFT_LINES = 3  # ponytail: a reader's imprecision around a stored line; closer unrelated ones block
@@ -340,6 +338,7 @@ class Subject(NamedTuple):
     paths: tuple[str, ...]
     lines: int
     description: str
+    main_base: str = ""  # the merge base with the default branch a `base` answer is judged on; "" none (sd:10892)
 
 
 def _default_base(root: pathlib.Path) -> str:
@@ -354,6 +353,22 @@ def _default_base(root: pathlib.Path) -> str:
     raise UsageError(
         "cannot resolve a base branch: no origin/HEAD, and neither main nor master exists"
     )
+
+
+def _main_base(root: pathlib.Path) -> str:
+    """The merge base of HEAD and the default branch, by commit; "" when git cannot say (sd:10892)."""
+    try:
+        return sd_lib.git_output(["merge-base", "HEAD", _default_base(root)], root) or ""
+    except UsageError:
+        return ""
+
+
+def base_ask(subject: Subject) -> str:
+    """The `base` question, against the default branch's merge base by commit, never the diff's own base: a
+    fix pass's `--base` or the worktree's HEAD is a branch commit (sd:10892 review). "" with none."""
+    return (f" base says whether commit {subject.main_base}, the merge base with the default branch, has the same "
+            "defect; read it there, and answer lacks if you cannot: "
+            + "; ".join(f"{name}: {why}" for name, why in BASES.items()) + ".") if subject.main_base else ""
 
 
 def _numstat(root: pathlib.Path, args: list[str]) -> tuple[list[str], int]:
@@ -413,7 +428,7 @@ def resolve_subject(root: pathlib.Path, scope: str, item: str | None = None, bas
             lines += _count_lines(root / path)
         return Subject(
             scope, "HEAD", "worktree", tuple(sorted(set(paths) | set(extra))), lines,
-            "uncommitted working-tree change against HEAD, including untracked files",
+            "uncommitted working-tree change against HEAD, including untracked files", _main_base(root),
         )
 
     if scope in ("branch", "pr"):
@@ -425,7 +440,7 @@ def resolve_subject(root: pathlib.Path, scope: str, item: str | None = None, bas
         paths, lines = _numstat(root, [f"{merge_base}..{head}"])
         return Subject(
             scope, merge_base, head, tuple(sorted(set(paths))), lines,
-            f"committed change {merge_base}..{head} (base branch {base_ref})",
+            f"committed change {merge_base}..{head} (base branch {base_ref})", merge_base if base is None else _main_base(root),
         )
 
     items = [i for i in sd_lib.work_items(root) if i.status in ("planning", "in_progress")]
@@ -1009,7 +1024,7 @@ def build_prompt(subject: Subject, challenge: bool, conventions: str) -> str:
         "speculative ones. path is the repository-relative file, "
         "line is the line in the new version or null, family is the defect's class, one short word such as security, correctness, testing, or maintainability. instances lists, as "
         "path:line, every place in the change where the same defect occurs, the reported one first; a high finding lists at least one. evidence is "
-        f"{EVIDENCE_ASK} {TRIGGER_ASK} {BASE_ASK} Respond only with JSON matching the output schema; an empty findings array means clean; verdicts is [] unless prior blockers are listed."
+        f"{EVIDENCE_ASK} {TRIGGER_ASK}{base_ask(subject)} Respond only with JSON matching the output schema; an empty findings array means clean; verdicts is [] unless prior blockers are listed."
     )
 
 
@@ -1842,13 +1857,13 @@ def run_provider(
 
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
             rebutted: Sequence[Rebuttal] = (), *, repro: bool = False,
-            prior: Sequence[Mapping[str, Any]] = ()) -> list[dict[str, Any]]:
+            prior: Sequence[Mapping[str, Any]] = (), base_asked: bool = False) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
     A finding at the floor posts as advisory, its summary saying why, when it cites no `evidence` and repeats
     one rebutted on this branch (pack sd:9270), or, with `repro`, outside the lane's own `LANE_PATHS` (pack
-    sd:9867, note #70162), a `synthetic` trigger (sd:10288), or, with `repro`, a defect the merge base already
-    has (sd:10892). Only that evidence exists is read.
+    sd:9867, note #70162), a `synthetic` trigger (sd:10288), or, with `repro` and `base_asked` (the prompt named
+    the default branch's merge base), a defect that merge base already has (sd:10892). Only that evidence exists is read.
     A prior blocker is not a finding here: `carried` decides it by verdict (pack sd:10087).
     """
 
@@ -1863,7 +1878,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     def _synthetic(row: Mapping[str, Any]) -> bool:  # a repro nothing real carries, not the lane's own (sd:10288, note #77932)
         return repro and _floor(row) and row.get("trigger") == "synthetic" and str(row.get("path") or "").strip() not in LANE_PATHS
     def _downgrade(record: dict[str, Any]) -> str | None:  # why a blocker posts as advisory
-        if repro and record.get("base") == "has":  # main already has it: filed, not this change's (sd:10892)
+        if repro and base_asked and record.get("base") == "has":  # main already has it: filed, not this change's (sd:10892)
             return ON_BASE_NOTE
         cited = isinstance(record.get("evidence"), str) and record["evidence"].strip()
         return None if cited and not _synthetic(record) else SYNTHETIC_NOTE if _synthetic(record) else NO_REPRO_NOTE if repro and str(
@@ -2717,7 +2732,7 @@ def review(
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       [row._replace(path=spelled(row.path), instances=tuple(respelled(spelled, {"instances": list(row.instances)})["instances"]))
                        for row in rebutted], subject.scope != "planning",
-                      followed(root, previous, subject.head) if previous else ())
+                      followed(root, previous, subject.head) if previous else (), bool(base_ask(subject)))
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:
@@ -2901,11 +2916,11 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
                   rebutted: Sequence[Rebuttal] = (), repro: bool = False,
-                  prior: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+                  prior: Sequence[Mapping[str, Any]] = (), base_asked: bool = False) -> dict[str, Any]:
     """Keep every distinct finding, once, and every prior blocker `carried` holds; only complete answers count
     toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    fresh = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior)
+    fresh = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior, base_asked=base_asked)
     disposed = fresh + carried(prior, outcomes, rebutted)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []

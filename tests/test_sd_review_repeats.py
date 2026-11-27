@@ -386,9 +386,26 @@ class ReproRuleTests(unittest.TestCase):
         has posts as advisory, filed for the repo, and says why."""
         parsed = sd_review._finding(finding(REPRO, base="has"))
         assert parsed is not None
-        [record] = sd_review.dispose([parsed], "high", repro=True)
+        [record] = sd_review.dispose([parsed], "high", repro=True, base_asked=True)
         self.assertEqual((record["disposition"], record["summary"]),
                          ("advisory", f"defect {sd_review.ON_BASE_NOTE}"))
+
+    def test_a_has_answer_no_prompt_asked_for_still_blocks(self) -> None:
+        """sd:10892 review: with no main merge base named in the prompt, a reader's `has` was judged
+        against no stated baseline, so it downgrades nothing."""
+        parsed = sd_review._finding(finding(REPRO, base="has"))
+        assert parsed is not None
+        [record] = sd_review.dispose([parsed], "high", repro=True)
+        self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_the_review_passes_whether_it_asked_to_dispose(self) -> None:
+        result = {"severity_floor": "high", "requested_reviews": 1}
+        answer = sd_review.Outcome("fake", sd_review.FINDINGS, (finding(REPRO, base="has", instances=["src.py:1"]),),
+                                   "", (), ())
+        sd_review.finish_review(dict(result), [answer], ["fake"], repro=True)
+        asked = dict(result)
+        sd_review.finish_review(asked, [answer], ["fake"], repro=True, base_asked=True)
+        self.assertEqual(asked["status"], "advisory")
 
     def test_a_defect_the_change_causes_still_blocks(self) -> None:
         """sd:10892: `lacks`, an older answer without `base`, or a value not exactly `has` still blocks."""
@@ -396,13 +413,12 @@ class ReproRuleTests(unittest.TestCase):
             with self.subTest(base=base):
                 parsed = sd_review._finding(finding(REPRO) if base is None else finding(REPRO, base=base))
                 assert parsed is not None
-                [record] = sd_review.dispose([parsed], "high", repro=True)
+                [record] = sd_review.dispose([parsed], "high", repro=True, base_asked=True)
                 self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
 
     def test_the_prompt_asks_whether_the_merge_base_has_it(self) -> None:
         self.assertIn("base", sd_review.FINDING_PROPERTIES)
         self.assertIn('"base": "lacks"', sd_review.URL_OUTPUT_CONTRACT)
-        self.assertIn("merge base", sd_review.BASE_ASK)
 
     def test_an_unknown_base_is_a_schema_error(self) -> None:
         for value in ("maybe", [], None, "Has"):

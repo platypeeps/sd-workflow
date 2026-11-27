@@ -1213,11 +1213,17 @@ class LineBudgetTests(unittest.TestCase):
         # defect the merge base already has as advisory, and `_bad_enum`,
         # which keeps `_finding_error` under the complexity ceiling.
         # Measured: `sd-review` is 3248.
+        #
+        # 5218 -> 5233 is the sd:10892 class pass: `bin/sd-review` +15 so
+        # the `base` question names the default branch's merge base by
+        # commit (`Subject.main_base`, `base_ask`), never the diff's own
+        # base, and only a review that asked it downgrades a `has`.
+        # Measured: `sd-review` is 3263.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5218,
+            5233,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

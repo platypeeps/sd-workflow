@@ -45,6 +45,7 @@ def load_module() -> Any:
 
 sd_review = load_module()
 from tests import row_seed  # noqa: E402
+from tests.clean_env import clean_environment  # noqa: E402
 
 
 class FakeRunner:
@@ -1176,11 +1177,43 @@ class PipelineTests(ReviewFixture):
         self.assertIn("the lane runs the full gate", text)
         self.assertIn("sd gate status", text)
 
-    def test_the_code_prompt_asks_whether_the_merge_base_has_the_defect(self) -> None:
-        """sd:10892: a finding blocks only when the merge base lacks it; the prompt asks the reader."""
+    def _topic_commit(self, root: pathlib.Path, name: str) -> str:
+        (root / name).write_text("y = 2\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(root), check=True, capture_output=True, env=clean_environment())
+        subprocess.run(["git", "commit", "--quiet", "-m", name], cwd=str(root), check=True, capture_output=True, env=clean_environment())
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root), check=True, capture_output=True,
+                              text=True, env=clean_environment()).stdout.strip()
+
+    def test_the_base_question_names_the_main_merge_base_in_every_code_scope(self) -> None:
+        """sd:10892 review: the `base` answer is judged against the merge base with the default branch,
+        by commit, whatever the diff's own base is: a fix pass's `--base` (a branch commit) or the
+        worktree's HEAD would let a defect an earlier branch commit added read as on main."""
         root = self.make_repo()
+        main = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root), check=True, capture_output=True,
+                              text=True, env=clean_environment()).stdout.strip()
+        subprocess.run(["git", "checkout", "--quiet", "-b", "topic"], cwd=str(root), check=True, env=clean_environment())
+        prior = self._topic_commit(root, "first.py")
+        self._topic_commit(root, "second.py")
         self.prepare(root)
-        self.assertIn(sd_review.BASE_ASK, sd_review.build_prompt(sd_review.resolve_subject(root, "worktree"), False, ""))
+        for subject in (sd_review.resolve_subject(root, "worktree"), sd_review.resolve_subject(root, "branch"),
+                        sd_review.resolve_subject(root, "branch", base=prior)):
+            with self.subTest(scope=subject.scope, base=subject.base):
+                self.assertEqual(subject.main_base, main)
+                prompt = sd_review.build_prompt(subject, False, "")
+                self.assertIn(sd_review.base_ask(subject), prompt)
+                self.assertIn(main, sd_review.base_ask(subject))
+                self.assertNotIn(prior, sd_review.base_ask(subject))
+
+    def test_no_base_question_without_a_main_merge_base(self) -> None:
+        """Planning, or a repository with no default branch to measure from, asks nothing, so a
+        `has` answer there cannot downgrade a blocker."""
+        root = self.make_repo()
+        subprocess.run(["git", "branch", "-m", "main", "trunk"], cwd=str(root), check=True, env=clean_environment())
+        self.prepare(root)
+        subject = sd_review.resolve_subject(root, "worktree")
+        self.assertEqual(subject.main_base, "")
+        self.assertEqual(sd_review.base_ask(subject), "")
+        self.assertNotIn("base says", sd_review.build_prompt(subject, False, ""))
 
     def test_the_code_prompt_names_the_six_operator_listed_defect_classes(self) -> None:
         """sd:1635: the classes a retired manual checklist held, named in the lane's own prompt."""
