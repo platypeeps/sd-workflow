@@ -1912,10 +1912,19 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome], reb
         if is_rebutted(rebutted, old) or answered and not opened and all(_said(row, name) and all(
                 given["verdict"] == "fixed" and given["evidence"].strip() for given in _said(row, name)) for row in answered):
             continue
-        notes = [old.get("evidence"), *opened]
-        evidence = "\n".join(dict.fromkeys(text.strip() for text in notes if isinstance(text, str) and text.strip()))
-        kept.append(dict(old, disposition="blocking", prior_blocker=name, evidence=evidence[:EVIDENCE_CHARS]))
+        notes = list(dict.fromkeys(text.strip() for text in (old.get("evidence"), *opened) if isinstance(text, str) and text.strip()))
+        kept.append(dict(old, disposition="blocking", prior_blocker=name, evidence="\n".join(shared(notes, EVIDENCE_CHARS))))
     return kept
+
+
+def shared(notes: Sequence[str], cap: int) -> list[str]:
+    """`notes` cut to fit `cap` joined by newlines, the shortest whole first and the rest in equal shares (round 5
+    of build/sd-2205: stored evidence at the cap pushed out each reader's new `open` evidence)."""
+    left, cut = cap - max(len(notes) - 1, 0), dict.fromkeys(notes, "")
+    for rank, text in enumerate(sorted(notes, key=len)):
+        cut[text] = text[:max(left // (len(notes) - rank), 0)]
+        left -= len(cut[text])
+    return [text for text in cut.values() if text]
 
 
 def instance_place(entry: Any) -> tuple[str, int | None] | None:
@@ -2284,10 +2293,11 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                    "against the fix and current code, including code outside changed hunks, and answer each by its id in "
                    "verdicts: fixed only when the defect is gone at every listed instance, with evidence naming the code "
                    "that now prevents it (path:line); open otherwise. An unrelated clean diff fixes nothing; a blocker you "
-                   "do not answer stays blocking; a row with no id needs no verdict. A blocker whose file is absent is fixed only when "
+                   "do not answer stays blocking; a row with no id needs no verdict. A path in a row's deleted_since_review was deleted after that review: "
+                   "code now at that path is new, not that blocker's, whose file counts as absent. A blocker whose file is absent is fixed only when "
                    "evidence names where its code went or shows the defect removed with it. Report new defects in findings. Prior findings:\n" + evidence)
         required = len(prompt.encode())
-        deleted = {name for row in blockers for name in row.get("deleted_since_review", ())}  # round 4 of build/sd-2205
+        deleted = replaced(blockers)
         for name in dict.fromkeys(map(repo_spelling(root), sd_lib.blocking_places([*blockers, *previous["findings"]]))):  # sd:9769; sd:9962 an old absolute path
             path = pathlib.Path(name)
             if path.is_absolute() or ".." in path.parts or not (root / path).resolve().is_relative_to(root.resolve()):
@@ -2318,6 +2328,13 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                 prompt += prefix + current + "\n"
             context.append({"path": name, "bytes": size, "included_bytes": size if included else 0, "boundary": "prior-finding-source"})
     return prompt, bool(conventions), context
+
+
+def replaced(blockers: Sequence[Mapping[str, Any]]) -> set[str]:
+    """The paths whose current file is no blocker's: deleted since the review of each blocker that names them. A
+    path one blocker still lives at keeps its source (round 5 of build/sd-2205: one mark per name hid it)."""
+    return {name for row in blockers for name in row.get("deleted_since_review", ())} - {
+        name for row in blockers for name in sd_lib.blocking_places([row]) if name not in row.get("deleted_since_review", ())}
 
 
 def prior_marker(root: pathlib.Path, path: pathlib.Path, entry: str, deleted: bool) -> str | None:

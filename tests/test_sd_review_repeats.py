@@ -691,6 +691,22 @@ class PriorVerdictTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["completed_reviews"], row["disposition"], row["evidence"]),
                                  (sd_review.UNAVAILABLE, 0, "blocking", evidence))
 
+    def test_new_open_evidence_survives_stored_evidence_at_the_cap(self) -> None:
+        # Round 5 of build/sd-2205 (bin/sd-review:1917): stored evidence at the cap filled the row, so the slice
+        # dropped each reader's new `open` evidence and a later reader could clear the blocker on the old input.
+        full = [dict(PRIOR[0], evidence="x" * sd_review.EVIDENCE_CHARS)]
+        for label, answers in (("interrupted", [answer("one", status=sd_review.UNAVAILABLE, verdicts=[verdict("open", "input A fails")])]),
+                               ("completed", [answer("one", verdicts=[verdict("open", "input A fails")]),
+                                              answer("two", verdicts=[verdict("open", "y" * sd_review.EVIDENCE_CHARS)])])):
+            with self.subTest(label):
+                done = [row.backend for row in answers if row.status in (sd_review.CLEAN, sd_review.FINDINGS)]
+                result = sd_review.finish_review({"severity_floor": "high", "requested_reviews": len(answers)}, answers, done,
+                                                 (), repro=True, prior=full)
+                [row] = result["findings"]
+                self.assertIn("input A fails", row["evidence"])
+                self.assertIn("x" * 100, row["evidence"])
+                self.assertLessEqual(len(row["evidence"]), sd_review.EVIDENCE_CHARS)
+
     def test_a_rebutted_prior_blocker_is_not_carried(self) -> None:
         rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
         self.assertEqual(verified(answer("one"), rebutted=rebutted)["status"], "clean")
@@ -816,6 +832,23 @@ class PriorVerdictReviewTests(RepeatFixture):
         self.assertEqual(places, [("src.py", ["src.py:10"])])
         self.assertNotIn("other1", prompt)
         self.assertIn("Current source for prior finding src.py:\n[file deleted since the prior review", prompt)
+
+    def test_a_deleted_files_blocker_does_not_hide_the_source_of_another_at_its_name(self) -> None:
+        """Round 5 of build/sd-2205 (bin/sd-review:2290): B1's `src.py` was deleted and a new `src.py` added,
+        where a later pass found B2. One mark per name hid the only source for B2. The mark is per blocker:
+        the file is attached while any blocker lives in it, and the prompt says whose it is not."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 21)), encoding="utf-8")
+        self.commit("add", "src.py") and self.commit("src")
+        self.commit("rm", "--quiet", "src.py") and self.commit("drop")
+        self.rewrite("src.py")
+        prior_head = self.commit("add", "src.py") and self.commit("new")
+        report = self.tmp / "aggregate.json"
+        report.write_text(json.dumps({"scope": "branch", "subject": {"head": prior_head}, "findings": [
+            dict(PRIOR[0], deleted_since_review=["src.py"]), dict(PRIOR[0], line=3, summary="Other defect")]}))
+        self.commit("later")
+        prompts, _result, _stderr = self.prompts(scope="branch", resume_report=str(report))
+        self.assertIn("Current source for prior finding src.py:\nother1\n", prompts[0])
+        self.assertIn("deleted_since_review", prompts[0].split("Prior findings:")[0])
 
     def test_a_resumed_review_asks_each_blocker_by_id_and_holds_it_without_a_fixed_verdict(self) -> None:
         report = self.report()

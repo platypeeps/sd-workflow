@@ -1177,11 +1177,17 @@ class LineBudgetTests(unittest.TestCase):
         # file that takes its name is not read as its source; the marker
         # is `prior_marker`, to keep `prepared_prompt` under the branch
         # ceiling. Measured: `sd-review` is 3152 here.
+        #
+        # 5122 -> 5139 is round 5 of build/sd-2205: `bin/sd-review` +17.
+        # `shared` gives each evidence note a share of the cap, so stored
+        # evidence does not push out a reader's new `open` evidence, and
+        # `replaced` hides a deleted file's new source only when no other
+        # blocker lives at the path. Measured: `sd-review` is 3169 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5122,
+            5139,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
