@@ -662,6 +662,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (!DOC) { put($('queue'), html`<tr class="empty"><td colspan="5">${failed ? `The queue could not be read: ${failed}. Read again tries again.` : 'Reading the queue…'}</td></tr>`); return; }
     if (!QV.lanes) unread.push(`Lanes not read: ${QV.lanesErr || 'no answer yet'}`);
     else QV.lanes.problems.forEach(p => unread.push(`${p.repo}: lane not read. ${p.error}`));
+    // sd:10420: a lane whose earlier version's queue file the next runner pass imports says so beside its rows.
+    if (QV.lanes) (QV.lanes.lanes || []).filter(l => l.legacy).forEach(l => unread.push(`${l.repo}: ${l.legacy}`));
     if (QV.lanes && QV.lanes.prs && QV.lanes.prs.error) unread.push(QV.lanes.prs.error);
     if (!QV.built || QV.built.error) unread.push(`Build runs not read: ${QV.built ? QV.built.error : QV.builtErr || 'no answer yet'}`);
     if (!QV.runner) unread.push(`Runner assignments not read: ${QV.runnerErr || 'no answer yet'}`);

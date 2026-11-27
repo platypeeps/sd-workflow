@@ -2783,6 +2783,12 @@ class Supervisor:
         except (OSError, ValueError):
             answer = None
         if not isinstance(answer, dict) or answer.get("ok") is not True:
+            # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
+            # that file queued or ended at this head; the shared queue says whether that entry is this head, read
+            # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
+            entry = lane_entry(self.tools.ship, self.work, delivered, env=self.env)
+            if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
+                return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"
             return self.finish("blocked", f"sd-ship lane enqueue refused: {reason}; see {out}")
         return self.lane_done(answer, delivered)
