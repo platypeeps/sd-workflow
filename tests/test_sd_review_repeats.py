@@ -406,7 +406,8 @@ class RepeatRuleTests(unittest.TestCase):
 
     def test_an_uncited_first_time_blocker_stays_blocking(self) -> None:
         for evidence in UNCITED:
-            for rebutted in ([], listed(adjudicated(("src.py", "another claim", "rebutted"),
+            # Another claim one line off: one at the same line is a reworded repeat (sd:10918).
+            for rebutted in ([], listed(adjudicated(("src.py", "another claim", "rebutted", 2),
                                                     ("other.py", "defect", "rebutted")))):
                 with self.subTest(evidence=evidence, rebutted=rebutted):
                     [record] = sd_review.dispose([finding(evidence)], "high", rebutted)
@@ -498,7 +499,7 @@ class RepeatRuleTests(unittest.TestCase):
         section = sd_review.rebuttal_section(seen)
         self.assertIn("a check you ran and its output", section)
         self.assertIn("when you cannot run commands, path:line and a quote of the current code", section)
-        self.assertIn("One raised again without it blocks nothing.", section)
+        self.assertIn("One raised again without it blocks nothing", section)
         self.assertEqual(sd_review.rebuttal_section([]), "")
 
     def test_one_finding_from_two_readers_is_one_row_whatever_each_cites(self) -> None:
@@ -970,10 +971,38 @@ class RebuttalIdentityTests(unittest.TestCase):
     """Bundle round 6 of pack sd:9270: which rebuttal a finding repeats, and which one still holds."""
 
     def test_the_key_is_the_whole_summary_folded_not_its_display_cut(self) -> None:
+        """A finding with no line is matched by its whole summary; one with a line by its place (sd:10918)."""
         shared = "x" * (sd_review.REBUTTED_SUMMARY_CHARS - 3)
-        body = adjudicated(("src.py", shared + " first defect", "rebutted"))
-        self.assertEqual(gate([row(summary=shared + " second defect")], body), ["blocking"])
-        self.assertEqual(gate([row(summary=shared + " first defect")], body), ["advisory"])
+        body = adjudicated(("src.py", shared + " first defect", "rebutted"), line=None)
+        self.assertEqual(gate([row(summary=shared + " second defect", line=None)], body), ["blocking"])
+        self.assertEqual(gate([row(summary=shared + " first defect", line=None)], body), ["advisory"])
+
+    def test_a_repeat_in_other_words_at_the_rebutted_line_is_held(self) -> None:
+        """sd:10918: readers raise a rebutted finding again in new words each round (build/sd-2204: "can
+        change the live repository's shared Git configuration" became "can overwrite shared Git
+        settings", both at :274), so the whole-summary key re-blocked it every round."""
+        body = adjudicated(("src.py", "A test can change the shared Git configuration", "rebutted"), line=274)
+        self.assertEqual(gate([row(summary="A passing test can overwrite shared Git settings", line=274)], body),
+                         ["advisory"])
+        self.assertEqual(gate([row(summary="A passing test can overwrite shared Git settings", line=275)], body),
+                         ["blocking"], "a finding at another line is another finding")
+        self.assertEqual(gate([row(summary="other words", line=274, path="other.py")], body), ["blocking"])
+
+    def test_a_tested_rebuttal_holds_a_cited_repeat(self) -> None:
+        """sd:10918: every reader cites evidence (sd:9867 asks for it), so a rebuttal that held only an
+        uncited repeat held none. One whose test passed (sd:10893) holds a cited repeat; one with no
+        test still holds only an uncited one."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted")))
+        body["proposal"]["findings"][0]["test"] = ["python3", "-m", "unittest", "tests.test_x"]
+        tested = json.dumps(body)
+        self.assertEqual(gate([row(evidence=REPRO)], tested), ["advisory"])
+        self.assertEqual(gate([row(evidence=REPRO)], adjudicated(("src.py", "defect", "rebutted"))), ["blocking"])
+        for test in ([], "python3 t.py", [7], [""]):
+            with self.subTest(test=test):
+                body["proposal"]["findings"][0]["test"] = test
+                self.assertEqual(gate([row(evidence=REPRO)], json.dumps(body)), ["blocking"])
+        body["proposal"]["findings"][0]["test"] = ["python3", "t.py"]
+        self.assertIn("Test: python3 t.py", sd_review.rebuttal_section(listed(json.dumps(body))))
 
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
@@ -1102,6 +1131,53 @@ class RebuttalIdentityTests(unittest.TestCase):
         # Review of sd:9769: a new occurrence in a file the rebuttal named is still not adjudicated.
         self.assertEqual(gate([row(instances=["src.py:1", "src.py:60"])], body), ["blocking"])
 
+    def test_a_test_holds_a_cited_repeat_only_in_the_rebuttals_words(self) -> None:
+        """Review of build/sd-2233 (bin/sd-review:1945): the place match for a reworded repeat and the test's
+        hold of a cited one composed, so a different defect at the tested line, cited, posted as advice.
+        A test holds a cited repeat only in the words it was recorded with; a reworded one only uncited."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted")))
+        body["proposal"]["findings"][0]["test"] = ["python3", "t.py"]
+        tested = json.dumps(body)
+        self.assertEqual(gate([row(summary="another defect", evidence=REPRO)], tested), ["blocking"])
+        self.assertEqual(gate([row(summary="another defect")], tested), ["advisory"])
+        self.assertEqual(gate([row(evidence=REPRO)], tested), ["advisory"])
+
+    def test_a_test_clears_no_blocker_a_reader_holds_open(self) -> None:
+        """Review of build/sd-2233 (bin/sd-review:2031): `carried` decides a prior blocker by verdict
+        (pack sd:10087). A reader's `open` with evidence keeps it whatever test its rebuttal names, and a
+        prior blocker in other words at a rebutted line is no repeat: the adjudication recorded its words."""
+        body = json.loads(adjudicated(("src.py", "defect", "rebutted")))
+        body["proposal"]["findings"][0]["test"] = ["python3", "t.py"]
+        seen = listed(json.dumps(body))
+        prior = [dict(row(evidence=REPRO), disposition="blocking")]
+        opened = sd_review.Outcome("codex", sd_review.FINDINGS, (), "", (), (), verdicts=(
+            {"id": "B1", "verdict": "open", "evidence": "python3 t.py --other: Traceback"},))
+        self.assertEqual([r["disposition"] for r in sd_review.carried(prior, [opened], seen)], ["blocking"])
+        self.assertEqual(sd_review.carried(prior, [], seen), [], "an unanswered rebutted blocker still holds")
+        other = [dict(row(summary="another defect", evidence=REPRO), disposition="blocking")]
+        self.assertEqual([r["disposition"] for r in sd_review.carried(other, [], seen)], ["blocking"])
+
+    def test_a_line_follows_a_zero_context_diff_or_lapses(self) -> None:
+        """sd:10918: `followed_line` moves a rebutted line past hunks outside `SHIFT_LINES` of it, and lapses
+        it on a hunk inside, no diff, or a diff with no hunk (binary, mode change)."""
+        follow, near = sd_review.followed_line, sd_review.SHIFT_LINES
+        header = "diff --git a/f b/f\n--- a/f\n+++ b/f\n"
+        for name, diff, want in (
+                ("no change", "", 50), ("git failed", None, None),
+                ("binary", "diff --git a/f b/f\nBinary files a/f and b/f differ", None),
+                ("mode only", "diff --git a/f b/f\nold mode 100644\nnew mode 100755", None),
+                ("two inserted at the top", header + "@@ -0,0 +1,2 @@\n+a\n+b", 52),
+                ("three removed above", header + "@@ -10,3 +9,0 @@\n-a\n-b\n-c", 47),
+                ("one replaced by four above", header + "@@ -10 +10,4 @@\n-a\n+a\n+b\n+c\n+d", 53),
+                ("an edit below", header + f"@@ -{50 + near + 1} +{50 + near + 1} @@\n-a\n+b", 50),
+                ("an edit at the line", header + "@@ -50 +50 @@\n-a\n+b", None),
+                ("an edit just inside the reach", header + f"@@ -{50 - near} +{50 - near} @@\n-a\n+b", None),
+                ("an insertion just inside the reach", header + f"@@ -{50 + near},0 +{50 + near + 1} @@\n+a", None),
+                ("a content line that looks like a hunk", header + "@@ -1 +1 @@\n-@@ -50 +50 @@\n+x", 50),
+                ("the file deleted", header + "@@ -1,80 +0,0 @@\n-a", None)):
+            with self.subTest(name):
+                self.assertEqual(follow(diff, 50), want)
+
     def test_the_lanes_own_blockers_are_never_rebutted(self) -> None:
         parsed = sd_review.oversized_findings()
         body = adjudicated(*((finding["path"], finding["summary"], "rebutted") for finding in parsed.findings))
@@ -1183,12 +1259,12 @@ class RebuttalScopeTests(RepeatFixture):
     def test_a_rebuttal_older_than_the_bound_does_not_downgrade(self) -> None:
         """A reused branch name does not inherit a merged branch's rebuttals."""
         days = sd_review.BLOCKER_DAYS
-        self.adjudication(("an old claim", "rebutted", "x"), days=days + 1, key="old")
+        self.adjudication(("an old claim", "rebutted", "x"), days=days + 1, key="old", line=30)
         self.adjudication(("a recent claim", "rebutted", "x"), days=days - 1, key="recent")
         prompt = self.prompts()[0][0]
         self.assertIn("a recent claim", prompt)
         self.assertNotIn("an old claim", prompt)
-        rows = self.review_answering(self.repeat("an old claim"), self.repeat("a recent claim"))
+        rows = self.review_answering(dict(self.repeat("an old claim"), line=30), self.repeat("a recent claim"))
         self.assertEqual((rows["an old claim"][0], rows["a recent claim"][0]), ("blocking", "advisory"))
 
     def test_only_a_receipt_at_a_head_on_this_branch_rebuts(self) -> None:
@@ -1198,8 +1274,8 @@ class RebuttalScopeTests(RepeatFixture):
         self.commit("checkout", "--quiet", BRANCH)
         off = {"on another branch": abandoned, "unknown": "a" * 40, "no head": None,
                "short": self.head[:12], "not text": [self.head], "a ref": "HEAD"}
-        for index, (claim, head) in enumerate(off.items()):
-            self.adjudication((claim, "rebutted", "x"), head=head, key=f"off{index}")
+        for index, (claim, head) in enumerate(off.items()):  # each at its own line (sd:10918)
+            self.adjudication((claim, "rebutted", "x"), head=head, key=f"off{index}", line=10 + index)
         self.adjudication(("at the base", "rebutted", "x"), head=self.base, key="base")
         self.adjudication(("on this branch", "rebutted", "x"), head=self.first, key="on")
         prompt = self.prompts()[0][0]
@@ -1207,7 +1283,8 @@ class RebuttalScopeTests(RepeatFixture):
         self.assertIn("at the base", prompt)
         for claim in off:
             self.assertNotIn(f": {claim} Rebuttal", prompt)
-        rows = self.review_answering(*(self.repeat(claim) for claim in [*off, "on this branch", "at the base"]))
+        rows = self.review_answering(*(dict(self.repeat(claim), line=10 + index) for index, claim in enumerate(off)),
+                                     self.repeat("on this branch"), self.repeat("at the base"))
         self.assertEqual({claim: rows[claim][0] for claim in off}, dict.fromkeys(off, "blocking"))
         self.assertEqual((rows["on this branch"][0], rows["at the base"][0]), ("advisory", "advisory"))
         for scope in ("worktree", "branch"):
@@ -1250,6 +1327,35 @@ class RebuttalScopeTests(RepeatFixture):
                 seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
                                                    self.environment())
                 self.assertEqual([entry.text for entry in seen if entry.listed], [])
+
+    def test_a_rebuttal_follows_its_line_past_an_edit_elsewhere_in_its_file(self) -> None:
+        """sd:10918: a fix commit to another part of the rebutted file lapsed every rebuttal in it, so the
+        next round re-blocked them. The rebuttal now moves with its line; an edit within `SHIFT_LINES`
+        of it, committed or not, still lapses it."""
+        tool = self.root / "bin" / "tool.py"
+        tool.parent.mkdir()
+        lines = [f"v{index} = {index}\n" for index in range(1, 41)]
+        tool.write_text("".join(lines), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        receipt = self.commit("the rebutted code")
+        self.adjudication(("lane claim", "rebutted", "x"), head=receipt, line=20)
+        tool.write_text("".join(["# one\n", "# two\n", *lines[:-1], "v40 = 0\n"]), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        self.commit("a fix far from the rebutted line")
+        moved = dict(self.repeat("the same claim in other words"), line=22)
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                                   self.environment())
+                self.assertEqual([(entry.line, entry.listed, entry.instances) for entry in seen],
+                                 [(22, True, ("bin/tool.py:22",))])
+        self.assertEqual(self.review_answering(moved)["the same claim in other words"][0], "advisory")
+        self.assertEqual(self.review_answering(dict(moved, line=20))["the same claim in other words"][0], "blocking")
+        text = tool.read_text(encoding="utf-8").replace("v21 = 21", "v21 = 0")  # beside the rebutted line
+        tool.write_text(text, encoding="utf-8")
+        seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, "worktree"), None,
+                                           self.environment())
+        self.assertEqual([entry.listed for entry in seen], [False], "an edit beside the line kept the rebuttal")
 
     def test_a_ruling_lapses_on_any_later_change_of_the_branch(self) -> None:
         """Review of sd:10286 (bin/sd-review:919): a ruling judged the code at its head; a later commit to a
