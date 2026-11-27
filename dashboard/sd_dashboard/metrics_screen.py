@@ -24,6 +24,8 @@ Progress areas made:
 - `prs`: pull-request waits from each item's PR lane notes (`_prs`, pack sd:7859): the time on you and on reviewers,
   the median first PR to merge, and the same per repository with its pull requests. Only the operator's count:
   authored or asked to review by name (sd:8084). All time, whatever the range.
+- `reviews`: per item, its review rounds (blocking and clean, build and lane) and their tokens and API-equivalent USD,
+  summed over all its runs (`reads.review_costs`, sd:10401), the `REVIEWS_MAX` costliest first. All time.
 - `controls`: the provider registry as `provider_controls.snapshot` reads it, with its `revision`, and per bill the
   one cap write the route takes (`_writes`, sd:3387).
 - `range`: the page's range, `7d` or `6mo` (`RANGES`, pack sd:7208). With `6mo`, `ranged` holds the parts the range
@@ -61,7 +63,7 @@ from . import pack_module
 from .queue_screen import READ_FAILURES
 from .tasks_screen import is_scheduled
 
-__all__ = ["BILL_NAME", "CI_DAYS", "GATE_CODES", "GATE_FAILED", "HEALTH_DAYS", "MONTHS", "RANGES", "SLOT_WAIT", "SLOW", "TREND_DAYS", "UNREAD", "WINDOW",
+__all__ = ["BILL_NAME", "CI_DAYS", "GATE_CODES", "GATE_FAILED", "HEALTH_DAYS", "MONTHS", "RANGES", "REVIEWS_MAX", "SLOT_WAIT", "SLOW", "TREND_DAYS", "UNREAD", "WINDOW",
            "document", "flaky", "health", "slow", "times"]
 
 #: A bill name the cap route (`/api/bills/<name>/cap`, `server.action_route`) accepts in its path. The registry puts
@@ -102,6 +104,9 @@ SLOT_WAIT = "gate_slot_wait"
 PASSED = ("merged", "prepared")
 
 FAILURES = (SdDbError, sqlite3.Error, OSError, ValueError)
+
+#: The items `reviews` lists, costliest first (sd:10401); `total` says how many have a round.
+REVIEWS_MAX = 200
 
 #: The parts that take seconds, which the served dashboard keeps in a `snapshot.Kept` (sd:4955).
 SLOW = ("usage", "numbers")
@@ -514,6 +519,18 @@ def _lanes(connection, now) -> dict:
                                     "times": times(connection, row["remote"], clock)} for row in managed]}
 
 
+def _reviews(connection) -> dict:
+    """Each item's review rounds and cost (sd:10401), costliest first, then most rounds; `total` counts them all."""
+    found = sorted(reads.review_costs(connection).values(), key=lambda row: (-row["usd"], -row["rounds"], row["item"]))
+    shown = found[:REVIEWS_MAX]
+    items = reads.items_by_ids(connection, [row["item"] for row in shown])
+    return {"error": "", "total": len(found), "items": [
+        {**row, "title": items[row["item"]]["title"] if row["item"] in items else "",
+         "status": items[row["item"]]["status"] if row["item"] in items else "",
+         "repo": os.path.basename((items[row["item"]]["repo"] or "").rstrip("/")) if row["item"] in items else ""}
+        for row in shown]}
+
+
 def _ranged(connection, now, today):
     """The parts the 6mo range changes, each guarded on its own (pack sd:7208)."""
     months = _months(today)
@@ -573,6 +590,7 @@ def document(connection, *, now: str, kept=None, span: str = "7d", month: str | 
         "ci": _guard(lambda: _ci(connection, now)),
         "lanes": _guard(lambda: _lanes(connection, now)),
         "prs": _guard(lambda: _prs(connection, now)),
+        "reviews": _guard(lambda: _reviews(connection)),
         "unread": list(UNREAD),
         **ranged,
     }

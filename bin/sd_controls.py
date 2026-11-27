@@ -249,7 +249,13 @@ def run_brief(args: argparse.Namespace) -> int:
             _mirror_briefs(connection, sys.stdout)
             return status
         elif verb == "list":
-            _list_briefs(routine_briefs.rows(connection, series=args.series, since=args.since), args.json)
+            limit = routine_briefs.LIST_LIMIT
+            listed = routine_briefs.rows(connection, series=args.series, since=args.since, limit=limit + 1)
+            _list_briefs(listed[:limit], args.json)
+            if len(listed) > limit:
+                # sd:10638: on stderr, so the text and JSON a script reads keep their shape.
+                print(f"sd: showing the newest {limit} briefs; more exist: narrow with --series or --since, "
+                      "or read one with `sd reports brief show STEM`", file=sys.stderr)
         elif verb == "show":
             sys.stdout.write(routine_briefs.show(connection, args.stem))
         else:
@@ -352,7 +358,11 @@ def register_briefs(verbs: Any) -> None:
                            help="take the file only when the row's text is a strict prefix of it")
     replacing.add_argument("--replace", action="store_true",
                            help="the operator's flag: take the file whatever the row holds")
-    listing = briefs.add_parser("list", help="day, series, stem and words, newest first")
+    listing = briefs.add_parser(
+        "list", help="day, series, stem and words, newest first, at most 200",
+        description="Each line is a brief's day, series, stem and word count, newest first. It prints at "
+                    "most 200 and says on stderr when more exist; --series and --since narrow the list, "
+                    "and `show STEM` reads any one brief.")
     listing.add_argument("--series")
     listing.add_argument("--since", metavar="DAY", type=_day)
     listing.add_argument("--json", action="store_true")
