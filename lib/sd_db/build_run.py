@@ -1759,7 +1759,10 @@ class Supervisor:
         self.enter("worktree")
         branch = self.row["branch"]
         if self.work.is_dir():
-            return self.guarded() or "building"
+            if held := self.guarded():
+                return held
+            self.take_over()
+            return "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1768,10 +1771,6 @@ class Supervisor:
             argv = ["worktree", "add", str(self.work), branch]
         except Unread:
             start = self.start_point()
-            # Before the branch exists: a resumed run that finds the branch never reaches here, so the hand-back
-            # is the start's first write, and a retry of this start finds the entry handed back already.
-            if start is not None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
-                build.take_over(self.db, failed, self.ident)
             if start is None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
                 why = self.start_refused or "did not read here"
                 self.once("start", lambda: add_note(
@@ -1780,7 +1779,26 @@ class Supervisor:
             argv = ["worktree", "add", "-b", branch, str(self.work), start or self.base()]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
-        return self.split_first() or "building"
+        if held := self.split_first():
+            return held
+        self.take_over()
+        return "building"
+
+    def take_over(self) -> None:
+        """Hand back the failed lane entry whose tip this branch holds (`build.take_over`), once the worktree exists:
+        a failed `git worktree add` leaves the entry as it was, for its Retry or Fix. A try that made the worktree
+        and stopped finds it on the next try's kept-worktree path, and an entry already handed back writes nothing
+        (lead review of build/sd-1808). A tip not read, or not in this branch, hands nothing back."""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None:
+            return
+        try:
+            tip = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env).strip()
+            _read([*self.tools.git, "-C", str(self.work), "merge-base", "--is-ancestor", tip, "HEAD"], env=self.env)
+        except Unread:
+            return
+        build.take_over(self.db, failed, self.ident)
 
     def start_point(self) -> str | None:
         """The commit a new branch starts from when its items' last bundle failed in the lane: the failed branch's

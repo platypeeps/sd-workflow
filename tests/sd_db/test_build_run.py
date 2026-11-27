@@ -5703,7 +5703,8 @@ class Tick(Case):
 
     def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
                                    outsider=None, left_out=False, reverted=None, rebundled=False,
-                                   other_failed=False, claimed=False, newer=False, imported=False):
+                                   other_failed=False, claimed=False, newer=False, imported=False,
+                                   retried=False, jammed=False, made=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -5787,8 +5788,19 @@ class Tick(Case):
         if left_out:  # a member cancelled out of the new bundle before its worktree: not selected
             self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
                             (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+        if retried:  # a lane Retry of the failed entry since, on the same branch, which failed too
+            self.store({"id": "e2", "item": self.items[0], "status": "failed", "reason": "gate red again",
+                        "expected_head": head}, self.failed_branch)
         supervisor = self.supervisor()
         supervisor.logs.mkdir(parents=True, exist_ok=True)
+        if jammed:  # a file where the worktree goes: `git worktree add` fails
+            Path(self.bundle["work_path"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.bundle["work_path"]).write_text("in the way\n", encoding="utf-8")
+            self.assertEqual(supervisor.worktree().get("outcome"), "blocked")
+            return head, supervisor
+        if made:  # an earlier try of this start made the worktree, then stopped before anything else
+            support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], self.bundle["work_path"],
+                        support.git(self.repo, "rev-parse", self.failed_branch))
         self.assertEqual(supervisor.worktree(), "building")
         return head, supervisor
 
@@ -5842,6 +5854,29 @@ class Tick(Case):
         assert failed is not None
         self.assertIn("cancelled", build.take_over(self.db, failed, self.bundle["id"]))
         self.assertEqual(self.stored("e1"), before)
+
+    def test_a_rebuild_hands_back_only_the_entry_its_failed_run_recorded(self):
+        """Lead review of build/sd-1808: a lane Retry of the failed entry e1 queued e2 on the same branch, which
+        failed too, and the rebuild handed back e2, an attempt its failed run never read. Only the recorded
+        entry is handed back; another newest entry is left as it is."""
+        self.rebuilt_after_lane_failure(2, retried=True)
+        self.assertEqual(self.stored("e2")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e2"))
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_failed_worktree_add_hands_nothing_back(self):
+        """Lead review of build/sd-1808: the hand-back ran before `git worktree add`; the add failed, and the
+        failed entry was cancelled with no checkout to replace it, so Retry of it was refused. It runs after."""
+        self.rebuilt_after_lane_failure(2, jammed=True)
+        self.assertEqual(self.stored("e1")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_resumed_start_with_its_worktree_made_hands_the_entry_back(self):
+        """Lead review of build/sd-1808: a try that made the worktree and stopped before the hand-back left the
+        entry failed; the next try finds the worktree and hands it back then."""
+        self.rebuilt_after_lane_failure(2, made=True)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
 
     def test_a_changed_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
         """Class pass of the lead review of build/sd-1808: a rebuild that moved the head past the imported
