@@ -2216,6 +2216,20 @@ class Supervise(Case):
             # A last report that verified another prior, or none, says nothing of the kept report's blockers.
             "not its verification": ([other], [open_row], None, False, None),
         }
+        # A short last round (a reader timed out), or one that covers no branch, cleared a blocker on part
+        # of the answers: its verdicts replace nothing, and the branch is reviewed in full (ruling round).
+        shorts: dict[str, dict] = {"short of a reader": {"completed_reviews": 0}, "a named shortfall": {"review_shortfall": "one timed out"},
+                  "covers no branch": {"covers_from": None}}
+        for name, short in shorts.items():
+            kept = {**report, "status": "blocking", "subject": {"head": older}, "findings": [open_row]}
+            supervisor.out("review").write_text(json.dumps(
+                {**report, **short, "status": "blocking", "subject": {"head": head}, "findings": [other],
+                 "verification_report_digest": hashlib.sha256(json.dumps(kept, sort_keys=True).encode()).hexdigest()}),
+                encoding="utf-8")
+            supervisor.out("prior").write_text(json.dumps(kept), encoding="utf-8")
+            with self.subTest(name), mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+                self.assertIsNone(supervisor.prior_review(head), "a short round's verdict dropped an open blocker")
         for name, (last_rows, kept_rows, history, linked, want) in cases.items():
             kept = {**report, "status": "blocking", "subject": {"head": older}, "findings": kept_rows,
                     **({"history": history} if history else {})}

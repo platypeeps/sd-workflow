@@ -1887,7 +1887,11 @@ class Supervisor:
             if reviewed == head:
                 # A fix with no commit (a rebuttal): the older kept report verifies the same delta again, its
                 # blockers replaced by the ones this round left open (sd:10902). Anything else reviews in full.
-                if path != last or not isinstance(answer, dict) or not isinstance(answer.get("findings"), list):
+                # A round short of a reader, or one that covers no branch, cleared a blocker on part of the
+                # answers: its verdicts replace nothing.
+                if (path != last or not isinstance(answer, dict) or not isinstance(answer.get("findings"), list)
+                        or not 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
+                        or answer.get("review_shortfall") or not answer.get("covers_from")):
                     return None
                 # Each read at this head, with no pass number: `sd-review` walks a row's path from its own
                 # `prior_review.head`, and reads a pass number against the older report's history.
