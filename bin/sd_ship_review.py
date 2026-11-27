@@ -255,7 +255,8 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     """sd:5988. The passing `sd-review --scope branch` pass recorded for `branch` that covers `head`, and why.
 
     A pass is clean or advisory only (sd:9767): a build's review that cleared
-    stands for the lane's at the same head; a blocking one is never recorded.
+    stands for the lane's at the same head; a blocking one is recorded for
+    `sd-ship adjudicate` alone (sd:10926) and covers nothing.
 
     It covers `head` when it reviewed `head`, or when `carry_forward` carries
     it across clean merges of `origin/<base>` alone, and only when it diffed

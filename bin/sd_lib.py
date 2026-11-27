@@ -110,6 +110,11 @@ def lead_review_key(repository: str, branch: str) -> str:
     return f"review:v1:{repository}:{branch}"
 
 
+#: The `bindings.source` of a rebuttal `sd-ship adjudicate` recorded from that branch review, not a ship one:
+#: the lead's ruling, which holds a reworded or cited repeat at its line until the line changes (sd:10926).
+LEAD_REVIEW_SOURCE = "lead-review"
+
+
 #: Operator 2026-11-27: while the pack and system tools change daily, a change to the
 #: review tools alone keeps a review and its rebuttals; a policy change still re-reviews.
 #: False restores the strict reading (any tool change re-reviews).

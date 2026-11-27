@@ -594,6 +594,9 @@ class Operations(unittest.TestCase):
                         "'not json')")
         self.assertEqual(lane_state(self.db, item),
                          {"id": "b", "status": "merged", "reason": None, "merge_commit": "c0ffee"})
+        entry("e", item=item, status="merged", merge_commit="c0ffee", delivery_pending=True, reason="held")
+        self.assertEqual(lane_state(self.db, item), {"id": "e", "status": "merged", "reason": "held",
+                                                     "merge_commit": "c0ffee", "delivery_pending": True})
         entry("c", item=item, status="cancelled", reason="handed back")
         self.assertEqual(lane_state(self.db, item),
                          {"id": "c", "status": "cancelled", "reason": "handed back", "merge_commit": None})

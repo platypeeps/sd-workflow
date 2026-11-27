@@ -1,0 +1,182 @@
+---
+title: Land a ready train in one train pull request, one gate run
+created: 2026-11-22
+item: sd:9923
+branch: build/sd-1543
+---
+
+# Design — train-landing
+
+## Problem
+
+The train of sd:9899 gates the top of up to 3 queued entries once, but
+each member still lands alone through GitHub's merge API. Every tree
+that becomes main must pass its own gate, so the train saves no gate
+run. A saving needs the members to land together, with one gate run
+for the joined tree (operator 2026-11-21).
+
+## Facts measured
+
+The hub measured these on a scratch repository with the pack's `main`
+protection (decision note on sd:9923, 2026-11-22):
+
+1. A direct push of a train tip to `main` is refused (`GH006`: changes
+   must go through a pull request), even with `sd/local-gate` success
+   on the tip. Only an admin bypass accepts it, so the train does not
+   push `main`.
+2. A train landed as one train pull request merges inside protection:
+   its head is the train tip, `sd/local-gate` success sits on that tip,
+   and the merge API takes it with `merge_method=merge`.
+3. GitHub then marks every member pull request merged and closed. A
+   member's `merge_commit_sha` is the train merge commit that brought
+   its head in; the train pull request's is the final merge.
+
+## Approach
+
+The runner lands a train of N ready members, 2 to `sd.lane_train`, in
+these steps. Each step reuses a reader or writer that exists today.
+
+1. Prepare: the claimed entry, then each pending member after it, runs
+   `sd-ship prepare` as today: its own review, pull request and
+   receipt. A member whose prepare stops leaves the train.
+2. Join: `sd-ship merge --train-onto L` runs the member's merge checks,
+   composes the message `sd-ship merge` lands today (title with `(#N)`,
+   body, `Item:`, `Delivers:`, `Reviewed-base:`), and writes `M_i`, a
+   merge of its reviewed head `H_i` onto L, with `git merge-tree` and
+   `git commit-tree`: no worktree, no checkout, no push. L is the
+   fetched `origin/<base>` F for the first member and `M_(i-1)` after.
+   The receipt records `train_joined` with `train_commit`. A member that
+   conflicts or refuses drops out and rides the next train.
+3. Re-read: each joined member must still be pending at its queued
+   head; one that was cancelled or moved ends the landing.
+4. Branch: `M_N` goes to `refs/heads/sd-train/<M_N's first 12 hex>`.
+5. Gate: the local gate runs once, on `M_N`, and posts `sd/local-gate`
+   there (`sd_local_gate.local_gate`).
+6. Train PR: one pull request, head the train branch, base `<base>`,
+   opened and merged through `sd-ship`'s GitHub client (`land_train`),
+   at `sha=M_N` with `merge_method=merge`. GitHub marks
+   each member merged at its `M_i` (fact 3). Once the PUT is sent,
+   only proof decides: the PUT's own `merged: true`, or a read of the
+   pull request merged, is the landing; a 4xx answer to the PUT, or a
+   merge onto another base, is no landing. Anything else is unknown:
+   the entry goes back at `step: train` and never merges alone.
+7. Reconcile: each member runs `sd-ship reconcile`, which sends no
+   merge. It reads `merged: true` and checks that `merge_commit_sha`
+   is the receipt's `train_commit`. `Delivers:` on `M_i` closes the
+   item; cleanup runs as today. A pending member's next claim
+   reconciles it as well: `prepare` on a `train_joined` receipt whose
+   pull request merged reconciles instead. While the train merge is
+   in the fetched base and GitHub still reads the pull request open,
+   prepare, join and merge refuse `train_landed` and write nothing.
+   An entry whose train may have landed never ends failed: its row
+   carries `train_sent`, then `train_landed` once the train pull
+   request reads merged, and one decision (`kept_landed`) puts it back
+   at every exit of a claim, then holds it for `sd-ship lane release`.
+8. Cleanup: the train branch is deleted; a missed delete leaves a ref
+   the next train with the same tip pushes up to date.
+
+The train lands only where the repository allows merge commits
+(`allow_merge_commit`, read by the join's merge checks) and the runner
+may merge each member (`merge_refusal`). Otherwise, and whenever a step
+from 2 to 6 fails, each member ships alone, as after sd:9899: a later
+`sd-ship merge` composes and records its own merge, so a stale
+`train_joined` receipt is replaced, not reused.
+
+## Rulings
+
+1. Shape: merge commits (operator 2026-11-22, note #73823). Each member
+   lands as `M_i`, so GitHub marks it merged and `reconcile` is reused.
+2. Hold: the joined-tree gate releases the hold (#73823). `M_i`'s
+   `Reviewed-base:` names L, the landing it merged onto, which the one
+   gate covered as part of `M_N`; `held_at_merge` then reads it as not
+   held. Main never sits at an `M_i` alone: the train PR moves it from
+   F to the final merge in one step.
+3. Members below the top keep their own prepare gate. A prepare without
+   a gate needs a new flag; that saving is a later item.
+
+## Acceptance criteria
+
+- A train of 3 green members lands through one train pull request and
+  one gate run on the joined tree; each member pull request reads
+  merged and each item closes by its own `Delivers:`.
+- A train PR GitHub does not merge lands nothing; each member ships
+  alone.
+- A member that conflicts drops out and stays pending.
+- A repository that allows no merge commit starts no train landing.
+- A run stopped after step 6 reconciles each member on the next run.
+
+## Failure table
+
+```text
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| 1 prepare | each member's PR and receipt | a member's prepare stops | it leaves the train; the rest join | lane: a member that fails prepare |
+| 1 mark | row train_preparing = queued head | the write fails | no prepare; the member drops, stays pending | lane: mark cannot be written |
+| 1 mark | none | the worktree moved before the train (an amend) | no mark, no prepare, row not moved; its claim skips head_moved | lane: member the train never prepared |
+| 1 prepare | a pending member's branch: a catch-up merge, or a rebase policy's rewrite, pushed | the train does not land, or stops | the row moves to the published head right after the prepare, mark dropped; its own claim starts there | lane: member caught up / rebased in a train |
+| 1 follow | none (branch pushed, row at the old head) | the queue write after the push fails, or both reads of the published head fail | the mark stays; the member's claim moves the row to the origin head that is the catch-up or rebase of the marked head | lane: follow write fails after a rebase push; follow that cannot read the rebased head |
+| 1 prepare | a pending member's worktree, rewritten, not pushed | its prepare refused after the rewrite | the row keeps the published head; its claim skips head_moved, as the lone lane does | lane: unpublished rewrite never queued |
+| 1 prepare | none | the member was enqueued again or cancelled during its prepare | that write wins; the row is not moved; the member drops | lane: member enqueued again during its prepare |
+| 1 prepare | a pending member's branch, rewritten | the run dies inside that prepare | the mark stays; its claim settles it as for a failed follow write | lane: follow write fails after a rebase push |
+| 2 join | an unreferenced commit | a member conflicts | refused train_conflict; it drops, stays pending | ship: train conflict |
+| 2 join | receipt train_joined | run twice | a second join writes the same M_i | ship: join twice |
+| 2 join | none | allow_merge_commit off | refused; each ships alone | ship: no merge commits |
+| 3 re-read | none | a member was cancelled | no landing; each ships alone | lane: cancelled member |
+| 4 branch | sd-train ref | push fails | no gate, no PR; each ships alone | lane: train land fails |
+| 5 gate | sd/local-gate on M_N | the gate fails | no PR; branch deleted; each ships alone | land_train: gate fails |
+| 6 train PR | PR merged, main at final merge | answer lost | read the PR back; merged counts | land_train: lost answer |
+| 6 train PR | PR merged | PUT says merged; the read after fails, breaks or lags | the PUT's merge is the landing | land_train: put merged, read-back fails / breaks / stale |
+| 6 train PR | PR may be merged | PUT answer lost; the read after fails or says unmerged | unknown; back at step train; no lone merge | land_train: put answer lost, read-back stale / lost |
+| 6 fence | lead row: step train, expected_head = the published head its prepare left, train_sent = train branch | runner dies after the PUT | reclaim puts it back pending at that head; its next prepare reconciles | lane: lead reclaimed after its rebase |
+| 6 fence | lead row: step train, train_sent, held, head_unknown, train_preparing = queued head | no read of the prepared head answers and the worktree is off the queued head | the row is held; `sd-ship lane release` lifts it, a train stop does not refuse that; the next claim's settle_mark moves the row to the rebase origin holds and drops both marks | lane: fence that cannot read the rebased head; released lead of an unread fence |
+| 6 put-back | none: the unread fence's row keeps head, hold and mark | a put-back, a reclaim or a hub-stop record follows the unread fence | each keeps train_preparing; the claim after the release settles it | lane: reclaimed or stopped lead of an unread fence |
+| 1 follow, 6 fence | none | origin answers, and the read of the pushed catch-up's commits fails | unknown, not unmoved: the mark stays (member) or is written (lead) | lane: rebase of the queued head (unread check) |
+| 1 follow, 6 fence | the mark also names the head prepare answered (train_placed) | no read can follow, and the rebase's tree is not the three-way merge | the claim takes origin's tip when it is that head, not a tree guess | lane: released lead moves to the head its prepare named; unread follow moves to its prepared head |
+| 6 train PR | lead row back pending at its prepared head, train_sent kept | answer unknown | the next claim reads the train PR first: merged, prepare reconciles; open, the lane deletes its branch and waits; closed or none, train_sent goes, then a lone merge may run | lane: lead put back after its rebase; unsettled train sends no lone merge |
+| 6 fence | each member row: train_sent, as the lead | a member is claimed before its lead settles | its own claim settles the train PR first; it joins no train until then | lane: fence marks each member; member of an unsettled train |
+| 6 put-back | none: a fenced row keeps the fenced head | a put-back, a move or a hub-stop record names the head the claim read | back_to_pending keeps the row's head while train_sent is set; the claim's copy follows the fence | lane: hub-stop record of the old head; put-back from the claim's copy; lone merge put back after a failed train |
+| 6 retry | train_sent moves to the item's new entry | the lead failed or was cancelled, then retried or enqueued again | add_entry takes the mark over in its own write | lane: new entry takes over its unsettled train |
+| 6 cancel | none | a cancel or hold of a row whose train is not settled | refused train_merging until its claim settles it | lane: cancel or hold in an unsettled train |
+| 6 settle | none: the mark stays | the train PR reads absent, or one element has another shape | unknown; the entry waits at its place | lane: train state by shape |
+| 6 settle | none: the mark stays | the mark names no train branch | the entry fails; nothing clears the mark | lane: mark that names no train branch |
+| 6 train PR | none | GitHub refuses the merge (4xx) | PR closed, branch deleted; ship alone | land_train: refused |
+| 7 reconcile | none | train merge in the base, GitHub reads the PR open | prepare, join, merge refuse train_landed; no push, no PUT | ship: landed member GitHub reads open |
+| 7 reconcile | none | git cannot say whether the train merge is in the base | retryable refusal; train record kept | ship: git that cannot answer |
+| 7 reconcile | entry merged, delivery_pending, code; member reconciled false | sd-ship answers merged with delivery_pending (base moved at the PUT) | entry stays merged with the blocker and a followup; its lane followups stay open | lane: delivery is pending (lead, member, recovery prepare, lone merge) |
+| 7 read | none (row merged, delivery_pending) | `lane watch --item` reads the row | line says delivery pending; exit 1 | lane: watch item of a merge whose delivery is pending |
+| 7 read | none | `sd assignments get --wait --until merged` reads the row | lane key carries delivery_pending; exit 1 | operations: until merged exits 1; sd_db: lane_state |
+| 7 read | none | watch or `lane prune` reaps the merged worktree | worktree kept: `sd-ship reconcile` runs there | lane: merged worktree is kept for its reconcile |
+| 7 read | none | `sd-status` lane section hides merged rows as history | row stays listed until its item is finished | status: failed entry of a finished item (held row) |
+| 7 note | landing notes | the landing notes `Landed` and `Closed by citation` | `Landed` says delivery pending; no close is noted | lane: notes no close by citation; kept for its reconcile |
+| 7 land | none: origin's branch and the worktree kept, remove kept in the row | the landing of a merge whose delivery is pending | note says cleanup held; reap removes the worktree once reconcile settles it | lane: landing whose delivery is pending cleans nothing up |
+| 7 land | lane worktree kept | the runner ends an entry whose delivery is pending | its lane worktree stays for `sd-ship reconcile` | lane: lane worktree whose delivery is pending is kept |
+| 7 reconcile | lane rows of the item: delivery_pending cleared | reconcile delivers; the lane write fails | answer carries lane_unsettled; a second reconcile clears it | ship: reconcile that delivers clears the lane's pending delivery; lane: reconcile clears the pending delivery |
+| 7 land | lane worktree kept | the run stops on the hub after a held merge, or is interrupted inside the merge call, and answers no row | the worktree stays unless the run answered a row that is not held; the next claim reuses or remakes it | lane: lane worktree is kept when the run stops after a held merge; when the merge call is interrupted |
+| 7 land | lane worktree kept | the run puts back an entry whose train may have landed (a train_landed refusal, a row marked train_landed that fails, step train) | delivery_owed keeps the worktree, as for a pending delivery; only a reconcile ends the entry | lane: lane worktree is kept when its train may have landed; when a landed train entry fails |
+| 7 reconcile | rows merged at the delivered commit: delivery_pending cleared | the item has another merge whose delivery is pending | the clear matches the merge commit; the other row stays pending; an empty commit matches nothing | lane: reconcile clears only the merge it delivered |
+| 7 reconcile | running row: delivery_settled lists each delivered commit | reconcile delivers before the runner records its stale delivery_pending answer | finish_entry drops a pending delivery of the marked commit; another commit stays pending | lane: reconcile before the runner's record; reconcile of another merge |
+| 7 reconcile | running row: the older commit joins delivery_settled | an older PR's merge is reconciled after the running entry's | the list keeps the running entry's commit; finish_entry still drops its pending delivery | lane: older PR's reconcile keeps the running entry's confirmation |
+| 7 reconcile | none | the stale answer sits in a hub-stop record the next run applies | resume_stopped drops a pending delivery of the marked commit | lane: hub-stop record written after a reconcile |
+| 7 reconcile | items done, PRs merged | stopped midway | next claim's prepare reconciles | ship: prepare reconciles |
+| 7 reconcile | none | merge_commit_sha is not M_i | refused train_merge_mismatch | ship: mismatch |
+| 7 reconcile | none | stale train_joined, lone merge | merge_dispatch clears train_commit | ship: lone merge after join |
+| 7 reconcile | entry pending | GitHub stays stale past the retry | entry held, never failed; release runs it | lane: past its retries is held |
+| 7 reconcile | none | GitHub read fails before prepare's lock | train_unread, retryable, no pass spent | ship: train read fails |
+| 7 reconcile | none | the lead's reconcile raises (log write) | entry back at step train, never failed | lane: claimed reconcile raises |
+| 7 settle | train_sent becomes train_landed | train PR reads merged | every later claim knows; only a reconcile ends it | lane: recovery claim, prepare refuses |
+| 7 recover | none | prepare refuses, any code or spend | put back; held past its retries | lane: recovery claim, prepare refuses |
+| 7 recover | none | prepare raises (full log volume) | put back | lane: recovery claim, prepare raises |
+| 7 recover | none | no checkout: a skip or a refusal | put back | lane: recovery claim, no checkout; checkout refuses |
+| 7 recover | none | train mark of another shape | mark kept; put back, then held | lane: mark names no train branch |
+| 6-7 | none | any raise at step train | put back at step train | lane: a raise after the train landed |
+| 6-7 | holder gone | runner dies RECLAIMS times | held, never failed; release runs it | lane: last reclaim holds |
+| 8 cleanup | ref deleted | delete fails | stale ref; noted, nothing else | land_train |
+```
+
+## Not in this change
+
+- One combined review: each member keeps its own (sd:9899).
+- Landing across repositories: a train is one repository's queue.
+- A claimed entry put back in a rebase-policy repository keeps its
+  pre-prepare head: the lone lane's rule (sd:10223). A train lead put
+  back at `step: train` follows its published prepared head.
