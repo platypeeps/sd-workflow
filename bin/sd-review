@@ -2917,7 +2917,8 @@ def workstation_lane_is_reachable(result: Mapping[str, Any]) -> bool:
 
 
 def render(result: Mapping[str, Any], stream: TextIO) -> None:
-    write = stream.write
+    code = getattr(stream, "encoding", None) or "utf-8"  # sd:10698: escape what the stream cannot encode
+    write = lambda text: stream.write(text.encode(code, "backslashreplace").decode(code))  # noqa: E731
     if result.get("operation") == "provider_preflight":
         write(f"Provider preflight: {result['status']}; {result['probe_calls']} probe call(s), no branch review.\n")
         for outcome in result["outcomes"]:
@@ -3033,7 +3034,9 @@ def render(result: Mapping[str, Any], stream: TextIO) -> None:
                 f"      {finding['summary']}\n"
             )
             # pack sd:10235: a blocker's repro for the lead; escaped (a reader wrote it), spaces kept (note #77417).
-            for index, line in enumerate(str(finding.get("evidence") or "").splitlines() if finding["disposition"] == "blocking" else ()):
+            # Newlines alone: `splitlines` also cut at U+2028 inside a quoted repro (sd:10698).
+            evidence = str(finding.get("evidence") or "").rstrip("\r\n") if finding["disposition"] == "blocking" else ""
+            for index, line in enumerate(re.split(r"\r?\n", evidence) if evidence else ()):
                 write(f"      {'evidence:' if index == 0 else ' ' * 9} {for_note(line, EVIDENCE_CHARS, spaced=True)}\n")
     remaining = result.get("remaining") or []
     if remaining:

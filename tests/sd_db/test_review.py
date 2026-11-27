@@ -713,6 +713,15 @@ class SealedExport(ReviewCase):
         review.write(review.export(self.db, item, key=KEY_A, who="tester"), out)
         self.assertEqual(len(out.read_text().splitlines()), 3)
 
+    def test_a_rename_after_the_close_keeps_the_exported_title(self):
+        """sd:10408: the first export closed the batch; a rename moved the manifest's title, not its digest."""
+        item = self.ruled_sealed()
+        before = review.export(self.db, item, key=KEY_A, who="tester")[0]
+        writes.set_item_fields(self.db, item, title="Renamed: ünïcode <b>title</b>")
+        after = review.export(self.db, item, key=KEY_A, who="tester")[0]
+        self.assertEqual((after["title"], after["digest"]), (before["title"], before["digest"]))
+        self.assertNotIn("Renamed", after["title"])
+
     def test_another_batchs_key_is_refused_and_changes_nothing(self):
         item = self.ruled_sealed()
         before = (self.counts(), workflow.item_state(self.db, item)["revision"])
@@ -784,6 +793,14 @@ class Apply(ReviewCase):
         self.assertIsNone(self.task(notes[2]))
         self.assertIn("cap-retries", self.task(notes[0])["title"])
         self.assertEqual((result["closed"], self.status(item)), ([item], "done"))
+
+    def test_a_batch_apply_closed_exports_its_title_at_the_close_after_a_rename(self):
+        """sd:10408: the nightly close keeps the title too; a hand close exports the live one."""
+        item = self.approved()
+        title = review.read(self.db, item)["item"]["title"]
+        review.apply(self.db, "nightly", who="tester")
+        writes.set_item_fields(self.db, item, title="Renamed later")
+        self.assertEqual(review.export(self.db, item, who="tester")[0]["title"], title)
 
     def test_a_stop_after_the_first_task_reruns_to_one_task_each_and_never_edits_the_first(self):
         item = self.approved()

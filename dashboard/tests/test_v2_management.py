@@ -122,6 +122,32 @@ class TheDocument(ScreenCase):
     def document(self, read=fleet):
         return management_screen.document(self.connection, now=NOW, fleet=read, jobs=self.jobs, services=NoServices())
 
+    def test_the_fleet_is_read_once_per_area_whichever_sections_ask(self):
+        """sd:10815: Git, Sessions and Claude each ran `fleet.collect`; the sessions child ran twice a read."""
+        calls = []
+
+        def read(area):
+            calls.append(area)
+            return fleet(area)
+
+        def claude(connection, *, now, fleet):
+            fleet("sessions")
+            return claude_stub(connection, now=now)
+        doc = management_screen.document(self.connection, now=NOW, fleet=read, jobs=self.jobs, services=NoServices(),
+                                         claude=claude)
+        self.assertEqual(sorted(calls), ["repos", "sessions"])
+        self.assertEqual((doc["sources"]["git"], doc["sources"]["sessions"], doc["sources"]["claude"]), ("", "", ""))
+
+        def broken(area):
+            calls.append(area)
+            raise ValueError("fleet collection was stopped at its budget")
+        calls.clear()
+        doc = management_screen.document(self.connection, now=NOW, fleet=broken, jobs=self.jobs, services=NoServices(),
+                                         claude=claude)
+        self.assertEqual(sorted(calls), ["repos", "sessions"])
+        self.assertEqual(doc["sources"]["sessions"], "fleet collection was stopped at its budget")
+        self.assertIn("stopped at its budget", doc["sources"]["claude"])
+
     def test_every_source_is_read_and_says_so(self):
         doc = self.document()
         # pack sd:7115: the lane's assignments moved to Queue, so the page reads no lane.
@@ -398,7 +424,8 @@ class TheDocument(ScreenCase):
         doc = management_screen.document(self.connection, now=NOW, fleet=fleet, jobs=self.jobs, services=NoServices(), claude=dark)
         self.assertIsNone(doc["claude"])
         self.assertEqual(doc["sources"]["claude"], "claude agents --json gave no answer in 10 s")
-        self.assertEqual(seen, [fleet], "the Claude read joins the same fleet read the page makes")
+        # sd:10815: the page's per-area read of the given fleet, so Claude shares the sessions answer Sessions got.
+        self.assertEqual(seen[0]("sessions"), fleet("sessions"), "the Claude read joins the same fleet read the page makes")
 
     def test_a_snapshot_section_carries_when_it_was_observed_and_why_it_is_stale(self):
         def kept(area):
