@@ -666,6 +666,13 @@ class CorePolicyReadTests(Fixture):
                 self.assertIs(sd_lib.tool_changes_keep_reviews(env), keeps)
         self.assertIn("review_tool_changes", sd_lib.FLEET_KEYS)
 
+    def test_review_tool_changes_strict_says_the_request_replay_still_keeps_a_review(self):
+        """Review of build/sd-2285: strict is the reading before sd:10928, where the sd:1397 replay keeps a
+        review whose reviewers would be asked the same; the description must not promise more."""
+        said = sd_lib.CORE_CONFIG["review_tool_changes"]["description"]
+        self.assertNotIn("any tool change re-reviews", said)
+        self.assertIn("sd:1397", said)
+
     def test_malformed_policy_never_becomes_a_grant(self):
         env = {"HOME": str(self.tmp)}
         path = self.tmp / ".config" / sd_lib.CONFIG_RELATIVE_PATH

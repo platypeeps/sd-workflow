@@ -117,8 +117,9 @@ LEAD_REVIEW_SOURCE = "lead-review"
 
 def tool_changes_keep_reviews(environ: Mapping[str, str] | None = None) -> bool:
     """`sd.review_tool_changes` (sd:10929): `keep`, the default (operator 2026-11-27), keeps a review and
-    its rebuttals across a change to the review tools alone; a policy change still re-reviews. `strict`
-    re-reviews on any tool change, as does a value or a database that does not read: the safe reading."""
+    its rebuttals across a change to the review tools alone; a policy change still re-reviews. `strict`,
+    as does a value or a database that does not read, is the reading before sd:10928: a tool change
+    voids rebuttals and re-reviews unless the sd:1397 replay asks the reviewers the same."""
     try:
         return core_setting("review_tool_changes", environ) != "strict"
     except ConfigError:
@@ -158,8 +159,9 @@ CORE_CONFIG = {
     "review_tool_changes": {"pattern": "keep|strict",
                             "description": "What a change to the review tools alone does to a recorded review and "
                                            "its rebuttals. keep (the default): both stand, and a policy change "
-                                           "still re-reviews; strict: any tool change re-reviews and voids "
-                                           "rebuttals (sd:10929)."},
+                                           "still re-reviews; strict: a tool change voids rebuttals and "
+                                           "re-reviews unless the reviewers would be asked the same "
+                                           "(sd:1397, sd:10929)."},
     "copilot_review": {"pattern": "|".join(COPILOT_REVIEW_POLICIES),
                        "description": "When a merge asks GitHub for a Copilot review on its own. deep (the default): only "
                                       "changes that get a deep review; always: every reviewed change; never: none. "

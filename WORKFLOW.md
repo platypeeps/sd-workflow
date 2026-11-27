@@ -665,7 +665,8 @@ The reserved `sd` namespace declares these settings:
   `deny` vetoes all local allowances. Absence supplies no standing grant.
 - `sd.review_tool_changes`: `keep`, the default, keeps a review and its rebuttals across a change to the
   review tools alone; a policy change still re-reviews. `strict`, or a value that does not read,
-  re-reviews on any tool change and voids rebuttals. Settings → Fleet sets it.
+  voids rebuttals on a tool change and re-reviews, unless the sd:1397 replay finds the reviewers
+  would be asked the same. Settings → Fleet sets it.
 - `sd.copilot_review`: when `sd-ship` requests a Copilot review by itself. `deep` requests one on deep-tier changes only,
   `always` on every reviewing tier, `never` on none. Absence reads `deep`, so a repository with no
   review declaration gets Copilot on deep changes and on nothing else.
