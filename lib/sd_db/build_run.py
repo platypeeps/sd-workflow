@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import glob
 import hashlib
 import json
 import math
@@ -59,11 +60,20 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from . import build, contributions, draft, paths, remote, runner_journal, sessions
+from . import (
+    build,
+    contributions,
+    draft,
+    paths,
+    remote,
+    repos,
+    runner_journal,
+    sessions,
+)
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
-from .errors import SchemaTooNew
+from .errors import SchemaTooNew, SdDbError
 from .ship import this_host
 from .workflow import WorkflowError
 from .writes import add_note, create_item, now, record_cost, record_state
@@ -290,6 +300,8 @@ HELD_NOTES = ("[downgraded: repeats a rebutted finding, no evidence cited]",
               "[downgraded: repeats a blocker a build ruling rejected]")
 #: The checkpoint key prefix of the head a blocking round found its blockers at, by assignment.
 ROUND_HEAD = "build-round-head:"
+#: The checkpoint key prefix of the round head whose rulings `ruled` applied, by assignment (sd:10913).
+RULINGS_APPLIED = "build-rulings-applied:"
 #: The rulings `RULING` asks for, and the longest reason kept.
 RULINGS = ("fix", "reject", "file", "ask")
 REASON_MAX = 500
@@ -790,11 +802,15 @@ def implicit(lines: list[str], start: int, *, named: Collection[str] = ()) -> bo
     return False
 
 
-def unwalked(work: Path, paths: Collection[str]) -> list[str]:
+def unwalked(work: Path, paths: Collection[str], *, data: Collection[str] = ()) -> list[str]:
     """Each of `paths` the name walk does not read: anything but Python source, a `.py` file or a regular file
-    under `work` whose first line is a Python shebang (class pass 7 on sd:10286). Code reads such a file as
-    data, by no name, so a round's change there reaches a blocker no edge finds. A closed test, not a list of
-    configuration kinds: a symlink, a missing file or one that does not read is none, fail closed."""
+    under `work` whose first line is a Python shebang (class pass 7 on sd:10286), and any path a `data` glob
+    matches, the repository's declared runtime data (policy `runtime_data`, sd:10906), Python or not. Code
+    reads such a file as data, by no name, so a round's change there reaches a blocker no edge finds. A closed
+    test, not a list of configuration kinds: a symlink, a missing file or one that does not read is none, fail
+    closed. Globs read as `check_scope`'s do: `*` within one segment, `**` across them."""
+    declared = [re.compile(glob.translate(pattern, recursive=True, include_hidden=True)) for pattern in data]
+
     def python(path: str) -> bool:
         if not path or (work / path).is_symlink():
             return False
@@ -806,7 +822,9 @@ def unwalked(work: Path, paths: Collection[str]) -> list[str]:
         except OSError:
             return False
         return first.startswith(b"#!") and b"python" in first
-    return [f"{path} (no Python source)" for path in sorted(paths) if not python(path)]
+    return [f"{path} (declared runtime data)" if any(pattern.match(path) for pattern in declared)
+            else f"{path} (no Python source)" for path in sorted(paths)
+            if any(pattern.match(path) for pattern in declared) or not python(path)]
 
 
 def round_words(git: Collection[str], work: str, base: str, head: str, *,
@@ -1860,6 +1878,13 @@ class Supervisor:
         refused = self.prechecked(head)
         if refused:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused], head)
+        # A check the last round failed runs again first: one that still fails spends no review (sd:10914).
+        # ponytail: the whole check, not only its failing tests; a narrower rerun if the gate's cost bites.
+        rerun = self.own_checks(head) if self.known_failure() else None
+        if isinstance(rerun, dict):
+            return rerun
+        if rerun:
+            return self.blocked_round(rerun, head)
         answer: dict | None = None
         argv, prior = self.review_plan(head)
         unknown = waits = 0
@@ -1889,8 +1914,12 @@ class Supervisor:
                 argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
+        # A blocking report this run settles to a pass is no pass `sd-review` recorded for the lane (sd:10919).
+        settled = answer["status"] == "blocking"
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
-        unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
+        # A rerun that passed at `head` is this round's check: it runs once (sd:10914).
+        unmanaged = build.unmanaged(self.db, self.row["repo"])
+        checked: list[dict] | dict | None = rerun
         # `sd-review` runs no gate on a blocking report: a pass made from one here runs the checks (sd:10286).
         ungated = unmanaged or answer["status"] == "blocking"
         # Read before `file_new_findings` rebuilds the answer: only a whole report may settle to a pass. A
@@ -1899,7 +1928,7 @@ class Supervisor:
         # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
         if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
             new, blockers = self.deferred(answer, prior, head)
-            if ungated and not blockers:  # before any rebuttal: a failed check means a fix round follows
+            if ungated and not blockers and checked is None:  # before any rebuttal: a failed check, a fix round
                 checked = self.own_checks(head)
             answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
             if isinstance(checked, dict):
@@ -1915,6 +1944,8 @@ class Supervisor:
                 return failed
             if failed:
                 return self.blocked_round(failed, head)
+            if whole and settled and answer["status"] in ("clean", "advisory"):
+                self.once(f"lead-pass:{head}", lambda: self.lead_pass(head, answer["status"]))
             self.reviewed = head
             return "enqueuing"
         return self.blocked_round(answer["blockers"], head)
@@ -2436,17 +2467,31 @@ class Supervisor:
         adjudicate` reads, and no blocker names a bundle member. So each ruling is a note on the lead;
         a reject or file is a rebuttal in the record `sd-review` reads for this branch, bound to `head`, the
         head after the round's last commit; a file is an item too. An `ask` ends the run with the question on
-        every member, so none is delivered around it. No file, or a blocker with no ruling that reads, changes
-        nothing for that blocker: the review finds it again and the run parks.
+        every member, so none is delivered around it. No file, a blocker with no ruling that reads, or round
+        blockers that do not read apply nothing and end the run blocked before the review: that review may
+        omit an unruled blocker, and the lane reuses its pass (sd:10914, sd:10919). The applied mark is
+        written only past that check, so no caller reads a partial round as applied.
         A blocker that is no review finding (an enqueue check, a failed gate: line "-") takes no rebuttal: no
         review reads one for it."""
         if not self.rulings.exists():
-            return None  # no ruling round wrote one for this head (a retry that kept the count): review as usual
+            # Applied at this round head already (a later walk, a retry that kept the count): review as usual.
+            # Else the ruling round wrote none: its blockers stand unruled, and a review that omits them must
+            # not deliver around them (sd:10913).
+            if self.rulings_applied():
+                return None
+            return self.finish("blocked", f"the ruling round wrote no rulings file at {head[:12]}, so its "
+                                          f"blockers stand unruled: {' '.join(self.summary(self.round_blockers()).split())}")
         blockers = self.round_blockers()
         found, unread = self.read_rulings(len(blockers))
+        if not blockers:  # a ruling round follows a blocking round: none that read is a round file lost
+            unread = "the round's blockers did not read"
         if unread:
-            self.note(self.lead, f"Build run {self.ident}: the ruling round's rulings at {head[:12]}: {unread}; "
-                                 f"each such blocker stays a blocker")
+            # Fail closed (sd:10914): apply no ruling and write no mark, so a later walk reads the same file and
+            # ends the same way; the review after it may omit the unruled blocker and the lane reuses its pass.
+            # The blocked end notes the lead with this detail.
+            return self.finish("blocked", f"the ruling round's rulings at {head[:12]} do not rule every blocker "
+                                          f"({unread}), so none is applied: "
+                                          f"{' '.join(self.summary(blockers).split()) if blockers else 'no blocker read'}")
         repository = self.github()
         delta = self.branch_delta(head, head) if found else {}
         changed = None if delta is None else delta.keys()
@@ -2457,9 +2502,12 @@ class Supervisor:
         # function, or that names nothing the round changed and is reached all the same (`reaches`).
         words = (round_words(self.tools.git, str(self.work), reviewed, head, env=self.env)
                  if reviewed and moved is not None else None)
+        data = self.runtime_data() if found else []
+        if data is None:  # a declaration that does not read: every path the round changed may be one (fail closed)
+            data = ["**"]
         for number, (ruling, reason) in sorted(found.items()):
             row = blockers[number - 1]
-            reached = (self.reaches(row, words, head) + unwalked(self.work, moved or {})
+            reached = (self.reaches(row, words, head) + unwalked(self.work, moved or {}, data=data)
                        if ruling in ("reject", "file") and ruleable(row) and words is not None else [])
             self.once(f"ruling:{head}:{number}", functools.partial(
                 self.rule, number, row, ruling, reason, head, repository, changed,
@@ -2474,8 +2522,40 @@ class Supervisor:
                 question=(f"Build run {self.ident} cannot rule on: {text}"[:build.FINDING_MAX - 80]
                           + "\nOption: Fix it in this build (Recommended)\nOption: Reject it and deliver"))
         # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
+        # Bound to the blocking round itself (its `ROUND_HEAD` record), not its commit: a later round at the
+        # same commit is another round, whose rulings are its own (review of sd:10913).
+        self.once(f"rulings-applied:{head}", lambda: record_state(
+            self.db, "checkpoint", key=f"{RULINGS_APPLIED}{self.row['assignment']}", body=self.round_mark()))
         self.rulings.unlink(missing_ok=True)
         return None
+
+    def rulings_applied(self) -> bool:
+        """Whether `ruled` applied rulings for the blockers of the last blocking round (`round_mark`), in this
+        run or one before it on the assignment; False when that round does not read (fail closed)."""
+        mark = self.round_mark()
+        if mark is None:
+            return False
+        for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?",
+                                       (f"{RULINGS_APPLIED}{self.row['assignment']}",)):
+            try:
+                if json.loads(body) == mark:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def runtime_data(self) -> list[str] | None:
+        """The repository's declared runtime-data globs (policy `runtime_data`, sd:10906); [] for none, None
+        for a declaration that does not read or a value that is no list of globs."""
+        try:
+            held = repos.declarations(self.db, self.row["repo"])
+        except (SdDbError, sqlite3.Error):
+            return None
+        policy = (held or {}).get("policy") or {}
+        globs = policy.get("runtime_data", []) if isinstance(policy, dict) else None
+        if not isinstance(globs, list) or not all(isinstance(text, str) and text.strip() for text in globs):
+            return None
+        return globs
 
     def reaches(self, row: dict, words: tuple[set[str], set[str]] | None, head: str) -> list[str]:
         """How a ruling round's own changes (`round_words`) reach a blocker that names none of them, at each
@@ -2494,6 +2574,14 @@ class Supervisor:
             elif self.calls_into(path, line, head, sources, words[1]):
                 found.append(f"a name {at} uses")
         return found
+
+    def round_mark(self) -> dict | None:
+        """The last blocking round as one record names it: its `ROUND_HEAD` row and head; None when it does not
+        read. Two rounds at one commit are two marks (review of sd:10913)."""
+        found = self.db.execute("SELECT id FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                "LIMIT 1", (f"{ROUND_HEAD}{self.row['assignment']}",)).fetchone()
+        head = self.round_head()
+        return None if found is None or head is None else {"round": found[0], "head": head}
 
     def round_head(self) -> str | None:
         """The head the last blocking round, whose blockers the ruling round ruled, read, as `blocked_round`
@@ -2555,8 +2643,9 @@ class Supervisor:
 
         A reject or file judged the code at the reviewed head. `moved` is what the round's own commits changed
         since: one that changed a file the blocker names can make it reachable, so that ruling is noted and
-        not applied (no item, no clearing, no rebuttal), as when `moved` does not read (None): the review
-        finds the blocker again and the run parks, fail closed (class pass 3).
+        not applied (no clearing, no rebuttal), as when `moved` does not read (None): the review finds the
+        blocker again and the run parks, fail closed (class pass 3). A lapsed FILE ruling still files its
+        item: a review that omits the blocker delivers the build, and the defect must not be lost.
 
         The note's opening names the run, the blocker's number and the head: a supervisor that walks this step
         again without its marks (a crash before the rulings file went) finds it and writes nothing twice."""
@@ -2576,6 +2665,9 @@ class Supervisor:
                   "" if touched == [] else
                   "; not applied: the round changed " + ", ".join(touched) if touched else
                   "; not applied: the round's own changes did not read")
+        # A lapse skips the clearing and the rebuttal, never the follow-up: a review that omits the blocker
+        # delivers the build, and the item is the one record of the ruling's defect (sd:10914 review).
+        follow_up = ruling == "file" and finding
         finding = finding and not lapsed
         mark = f"Build run {self.ident} ruling {number} at {head[:12]}: "
         with transaction(self.db):
@@ -2584,12 +2676,12 @@ class Supervisor:
                                (self.lead, len(mark), mark)).fetchone():
                 return
             filed = None
-            if ruling == "file" and finding:
+            if follow_up:
                 filed = create_item(self.db, kind="task", repo=self.row["repo"], title=(
                     f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')} "
                     f"{row.get('summary') or ''}")[:200])
                 add_note(self.db, filed, "comment", f"Build run {self.ident}'s ruling round filed this review "
-                                                    f"blocker, not caused by its change ({reason}): "
+                                                    f"blocker, not caused by its change ({reason}{lapsed}): "
                                                     f"{self.summary([row], None)}")
             # A comment: a note the library writes is never a decision, whoever ruled (sd:3008).
             add_note(self.db, self.lead, "comment",
@@ -2765,6 +2857,38 @@ class Supervisor:
     def late_brief(rounds: int) -> str:
         """The fix brief for a round at or past the bound: the class pass, then the ruling round (sd:10286)."""
         return CLASS_PASS if rounds == REVIEW_ROUNDS else RULING
+
+    def lead_pass(self, head: str, status: str) -> None:
+        """Record the review at `head` this run settled to a pass (every blocker ruled or deferred) as the lead
+        pass lane prepare reuses at the same head (sd:10919, pack sd:5988), in the record `sd-review` writes
+        for a pass of its own (`sd_lib.lead_review_key`, `record_lead_review`). The lane checks the binding,
+        the fork and the head itself, so a report that lacks one records nothing: the lane reviews in full. The record
+        covers `head` alone: the lane carries no ruled pass across a merge (review of sd:10919)."""
+        try:
+            report = json.loads(self.out("review").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(report, dict):
+            return
+        subject, base, binding = report.get("subject"), report.get("covers_from"), report.get("binding")
+        copilot = ((report.get("remote_reviews") or {}).get("copilot") or {}) if isinstance(
+            report.get("remote_reviews"), dict) else {}
+        repository = self.github()
+        if not (isinstance(subject, dict) and subject.get("head") == head and isinstance(base, str)
+                and isinstance(binding, dict) and repository and isinstance(copilot, dict)):
+            return
+        record_state(self.db, "checkpoint", key=f"review:v1:{repository}:{self.row['branch']}", body={
+            "repository": repository, "branch": self.row["branch"], "head": head, "base": base, "status": status,
+            "binding": binding, "reviewed_by": report.get("reviewed_by", []), "challenge": False,
+            "copilot_automatic": copilot.get("automatic"), "settled_by": f"build run {self.ident}",
+            # Its rulings judged the tree at `head`: a catch-up merge may add the caller one said was missing.
+            "head_only": True})
+
+    def known_failure(self) -> bool:
+        """Whether the last blocking round, after which a fix ran, failed a check: a blocker with no line
+        that is no enqueue check, from this run's checks or the review's gate (sd:10914)."""
+        return bool(self.fresh()["review_round"]) and any(
+            row.get("line") == "-" and row.get("path") != "enqueue check" for row in self.round_blockers())
 
     def round_blockers(self) -> list[dict]:
         """The last blocking round's findings as `blocked_round` kept them; [] for none or an unreadable file."""

@@ -42,6 +42,7 @@ from sd_db import (
     operations,
     paths,
     remote,
+    repos,
     runner,
     sessions,
     writes,
@@ -303,7 +304,9 @@ FAKE = textwrap.dedent('''
         # blocking2_uncovered: blocking2 read from patches only, so the next round reviews the branch whole
         short = mode == "repeat2_short"
         uncovered = mode in ("repeat2_uncovered", "blocking2_uncovered")
-        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered else mode
+        # repeat2_forked: repeat2 from the branch's real fork, with the binding `sd-review` reports (sd:10919)
+        forked = mode == "repeat2_forked"
+        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered or forked else mode
         if mode in ("blocking2", "repeat2", "moved2", "twin2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
                       "evidence": "the original evidence"}
@@ -324,7 +327,10 @@ FAKE = textwrap.dedent('''
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
                           "requested_reviews": 2, "completed_reviews": 1 if short else 2,
                           "verification_report_digest": verified,
-                          "covers_from": None if mode == "clean_uncovered" or uncovered else "c" * 40,
+                          "covers_from": None if mode == "clean_uncovered" or uncovered else
+                          git("-C", work, "merge-base", "HEAD", "refs/remotes/origin/main") if forked else "c" * 40,
+                          **({"binding": {"fixture": "binding"}, "reviewed_by": ["fixture-reader"],
+                              "remote_reviews": {"copilot": {"automatic": False}}} if forked else {}),
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -1284,7 +1290,8 @@ class Supervise(Case):
         block the items; each fix resumes."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
         self.assertIn(f"{R + 2} review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
@@ -1300,6 +1307,11 @@ class Supervise(Case):
         self.assertIn("rule each numbered blocker", prompts[-1], "sd:10286: the last round rules")
         self.assertIn("1. work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
+
+    def fixed_ruling(self):
+        """The ruling round's child that rules its one blocker FIX, as each ruling round writes a file (sd:10913)."""
+        (self.plans / "rulings.txt").write_text(json.dumps([{"blocker": 1, "ruling": "fix", "reason": "a failing input"}]))
+        return "rule_apart"
 
     def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2", rule="rule_apart",
                      **options):
@@ -1397,6 +1409,48 @@ class Supervise(Case):
                 (found,) = review.dispose([review._finding(repeat)], "high", seen)
                 self.assertEqual(found["disposition"], lane)
 
+    def test_a_settled_final_review_is_the_lanes_lead_pass(self):
+        """sd:10919: a final review whose blockers every ruling cleared, at head H, is recorded as the lead
+        pass the lane reuses: prepare at H skips its review; a head moved by a commit of its own reviews."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2_forked",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        work = Path(self.bundle["work_path"])
+        head = support.git(work, "rev-parse", "HEAD").strip()
+        sys.path.insert(0, str(BIN))
+        try:
+            lane = importlib.import_module("sd_ship_review")
+            key = importlib.import_module("sd_lib").lead_review_key("fixture/repo", self.bundle["branch"])
+        finally:
+            sys.path.remove(str(BIN))
+        found = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?", (key,)).fetchone()
+        self.assertIsNotNone(found, "the settled pass is not recorded for the lane")
+        self.assertEqual(json.loads(found[0])["status"], "advisory")
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], head, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNotNone(record, why)
+        # A clean merge of main far from the branch carries a plain pass; a ruling judged the tree at H, and
+        # main may add the caller it said was missing, so this pass covers H alone (review of sd:10919).
+        support.git(work, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        (work / "far").mkdir()
+        (work / "far" / "caller.txt").write_text("a new caller\n", encoding="utf-8")
+        support.git(work, "add", "far")
+        support.git(work, "commit", "-q", "-m", "feat: a new caller")
+        support.git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
+        support.git(work, "checkout", "-q", self.bundle["branch"])
+        support.git(work, "merge", "-q", "--no-edit", "refs/remotes/origin/main")
+        merged = support.git(work, "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(lane.carry_forward(work, head, merged, "refs/remotes/origin/main"))
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], merged, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
+        support.git(work, "commit", "-q", "--allow-empty", "-m", "fix: later")
+        moved = support.git(work, "rev-parse", "HEAD").strip()
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], moved, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
+
     def test_two_rulings_one_words_and_place_clear_no_repeat(self):
         """Night triage of sd:10286 (bin/sd-review:917, build_run.py:2199): two ruled blockers with one summary
         and place but other evidence. The lane reads only the newest record there, so it blocked the repeat of
@@ -1443,6 +1497,47 @@ class Supervise(Case):
         self.assertEqual(len(self.calls("gate")), 1, "the settled pass ran no gate")
         self.assertEqual(ended.get("outcome"), "blocked", ended)
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def known_failure(self, code):
+        """A managed run whose first review cleared and whose gate failed; its own check exits `code` after."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", f"exit({code})"])
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["gate_failed", "clean"])
+        return self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+
+    def test_a_known_failure_still_failing_spends_no_review(self):
+        """sd:10914: after a fix round for a failed gate, the check runs again before the review. One that
+        still fails starts no reviewer and goes back to the builder."""
+        ended = self.known_failure(3)
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(len(self.calls("sd-review")), 1, "a review ran on a head whose known failure stands")
+        self.assertGreater(len(self.calls("gate")), 1, "the check was not run again after each fix")
+        self.assertIn("exit 3", self.latest()["detail"])
+
+    def test_a_known_failure_that_passes_reviews_once_and_checks_once(self):
+        """sd:10914: a rerun that passes permits the usual review, and its pass is the round's check."""
+        ended = self.known_failure(0)
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual((len(self.calls("sd-review")), len(self.calls("gate"))), (2, 1))
+
+    def test_a_healthy_build_runs_no_extra_check(self):
+        """sd:10914: no known failure, no rerun: a clean managed review runs no check of its own."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(0)"])
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
+        ended = self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+        self.assertEqual(ended.get("step"), "enqueued")
+        self.assertEqual(self.calls("gate"), [])
 
     def test_a_ruled_repeat_in_an_incomplete_review_is_no_pass(self):
         """Review of sd:10286: clearing a ruled blocker turns no short or uncovered review into a pass. A
@@ -1510,6 +1605,39 @@ class Supervise(Case):
                 self.assertEqual(ended.get("outcome"), "blocked", ended)
                 self.assertEqual(self.rebuttals(), [])
                 self.assertIn(f"not applied: the round changed {name} (no Python source)", self.decisions()[1])
+
+    def test_a_ruling_lapses_when_its_round_changes_declared_runtime_data(self):
+        """sd:10906: code reads a `.py` file as data, by no name, and the round changed it. The name walk read
+        it as source, so the reject applied. A path the policy's `runtime_data` declares lapses it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.rebuttals(), [])
+        self.assertIn("not applied: the round changed apart.py (declared runtime data)", self.decisions()[1])
+
+    def test_a_lapsed_file_ruling_still_files_its_follow_up(self):
+        """sd:10914 review: a FILE ruling the round's runtime-data change lapsed filed no item, and a review
+        that omitted the blocker enqueued the build: the follow-up was lost. A lapse skips the clearing and
+        the rebuttal alone; the item is filed and the lead's note names it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "file", "reason": "older than this change"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        (filed,) = self.db.execute("SELECT id FROM item WHERE title LIKE 'Review follow-up%work.txt:2%'").fetchall()
+        self.assertIn(f"FILE as sd:{filed['id']}, older than this change; not applied: the round changed "
+                      f"apart.py (declared runtime data)", self.decisions()[1])
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE ?",
+                                         (f"{build_run.RULED}%",)).fetchone()[0], 0)
+
+    def test_declared_runtime_data_is_matched_by_glob(self):
+        """sd:10906: `runtime_data` globs as `check_scope` reads them: `*` in one segment, `**` across them."""
+        self.assertEqual(build_run.unwalked(self.root, ["a/b.py", "data/x/t.py", "top.py", "c.py"],
+                                            data=["data/**", "c.py"]),
+                         ["c.py (declared runtime data)", "data/x/t.py (declared runtime data)"])
 
     def test_only_python_source_is_a_file_the_name_walk_reads(self):
         """Class pass 7: a `.py` file, or a regular file whose first line is a Python shebang; a symlink, a
@@ -1864,11 +1992,85 @@ class Supervise(Case):
                 self.setUp()
                 ended = self.ruling_round(text, after=("blocking2",))
                 self.assertEqual(ended["outcome"], "blocked", ended)
-                self.assertIn(f"{build_run.REVIEW_ROUNDS + 2} review rounds left blockers", self.latest()["detail"])
+                # sd:10913: no file at all ends the run before the review; sd:10914: so does one that does not
+                # rule every blocker, as the review after it may omit one.
+                self.assertIn("the ruling round wrote no rulings file" if name == "no file" else
+                              "do not rule every blocker", self.latest()["detail"])
+                self.assertEqual(len(self.calls("sd-review")), build_run.REVIEW_ROUNDS + 1)
+                self.assertFalse(self.supervisor().rulings_applied())
                 self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
-                said = [body for (body,) in self.db.execute(
-                    "SELECT body FROM note WHERE item = ? AND body LIKE '%ruling round%rulings%'", (self.items[0],))]
-                self.assertEqual(len(said), 0 if name == "no file" else 1, said)
+
+    def test_a_ruling_round_that_writes_no_rulings_file_delivers_nothing(self):
+        """sd:10913: the ruling round wrote no rulings file and the review after it omitted the blockers. The
+        run delivered; it now ends blocked before that review, and no review is spent."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round(None, after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the missing rulings")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_rulings_file_that_leaves_a_blocker_unruled_delivers_nothing(self):
+        """sd:10914: a rulings file that ruled blocker 1 alone read as applied; the review after it omitted
+        blocker 2 and the run delivered it unruled, and the lane reuses that pass (sd:10919). Each blocker
+        needs a ruling that reads: else the run ends blocked before that review, none applied, no mark."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round([{"blocker": 1, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("no single ruling for blocker(s) 2", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the unruled blocker")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+        again = self.supervisor()
+        self.assertFalse(again.rulings_applied(), "a round with an unruled blocker reads as applied")
+        # A later walk reads the same file and stays blocked: the mark is never written around it.
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(again.ruled(head))
+        self.assertEqual(again.ending[0], "blocked")
+        self.assertFalse(again.rulings_applied())
+
+    def test_rulings_for_round_blockers_that_do_not_read_apply_nothing(self):
+        """sd:10914, class pass: a round file lost or not JSON reads as no blocker, so an empty rulings list
+        ruled them all. The round's blockers must read, else nothing applies and no mark is written."""
+        for name, text in {"no round file": None, "not json": "{", "empty list": "[]"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.ruling_round([], after=("clean",))
+                again = self.supervisor()
+                again.round_file.unlink(missing_ok=True)
+                if text is not None:
+                    again.round_file.write_text(text)
+                again.rulings.write_text("[]")
+                head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+                self.assertIsNotNone(again.ruled(head))
+                self.assertEqual(again.ending[0], "blocked")
+                self.assertIn("the round's blockers did not read", again.ending[1])
+                self.assertFalse(again.rulings_applied())
+
+    def test_applied_rulings_walked_again_review_as_usual(self):
+        """sd:10913: a later walk at the same count, the applied rulings file gone, is no missing file."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertFalse(again.rulings.exists())
+        self.assertIsNone(again.ruled(head))
+
+    def test_applied_rulings_clear_no_later_round_at_the_same_head(self):
+        """Review of sd:10913: the applied mark named the commit alone, so a later blocking round at that same
+        head, whose ruling round wrote no file, read as applied and reviewed as usual. It names the round."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        self.assertTrue(again.rulings_applied())
+        head = again.round_head()
+        # A later blocking round at the same commit, as `blocked_round` records it.
+        record_state(self.db, "checkpoint", key=f"{build_run.ROUND_HEAD}{again.row['assignment']}", body=head)
+        self.assertEqual(again.round_head(), head)
+        self.assertFalse(again.rulings_applied(), "a later round's missing rulings read as applied")
 
     def test_a_reason_is_one_bounded_line(self):
         """sd:10286, long input: a reason is folded and cut before it is a note or a rebuttal."""
@@ -1878,14 +2080,15 @@ class Supervise(Case):
 
     def test_a_rulings_file_from_before_the_round_is_not_this_rounds(self):
         """sd:10286, a stale value: a rulings file an earlier round left is gone before the ruling child
-        starts, so a builder that writes none rejects nothing."""
+        starts, so a builder that writes none rejects nothing, and delivers nothing (sd:10913)."""
         self.press()
         self.supervisor().logs.mkdir(parents=True, exist_ok=True)
         self.rulings_file().write_text(json.dumps([{"blocker": 1, "ruling": "reject", "reason": "stale"}]))
         R = build_run.REVIEW_ROUNDS
         self.write_pr()
         self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=[*["blocking"] * (R + 1), "clean"])
-        self.assertEqual(self.supervisor().run().get("step"), "enqueued")
+        self.assertEqual(self.supervisor().run().get("outcome"), "blocked")
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
         self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
 
     def test_rulings_walked_twice_are_written_once(self):
@@ -1917,7 +2120,8 @@ class Supervise(Case):
         model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
         self.assertEqual(len(self.calls("sd-review")), R + 2, "the park moved")
@@ -2107,7 +2311,8 @@ class Supervise(Case):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
         R = build_run.REVIEW_ROUNDS
         self.press(2)
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         add_note(self.db, self.items[1], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
@@ -2349,7 +2554,9 @@ class Supervise(Case):
         self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
         self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()  # bare entrypoints pass
         self.assertGreaterEqual(len(self.calls("gate")), 1, "the deferral's pass ran no gate")
-        self.assertEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        self.assertGreaterEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        # sd:10914: the check still fails after the fix, so it runs again and no third review is spent.
+        self.assertEqual(len(self.calls("sd-review")), 2)
 
     def test_a_gate_that_refused_to_run_is_no_fix_round(self):
         """Class pass on sd:10286: `sd gate check` that refuses (exit 1, no result) ran no check: unknown,
@@ -4210,7 +4417,7 @@ class Supervise(Case):
             again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
                                 root=self.root / "worktrees")
         assert again is not None
-        self.plan(claude=["fixr"], sd_review=["clean"])
+        self.plan(claude=[self.fixed_ruling()], sd_review=["clean"])
         self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
         fix = [call["argv"] for call in self.calls("claude")][-1]
         self.assertIn("rule each numbered blocker", fix[fix.index("-p") + 1])
