@@ -1181,7 +1181,7 @@ class RebuttalIdentityTests(unittest.TestCase):
         body = self.lead_body()
         body["proposal"]["findings"][0]["raw_finding"]["evidence"] = f"{one}\n{two}"
         lead = json.dumps(body)
-        for cited in (one, two, f"{two}\n{one}", f" {one} \n\n"):
+        for cited in (one, two, f"{one}\n\n {two}", f" {one} \n\n"):
             with self.subTest(cited=cited):
                 self.assertEqual(gate([row(line=40, evidence=cited)], lead), ["advisory"])
                 self.assertEqual(self.lead_kept(f"{one}\n{two}", cited), [])
@@ -1190,6 +1190,21 @@ class RebuttalIdentityTests(unittest.TestCase):
                 self.assertEqual(gate([row(line=40, evidence=cited)], lead), ["blocking"])
                 self.assertEqual(self.lead_kept(f"{one}\n{two}", cited), ["blocking"])
         self.assertEqual(self.lead_kept(one, one, saved=f"{one}\n{two}"), ["blocking"], "a saved line it never saw")
+
+    def test_a_lead_rejection_holds_no_repro_whose_lines_run_in_another_order(self) -> None:
+        """sd:10926 ruling round (bin/sd-review:2013): the cited lines were compared as a set, so a repro
+        running the rejected commands in another order, a new claim, was held. The cited lines must run
+        together and in order in the rejected evidence."""
+        stored = "pytest -q\nexport FEATURE=1"
+        body = self.lead_body()
+        body["proposal"]["findings"][0]["raw_finding"]["evidence"] = stored
+        lead = json.dumps(body)
+        swapped = "export FEATURE=1\npytest -q"
+        self.assertEqual(gate([row(line=40, evidence=swapped)], lead), ["blocking"])
+        self.assertEqual(self.lead_kept(stored, swapped), ["blocking"])
+        self.assertEqual(self.lead_kept("a\nb\nc", "a\nc"), ["blocking"], "a line left out between")
+        self.assertEqual(gate([row(line=40, evidence=stored)], lead), ["advisory"])
+        self.assertEqual(self.lead_kept("a\nb\nc", "b\nc"), [])
 
     def test_a_lead_rejection_holds_an_uncut_repeat_of_evidence_stored_cut(self) -> None:
         """sd:10926 last class pass (bin/sd-review:2025, :2120): a finding's evidence is stored cut with the
@@ -1202,6 +1217,9 @@ class RebuttalIdentityTests(unittest.TestCase):
         self.assertEqual(self.lead_kept(stored, f"  {whole}\n"), [])
         self.assertEqual(self.lead_kept(stored, whole + "y"), ["blocking"])
         self.assertEqual(self.lead_kept(f"{REPRO}\n{stored}", whole), [], "one of two, stored cut")
+        # Ruling round (:2012): a reader may quote the cut form the prior report showed; cutting it again lost it.
+        self.assertEqual(self.lead_kept(stored, stored), [], "the stored form quoted as shown")
+        self.assertEqual(self.lead_kept(stored, f" {stored}\n"), [])
 
     def test_case_spacing_and_the_repeat_note_do_not_change_the_key(self) -> None:
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
