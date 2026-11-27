@@ -87,9 +87,11 @@ MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
 READ_SECONDS = 120
-# Ignored folders that `git worktree remove` may delete: tools rebuild them (pack sd:6979). The same names as
-# repo-sync's `hyg_not_build` in the system repo, so a landed build worktree goes by either sweep (sd:10830).
-DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache", "node_modules", "target"})
+# Ignored folders that `git worktree remove` may delete: tools rebuild them (pack sd:6979).
+DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache"})
+#: Ignored build output, by folder name, and the manifest beside it that rebuilds it: the names repo-sync's
+#: `hyg_not_build` in the system repo drops. With no manifest there, the folder is data and keeps the worktree.
+BUILD_OUTPUT = {"node_modules": "package.json", "target": "Cargo.toml"}
 #: The pack checkout this module runs from: its `dashboard/dashboard.sh` is the health check.
 PACK = Path(__file__).resolve().parents[2]
 #: The `heartbeat` state row the tick writes first; a satellite's tick writes `<key>@<host>` (pack sd:7933).
@@ -620,12 +622,20 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
 
 def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder, or a `BUILD_OUTPUT`
+    folder beside its manifest (sd:10830); "" when it may go."""
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
-    return "\n".join(line for line in lines.splitlines() if line.strip() and not (
+
+    def rebuilt(line: str) -> bool:
+        if not line.startswith("!! "):
+            return False
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
-        line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+        parts = line[3:].strip('"').split("/")[:-1]
+        return any(part in DISPOSABLE or (part in BUILD_OUTPUT
+                                          and Path(work, *parts[:at], BUILD_OUTPUT[part]).is_file())
+                   for at, part in enumerate(parts))
+    return "\n".join(line for line in lines.splitlines() if line.strip() and not rebuilt(line))
 
 
 def ruleable(row: dict) -> bool:

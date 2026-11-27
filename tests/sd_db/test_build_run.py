@@ -5889,8 +5889,10 @@ class Sweep(Case):
         self.assertIn(kept, note["body"])
 
     def test_ignored_build_output_does_not_keep_the_worktree(self):
-        """sd:10830: node_modules/ and target/ rebuild, as repo-sync's hygiene reads them; an ignored file
-        of that name, or any other ignored folder, still keeps the worktree."""
+        """sd:10830: node_modules/ and target/ rebuild, as repo-sync's hygiene reads them, but only beside the
+        manifest that rebuilds them (package.json, Cargo.toml): a folder of that name with none is data, as is
+        an ignored file of that name. The same `kept_files` decides the sweep, the cleaning step and the
+        split check."""
         work = self.blocked()
         self.done()
         exclude = Path(support.git(self.repo, "rev-parse", "--git-common-dir"))
@@ -5900,9 +5902,21 @@ class Sweep(Case):
         (work / "target").write_text("data")
         self.assertEqual(build_run.sweep(self.db), [], "a file named target is data")
         (work / "target").unlink()
-        for folder in ("node_modules/left-pad", "target/debug"):
+        for folder in ("node_modules/left-pad", "target/debug", "web/node_modules/x"):
             (work / folder).mkdir(parents=True)
             (work / folder / "index.js").write_text("x")
+        self.assertEqual(build_run.sweep(self.db), [], "no manifest: nothing rebuilds them")
+        self.assertEqual(sorted(build_run.kept_files(["git"], str(work)).splitlines()),
+                         ["!! node_modules/left-pad/index.js", "!! target/debug/index.js",
+                          "!! web/node_modules/x/index.js"])
+        for manifest in ("package.json", "Cargo.toml"):
+            (work / manifest).write_text("{}")
+        self.assertEqual([line for line in build_run.kept_files(["git"], str(work)).splitlines()
+                          if line.startswith("!!")], ["!! web/node_modules/x/index.js"],
+                         "web/ has no package.json of its own")
+        (work / "web" / "package.json").write_text("{}")
+        support.git(work, "add", "package.json", "Cargo.toml", "web/package.json")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "chore: manifests")
         self.assertEqual(build_run.sweep(self.db), [str(work)])
         self.assertFalse(work.exists())
 
