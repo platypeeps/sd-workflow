@@ -1036,12 +1036,15 @@ def holds_fix(old: list[bytes], fixed: list[bytes], text: list[bytes]) -> bool:
     return True
 
 
-def puts_back(old: list[bytes], fixed: list[bytes], base: list[bytes]) -> bool:
-    """Whether a cited commit that changed `old` to `fixed` put back a line `base` holds and `old` lacked: it
-    undid part of an earlier branch commit, so a file back as `base` holds it may still ship the fix, and
-    the base read says nothing (sd:10214, class pass 19). A blank line is no text."""
-    # ponytail: added lines only; a fix that deletes a line a draft added reads as no put-back.
-    return any(line.strip() for line in (set(fixed) - set(old)) & set(base))
+def same_but_spacing(fixed: list[bytes], text: list[bytes]) -> bool:
+    """Whether `text` reads as `fixed`, spacing aside: blank lines, trailing blanks and the width of a gap
+    inside a line. A revert that took out only a cited fix's formatting left the fix (sd:10214, class pass
+    20); any other difference is read as the fix undone, and no part of it is guessed to be the work."""
+    # ponytail: an indent stays exact, as it carries meaning in Python and YAML; a re-indented fix that
+    # still ships loses its close, and the revert cites the item itself.
+    def plain(lines: list[bytes]) -> list[bytes]:
+        return [line[:len(line) - len(line.lstrip())] + b" ".join(line.split()) for line in lines if line.strip()]
+    return plain(fixed) == plain(text)
 
 
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
@@ -1268,14 +1271,16 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         for one a refactor removed before it, and two partial reverts a merge joins undo all of it (sd:10214
         review). A file is undone when a read of `befores` finds reverts took it out, and holds no work only
         when every read finds the cited commit left it as before: a deletion the base never saw still ships
-        against its parent (sd:10214 review, the one-file revert)."""
+        against its parent (sd:10214 review, the one-file revert). A fix that undid part of a draft may read
+        as the base again while it ships: the base read counts unless the head holds the file as the fix left
+        it, spacing aside (`same_but_spacing`, class pass 20)."""
         # ponytail: one walk per file and read; cache reads per commit if a wide commit makes this slow.
         judged = []
         for name in names:
-            texts = [lines((blobs(rev, [name]) or {}).get(name)) or [] for rev in (f"{commits[index][0]}^",
-                                                                                  commits[index][0], *befores[1:])]
-            verdicts = [undone(index, [name], before) for at, before in enumerate(befores)
-                        if not at or not puts_back(texts[0], texts[1], texts[at + 1])]
+            fixed, text = (lines((blobs(rev, [name]) or {}).get(name)) for rev in (commits[index][0], head))
+            # The parent read alone judges a file the head holds as the fix left it, spacing aside.
+            whole = fixed is not None and text is not None and same_but_spacing(fixed, text)
+            verdicts = [undone(index, [name], before) for before in (befores[:1] if whole else befores)]
             if True in verdicts or False in verdicts:
                 judged.append(True in verdicts)
         return bool(judged) and all(judged)

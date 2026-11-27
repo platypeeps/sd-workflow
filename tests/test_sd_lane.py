@@ -4264,34 +4264,44 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
 
-    def test_a_partial_revert_to_the_base_keeps_a_fix_that_put_base_text_back(self) -> None:
-        """sd:10214 review, class pass 19: the base read overrode the parent read. A draft turned the API
-        off; the cited fix turned it back on and tidied the file; a revert of the tidying alone left the
-        file as the base has it. The fix still ships. A revert of a stacked fix that put no base text
-        back still undoes it."""
+    def test_a_revert_to_the_base_keeps_only_a_fix_it_left_whole(self) -> None:
+        """sd:10214 review, class pass 20: a cited fix both undid part of a draft and made a change of its own;
+        a revert of its own change left the file as the base has it. Which part was the item's work was
+        guessed from the lines the fix put back. The file's text decides instead: it holds the fix when it
+        reads as the fix left it, spacing aside (a revert of formatting), and no longer when a value or a
+        line differs (a revert of the fast mode the item asked for)."""
         import sd_operations
-        # A blank line, an absent file or a line the parent already had puts nothing back.
-        self.assertEqual([sd_lane.puts_back(old, fixed, held) for old, fixed, held in (
-            ([b"x"], [b"x", b"", b" "], [b"", b" "]), ([], [], [b"y"]), ([b"y"], [b"y", b"z"], [b"y"]),
-            ([b"n"], [b"y\xff"], [b"y\xff"]))], [False, False, False, True])
         a, *_ = self.open
-        base = "api: on\nname:  example\n"
-        for case, (cited, closes) in {"restores": ("api: on\nname: example\n", {a}),
-                                      "stacked": ("api: off\nname: example\nmode: fast\n", set())}.items():
+        for case, (base, draft, cited, closes) in {
+                # The fix turned the API back on and tidied the file; the revert took the tidying out.
+                "formatting": ("api: on\nname:  example\n", "api: off\nname:  example\n",
+                               "api: on\nname: example\n", {a}),
+                # The fix deleted the draft's line and tidied the file.
+                "deleted": ("name:  example\n", "deny: true\nname:  example\n", "name: example\n", {a}),
+                # The fix turned the API back on and set the fast mode its item asked for; the revert took
+                # the fast mode out.
+                "fast-mode": ("api: on\nmode: slow\n", "api: off\nmode: slow\n", "api: on\nmode: fast\n", set()),
+                # PR #727's case: a stacked fix that undid nothing of the draft.
+                "stacked": ("api: on\nname:  example\n", "api: off\nname:  example\n",
+                            "api: off\nname: example\nmode: fast\n", set())}.items():
             with self.subTest(case=case):
-                tree, _ = self.committed(f"topic-partial-to-base-{case}")
+                tree, _ = self.committed(f"topic-revert-to-base-{case}")
                 git(tree, "fetch", "-q", "origin")
                 git(tree, "reset", "-q", "--hard", "origin/main")
-                if not (tree / "settings.txt").exists():
-                    self.on_main(tree, {"settings.txt": base})
-                (tree / "settings.txt").write_text("api: off\nname:  example\n", encoding="utf-8")
-                git(tree, "commit", "-q", "-am", "feat: a draft that turns the api off")
-                (tree / "settings.txt").write_text(cited, encoding="utf-8")
-                git(tree, "commit", "-q", "-am", f"fix: the api\n\nCloses: sd:{a}")
-                (tree / "settings.txt").write_text(base, encoding="utf-8")
-                git(tree, "commit", "-q", "-am", "revert: formatting")
+                name = f"settings-{case}.txt"
+                self.on_main(tree, {name: base})
+                (tree / name).write_text(draft, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", "feat: a draft")
+                (tree / name).write_text(cited, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", f"fix: the settings\n\nCloses: sd:{a}")
+                (tree / name).write_text(base, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", "revert: part of the settings fix")
                 head = git(tree, "rev-parse", "HEAD")
                 self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
+        self.assertEqual([sd_lane.same_but_spacing(fixed, text) for fixed, text in (
+            ([b"a: 1", b""], [b"a:  1", b"", b"\t"]), ([b"a b"], [b"ab"]), ([b"a: 1"], [b"a: 2"]), ([], []),
+            ([b"a", b"b"], [b"b", b"a"]), ([b"\xff x"], [b"\xff  x"]), ([b"a"], []))],
+            [True, False, False, True, False, True, False])
 
     def test_a_merge_reads_the_move_each_parent_made(self) -> None:
         """sd:10214 review, class pass 18: a merge read only its first parent's moves. Its first parent
