@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+import sd_lib
 from sd_ship_bindings import adjudicator_binding
 from sd_ship_remote import Refusal, git
 
@@ -127,6 +128,19 @@ def recorded_key(operation: Any, bindings: dict) -> str:
     return "ship-adjudication:lead:" + where.split(":", 1)[1] if bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE else where
 
 
+#: The `context` entries a tool change moves; under `sd_lib.TOOL_CHANGES_KEEP_REVIEWS` a recorded
+#: rebuttal survives them (operator 2026-11-27). A policy change still re-reviews, so a new report
+#: (its digest and `passes_digest`) voids the rebuttal there.
+TOOL_BINDINGS = ("review_binding", "adjudicator_binding")
+
+
+def same_bindings(stored: object, current: dict) -> bool:
+    if sd_lib.TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict):
+        return digest({k: v for k, v in stored.items() if k not in TOOL_BINDINGS}) == digest(
+            {k: v for k, v in current.items() if k not in TOOL_BINDINGS})
+    return digest(stored) == digest(current)
+
+
 def context(operation: Any, head: str) -> tuple[dict, list[dict]]:
     if git(operation.root, "status", "--porcelain", "--untracked-files=all") or git(operation.root, "rev-parse", "HEAD") != head:
         raise Refusal("adjudication requires the clean exact reviewed head")
@@ -214,7 +228,7 @@ def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool = Fals
     bindings, expected = context(operation, head)
     if (not isinstance(proposal, dict) or set(proposal) != {"schema_version", "bindings", "findings"}
             or type(proposal["schema_version"]) is not int or proposal["schema_version"] != 1
-            or digest(proposal["bindings"]) != digest(bindings)):
+            or not same_bindings(proposal["bindings"], bindings)):
         raise Refusal("disposition proposal does not bind the current review, history, tools and head")
     rows = proposal["findings"]
     if not isinstance(rows, list) or len(rows) != len(expected):
@@ -367,7 +381,7 @@ def adjudicate(operation: Any) -> dict:
         # sd:9966: the dispositions this review already holds, which a filled template replaces whole.
         revision, value = operation.store.read(operation.connection, recorded_key(operation, bindings))
         held = (revision and value.get("decision") == "accepted"
-                and digest((value.get("proposal") or {}).get("bindings")) == digest(bindings))
+                and same_bindings((value.get("proposal") or {}).get("bindings"), bindings))
         return operation.result("disposition_template", proposal=proposal, recorded_revision=revision if held else None)
     try:
         proposal = json.loads(read_file(args.dispositions_file, MAX_PROPOSAL_BYTES), object_pairs_hook=unique_object)

@@ -691,7 +691,8 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
                 unstarted[ident] = f"cannot start {ident}'s supervisor: {error}"
 
         def lane(row: dict, items: list[int]) -> dict | None:
-            return build_run.lane_entry(tools(build_run).ship, build_run.paths.expand(row["repo"]), items)
+            return build_run.lane_entry(tools(build_run).ship, build_run.paths.expand(row["repo"]), items,
+                                        branch=row["branch"])
 
         interactive, uncounted = interactive_builders(connection, build_run.now(), build_run.paths.key)
         # The beat names the reason, so the hub can say why (pack sd:8606). The claim's own name: `why` also says

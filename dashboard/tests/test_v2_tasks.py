@@ -863,6 +863,7 @@ class TheScript(ScreenCase):
                     for i, s in enumerate(["planning", "ready", "in_progress", "blocked", "done"])]
         self.assertEqual(out["R"]["reg"], statuses + [
             ["item.complete", "item", "confirm", "5", True, True, False],
+            ["item.done.resolve", "item", "confirm", None, True, True, False],
             ["item.edit", "item", "safe", "e", None, True, False],
             ["item.move", "item", "safe", "m", None, True, False],
             ["item.p1", "item", "undo", None, None, True, True],
@@ -1727,6 +1728,31 @@ shellRun(cmd('note.resolve'), C.get('note:{note}')); await flush();""", answer)
         self.assertEqual(out["posts"], [[f"/api/notes/{note}/resolve", {"revision": row["revision"]}, 64]])
         self.assertEqual(out["toasts"], [[f"Resolved note {note} · sd note resolve {note}", False]])
 
+    def test_a_done_refused_on_open_followups_shows_each_and_done_resolve_all(self):
+        """sd:10429: the refusal names each followup; Details list each with Resolve, and Done, resolve all closes both."""
+        plan = self.ids["plan"]
+        note = self.details[str(plan)]["notes"][0]["id"]
+        refusal = f"item {plan} has open followups; resolve each first: resolve followup {note}"
+        answer = f"""(path, body) => !body.resolve_followups ? [400, {{ error: {json.dumps(refusal)} }}]
+  : [200, {{ item: {{ id: {plan}, status: 'done', priority: 2, due: '2026-09-09', recurrence: null }}, notes: [], revision: 'b'.repeat(64) }}]"""
+        out = self.run_page(f"""open({plan}); await flush(); R.before = ELS.details.html;
+shellRun(cmd('item.status.done'), C.get('{plan}')); await flush(); R.after = ELS.details.html;
+R.unshown = await cmd('item.done.resolve').run(C.get('{plan}')).then(() => 'ran', e => e.message);
+R.consequence = cmd('item.done.resolve').consequence(C.get('{plan}'));
+shellRun(cmd('item.done.resolve'), C.get('{plan}')); await flush();""", answer)
+        self.assertIn("not shown", out["R"]["unshown"])
+        self.assertNotIn("Done waits on", out["R"]["before"])
+        after = out["R"]["after"]
+        self.assertIn("Done waits on 1 open followup", after)
+        self.assertIn(refusal, after)
+        self.assertIn(f'<li data-note="{note}"><span><b>followup {note}</b> Check the budget first', after)
+        self.assertIn(f'data-cmd="item.done.resolve" data-obj="{plan}">Done, resolve all</button>', after)
+        self.assertIn(f"Resolves followup {note} and moves", out["R"]["consequence"])
+        self.assertEqual(out["confirms"], ["item.done.resolve"])
+        sent = [{k: v for k, v in p[1].items() if k != "revision"} for p in out["posts"]]
+        self.assertEqual(sent, [{"status": "done"}, {"status": "done", "resolve_followups": [note]}])
+        self.assertIn(f"sd task status {plan} done --resolve-followups", out["toasts"][-1][0])
+
     def owned_work(self):
         """A work item in a repository the database owns, with no assignment: sd work relink and cancel take it."""
         owned = self.repo("/repos/owned")
@@ -2385,6 +2411,21 @@ if (D) { D.returnValue = 'build'; D.onclose(); await flush(); }"""
         with patch.object(build, "split_held", side_effect=lambda connection, item: item == held):
             self.doc = tasks_screen.document(self.connection, now=NOW)
         out = self.run_page(f"R.on = cmd('item.build').when(C.get('{held}'));"
+                            f" R.off = cmd('item.build').when(C.get('{other}'));", "() => [404, {}]")
+        self.assertIs(out["R"]["on"], True)
+        self.assertIn("a build takes a ready task", out["R"]["off"])
+
+    def test_build_is_on_for_a_blocked_item_its_own_build_left_behind(self):
+        """Review of build/sd-1867: the press takes an item its own build blocked once its bundle shipped
+        (`build._rebuild_since`), but the row's flag read a held split only, so Build stayed greyed out."""
+        from sd_db import build
+
+        left, other = self.ids["plan"], self.ids["port"]
+        for item in (left, other):
+            self.connection.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
+        with patch.object(build, "_rebuild_since", side_effect=lambda connection, item: "" if item == left else None):
+            self.doc = tasks_screen.document(self.connection, now=NOW)
+        out = self.run_page(f"R.on = cmd('item.build').when(C.get('{left}'));"
                             f" R.off = cmd('item.build').when(C.get('{other}'));", "() => [404, {}]")
         self.assertIs(out["R"]["on"], True)
         self.assertIn("a build takes a ready task", out["R"]["off"])
