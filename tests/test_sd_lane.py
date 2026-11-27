@@ -4264,6 +4264,46 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
 
+    def test_a_merge_reads_the_move_each_parent_made(self) -> None:
+        """sd:10214 review, class pass 18: a merge read only its first parent's moves. Its first parent
+        reverted x, its second moved x to y with the fix; a merge that keeps y as moved still ships the
+        fix, at either parent order. Git's own merge carries the revert into y and undoes it."""
+        import sd_operations
+        a, *_ = self.open
+        original = "".join(f"line {n}\n" for n in range(20))
+        fixed = original.replace("line 7\n", "line 7 fixed\n")
+        for case, (first, y_text, closes) in {"kept": ("main", fixed, {a}), "kept-moved-first": ("side", fixed, {a}),
+                                              "carried": ("main", original, set()),
+                                              "carried-moved-first": ("side", original, set())}.items():
+            with self.subTest(case=case):
+                tree, _ = self.committed(f"topic-merge-moves-{case}")
+                git(tree, "fetch", "-q", "origin")
+                git(tree, "reset", "-q", "--hard", "origin/main")
+                if not (tree / "x.txt").exists():
+                    self.on_main(tree, {"x.txt": original})
+                (tree / "x.txt").write_text(fixed, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", f"fix: line 7\n\nCloses: sd:{a}")
+                git(tree, "branch", "-f", "moves")
+                git(tree, "checkout", "-q", "moves")
+                git(tree, "mv", "x.txt", "y.txt")
+                git(tree, "commit", "-q", "-m", "refactor: rename x to y")
+                git(tree, "checkout", "-q", "-")
+                (tree / "x.txt").write_text(original, encoding="utf-8")
+                git(tree, "commit", "-q", "-am", "revert: line 7")
+                if first == "side":
+                    git(tree, "branch", "-f", "reverts")
+                    git(tree, "reset", "-q", "--hard", "moves")
+                    other = "reverts"
+                else:
+                    other = "moves"
+                git(tree, "merge", "-q", "--no-ff", "--no-commit", other)
+                (tree / "x.txt").write_text(original, encoding="utf-8")
+                (tree / "y.txt").write_text(y_text, encoding="utf-8")
+                git(tree, "add", "-A")
+                git(tree, "commit", "-q", "-m", "Merge the two lines")
+                head = git(tree, "rev-parse", "HEAD")
+                self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), closes)
+
     def test_a_submodule_link_holds_no_text_and_hides_no_revert(self) -> None:
         """sd:10214 class pass 10: a submodule link is a commit, not text. An unrelated link the head changed
         is no failed read that keeps a reverted item's close, and a cited link a revert set back is undone."""

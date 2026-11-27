@@ -1182,6 +1182,22 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             return now.get(at) == want.get(name)
         return all(one(at, name) for at, name in zip(held, names, strict=True))
 
+    def places_in(later: str, held: list[str], revert: bool, names: list[str],
+                  places: dict[str, dict[str, str]]) -> list[dict[str, str]] | None:
+        """Where `later` holds `names`, once per parent in `held` that held the work, each place `places` gives
+        for that parent followed through the renames git pairs from it; None when git gave no answer. A merge
+        reads each parent's moves: one side may revert the file while the other moves it, and the moved file
+        ships the fix (class pass 18)."""
+        wheres: list[dict[str, str]] = []
+        for parent in held or [""]:
+            step = {} if revert else renames_since(parent, later) if parent else None
+            if step is None:
+                return None
+            where = {name: step.get(old, old) for name in names
+                     for old in [places[parent].get(name, name)] if step.get(old, old) != name}
+            wheres.extend([] if where in wheres else [where])
+        return wheres
+
     def undone(index: int, names: list[str], before: str) -> bool | None:
         """Whether reverts alone took the work in `names` out; None when the cited commit itself left them as
         `before` (a fix that restores the base), so no later commit undid anything there."""
@@ -1220,19 +1236,18 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 return forked in left and left[forked] is None
 
             revert = bool(sd_ship_body.REVERT_SUBJECT.match(text))
-            # ponytail: a merge follows its first parent that held the work; read each side if two move it.
-            step = {} if revert else renames_since(held[0], later) if held else None
-            if step is None:
+            wheres = places_in(later, held, revert, names, places)
+            if wheres is None:
                 return False
-            where = places[later] = {name: step.get(old, old) for name in names
-                                 for old in [places[held[0]].get(name, name)] if step.get(old, old) != name}
+            reads = [git_answered(reads_before(where, later, names, before, moved, sha)) for where in wheres]
+            places[later] = next((where for where, read in zip(wheres, reads, strict=True) if not read), wheres[0])
 
-            def back(later: str = later, where: dict[str, str] = where) -> bool:
+            def back(later: str = later, wheres: list[dict[str, str]] = wheres) -> bool:
                 # Both names, as the reads above: a stale mapping hides the work back at the old name.
-                return git_answered(reads_before(where, later, names, sha)) or \
+                return any(git_answered(reads_before(where, later, names, sha)) for where in wheres) or \
                     git_answered(reads_before({}, later, names, sha))
 
-            was[later] = git_answered(reads_before(where, later, names, before, moved, sha))
+            was[later] = all(reads)
             left[later] = work_left(was[later], revert,
                                     [(was[parent], left[parent]) for parent in held], back, forked_in)
             if unread:
