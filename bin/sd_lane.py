@@ -1064,8 +1064,9 @@ def mode_holds(cited: str, holder: str, cited_path: str, holder_path: str, scrip
     """Whether an entry of mode `holder` at `holder_path` can hold the work of one of mode `cited` at
     `cited_path`: the same kind, or an executable file for a plain one, with the same file suffix. A
     plain-text copy of an executable does not run, nor does a script kept in a document (class pass 11).
-    The executable bit is the work only for a `script`, a file that starts with `#!`: a module runs by
-    import, so a plain copy of an executable one still holds its work (class pass 24)."""
+    The executable bit is the work only for a `script`, a file that starts with `#!` and is no `.py`
+    file: a module runs by import, so a plain copy of an executable one still holds its work (class
+    passes 24 and 25)."""
     # ponytail: the suffix stands for the file's kind; a move that renames `tool` to `tool.py` loses its
     # close (fixed by hand), never a false close. Read the language if that matters.
     return (holder == cited or (cited, holder) == TEXT_MODES or
@@ -1143,9 +1144,15 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                                             (line.partition("\t") for line in listed if line)}
 
     @functools.cache
-    def script(blob: str) -> bool:
-        """Whether `blob` starts with `#!`, so its executable bit is part of its work; True when git gives
-        no answer: the bit then counts, as it did before class pass 24 (a lost close, never a false one)."""
+    def script(blob: str, path: str) -> bool:
+        """Whether the executable bit of `blob` at `path` is part of its work: it starts with `#!` and is no
+        `.py` file, which something may import whatever its bit or first line (class pass 25); True when
+        git gives no answer: the bit then counts, as it did before class pass 24."""
+        # ponytail: a `.py` file run only by its path and disabled by its bit keeps its close (a wrong close
+        # a reopen recovers, decision on sd:10214); a sourced shell library loses one. Read the callers if
+        # either matters.
+        if pathlib.PurePosixPath(path).suffix == ".py":
+            return False
         try:
             done = subprocess.run(["git", "cat-file", "blob", blob], cwd=worktree, capture_output=True,
                                   timeout=PUBLISH_SECONDS, check=False, env=sd_lib.without_fsmonitor(os.environ))
@@ -1164,7 +1171,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             meta = status[at].split()
             names = 2 if meta[-1][:1] in "RC" else 1
             if meta[-1][:1] == "R" and at + 2 < len(status) and \
-                    mode_holds(meta[0][1:], meta[1], status[at + 1], status[at + 2], script(meta[2])):
+                    mode_holds(meta[0][1:], meta[1], status[at + 1], status[at + 2], script(meta[2], status[at + 1])):
                 found[status[at + 1]] = status[at + 2]
             at += 1 + names
         return found
@@ -1216,7 +1223,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
 
         def runs(path: str, name: str) -> bool:
             wrote = fix.get(name)
-            return runs_as(now.get(path), wrote, path, name, not wrote or script(wrote.split()[-1]))
+            return runs_as(now.get(path), wrote, path, name, not wrote or script(wrote.split()[-1], name))
 
         def holds(path: str, name: str) -> bool:
             """Whether `path` holds the text of the fix `cited` left at `name`: its blob, or what it changed

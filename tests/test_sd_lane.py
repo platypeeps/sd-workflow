@@ -4203,20 +4203,23 @@ class CitedCloses(SharedQueue):
         """sd:10214 review, class pass 24: the executable bit is the work only for a script, a file that
         starts with `#!`. A revert that clears the bit of a Python module, which runs by import, leaves the
         fix shipping: at its own name, after a move, at a stale mapping's new name, and through a refactor
-        that moves the module and clears the bit at once. A script so disabled still undoes it."""
+        that moves the module and clears the bit at once. A `.py` file that starts with `#!` is a module
+        too: something may import it, so its bit proves nothing (class pass 25). A shell script so disabled
+        still undoes it (test_a_revert_that_disables_a_delivered_executable_undoes_it)."""
         import sd_operations
         a, *_ = self.open
         module = "".join(f"STEP_{n} = {n}\n" for n in range(20))
         script = "#!/usr/bin/env python3\n" + module
-        for case, closes in (("in-place", {a}), ("moved", {a}), ("stale", {a}), ("refactor", {a}),
-                             ("script", set())):
+        for case in ("in-place", "moved", "stale", "refactor",
+                     "shebang-in-place", "shebang-moved", "shebang-stale", "shebang-refactor"):
             with self.subTest(case=case):
-                original = script if case == "script" else module
+                original = script if case.startswith("shebang") else module
+                closes, case = {a}, case.removeprefix("shebang-")
                 fixed = original.replace("STEP_7 = 7\n", "STEP_7 = 70\n")
-                tree, _ = self.committed(f"topic-mode-only-module-{case}")
+                tree, _ = self.committed(f"topic-mode-only-module-{len(original)}-{case}")
                 git(tree, "fetch", "-q", "origin")
                 git(tree, "reset", "-q", "--hard", "origin/main")
-                lib = f"lib_{case.replace('-', '_')}.py"
+                lib = f"lib_{len(original)}_{case.replace('-', '_')}.py"
                 self.on_main(tree, {lib: original})
                 (tree / lib).chmod(0o755)
                 git(tree, "add", lib)
