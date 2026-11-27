@@ -83,12 +83,18 @@ def lead_context(operation: Any, head: str) -> tuple[dict, list[dict]] | None:
     the ship receipt holds no pass of `head`: a lead's rejection is a rebuttal in the store `sd-review` reads.
     None, and the ship review decides, for a record of another subject, head or status, or one that does not read."""
     import sd_lib  # noqa: PLC0415
+    import sd_ship_review  # noqa: PLC0415 -- it imports this module
 
     passes = operation.history.native(operation.state)
-    # A reserved pass a failed prepare left has no report: it is no review of `head` (ruling round, sd:10926).
-    if passes and (operation.state.get("reviewed_head") == head or (
-            passes[-1].get("head") == head and isinstance(passes[-1].get("report"), dict))):
-        return None
+    # The ship pass decides only when the review loader takes it (`review_inputs`): a reserved pass a failed
+    # prepare left, or one a timed-out reviewer left short of depth, is no review of `head` (lead ruling, sd:10926).
+    if passes:
+        last = passes[-1]
+        report = last.get("report") if isinstance(last.get("report"), dict) else {}
+        subject = operation.carried_from(head, last)
+        reviewed = subject if subject != head else operation.state.get("reviewed_head")
+        if sd_ship_review.missing_part(last, report, subject, reviewed) is None:
+            return None
     found = operation.connection.execute(
         "SELECT body FROM state WHERE id = (SELECT MAX(id) FROM state WHERE kind = 'checkpoint' AND key = ?)",
         (sd_lib.lead_review_key(operation.repository, operation.branch),)).fetchone()
