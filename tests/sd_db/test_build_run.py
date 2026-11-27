@@ -1223,8 +1223,10 @@ class Supervise(Case):
         return self.supervisor(**options).run()
 
     def decisions(self, item=None):
+        """Each ruling the run noted: a comment, as every note the library writes is (sd:3008)."""
         return [body for (body,) in self.db.execute(
-            "SELECT body FROM note WHERE item = ? AND kind = 'decision' ORDER BY id", (item or self.items[0],))]
+            "SELECT body FROM note WHERE item = ? AND kind = 'comment' AND body GLOB 'Build run * ruling [0-9]* at *' "
+            "ORDER BY id", (item or self.items[0],))]
 
     def rebuttals(self):
         return [json.loads(body)["proposal"] for (body,) in self.db.execute(

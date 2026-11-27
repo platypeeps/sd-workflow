@@ -268,7 +268,7 @@ not fix everything: rule each numbered blocker below by the merge-lane rule, the
 Record nothing yourself: run no `sd` command for a ruling. Write them as a JSON list to `{rulings}`, the
 one more file outside the worktree you may write, one object per blocker, every blocker ruled:
 {{"blocker": <its number>, "ruling": "fix" | "reject" | "file" | "ask", "reason": "<one line>"}}
-The supervisor reads that file after your last commit: it notes each ruling as a decision, records each
+The supervisor reads that file after your last commit: it notes each ruling on the item, records each
 reject and file as a rebuttal at the final head, files the items and asks the questions. A blocker with no
 ruling it can read stays a blocker. Then update the body at {body}. Never push. Your final message is
 your report: each blocker, its ruling and reason, and the test of each fix.
@@ -2295,7 +2295,7 @@ class Supervisor:
         end when one is the operator's, else None.
 
         The supervisor writes what the builder cannot: the builder's review is no ship review `sd-ship
-        adjudicate` reads, and no blocker names a bundle member. So each ruling is a decision note on the lead;
+        adjudicate` reads, and no blocker names a bundle member. So each ruling is a note on the lead;
         a reject or file is a rebuttal in the record `sd-review` reads for this branch, bound to `head`, the
         head after the round's last commit; a file is an item too. An `ask` ends the run with the question on
         every member, so none is delivered around it. No file, or a blocker with no ruling that reads, changes
@@ -2379,7 +2379,7 @@ class Supervisor:
         """The review after the ruling round, less each blocker that repeats one ruled REJECT or FILE at `head`
         (lead ruling on sd:10286): a repeat that cites evidence blocks past its rebuttal in `sd-review`, so the
         ruling clears it here. A repeat is the same file and summary at any line: the round's fixes move lines.
-        The ruled blockers come from the checkpoints `rule` wrote with each decision note, never the round's
+        The ruled blockers come from the checkpoints `rule` wrote with each ruling note, never the round's
         file: a replay after the review rewrote it would shift a number onto another blocker. A repeat is the
         same record (`place`): the same words at another line, or other words, instances or evidence at the
         same line, are another claim, and a fix that moved the line parks the run, fail closed. A FIX ruling,
@@ -2413,7 +2413,7 @@ class Supervisor:
     def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str,
              changed: Collection[str] | None = (), moved: Collection[str] | None = (),
              functions: Collection[str] | None = (), reached: Collection[str] = ()) -> None:
-        """One ruling's writes in one transaction: the decision note, a filed item, the rebuttal (sd:10286).
+        """One ruling's writes in one transaction: the ruling note, a filed item, the rebuttal (sd:10286).
 
         A reject or file judged the code at the reviewed head. `moved` is what the round's own commits changed
         since: one that changed a file the blocker names can make it reachable, so that ruling is noted and
@@ -2441,7 +2441,8 @@ class Supervisor:
         finding = finding and not lapsed
         mark = f"Build run {self.ident} ruling {number} at {head[:12]}: "
         with transaction(self.db):
-            if self.db.execute("SELECT 1 FROM note WHERE item = ? AND kind = 'decision' AND substr(body, 1, ?) = ?",
+            # Any kind: a run from before sd:3008 applied here wrote this note as a decision.
+            if self.db.execute("SELECT 1 FROM note WHERE item = ? AND substr(body, 1, ?) = ?",
                                (self.lead, len(mark), mark)).fetchone():
                 return
             filed = None
@@ -2452,7 +2453,8 @@ class Supervisor:
                 add_note(self.db, filed, "comment", f"Build run {self.ident}'s ruling round filed this review "
                                                     f"blocker, not caused by its change ({reason}): "
                                                     f"{self.summary([row], None)}")
-            add_note(self.db, self.lead, "decision",
+            # A comment: a note the library writes is never a decision, whoever ruled (sd:3008).
+            add_note(self.db, self.lead, "comment",
                      (f"{mark}{ruling.upper()}{f' as sd:{filed}' if filed else ''}, {reason}{lapsed}. Blocker: {said}"
                       )[:build.FINDING_MAX])
             if ruling in ("reject", "file") and finding:  # the blocker itself, for `settled`
