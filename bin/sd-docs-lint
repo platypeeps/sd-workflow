@@ -381,7 +381,9 @@ def own_only(line: bytes, flags: list[str], own: re.Pattern[str]) -> bool:
     one it replaces, and the line is read again until no match is left.
     One byte a read: blanking every match found at once could erase a
     skipped match that crosses two of them (`hop/shop` in `shop/shop`,
-    sd:10778). Each match is then the leftmost of some read. Anything
+    sd:10778). Each match is then the leftmost of some read, and grep
+    reports the longest from a start, so the blanked byte begins no
+    longer match left unread. Anything
     unexpected fails: no offset, an empty match, a read that changes nothing."""
     try:
         text = line.decode("utf-8")
