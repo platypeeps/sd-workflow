@@ -380,13 +380,17 @@ def base_check(root: pathlib.Path, subject: Subject, readers: set[str]) -> Calla
     """Whether a finding's `base: has` holds: a claim, so git decides (sd:10892 last round). It holds only from
     one of `readers`, who read the checkout (a patch shows no named commit), and only when every place it names
     is a line of a file the main merge base holds that nothing since touched. A deleted line counts as
-    touching the lines beside it. Git failing, or a diff not from the main merge base, holds nothing."""
+    touching the lines beside it; a mode, type or presence change touches the whole file (round 5). Git failing,
+    or a diff not from the main merge base, holds nothing."""
     spec = f"{subject.main_base}..{subject.head}"
     def _untouched(place: str) -> bool:
         path, _, line = place.rpartition(":")
-        if not path or re.fullmatch(r"[0-9]+", line) is None or sd_lib.git_output(["cat-file", "-e", f"{subject.main_base}:{path}"], root) is None:
+        entries = {(sd_lib.git_output(["ls-tree", end, "--", f":(literal){path}"], root) or "")[:12]  # mode, type
+                   for end in (subject.main_base, subject.head)}
+        kind = next(iter(entries)) if len(entries) == 1 else None  # a mode, type or presence change: touched
+        if not path or re.fullmatch(r"[0-9]+", line) is None or not kind or not re.match(r"100[0-7]{3} blob ", kind):
             return False
-        diff = sd_lib.git_output(["diff", "-U0", "--text", "--no-ext-diff", spec, "--", path], root)
+        diff = sd_lib.git_output(["diff", "-U0", "--text", "--no-ext-diff", "--no-renames", spec, "--", f":(literal){path}"], root)
         return diff is not None and not any(
             int(start) <= int(line) <= int(start) + (int(count or 1) or 2) - 1  # `,0`: a deletion, both sides
             for start, count in re.findall(r"^@@ -[0-9,]+ \+([0-9]+)(?:,([0-9]+))? @@", diff, re.M))

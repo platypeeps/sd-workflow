@@ -1242,11 +1242,15 @@ class LineBudgetTests(unittest.TestCase):
         # a diff from the main merge base is asked or judged (`_judged`).
         # Measured: `sd-review` is 3361,
         # after the merge of origin/main (sd:10918, build/sd-2233).
+        #
+        # 5331 -> 5335 is sd:10892 round 5: `bin/sd-review` +4 so `base_check`
+        # counts a mode, type or presence change as touching the whole file.
+        # Measured: `sd-review` is 3365.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5331,
+            5335,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

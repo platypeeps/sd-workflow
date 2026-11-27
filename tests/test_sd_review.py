@@ -1259,6 +1259,28 @@ class PipelineTests(ReviewFixture):
                 self.assertIs(sd_review.base_check(root, subject, {"local"})(row()), False)
         self.assertFalse((root / "x").exists())
 
+    def test_a_has_answer_holds_on_no_file_the_branch_changed_outside_its_lines(self) -> None:
+        """sd:10892 round 5: git shows a mode change, a deletion or a rename outside the line hunks a
+        `-U0` diff counts. A file the branch changed that way is touched at every line: nothing holds."""
+        root = self.make_repo()
+        names = ("tool.sh", "gone.py", "moved.py", "linked.py", "kept.py")
+        for name in names:
+            (root / name).write_text("a = 1\nb = 2\nc = 3\nd = 4\n", encoding="utf-8")
+        (root / "tool.sh").chmod(0o755)
+        self._topic_commit(root, "seed.py")
+        subprocess.run(["git", "checkout", "--quiet", "-b", "topic"], cwd=str(root), check=True, env=clean_environment())
+        (root / "tool.sh").chmod(0o644)  # the execute bit removed
+        (root / "gone.py").unlink()
+        (root / "moved.py").rename(root / "elsewhere.py")
+        (root / "linked.py").unlink()
+        (root / "linked.py").symlink_to("kept.py")
+        self._topic_commit(root, "first.py")
+        check = sd_review.base_check(root, sd_review.resolve_subject(root, "branch"), {"local"})
+        for name, held in (("kept.py", True), ("tool.sh", False), ("gone.py", False),
+                           ("moved.py", False), ("linked.py", False)):
+            with self.subTest(name):
+                self.assertIs(check({"path": name, "line": 3, "backend": "local", "base": "has"}), held)
+
     def test_no_has_answer_holds_without_a_main_merge_base(self) -> None:
         root = self.make_repo()
         subprocess.run(["git", "branch", "-m", "main", "trunk"], cwd=str(root), check=True, env=clean_environment())
