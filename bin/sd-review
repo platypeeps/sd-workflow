@@ -937,8 +937,9 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
     """`records`, newest first, with each listed rebuttal and each newer ruling of its summary at the lines `kept`
     moved them to; `listed` only for a rebuttal that is still the newest at its place there (`rebuttals`). Each
     path is read in `spelled`'s one spelling first: `./a.py` and `a.py` are one place (bin/sd-review:967)."""
+    _LINED = re.compile(r"(?s)(.*):([0-9]+)")  # a place; an instance with no line is a file whose change lapses the ruling, a judged dependency
     def _spelled(entry: str) -> str:  # the pattern `_moved` reads, so a line it lapses still lapses
-        found = re.fullmatch(r"(?s)(.*):([0-9]+)", entry)
+        found = _LINED.fullmatch(entry)
         return f"{spelled(found[1])}:{found[2]}" if found else spelled(entry)
     records = [record._replace(path=spelled(record.path), instances=tuple(map(_spelled, record.instances)))
                for record in records]
@@ -947,21 +948,20 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
         line = kept(record.head, record.path, record.line)
         instances = []
         for entry in record.instances if line is not None else ():
-            found = re.fullmatch(r"(?s)(.*):([0-9]+)", entry)
+            found = _LINED.fullmatch(entry)
             at = (kept(record.head, found[1], int(found[2])) if len(found[2]) < 10 else None) if found else kept(record.head, entry, None)
             if at is None:
                 return None
             instances.append(f"{found[1]}:{at[0]}" if found else entry)
         return None if line is None else record._replace(line=line[0], instances=tuple(instances))
     placed: dict[int, Rebuttal | None] = {}
-
     def _placed(index: int) -> Rebuttal | None:
         if index not in placed:
             placed[index] = _moved(records[index])
         return placed[index]
 
     def _named_files(record: Rebuttal) -> set[str]:
-        return {str(record.path), *(re.sub(r":[0-9]+$", "", entry) for entry in record.instances)}
+        return {str(record.path), *(found[1] for found in filter(None, map(_LINED.fullmatch, record.instances)))}
 
     # Newest at its place is read where the places are now (sd:10191 review): receipts of two heads number one
     # line differently, so every newer ruling of the summary is placed first. One that cannot be placed may
@@ -973,7 +973,7 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
         if moved is not None and not any(_placed(n) is None and _named_files(records[n]) & _named_files(record)
                                          for n in newer) and recorded_at(
                 [*(at for n in newer for at in [_placed(n)] if at is not None), moved],
-                moved.path, moved.summary, moved.line, list(moved.instances)) is moved:
+                moved.path, moved.summary, moved.line, [*filter(_LINED.fullmatch, moved.instances)]) is moved:
             shown[index] = moved
     return [shown.get(index) or (placed.get(index) or record)._replace(listed=False)
             for index, record in enumerate(records)]

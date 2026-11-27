@@ -1895,6 +1895,21 @@ class RebuttalScopeTests(RepeatFixture):
         placed = sd_review.rulings_placed([newer, older], lambda _head, _path, line: (line,))
         self.assertEqual([entry.listed for entry in placed], [False, False])
 
+    def test_a_shared_dependency_file_is_not_a_place_two_rulings_share(self) -> None:
+        """Review of sd:10191 (bin/sd-review:973, :975): a build files every judged file as a bare instance, so two
+        rebuttals of one summary at lib/tool.py:20 and :60 both name `src/caller.py`. Placement read that file as
+        a place both sit at, and the newer unlisted the older with no file changed. A bare file lapses a ruling
+        when it changes; only a `path:line` is a place."""
+        def ruling(path: str, line: int, listed: bool = True) -> Any:
+            return sd_review.Rebuttal("head", path, "s", line, listed, path, "x", "y", (f"{path}:{line}", "src/caller.py"))
+        placed = sd_review.rulings_placed([ruling("lib/tool.py", 60), ruling("lib/tool.py", 20)],
+                                          lambda _head, _path, line: (line,))
+        self.assertEqual([entry.listed for entry in placed], [True, True])
+        # A newer ruling that cannot be placed decides for the files its places are in, not for a dependency.
+        placed = sd_review.rulings_placed([ruling("lib/other.py", 30, False), ruling("lib/tool.py", 20)],
+                                          lambda _head, _path, line: None if line == 30 else (line,))
+        self.assertEqual([entry.listed for entry in placed], [False, True])
+
     def test_a_newer_ruling_in_another_spelling_decides_for_an_older_rebuttal(self) -> None:
         """Review of sd:10191 (bin/sd-review:967): a newer parked ruling at `./src.py:20` and an older
         rebuttal at `src.py:20` name one place, but placement compared the raw spellings and listed the
