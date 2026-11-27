@@ -60,6 +60,7 @@ from sd_db.workflow import WorkflowError
 
 from . import issue_filing, sweep
 from .markup import href
+from .now_screen import ADVISORY_REFS
 
 __all__ = ["details", "document"]
 
@@ -180,6 +181,8 @@ def _rows(connection, rows, found, *, now: str) -> list[dict]:
             # File GitHub issue and File Jira issue (sd:5103): where each would file, or why it is off; and the
             # issue the item's ref names, for the row's link icon.
             "issue_targets": filing[row["repo"]], "issue_link": issue_filing.link_of(state["item"]),
+            # sd:10915: an advisory item, so a refresh hides one filed after /api/now's `advisories.ids` read.
+            "advisory": row["source"] == "task-ref" and str(row["external_id"] or "").startswith(ADVISORY_REFS),
             **_base_fields(state["item"]),
         })
     return out

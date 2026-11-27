@@ -1895,6 +1895,8 @@ class Supervisor:
             return None
         last, mine = self.review_files()
         kept = self.out("prior")
+        carried: list[dict] | None = None  # the open blockers of a last report at `head`
+        verified: Any = None  # the digest of the prior that report verified
         for path in (last, mine):
             try:
                 text = path.read_text(encoding="utf-8")
@@ -1913,8 +1915,21 @@ class Supervisor:
                     return None
                 continue
             reviewed = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
-            if reviewed == head:  # a fix with no commit: an older report would omit this round's blockers
-                return None
+            if reviewed == head:
+                # A fix with no commit (a rebuttal): the older kept report verifies the same delta again, its
+                # blockers replaced by the ones this round left open (sd:10902). Anything else reviews in full.
+                # A round short of a reader, or one that covers no branch, cleared a blocker on part of the
+                # answers: its verdicts replace nothing.
+                if (path != last or not isinstance(answer, dict) or not isinstance(answer.get("findings"), list)
+                        or not 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
+                        or answer.get("review_shortfall") or not answer.get("covers_from")):
+                    return None
+                # Each read at this head, with no pass number: `sd-review` walks a row's path from its own
+                # `prior_review.head`, and reads a pass number against the older report's history.
+                carried = [dict(row, prior_review={"head": head}) for row in answer["findings"]
+                           if isinstance(row, dict) and row.get("disposition") == "blocking"]
+                verified = answer.get("verification_report_digest")
+                continue
             # `sd-review` verifies only these statuses: a `skipped` round has no prior to verify (sd:2721).
             if (not isinstance(reviewed, str) or answer.get("scope") != "branch"
                     or answer.get("status") not in ("clean", "advisory", "blocking", "gate_failed")
@@ -1935,6 +1950,20 @@ class Supervisor:
                 if path == last:
                     return None
                 continue
+            if carried is not None:
+                # One row for each open blocker, so one verdict id: the last round verified this report and
+                # carried what it left open, so its blockers are the open ones, a cleared one among neither.
+                # No row is matched across the two reports. Its digest names the report it verified; a kept
+                # report that already holds exactly its blockers is a re-run of this step.
+                held = [row for row in answer["findings"]
+                        if isinstance(row, dict) and row.get("disposition") == "blocking"]
+                if held != carried and verified != hashlib.sha256(
+                        json.dumps(answer, sort_keys=True).encode()).hexdigest():
+                    return None  # it verified another prior, or none: review the branch in full
+                rest = [row for row in answer["findings"] if row not in held]
+                answer["findings"] = [*rest, *carried]
+                if carried:
+                    answer["status"] = "blocking"
             for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
                 if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
                     row["path"] = self.locations({"path": row["path"]})[0][0]
