@@ -3707,6 +3707,57 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [b])
 
+    def _side_merge(self, name: str, mainline_fix: int, side_fix: int) -> tuple[pathlib.Path, str]:
+        """Topic commit `a.txt` citing `mainline_fix` and side commit `side.txt` citing `side_fix`, each by a
+        `Lane review fix` line, then the side merged in; the merge's short sha."""
+        tree, _ = self.committed(name)
+        git(tree, "switch", "-q", "-c", f"{name}-side")
+        (tree / "side.txt").write_text("side\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", f"fix: side\n\nLane review fix, pack sd:{side_fix}: y.")
+        git(tree, "switch", "-q", name)
+        (tree / "a.txt").write_text("guard\n", encoding="utf-8")
+        git(tree, "add", "a.txt")
+        git(tree, "commit", "-q", "-m", f"fix: guard\n\nLane review fix, pack sd:{mainline_fix}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", f"{name}-side")
+        return tree, git(tree, "rev-parse", "--short=9", "HEAD").strip()
+
+    def _move(self, tree: pathlib.Path, old: str, new: str) -> None:
+        """A later commit, citing nothing, that keeps `old`'s fix in `new`."""
+        (tree / old).unlink()
+        (tree / new).write_text("moved\n", encoding="utf-8")
+        git(tree, "add", "-A")
+        git(tree, "commit", "-q", "-m", f"refactor: keep the fix in {new}")
+
+    def test_a_listed_merge_reads_no_commit_on_the_side_its_revert_kept(self) -> None:
+        """Review of build/sd-1654 (sd_lane.py:1018): the file check read both sides of a listed merge, so
+        a topic commit the `-m 1` revert kept, whose fix a later commit moved, lost its citation. A side
+        file that is not UTF-8 reads too."""
+        b, c, *_ = self.open
+        tree, merge = self._side_merge("topic-kept-side", b, c)
+        (tree / "side.bin").write_bytes(b"\xff\xfe side\n")
+        git(tree, "add", "side.bin")
+        git(tree, "commit", "-q", "--amend", "--no-edit")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        self._move(tree, "a.txt", "b.txt")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_listed_merge_reverted_on_its_other_side_reads_the_side_it_undid(self) -> None:
+        """Review of build/sd-1654 (sd_lane.py:1041): a revert listing the merge undid its topic side
+        (`-m 2`). The side commit survived, its fix moved by a later commit, and the file check dropped it."""
+        b, c, *_ = self.open
+        tree, merge = self._side_merge("topic-other-side", b, c)
+        git(tree, "revert", "--no-commit", "-m", "2", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the guard\n\nReverted commits:\n\n- {merge} the merge\n")
+        self._move(tree, "side.txt", "other.txt")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [c])
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open

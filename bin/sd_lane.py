@@ -1005,19 +1005,41 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
 
 
 def listed_sides(worktree: pathlib.Path, commits: list[tuple[str, str]]) -> set[str]:
-    """The side commits of each merge a hand-written revert in `commits` lists (pack sd:10108): both sides since
-    the merge base, since the list names no mainline (`-m 1` or `-m 2`). A listed commit that is no merge, or an
-    ambiguous prefix (git refuses one), reads nothing; so does a failed read."""
+    """The side commits each merge a hand-written revert in `commits` lists brought in over the parent the
+    revert kept (pack sd:10108). The list names no mainline, so the revert's own patch decides it: the side
+    whose undoing matches the revert's patch id (`-m 1` or `-m 2`). Both sides read, a commit the revert kept
+    lost its citation when a later commit moved its fix (review of build/sd-1654). A revert that matches
+    neither side, a listed commit that is no merge, an ambiguous prefix (git refuses one) or a failed read
+    reads nothing."""
     import sd_ship_body  # noqa: PLC0415
     sides: set[str] = set()
-    for _, message in commits:
+    for revert, message in commits:
         if not sd_ship_body.REVERT_SUBJECT.match(message):
             continue
+        undid = _patch_id(worktree, f"{revert}^", revert)
         for prefix in sd_ship_body._listed_undone(message):  # noqa: SLF001
             named = [sha for sha, _ in commits if sha.startswith(prefix)]
-            listed = publish_git(worktree, "rev-list", f"{named[0]}^1...{named[0]}^2") if len(named) == 1 else None
+            kept = next((parent for parent in (1, 2) if len(named) == 1 and undid
+                         and _patch_id(worktree, named[0], f"{named[0]}^{parent}") == undid), None)
+            listed = kept and publish_git(worktree, "rev-list", f"{named[0]}^{3 - kept}", f"^{named[0]}^{kept}")
             sides |= set(listed.stdout.split()) if listed and listed.returncode == 0 else set()
     return sides
+
+
+def _patch_id(worktree: pathlib.Path, old: str, new: str) -> str:
+    """The stable patch id of `git diff old new`, or "" for an empty diff or a failed read. Bytes, not text: a
+    file that is not UTF-8 must not fail the read."""
+    env = sd_lib.without_fsmonitor(os.environ)
+    try:
+        diff = subprocess.run(["git", "diff", "--no-ext-diff", "--no-color", old, new], cwd=worktree,
+                              capture_output=True, timeout=PUBLISH_SECONDS, check=False, env=env)
+        if diff.returncode != 0 or not diff.stdout:
+            return ""
+        found = subprocess.run(["git", "patch-id", "--stable"], cwd=worktree, input=diff.stdout,
+                               capture_output=True, timeout=PUBLISH_SECONDS, check=False, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return found.stdout.split(b" ", 1)[0].decode("ascii", "replace") if found.returncode == 0 else ""
 
 
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
