@@ -1224,8 +1224,9 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "",
     build, so a task just filed builds with no status step (sd:9063). One transaction, so one refusal writes
     nothing, the ready step included (pack sd:8785).
     A `finding` is Send to builder on a Retry or a Fix; a fresh build has no builder to send it to (pack sd:8792).
-    `expected_branch` is the branch the caller read: each item must Retry or Fix a bundle on it, checked in the
-    write's transaction, or the press refuses and writes nothing (sd:10897)."""
+    `expected_branch` is the branch the caller read: every assignment the press queued must build on it, each
+    selected item among them, read in the write's transaction, or the press refuses and writes nothing
+    (sd:10897, `_bound`)."""
     if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
         raise BuildRefused("select one or more distinct items")
     finding = finding.strip()
@@ -1299,8 +1300,6 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "",
                 named.setdefault(lead, set()).add(item)
             else:
                 fresh.append(item)
-        if expected_branch is not None:
-            _check_branch(connection, items, leads, named, fixes, expected_branch)
         if finding and fresh:
             raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
                                "would be a fresh build, with no builder to send it to")
@@ -1331,26 +1330,27 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "",
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
         fresh = list(dict.fromkeys(fresh))
-        return queued + (queue(connection, fresh, who=who) if fresh else [])
+        queued += queue(connection, fresh, who=who) if fresh else []
+        if expected_branch is not None:
+            _bound(connection, items, queued, expected_branch)
+        return queued
 
 
-def _check_branch(connection, items: list[int], leads: list[int], named: dict[int, set[int]], fixes: list[dict],
-                  expected: str) -> None:
-    """Refuse unless every item in `items` builds on `expected`: a Retry on its lead's newest run's branch, a Fix
-    on its failed run's. An item the press would build fresh, or one a split freed, has no build branch yet."""
-    on: dict[int, str] = {}
-    for lead in leads:
-        run = queue_state(connection, lead)["run"]
-        for item in named[lead]:
-            on[item] = run["branch"] if run else branch(lead)
-    for run in fixes:
-        for member in _sent_back(connection, run):
-            on.setdefault(member["item"], run["branch"])
+def _bound(connection, items: list[int], queued: list[dict], expected: str) -> None:
+    """Refuse unless every assignment the press queued builds on `expected`, its lead's branch, and every item in
+    `items` is among them: read from what was queued, not predicted, since a Retry's split or a fresh press
+    queues on another branch (review of build/sd-2260). The caller's transaction undoes the press."""
+    on = {}
+    for entry in queued:
+        row = connection.execute("SELECT id, parent FROM assignment WHERE id = ?", (entry["id"],)).fetchone()
+        on[entry["item"]] = branch(row["parent"] or row["id"])
+    for item, built in on.items():
+        if built != expected:
+            raise BuildRefused(f"sd:{item} would build on {built}, not the expected branch {expected}; read it "
+                               "again")
     for item in items:
         if item not in on:
-            raise BuildRefused(f"sd:{item} has no build branch to retry; --expected-branch {expected} names one")
-        if on[item] != expected:
-            raise BuildRefused(f"sd:{item} builds on {on[item]}, not the expected branch {expected}; read it again")
+            raise BuildRefused(f"sd:{item} queues no build on the expected branch {expected}; read it again")
 
 
 def _retry_row(connection, item: int):
