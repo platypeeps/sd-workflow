@@ -2020,7 +2020,7 @@ def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any], cited: str
         tested = record is worded and bool(getattr(record, "test", "")) and not verdict
         # sd:10926: a lead's rejection holds a repeat of the evidence it rejected, in any words, at its line
         # until a change reaches it (`lines_now`); fresh evidence is a new claim and blocks.
-        bound = bool(getattr(record, "lead", None)) and cited == record.lead and not verdict
+        bound = bool(cited) and cited == getattr(record, "lead", None) and not verdict
         return (cited is None or tested or bound) and getattr(record, "listed", False)
     def _judged(old: Mapping[str, Any]) -> bool:
         kept = old.get("evidence") if isinstance(old.get("evidence"), str) and old["evidence"].strip() else None
