@@ -554,8 +554,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     return new Map([...TASKS].filter(([k, t]) => (all || qShow.has('open')) && t.status !== 'done' && !t.parked && t.repo_path && !ideas.has(t.kind)
       && !ADV.has(Number(t.id)) && !(qShow.has('suggested') && SUGG.has(k))));
   }
-  const parkedTasks = () => { const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
-    return QV.tasks ? QV.tasks.rows.filter(t => t.parked && !ideas.has(t.kind) && !ADV.has(Number(t.id))).map(TD.shape) : []; };
+  // sd:10915: parkedAll is every parked task, hidden advisories too: it is the set whose blocked rows fold into Parked, so
+  // a hidden one stays parked and its blocked rows stay out of Blocked. parkedTasks is the ones drawn and counted.
+  const parkedAll = () => { const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
+    return QV.tasks ? QV.tasks.rows.filter(t => t.parked && !ideas.has(t.kind)).map(TD.shape) : []; };
+  const parkedTasks = () => parkedAll().filter(t => !ADV.has(Number(t.id)));
   // sd:9258: a parked task with no repo is no row (pack sd:7731), so no row object; the tally still counts it.
   const parkedItems = () => new Map(parkedTasks().filter(t => t.repo_path).map(t => [t.key, t]));
   // A task's read row (SROW) holds while it is still an item row at the revision its /api/tasks row has (pack sd:7251): a
@@ -596,7 +599,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
     // pack sd:9425: a parked item is its Parked row alone: a blocked build or lane entry of it is no row and counts in no
     // box; the Parked row says why it waits instead. A parked task with no repo is no row, so its blocked rows stay.
-    const parked = new Set(parkedTasks().filter(t => t.repo_path).map(t => Number(t.id))), why = new Map();
+    const parked = new Set(parkedAll().filter(t => t.repo_path).map(t => Number(t.id))), why = new Map();
     // Each blocked row's reason and its controls move to the Parked row, so the item can still be retried or cancelled.
     const aside = (item, text, ctl) => parked.has(Number(item)) && !!why.set(Number(item), [...(why.get(Number(item)) || []), { text, ctl }]);
     ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))

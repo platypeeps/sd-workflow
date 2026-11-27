@@ -2615,6 +2615,26 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("blocked build · assignment 90 · build run ended", row(built))
         self.assertIn("lane failed at prepare · gate failed", row(made))
 
+    def test_a_hidden_advisory_parked_item_moves_none_of_its_rows_back_into_blocked(self):
+        """sd:10915 review: hiding advisories dropped a parked item from the parked set too, so its blocked build and
+        failed lane entry were Blocked rows again. Hidden, the item is no row at all and Blocked counts neither."""
+        built, _ = self.parked_answers(self.checkout)
+        made, answers = self.parked_answers(self.checkout)
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        asg = {"id": 90, "lead": 90, "item": built, "title": "Set aside", "repo": str(self.checkout),
+               "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
+               "cancel": {"allowed": True, "reason": ""}}
+        answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [built, made], "row": None,
+                                  "show": False, "error": ""}
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", answers=answers)
+        _, attrs, _ = self.repo_detail(out["R"]["html"], "system")
+        self.assertIn(" 2 blocked,", attrs, "the fixture's two blocked rows, not the hidden parked item's")
+        self.assertIn(" 0 parked", attrs)
+        self.assertNotIn('data-asg-row="90"', out["R"]["html"])
+        self.assertNotIn(f'data-id="entry:{self.checkout}:{made}"', out["R"]["html"])
+
     def test_a_parked_items_blocked_rows_keep_their_controls_on_its_parked_row(self):
         """Re-review of pack sd:9425: the Parked row took the blocked rows' reasons and dropped their controls, so a
         parked item's failed lane entry or blocked build could not be retried, approved, fixed or cancelled."""
