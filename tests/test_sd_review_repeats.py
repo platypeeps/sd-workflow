@@ -421,6 +421,12 @@ class ReproRuleTests(unittest.TestCase):
         self.assertIn("base", sd_review.FINDING_PROPERTIES)
         self.assertIn('"base": "lacks"', sd_review.URL_OUTPUT_CONTRACT)
 
+    def test_has_means_the_same_failure_at_the_merge_base_not_a_defect_made_reachable(self) -> None:
+        """sd:10892 ruling round: a branch caller that starts sending empty input to an unchanged parser
+        is this change's failure, so the prompt says that is `lacks`, never `has`."""
+        self.assertIn("same failure already happens there, by the same route", sd_review.BASES["has"])
+        self.assertIn("makes an old defect reachable", sd_review.BASES["lacks"])
+
     def test_an_unknown_base_is_a_schema_error(self) -> None:
         for value in ("maybe", [], None, "Has"):
             with self.subTest(value=value):

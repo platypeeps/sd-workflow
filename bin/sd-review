@@ -103,8 +103,8 @@ TRIGGERS = {"caller": "a real caller path in the repository", "recorded": "repos
             "untrusted": "outside the operator's control: a network reply, another person's file or text, user-typed text",
             "loss_or_leak": "a data-loss or secret-leak path", "synthetic": "only input no caller or recorded data produces"}
 #: Whether the merge base (origin/main) has the same defect (sd:10892): only `lacks` lets a finding block.
-BASES = {"lacks": "the merge base lacks it: this change causes it",
-         "has": "the merge base already has the same defect: it is filed for the repo and blocks nothing"}
+BASES = {"lacks": "this change causes the failure, also when it only makes an old defect reachable, as a changed caller does",
+         "has": "the same failure already happens there, by the same route: it is filed for the repo and blocks nothing"}
 FINDING_PROPERTIES: dict[str, Any] = {
     "path": {"type": "string", "minLength": 1},
     "line": {"type": ["integer", "null"]},
