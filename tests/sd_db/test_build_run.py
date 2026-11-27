@@ -362,6 +362,17 @@ FAKE = textwrap.dedent('''
                and row["expected_head"] == argv[argv.index("--expected-head") + 1] for row in entries):
             print(json.dumps({"ok": False, "error": f"sd:{items[0]} at this head already ran in this lane"}))
             sys.exit(3)
+        import sqlite3  # the lane's own guard, over each entry as the shared queue stores it now (a hand-back)
+        stored = sqlite3.connect(os.environ["FAKE_DB"])
+        def now(row):
+            newest = stored.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                    "LIMIT 1", (f"lane:v1:example/repo:{row.get('id')}",)).fetchone()
+            return {**row, "status": json.loads(newest[0]).get("status")} if newest else row
+        try:
+            sd_lane.refuse_ran([now(row) for row in entries], items[0], argv[argv.index("--expected-head") + 1])
+        except sd_lane.LaneError as error:
+            print(json.dumps({"ok": False, "error": str(error)}))
+            sys.exit(3)
         entry = {"id": f"e{len(entries) + 1}", "item": items[0], "status": "pending", "enqueue_seq": len(entries) + 1,
                  "expected_head": argv[argv.index("--expected-head") + 1]}
         lane.write_text(json.dumps(entries + [entry]))
@@ -5485,7 +5496,7 @@ class Tick(Case):
 
     def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
                                    outsider=None, left_out=False, reverted=None, rebundled=False,
-                                   other_failed=False, claimed=False, newer=False):
+                                   other_failed=False, claimed=False, newer=False, imported=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -5507,7 +5518,8 @@ class Tick(Case):
         if lost:  # the failed branch is gone and its entry names a commit this checkout lacks
             support.git(self.repo, "branch", "-D", run["branch"])
             head = "0" * 40
-        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red", "expected_head": head}
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red", "expected_head": head,
+                                       **({"imported_from": "queue.json"} if imported else {})}
         self.tick()
         self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
         if trimmed:  # the operator drops the failed branch's commit after the failure; the entry still names it
@@ -5601,6 +5613,47 @@ class Tick(Case):
         entries = json.loads((self.plans / "lane.json").read_text())
         self.assertEqual([(row["status"], row["expected_head"]) for row in entries],
                          [("failed", head), ("pending", head)])
+
+    def test_an_unchanged_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Lead review of build/sd-1808: an earlier version's entry failed head H on a flaky gate; the rebuild
+        started at H and changed nothing. The lane's guard (`sd_lane.refuse_ran`) refused H as already run, and
+        the recovery reads only this run's branch, so the run blocked. The rebuild that starts at the failed head
+        hands that entry back, as Fix does, and the same head enters the lane again."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
+        # A second try of the same start (a crash before its worktree) finds it handed back and writes nothing.
+        before = self.stored("e1")
+        failed = build.lane_failed_start(self.db, self.bundle["assignment"])
+        assert failed is not None
+        self.assertIn("cancelled", build.take_over(self.db, failed, self.bundle["id"]))
+        self.assertEqual(self.stored("e1"), before)
+
+    def test_a_changed_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Class pass of the lead review of build/sd-1808: a rebuild that moved the head past the imported
+        entry's enters the lane as a new head, the old entry handed back."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        work = Path(self.bundle["work_path"])
+        (work / "fix.txt").write_text("the gate's fix\n", encoding="utf-8")
+        support.git(work, "add", "fix.txt")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", "fix: the gate's fix")
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual(entries[-1]["expected_head"], support.git(work, "rev-parse", "HEAD"))
+        self.assertNotEqual(entries[-1]["expected_head"], head)
 
     def test_a_refused_rebuild_enqueue_never_adopts_the_failed_branchs_entry(self):
         """Review of build/sd-1808: the enqueue refused, and its recovery took the newest entry at this head as the

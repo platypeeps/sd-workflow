@@ -3011,6 +3011,24 @@ def _hand_back(connection, key: str, entry: dict, run: str, *, who: str, by: str
                        (key, stamp, json.dumps(entry, sort_keys=True)))
 
 
+def take_over(connection, failed: dict, run: str) -> str:
+    """Build run `run` starts its branch at the failed bundle `failed`'s tip (`lane_failed_start`), so it owns that
+    work now: the failed lane entry is handed back (`_hand_back`), as Fix does. Its head may stay unchanged, and the
+    lane refuses a head an imported entry ended (`sd_lane.refuse_ran`) but not a cancelled one; nor does a Retry
+    of the old entry deliver the same commits beside the rebuild (lead review of build/sd-1808). Answers "" once
+    handed back, or why not: one already handed back by an earlier try of this start, or a lane not read, writes
+    nothing, and the enqueue then names any refusal."""
+    named = LANE_ENTRY.match(failed["detail"] or "")
+    with transaction(connection):
+        try:
+            key, entry = _lane_entry(connection, failed["branch"], named.group(1) if named else None,
+                                     actor="the rebuild")
+        except BuildRefused as refused:
+            return str(refused)
+        _hand_back(connection, key, entry, run, who="build", by="a rebuild", stamp=clock())
+    return ""
+
+
 def _lane_entry(connection, branch: str, ident: str | None = None, *, actor: str = "Fix") -> tuple[str, dict]:
     """The newest lane entry on `branch`, by the order the hub took them (`sd_lane.enqueue_order`), and its key, when
     it ended `failed` or `skipped`. Any other end is `BuildRefused`: pending or running is the lane's again (a Retry),

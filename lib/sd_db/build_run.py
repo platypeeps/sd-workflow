@@ -1750,6 +1750,10 @@ class Supervisor:
             argv = ["worktree", "add", str(self.work), branch]
         except Unread:
             start = self.start_point()
+            # Before the branch exists: a resumed run that finds the branch never reaches here, so the hand-back
+            # is the start's first write, and a retry of this start finds the entry handed back already.
+            if start is not None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
+                build.take_over(self.db, failed, self.ident)
             if start is None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
                 why = self.start_refused or "did not read here"
                 self.once("start", lambda: add_note(
