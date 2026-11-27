@@ -1,6 +1,7 @@
 # Open pull requests
 
 Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next routes it): every open PR in this repo and its companion repos.
+Budget: about 30 minutes. Follow `skills/_shared/references/decide-ask-record.md` in the sd-workflow checkout to decide, ask, record and report; this run's tag is `open-prs`.
 
 1. List them with `mcp__github__list_pull_requests`, and read each one's state with `pull_request_read` `get`.
    Keep each PR's head branch, full head commit and base branch (`base.ref`) from that read; every later step binds to them.
@@ -24,7 +25,7 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
    - its repo is one the operator does not manage (no row in `sd-db repo list`): report it, and act on nothing there.
 4. Act on the rest:
    - A finding blocks only when it names a concrete failing input, command or interruption that a real caller reaches.
-     File every other finding as an sd item for the repo's next PR.
+     File every other finding as an sd item for the repo's next PR, as that file's filing command says, with `--ref open-prs:<date>:<slug>`.
    - The sweep sends no finding to a builder and retries no lane entry: both commands name the item, not the branch,
      and pick the item's newest build or entry when they write, so one queued since the sweep's read takes the write.
      Record a blocking finding with `sd task note N "<PR URL>: <finding>"`, and report the PR for the operator's Fix.
@@ -46,4 +47,4 @@ Run on `/sd-ship open-prs`, or when the operator says "check open PRs" (sd-next 
      read the PR again before any other try.
 5. Ask the operator first, one question at a time, before you close a PR, merge one by hand, or request a person's review.
 
-End with a table: PR, item, what held it, action, new state.
+End with a table: PR, item, what held it, action, new state; then the veto table and the line `RESULT: filed <n>, built <n>, asked <n>`.

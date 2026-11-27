@@ -12,7 +12,7 @@ Post-merge closeout removes the merged PR's safe branches, stashes, refs and sta
 Invocation alone authorizes no checkout deletion.
 Use STE-Concise; report delivery state, decisive checks, blockers, and retained worktrees.
 
-On `/sd-ship open-prs`, or "check open PRs" routed from sd-next, read `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout and follow it: every open pull request, what holds it, and the lane action.
+On `/sd-ship open-prs`, or "check open PRs" routed from sd-next, read `skills/sd-ship/references/open-prs.md` in the sd-workflow checkout and follow it: every open pull request, what holds it, and the lane action. It decides, asks, records and reports as `skills/_shared/references/decide-ask-record.md` in the sd-workflow checkout says.
 
 ## Standing permission
 
