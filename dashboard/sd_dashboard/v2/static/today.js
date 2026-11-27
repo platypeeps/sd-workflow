@@ -58,6 +58,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // dashboard.queue_advisories) is off. A read that failed hides none. Suggested, All items and Parked leave them out.
   let ADV = new Set();
   const advHidden = doc => { const a = (doc || {}).advisories; return a && !a.error && !a.show ? new Set((a.ids || []).map(Number)) : new Set(); };
+  // A task row's own `advisory` flag hides it too while the filter is off: a refresh of /api/tasks can bring one filed
+  // after /api/now's ids were read (sd:10915 lane review).
+  const advOff = () => { const a = (DOC || {}).advisories; return !!a && !a.error && !a.show; };
+  const advTask = t => ADV.has(Number(t.id)) || (!!t.advisory && advOff());
   const SROW = new Map();
   const listedTask = k => OPENI.get(k) || PARKI.get(k) || (SUGG.has(k) ? TASKS.get(k) : undefined);
   const isItem = id => SUGG.has(id) || OPENI.has(id) || PARKI.has(id), taskOf = k => SROW.get(k) || listedTask(k);
@@ -552,13 +556,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     TASKS = new Map((QV.tasks ? QV.tasks.rows.map(TD.shape) : []).map(t => [t.key, t]));
     const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
     return new Map([...TASKS].filter(([k, t]) => (all || qShow.has('open')) && t.status !== 'done' && !t.parked && t.repo_path && !ideas.has(t.kind)
-      && !ADV.has(Number(t.id)) && !(qShow.has('suggested') && SUGG.has(k))));
+      && !advTask(t) && !(qShow.has('suggested') && SUGG.has(k))));
   }
   // sd:10915: parkedAll is every parked task, hidden advisories too: it is the set whose blocked rows fold into Parked, so
   // a hidden one stays parked and its blocked rows stay out of Blocked. parkedTasks is the ones drawn and counted.
   const parkedAll = () => { const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
     return QV.tasks ? QV.tasks.rows.filter(t => t.parked && !ideas.has(t.kind)).map(TD.shape) : []; };
-  const parkedTasks = () => parkedAll().filter(t => !ADV.has(Number(t.id)));
+  const parkedTasks = () => parkedAll().filter(t => !advTask(t));
   // sd:9258: a parked task with no repo is no row (pack sd:7731), so no row object; the tally still counts it.
   const parkedItems = () => new Map(parkedTasks().filter(t => t.repo_path).map(t => [t.key, t]));
   // A task's read row (SROW) holds while it is still an item row at the revision its /api/tasks row has (pack sd:7251): a

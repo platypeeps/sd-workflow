@@ -2518,6 +2518,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         none = self.run_view("R.tally = ELS['queue-tally'].html;")
         self.assertNotIn("parked", none["R"]["tally"], "no parked task, no tile")
 
+    def test_an_advisory_filed_after_the_now_read_stays_hidden_on_a_tasks_refresh(self):
+        """sd:10915 lane review: the hidden set came from /api/now's ids alone, so an advisory item a refresh of
+        /api/tasks brought in showed while the filter was off. The task row's own `advisory` flag hides it too."""
+        from sd_dashboard import tasks_screen
+        for title in ("Parked plain", "Parked advisory"):
+            made = self.item(title, kind="task", priority=4, repo=str(self.checkout))
+            self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
+            if title.endswith("advisory"):
+                self.connection.execute("UPDATE item SET source = 'task-ref', external_id = ? WHERE id = ?",
+                                        (f"advisory:sd:{made}", made))
+        self.doc["advisories"] = {"key": "dashboard.queue_advisories", "ids": [], "row": None, "show": False, "error": ""}
+        answers = {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]}
+        out = self.run_view("R.tally = ELS['queue-tally'].html;", answers=answers)
+        self.assertIn(">1 parked</a>", out["R"]["tally"])
+
     def test_each_repo_row_has_a_parked_box_last_that_shows_its_parked_tasks(self):
         """sd:9247 (operator 2026-11-17): "add a per repo tile for the respective parked items like the other tiles
         ... as last one, and have it do the same filtering". The box counts the repo's parked tasks the tally counts
