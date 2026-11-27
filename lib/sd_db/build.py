@@ -2899,17 +2899,21 @@ def branch_run(connection, branch: str) -> dict | None:
     return dict(found) if found else None
 
 
-def _last_builds(connection, ids: Collection[int], items: Collection[int]) -> list[dict]:
-    """Each of `items`' newest build run outside the assignments `ids`, by the bundle it rode in: an assignment
-    that never ran (a press cancelled before its claim) hides no earlier build (lane review of build/sd-1808)."""
+def _last_builds(connection, ids: Collection[int], items: Collection[int]) -> dict[int, dict]:
+    """Each of `items`' newest build run outside the assignments `ids`, by the bundle it rode in, keyed by item: an
+    assignment that never ran (a press cancelled before its claim) hides no earlier build (lane review of
+    build/sd-1808), nor does a run that ended before its builder ran (`step` still `claimed` or `worktree`): it
+    built nothing, so the earlier run holds the item's newest work (lane review at 992ef580). A run from before
+    `step` was kept (NULL) counts as built."""
     marks = ", ".join("?" for _ in ids)
-    found = (connection.execute(
+    found = {item: connection.execute(
         f"SELECT runner_run.id, runner_run.outcome FROM runner_run JOIN assignment "
         f"ON assignment.id = runner_run.assignment OR assignment.parent = runner_run.assignment "
         f"WHERE assignment.item = ? AND assignment.scope = ? AND assignment.id NOT IN ({marks}) "
-        f"ORDER BY runner_run.created_at DESC, runner_run.run DESC, runner_run.rowid DESC LIMIT 1", (item, SCOPE, *ids)).fetchone()
-        for item in items)
-    return [dict(row) for row in found if row]
+        f"AND COALESCE(runner_run.step, '') NOT IN ('claimed', 'worktree') "
+        f"ORDER BY runner_run.created_at DESC, runner_run.run DESC, runner_run.rowid DESC LIMIT 1",
+        (item, SCOPE, *ids)).fetchone() for item in items}
+    return {item: dict(row) for item, row in found.items() if row}
 
 
 def lane_failed_start(connection, lead: int) -> dict | None:
@@ -2918,14 +2922,18 @@ def lane_failed_start(connection, lead: int) -> dict | None:
     moved back to ready and built again is a fresh press with a new branch, which from origin/main dropped the
     failed bundle's commits. None, so main, unless exactly one lane-failed run that some item last rode in had
     every item it built in this bundle: its commits cite them, and a missing one would not deliver. An item never
-    built, or last built elsewhere, rides along: it cites nothing on that branch (lane review of build/sd-1808)."""
+    built, or last built elsewhere, rides along: it cites nothing on that branch (lane review of build/sd-1808).
+    That run must be the last build of each item it built, too: an item built again since has newer work on
+    another branch, and the failed branch holds only its older commits (lane review at 992ef580)."""
     # A member cancelled out of this bundle (`ALONE`) is not selected: it neither builds nor delivers here.
     bundle = connection.execute(f"SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
                                 f"AND {_in_group()}", (lead, lead, SCOPE)).fetchall()
     ids, items = {row["id"] for row in bundle}, {row["item"] for row in bundle}
-    runs = {last["id"] for last in _last_builds(connection, ids, items) if last["outcome"] == "lane_failed"}
+    last = _last_builds(connection, ids, items)
+    runs = {row["id"] for row in last.values() if row["outcome"] == "lane_failed"}
     whole = [failed for failed in (run(connection, ident) for ident in sorted(runs))
-             if {member["item"] for member in failed["members"]} <= items]
+             if all(member["item"] in items and last.get(member["item"], {}).get("id") == failed["id"]
+                    for member in failed["members"])]
     if len(whole) != 1:
         return None
     failed = whole[0]
@@ -2940,7 +2948,7 @@ def outside_rebuild(connection, lead: int, cited: Collection[int]) -> list[int]:
     bundle = connection.execute("SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
                                 (lead, lead, SCOPE)).fetchall()
     ids, items = [row["id"] for row in bundle], {row["item"] for row in bundle}
-    if any(last["outcome"] == "lane_failed" for last in _last_builds(connection, ids, items)):
+    if any(last["outcome"] == "lane_failed" for last in _last_builds(connection, ids, items).values()):
         return sorted(set(cited) - items)
     return []
 

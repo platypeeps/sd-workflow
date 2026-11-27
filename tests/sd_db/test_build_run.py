@@ -5485,7 +5485,7 @@ class Tick(Case):
 
     def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
                                    outsider=None, left_out=False, reverted=None, rebundled=False,
-                                   other_failed=False):
+                                   other_failed=False, claimed=False, newer=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -5522,6 +5522,29 @@ class Tick(Case):
             self.db.execute(f"UPDATE assignment SET status = 'cancelled' WHERE id IN "
                             f"({', '.join('?' for _ in queued)})", [entry["id"] for entry in queued])
             build.queue(self.db, rebuild, who="operator")
+        if claimed:  # that press is claimed and cancelled before its builder ran: a run that built nothing
+            first = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+            assert first is not None
+            self.assertEqual(build.run(self.db, first["id"])["step"], "claimed")
+            self.assertIsNotNone(build.end(self.db, first["id"], "cancelled", "fixture: cancelled at its claim"))
+            with self.db:  # as the reap releases it once its groups read gone
+                stamp = build.clock()
+                self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (stamp, first["id"]))
+                self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, first["id"]))
+                for item in rebuild:
+                    build.unpark(self.db, item)
+            build.queue(self.db, rebuild, who="operator")
+        if newer:  # the lead was built since in a bundle of its own, which ran its builder and ended blocked
+            with self.db:
+                ran = self.db.execute("INSERT INTO assignment (item, role, status, lane, scope, run_count) "
+                                      "VALUES (?, 'author', 'blocked', 'parallel', ?, 1)",
+                                      (self.items[0], build.SCOPE)).lastrowid
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "step, outcome, released_at, created_at, updated_at) VALUES ('newer', ?, 1, ?, "
+                    "'build/sd-newer', 'fixture', '', '', 'building', 'blocked', '2999-01-01T00:00:00Z', "
+                    "'2999-01-01T00:00:00Z', '2999-01-01T00:00:00Z')", (ran, str(self.repo)))
         if extra:  # an unrelated item, never built, queued beside them: the claim bundles it in
             fresh = create_item(self.db, kind="task", title="Unrelated", repo=str(self.repo), status="ready")
             if other_failed:  # its own bundle, with an item left out here, failed in the lane before
@@ -5606,6 +5629,24 @@ class Tick(Case):
         that ran is the one that counts."""
         head, _ = self.rebuilt_after_lane_failure(2, rebundled=True)
         self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_rebuild_claimed_and_cancelled_before_its_builder_keeps_the_failed_head(self):
+        """Lane review of build/sd-1808: a fresh bundle of a whole failed bundle, claimed and cancelled before its
+        builder ran, left each item a newer run that built nothing, and the next fresh bundle started from main
+        without the failed bundle's commits. A run that never reached its builder hides no failed bundle."""
+        head, _ = self.rebuilt_after_lane_failure(2, claimed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(build.outside_rebuild(self.db, self.bundle["assignment"], [99999]), [99999],
+                         "the delivery keeps a citation outside the bundle open as well")
+
+    def test_a_failed_bundle_whose_item_was_built_since_starts_from_main(self):
+        """Lane review of build/sd-1808: the lead was built again after its bundle failed in the lane; the other
+        member's last build named the failed bundle, so the fresh bundle started there, from the lead's older
+        commits. A failed bundle sets the start only when it is the last build of every item it built."""
+        head, _ = self.rebuilt_after_lane_failure(2, newer=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        self.assertNotEqual(head, support.git(self.repo, "rev-parse", "main"))
 
     def test_a_rebuild_beside_an_item_of_another_failed_bundle_starts_from_the_whole_one(self):
         """Lane review of build/sd-1808: an item whose own earlier bundle failed in the lane, bundled in with a
