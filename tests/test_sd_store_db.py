@@ -199,7 +199,8 @@ class TheWrites(DbStoreFixture):
         self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Tip").stdout, code + "\n")
         self.ok("store", "set-section", "pp.tip", "First tip", "--section", f"Notes={code}")
         self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout, code + "\n")
-        for text in ("x\n## Notes", "```\n## Notes", "```\n```\n## Notes", "~~~\n## Notes\n```"):
+        for text in ("x\n## Notes", "```\n## Notes", "```\n```\n## Notes", "~~~\n## Notes\n```",
+                     "- item\n  ```\n## Notes\n  ```", " ```\n## Notes\n ```"):
             with self.subTest(text=text):
                 self.refused("store", "set-section", "pp.tip", "First tip", "--section", f"Tip={text}",
                              says="its own `## ` heading")
