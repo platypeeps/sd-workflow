@@ -141,6 +141,19 @@ class OpenPrSweep(unittest.TestCase):
         self.assertIn("the operator's Fix", self.text())
         self.assertIn("the operator's Retry", self.text())
 
+    def test_each_fix_or_retry_it_names_is_bound_to_the_branch(self):
+        """The operator's Fix and Retry act on the item's newest build or
+        entry: on another branch, naming either sends it there."""
+        text = self.text()
+        bind = "the item's newest lane entry, of every entry with `item` N in any `status`, has `branch` equal to the PR's head branch"
+        self.assertIn(bind, text)
+        for name in ("the operator's Fix", "the operator's Retry"):
+            for at in [m.start() for m in re.finditer(re.escape(name), text)]:
+                with self.subTest(name=name, at=at):
+                    line = text[text.rindex("\n", 0, at) + 1:text.index("\n", at)]
+                    self.assertIn("the step-4 branch check", line)
+        self.assertLess(text.index(bind), text.index("the operator's Fix"))
+
     def test_an_item_with_two_open_prs_is_reported_only(self):
         text = self.text()
         guard = text.index("resolve to one item: report each and act on none")
