@@ -113,8 +113,12 @@ BULK_JOB = "reports-acknowledge"
 REMEMBERED_RUNS = 20
 
 
-def _folded_into(connection, job, run_id):
-    """The `cron-report` row of `job` that remembers `run_id` under `repeats.run_ids`, or `None`.
+def _folded_into(connection, job, run_id, host=None):
+    """The `cron-report` row of `job` on `host` that remembers `run_id` under `repeats.run_ids`, or `None`.
+
+    A run folds only into its own host's report, and two hosts can mint one
+    run id (sd:10440), so another host's row is not this run's replay. A row
+    filed before the host was stored matches any host, as it always did.
 
     Done or not: a folded run's identity lives only here, so this is how a
     replay of one is told from a new failure after the report it folded into
@@ -141,7 +145,34 @@ def _folded_into(connection, job, run_id):
         " AND CASE WHEN json_valid(fields) THEN json_extract(fields, '$.report.job') END = ?"
         " AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(fields) THEN fields END, '$.repeats.run_ids')"
         "             WHERE value = ?)"
-        " ORDER BY id DESC LIMIT 1", (job + ":", job + ";", job, run_id)).fetchone()
+        " AND COALESCE(CASE WHEN json_valid(fields) THEN json_extract(fields, '$.report.host') END = ?, 1)"
+        " ORDER BY id DESC LIMIT 1", (job + ":", job + ";", job, run_id, host)).fetchone()
+
+
+def _filed(connection, job, run_id, host):
+    """This run's own report row and its `external_id`: `(external, row or None)`.
+
+    The identity is `job:run_id`. A run id is a UTC second and a pid, so two
+    hosts can mint one (sd:10440): when that row is another host's, this
+    host's run is `job:run_id@host`. A row with no stored host is anyone's,
+    as it was before hosts were stored.
+    """
+    external = job + ":" + run_id
+    query = "SELECT id, fields FROM item WHERE source='cron-report' AND external_id=?"
+    row = connection.execute(query, (external,)).fetchone()
+    if row and host is not None and _stored_host(row) not in (None, host):
+        external += "@" + host
+        row = connection.execute(query, (external,)).fetchone()
+    return external, row
+
+
+def _stored_host(row):
+    """The host a report row stored, or `None` when it stored none or its fields do not parse."""
+    try:
+        host = (json.loads(row["fields"]).get("report") or {}).get("host")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return host if isinstance(host, str) else None
 
 
 #: A report's current set of findings: `repeats.basis` once a shrunken set
@@ -301,7 +332,6 @@ def ingest(connection, *, job, run_id, started, ended, exit_code, text, source_p
     if grade is not None and (not isinstance(grade, str) or not 1 <= len(grade) <= 200 or "\x00" in grade):
         raise workflow.WorkflowError("report grade must be short text")
     started, ended = _check_times(started, ended)
-    external = job + ":" + run_id
     provenance = {"job": job, "run_id": run_id, "started": started, "ended": ended,
                   "exit_code": exit_code, "source_path": source_path, "truncated": truncated,
                   "text_sha256": hashlib.sha256(text.encode()).hexdigest(), "attention_basis": attention_basis}
@@ -317,7 +347,7 @@ def ingest(connection, *, job, run_id, started, ended, exit_code, text, source_p
     if record is not None:
         fields["record"] = record
     with transaction(connection):
-        previous = connection.execute("SELECT id,fields FROM item WHERE source='cron-report' AND external_id=?", (external,)).fetchone()
+        external, previous = _filed(connection, job, run_id, host)
         if previous:
             # `repeats` is written by later runs, not by this one, so the
             # open report's own run replays against its fields without it.
@@ -332,7 +362,7 @@ def ingest(connection, *, job, run_id, started, ended, exit_code, text, source_p
         # A record replays only through the exact identity above: it was
         # never folded, so a folded run id it happens to reuse is not its
         # replay, and answering with that report would drop its own fields.
-        folded = _folded_into(connection, job, run_id) if record is None else None
+        folded = _folded_into(connection, job, run_id, host) if record is None else None
         if folded:
             return workflow.item_state(connection, folded["id"])
         # A failure never folds into a done report: its basis says how the
@@ -466,7 +496,7 @@ def health(connection, job):
     return json.loads(row["body"])["healthy"] if row else None
 
 
-def _beat(connection, *, job, run_id, healthy, ended, exit_code, now):
+def _beat(connection, *, job, run_id, healthy, ended, exit_code, now, host=None):
     """Record this tick's health, once per run, and only if it is the newest.
 
     Guarded on `run_id` rather than written unconditionally, for the same
@@ -513,6 +543,11 @@ def _beat(connection, *, job, run_id, healthy, ended, exit_code, now):
     it, so nothing can rank it, and it is written as the newest. Closing that
     needs an order finer than a whole second, outside this function.
 
+    The run is `run_id` on `host`, stored as `host` and, in `same_second`,
+    as `run_id@host`: two hosts can mint one run id (sd:10440), and another
+    host's clean run read as this host's replay and hid its failure. A row or
+    entry with no host is anyone's, as it was before hosts were stored.
+
     Returns `"written"`, `"tied"` when written at a tie with a different run,
     `"recorded"` when a row already carries this run, or `"older"` when a
     newer tick is recorded, so a result can say which.
@@ -520,10 +555,10 @@ def _beat(connection, *, job, run_id, healthy, ended, exit_code, now):
     key = HEARTBEAT_KEY + job
     if connection.execute(
             "SELECT 1 FROM state WHERE kind='heartbeat' AND key=?"
-            " AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.run_id') END = ?"
+            " AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.run_id') END = ? AND " + _SAME_HOST +
             "      OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(body) THEN body END, '$.same_second')"
-            "                 WHERE value = ?))",
-            (key, run_id, run_id)).fetchone():
+            "                 WHERE value IN (?, ?)))",
+            (key, run_id, host, run_id, _tagged(run_id, host))).fetchone():
         return "recorded"
     latest = connection.execute(
         "SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
@@ -532,14 +567,26 @@ def _beat(connection, *, job, run_id, healthy, ended, exit_code, now):
     if ended < newest <= stamp((now + FUTURE_ALLOWANCE).isoformat()):
         return "older"
     body = {"healthy": healthy, "run_id": run_id, "ended": ended, "exit_code": exit_code}
+    if host is not None:
+        body["host"] = host
     tied = ended == newest
     if tied:
         earlier = newest_body.get("same_second")
         earlier = [value for value in earlier if isinstance(value, str)] if isinstance(earlier, list) else []
-        previous = [newest_body["run_id"]] if isinstance(newest_body.get("run_id"), str) else []
+        newest_host = newest_body.get("host") if isinstance(newest_body.get("host"), str) else None
+        previous = [_tagged(newest_body["run_id"], newest_host)] if isinstance(newest_body.get("run_id"), str) else []
         body["same_second"] = [*earlier, *previous][-REMEMBERED_RUNS:]
     record_state(connection, "heartbeat", key=key, body=body)
     return "tied" if tied else "written"
+
+
+#: A heartbeat row is this host's, the second `?`, or stored no host (sd:10440).
+_SAME_HOST = "COALESCE(CASE WHEN json_valid(body) THEN json_extract(body,'$.host') END = ?, 1)"
+
+
+def _tagged(run_id, host):
+    """A run as a `same_second` entry: `run_id@host`, or `run_id` alone with no host."""
+    return run_id if host is None else f"{run_id}@{host}"
 
 
 def _quiet(beat, previous):
@@ -666,7 +713,7 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
     # no failure, so its findings keep `needs attention`.
     grade = _grade(marks, starts, started=started, ended=ended) if exit_code else None
     attention = exit_code != 0 or bool(declared)
-    host = ship.this_host()
+    host = ship.this_host() or None
     # A carried safe line gives an ungraded failure the lines of a safe one,
     # so a failure with a safe line names its grade too, and a fold never
     # moves it under another grade's title. Without one the basis is as it
@@ -674,7 +721,7 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
     # The ungraded basis is the one a run filed before the grades holds: its
     # replay is answered against it (pack sd:6151).
     graded = f" ({grade})" if exit_code and any(mark.startswith(SAFE) for mark in marks) else ""
-    basis, ungraded = ((f"job exited {exit_code} on {host}{suffix}" + (f": {declared}" if declared else "")
+    basis, ungraded = ((f"job exited {exit_code} on {host or ''}{suffix}" + (f": {declared}" if declared else "")
                         if exit_code else declared or "not supplied by the job") for suffix in (graded, ""))
     basis, ungraded = (value if len(value) <= 2000 else f"{value[:1900]} [sha256 {hashlib.sha256(value.encode()).hexdigest()[:16]}]"
                        for value in (basis, ungraded))
@@ -686,18 +733,29 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
         # A run that already filed a report is answered with that report, the
         # way `ingest` answers an attention replay: a recovery's own heartbeat
         # makes the job read healthy, so its replay cannot be told by health.
-        filed = connection.execute("SELECT fields FROM item WHERE source='cron-report' AND external_id=?",
-                                   (job + ":" + run_id,)).fetchone()
+        _, filed = _filed(connection, job, run_id, host)
         if filed and basis != ungraded and (json.loads(filed["fields"]).get("report") or {}).get("attention_basis") == ungraded:
             basis = ungraded
+        # The newest run of this job on this host, before this one (sd:4629).
+        chain_key = f"{CHAIN_KEY}{job}@{host or ''}"
+        newest_row = connection.execute(
+            "SELECT id, body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1", (chain_key,)).fetchone()
+        last = json.loads(newest_row["body"]) if newest_row else {}
         # Read the previous health before this tick overwrites it, or a
         # recovery reads as a run that was always fine. And only a tick that
         # became the current health can recover from anything: an older run
-        # was never the tick after the failure.
-        previous = health(connection, job)
+        # was never the tick after the failure. It is this host's (sd:10440):
+        # its chain row's, else the job's when no other host wrote that, so
+        # another host's clean tick is no recovery from this host's failure.
+        previous = last.get("healthy")
+        if type(previous) is not bool:
+            latest = connection.execute("SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1",
+                                        (HEARTBEAT_KEY + job,)).fetchone()
+            latest = json.loads(latest["body"]) if latest else {}
+            previous = latest.get("healthy") if latest.get("host") in (None, host) else None
         clock = now or datetime.now(UTC)
         beat = _beat(connection, job=job, run_id=run_id, healthy=not attention,
-                     ended=ended, exit_code=exit_code, now=clock)
+                     ended=ended, exit_code=exit_code, now=clock, host=host)
         wrote = beat in ("written", "tied")
         recovered = not attention and wrote and previous is False
         # This run's own heartbeat says it was clean, and it filed no report,
@@ -709,29 +767,24 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
         # list has no health of its own to read, and is left to `ingest`.
         if beat == "recorded" and attention and not filed and connection.execute(
                 "SELECT 1 FROM state WHERE kind='heartbeat' AND key=?"
-                " AND CASE WHEN json_valid(body) THEN json_extract(body, '$.run_id') END = ?"
+                " AND CASE WHEN json_valid(body) THEN json_extract(body, '$.run_id') END = ? AND " + _SAME_HOST +
                 " AND CASE WHEN json_valid(body) THEN json_type(body, '$.healthy') END = 'true'",
-                (HEARTBEAT_KEY + job, run_id)).fetchone():
+                (HEARTBEAT_KEY + job, run_id, host)).fetchone():
             return {"recorded": "nothing", "job": job, "run_id": run_id, "healthy": False,
                     "exit_code": exit_code, "ended": ended,
                     "why": "a replay of a run whose heartbeat recorded it clean;"
                            " the run id is the key, so its changed evidence was not written"}
-        # The newest run of this job on this host, before this one (sd:4629).
         # A run that ended no earlier is the newest now, ties in arrival
         # order as `_beat` ranks them; an older one, a hand recovery, takes
         # no done target and moves nothing. A replay moved it the first time,
         # and is told by its run id, not by `beat`: once compaction took its
         # heartbeat, a replay reads as a new run that ties the newest end. A
         # row stamped past `FUTURE_ALLOWANCE` outranks nothing, as in `_beat`.
-        chain_key = f"{CHAIN_KEY}{job}@{host}"
-        newest_row = connection.execute(
-            "SELECT id, body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1", (chain_key,)).fetchone()
-        last = json.loads(newest_row["body"]) if newest_row else {}
-        replay = beat == "recorded" or bool(filed) or bool(attention and _folded_into(connection, job, run_id))
+        replay = beat == "recorded" or bool(filed) or bool(attention and _folded_into(connection, job, run_id, host))
         moves = not replay and not ended < (last.get("ended") or "") <= stamp((clock + FUTURE_ALLOWANCE).isoformat())
         if not (attention or filed):
             if moves:
-                _set_chain(connection, chain_key, newest_row, {"run_id": run_id, "ended": ended, "item": None})
+                _set_chain(connection, chain_key, newest_row, {"run_id": run_id, "ended": ended, "item": None, "healthy": True})
                 if host:
                     _supersede(connection, job=job, host=host, by=None, recovered=f"{job}:{run_id}")
             return {"recorded": "heartbeat" if wrote else "nothing", "job": job, "run_id": run_id,
@@ -741,7 +794,7 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
                        exit_code=exit_code, text=text, source_path=str(path.resolve()),
                        attention=attention, attention_basis=basis, truncated=truncated,
                        chain=last.get("item") if moves and type(last.get("item")) is int else None, now=clock,
-                       host=host or None, grade=grade)
+                       host=host, grade=grade)
         # A truncated body is not the whole set to show in place of the older
         # report's, even with every finding named in the basis: neither this
         # run's nor the one the report it folded into kept. A whole run
@@ -751,8 +804,9 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
             _supersede(connection, job=job, host=host, by=state["item"]["id"])
         if moves:
             _set_chain(connection, chain_key, newest_row, {
-                "run_id": run_id, "ended": ended, "item": state["item"]["id"] if attention and not exit_code else None})
-        if state["item"]["external_id"] != job + ":" + run_id:
+                "run_id": run_id, "ended": ended, "item": state["item"]["id"] if attention and not exit_code else None,
+                "healthy": not attention})
+        if state["item"]["external_id"] != _filed(connection, job, run_id, host)[0]:
             # `ingest` answered with another run's report: this run folded
             # into it (sd:920), or is the replay of one that did.
             return {"recorded": "folded", "why": basis,

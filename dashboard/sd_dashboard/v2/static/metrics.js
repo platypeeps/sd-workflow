@@ -281,6 +281,14 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
     $('prs-note').textContent = [`${plural(P.open, 'pull request')} open now; waiting in all: ${dur(P.on_you + P.on_reviewers)}.`, unknown].filter(Boolean).join(' ');
   }
   // pack sd:7208: each of the six months by bill. A month with no ledger row says so, never $0; a window bill is not a zero.
+  // Review rounds (sd:10401): one row per item, costliest first; the shell sorts the table by any column.
+  function reviews() {
+    const R = DOC?.reviews;
+    if (!R || R.error) { put($('rev-body'), html`<tr><td colspan="9">${unknownBlock(R ? R.error : 'the Metrics document did not arrive')}</td></tr>`); $('rev-note').textContent = ''; return; }
+    put($('rev-body'), R.items.length ? html`${R.items.map(r => html`<tr><td class="what">sd:${String(r.item)} ${r.title}</td><td class="hide-sm">${r.status}</td><td class="num">${String(r.rounds)}</td><td class="num hide-sm">${String(r.blocking)}</td><td class="num hide-sm">${String(r.clean)}</td><td class="num hide-sm">${String(r.lane)}</td><td class="num hide-sm">${fmt(r.tokens_in)}</td><td class="num hide-sm">${fmt(r.tokens_out)}</td><td class="num">${money(r.usd)}</td></tr>`)}`
+      : html`<tr><td colspan="9" class="why">No item has a build run or a lane review yet.</td></tr>`);
+    $('rev-note').textContent = R.total > R.items.length ? `The ${R.items.length} costliest of ${plural(R.total, 'item')}.` : '';
+  }
   function months() {
     const sm = DOC?.ranged?.spend;
     $('months-block').hidden = !sm;
@@ -306,6 +314,7 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
     ci();
     laneTimes();
     prWaits();
+    reviews();
     const o = DOC?.observed;
     put($('observed'), !DOC ? html`` : o.error ? unknownBlock(o.error) : html`<p class="foot-note">Observed ${o.since} → ${o.until}: ${plural(o.recorded_requests, 'request')} recorded, ${plural(o.finished_review_attempts, 'finished review attempt')}, ${plural(o.recorded_deliveries, 'recorded delivery', 'recorded deliveries')}. <button class="linkbtn" type="button" data-ev="observed">Details</button></p>`);
   }
@@ -390,7 +399,7 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
     adopt: doc => {
       DOC = doc; evidence(); CELLS = readCells(); attention();
       document.body.dataset.observed = doc.read;
-      const parts = [...['usage', 'trend', 'numbers', 'scorecard', 'age', 'observed', 'controls', 'ci', 'lanes', 'prs'].map(k => [k, doc[k]]),
+      const parts = [...['usage', 'trend', 'numbers', 'scorecard', 'age', 'observed', 'controls', 'ci', 'lanes', 'prs', 'reviews'].map(k => [k, doc[k]]),
         ...(doc.ranged ? ['spend', 'scorecard', 'ci'].map(k => [`6mo ${k}`, doc.ranged[k]]) : [])];
       const failed = parts.filter(([, p]) => p.error || p.stale);
       FIRST = CELLS.find(c => c.state === 'warning' || c.state === 'caution')?.ev || Object.keys(EV).find(k => k.startsWith('win:')) || null;

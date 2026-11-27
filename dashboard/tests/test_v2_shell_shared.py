@@ -1044,7 +1044,7 @@ class TheTableGrammar(unittest.TestCase):
                            ("briefs.js", "shell.view.count('list', all.length);"),
                            ("skills.js", "window.shell.view?.count('catalog', DOC ? v.length : null);"),
                            ("management.js", "shell.view.count('repos', rows.length);"),
-                           ("documents.js", "window.PAGE_VIEWS = [{ id: 'documents', label: 'Documents' }, { id: 'books', label: 'Books', api: '/api/documents/books' },")]:
+                           ("documents.js", "window.PAGE_VIEWS = [{ id: 'documents', label: 'Documents' }, { id: 'books', label: 'Books and courses', api: '/api/documents/books' },")]:
             self.assertIn(call, (STATIC / page).read_text(encoding="utf-8"), page)
 
     def test_a_kept_state_that_is_malformed_falls_back_field_by_field(self):

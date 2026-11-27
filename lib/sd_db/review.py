@@ -666,7 +666,7 @@ def _lines(found: dict, key: bytes | None, rows: dict[str, dict] | None, now: st
     questions = found["questions"]
     manifest = {
         "kind": "manifest", "schema": SCHEMA, "batch": found["item"]["id"], "ref": found["ref"],
-        "queue": header["queue"], "name": header["batch"], "title": found["item"]["title"],
+        "queue": header["queue"], "name": header["batch"], "title": closed_title(found),
         "closed": found["closed"], "source": header["source"], "mode": header["mode"],
         "seal": header["seal"], "digest": header["digest"],
         "exported_by": f"sd-ai-command-pack@{_pack_commit()}",
@@ -728,8 +728,7 @@ def export(connection: sqlite3.Connection, item: int, *, who: str, key: bytes | 
                 raise ReviewError(f"sd:{item} has {count} question{'s' if count != 1 else ''} open; "
                                   f"a sealed export waits until every question is ruled")
             if found["closed"] is None:
-                workflow.change_status(connection, item, "done", who=who,
-                                       reason="sealed export: closed before the key is read")
+                _close_batch(connection, found, who, "sealed export: closed before the key is read")
         rows = _key_rows(key)
     return _lines(read(connection, item), key, rows, now)
 
@@ -912,6 +911,33 @@ def _expire(connection: sqlite3.Connection, item: int, note: int, who: str) -> b
         return True
 
 
+#: The item `fields` key that holds the batch's title as it stood at its close (sd:10408).
+CLOSED_TITLE = "closed_title"
+
+
+def _close_batch(connection: sqlite3.Connection, found: dict, who: str, reason: str) -> None:
+    """Close batch `found` (`read`'s answer, read in this transaction) and keep its title as it stood, so a later
+    rename moves no export's manifest: the digest binds the questions, not the title (sd:10408)."""
+    row = found["item"]
+    try:
+        fields = json.loads(row["fields"] or "{}")
+    except ValueError:
+        fields = None
+    if isinstance(fields, dict) and CLOSED_TITLE not in fields:
+        writes.set_item_fields(connection, row["id"], fields={**fields, CLOSED_TITLE: row["title"]})
+    workflow.change_status(connection, row["id"], "done", who=who, reason=reason, resolve_followups=True)
+
+
+def closed_title(found: dict) -> str:
+    """The title a closed batch's export names: the one kept at its close, else (a hand close) the live one."""
+    try:
+        fields = json.loads(found["item"]["fields"] or "{}")
+    except ValueError:
+        fields = None
+    kept = fields.get(CLOSED_TITLE) if isinstance(fields, dict) and found["closed"] is not None else None
+    return kept if isinstance(kept, str) else found["item"]["title"]
+
+
 def _close(connection: sqlite3.Connection, item: int, who: str, reason: str) -> bool:
     """Close the batch when nothing is open and every approval has its task; False otherwise."""
     with transaction(connection):
@@ -921,7 +947,7 @@ def _close(connection: sqlite3.Connection, item: int, who: str, reason: str) -> 
                       for question in found["questions"])
         if found["open"] or waiting or found["closed"] is not None:
             return False
-        workflow.change_status(connection, item, "done", who=who, reason=reason)
+        _close_batch(connection, found, who, reason)
         return True
 
 

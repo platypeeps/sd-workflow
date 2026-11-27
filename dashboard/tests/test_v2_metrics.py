@@ -343,6 +343,34 @@ class ThePrWaits(Fixture):
             self.assertEqual(self.doc()["prs"], {"error": "OperationalError: database is locked"})
 
 
+class TheReviewRounds(Fixture):
+    """sd:10401: per item, its review rounds, clean ones too, and its runs' cost, costliest first."""
+
+    def test_an_item_with_a_three_round_build_lists_three_rounds_and_its_cost(self):
+        from sd_db.writes import create_assignment
+
+        repo = self.repo()
+        built = self.item("Built <b>", kind="task", repo=repo)
+        lead = create_assignment(self.connection, item=built, role="author", status="done", lane="parallel")
+        self.connection.execute("UPDATE assignment SET scope = 'build' WHERE id = ?", (lead,))
+        self.connection.execute(
+            "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, step, "
+            "review_round, created_at, updated_at) VALUES ('r1', ?, 1, ?, 'build/sd-1', 'fixture', '/w', '/w', "
+            "'enqueued', 2, ?, ?)", (lead, repo, NOW, NOW))
+        self.cost("run", NOW, role="author", assignment=lead, pass_="r1", tokens_in=900, tokens_out=40, usd=4.5)
+        reviews = self.doc()["reviews"]
+        self.assertEqual((reviews["error"], reviews["total"]), ("", 1))
+        row = reviews["items"][0]
+        self.assertEqual((row["item"], row["title"], row["rounds"], row["blocking"], row["clean"], row["usd"]),
+                         (built, "Built <b>", 3, 2, 1, 4.5))
+
+    def test_a_failed_read_is_the_parts_error(self):
+        from sd_db import reads
+
+        with mock.patch.object(reads, "review_costs", side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertEqual(self.doc()["reviews"], {"error": "OperationalError: database is locked"})
+
+
 class TheHealth(Fixture):
     """The weekly KISS audit's numbers (pack sd:6744). NOW is 2026-09-06T12:00Z; the window is 14 days, and last
     week's is the 14 days that ended 2026-08-30T12:00Z."""
@@ -804,7 +832,7 @@ class TheScript(Controlled):
         panels = {m.group(1): re.findall(r'<section class="panel" id="([a-z-]+)"', m.group(2))
                   for m in re.finditer(r'<div id="view-([a-z]+)"(.*?)(?=<div id="view-|</main>)', page, re.S)}
         self.assertEqual(panels, {"spend": ["spend", "week", "usage"], "providers": ["scorecard"], "ci": ["ci"],
-                                  "times": ["times", "prs"], "age": ["age"]})  # pack sd:7859: PR waits beside lane times
+                                  "times": ["times", "prs", "reviews"], "age": ["age"]})  # pack sd:7859, sd:10401
 
     def test_a_lamp_shows_the_view_that_holds_its_reading(self):
         out = self.run_page("""const lamp = (cell, ev, view) => ({ dataset: { cell, ev, view } });
@@ -951,6 +979,18 @@ await flush();"""
         self.assertIn('data-open="example/other"', rows[2])
         self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', rows[2]), ["0m 0s", "10m 0s", "none merged"])
         self.assertEqual(out["R"]["note"], "1 pull request open now; waiting in all: 3h 40m.")
+
+    def test_review_rounds_lists_each_item_with_its_rounds_and_cost(self):
+        """sd:10401: one row per item, its title escaped; a cut list says how many it leaves out."""
+        doc = self.doc()
+        doc["reviews"] = {"error": "", "total": 3, "items": [
+            {"item": 7, "title": "Built <b>", "status": "done", "repo": "system", "runs": 1, "blocking": 2,
+             "clean": 1, "lane": 2, "rounds": 5, "tokens_in": 1200, "tokens_out": 30, "usd": 3.5}]}
+        out = self.run_page("R.body = ELS['rev-body'].html; R.note = ELS['rev-note'].textContent;", doc)
+        self.assertIn("sd:7 Built &lt;b&gt;", out["R"]["body"])
+        self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', out["R"]["body"]),
+                         ["5", "2", "1", "2", "1,200", "30", "$3.50"])
+        self.assertEqual(out["R"]["note"], "The 1 costliest of 3 items.")
 
     def test_a_press_on_a_repo_row_opens_its_pull_requests_slowest_first(self):
         doc = self.doc()

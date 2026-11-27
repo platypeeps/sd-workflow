@@ -2587,6 +2587,63 @@ class Landing(Lane):
                           (2, f"Post-merge: make post-merge passed in {self.repo}")])
         self.assertEqual(self.note_kinds[-2:], ["comment", "comment"])
 
+    def test_a_passing_post_merge_resolves_the_repositorys_earlier_post_merge_followups(self) -> None:
+        """sd:10406, sd:10407: a refresh refused while a lane held its lock filed a followup on every merge,
+        217 of them, each answered by the next refresh that passed. A pass resolves one only when the main
+        checkout holds its item's delivered commit (B1): an older pin, another repository's, a person's stay."""
+        import sd_db
+        covered, pinned, landed = self.register_items(3)
+        held = git(self.repo, "rev-parse", "HEAD")
+        newer = self.advance_origin_main()  # on origin, not in the pinned checkout the pass runs in
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            sd_db.upsert_repo(connection, str(self.tmp / "other"), remote="https://github.com/example/other.git",
+                              managed=1)
+            other = sd_db.create_item(connection, kind="task", title="other", status="done", repo=str(self.tmp / "other"))
+            failed, late, foreign = (
+                sd_db.add_note(connection, item, "followup",
+                               f"Post-merge: make post-merge failed (exit 2)\nMerged at {commit}",
+                               session=sd_lane.LANE_SESSION)
+                for item, commit in ((covered, held), (pinned, newer), (other, held)))
+            person = sd_db.add_note(connection, covered, "followup", "Post-merge: I check the refresh by hand",
+                                    session="operator")
+            connection.commit()
+        finally:
+            connection.close()
+        tree, head = self.topic()
+        git(self.repo, "switch", "-q", "--detach")  # a deploying checkout is pinned (sd:3647)
+        self.post_merge("touch ran")
+        self.merge_lands(tree, landed, head)
+        answer = self.drain()
+        self.assertEqual(answer["post_merge"],
+                         f"make post-merge passed in {self.repo}; resolved earlier post-merge followups #{failed}")
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            still = [row[0] for row in connection.execute(
+                "SELECT id FROM note WHERE kind = 'followup' AND resolved_at IS NULL ORDER BY id")]
+        finally:
+            connection.close()
+        self.assertNotIn(newer, git(self.repo, "rev-list", "HEAD").split())  # the pin holds the older commit only
+        self.assertEqual(still, [late, foreign, person])
+
+    def test_the_library_knows_the_lanes_session_by_the_lanes_own_name(self) -> None:
+        from sd_db import workflow
+        self.assertEqual(workflow.LANE_SESSION, sd_lane.LANE_SESSION)
+
+    def test_the_library_reads_the_merge_the_lanes_followup_names(self) -> None:
+        from sd_db import workflow
+        commit = "ab" * 20
+        body = "Post-merge: make post-merge failed (exit 2)" + sd_lane.post_merge_stamp({"merge_commit": commit})
+        self.assertEqual(workflow.stamped_merge(body), commit)
+        # Class pass: a row with no full commit says so on the last line, so the line is always the
+        # lane's own: a target's output that ends like a stamp is not read as one.
+        forged = f"Post-merge: make post-merge failed: stderr: x\nMerged at {commit}"
+        for merged in (None, "", "not-a-sha", "AB" * 20, commit + "\nMerged at " + commit, 7):
+            with self.subTest(merged=merged):
+                stamp = sd_lane.post_merge_stamp({"merge_commit": merged})
+                self.assertEqual(stamp, "\nMerge commit not recorded: no pass resolves this, resolve it by hand")
+                self.assertIsNone(workflow.stamped_merge(forged + stamp))
+
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()
         (self.repo / "Makefile").write_text("post-merge-later:\n\ttouch ran\npost-merge := 1\n", encoding="utf-8")
@@ -2613,7 +2670,9 @@ class Landing(Lane):
         self.assertEqual(self.entries()[0]["status"], "merged")
         self.assertTrue(answer["post_merge"].startswith(f"make post-merge failed (exit 2) in {self.repo}:"), answer)
         self.assertIn("the install broke", answer["post_merge"])
-        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]), (f"Post-merge: {answer['post_merge']}", "followup"))
+        # Round 2: the followup names the merge it reports, so only a pass that holds it answers it.
+        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]),
+                         (f"Post-merge: {answer['post_merge']}\nMerged at {'c0ffee' * 6 + 'c0ff'}", "followup"))
         tree, head = self.topic("slow")
         self.post_merge("sleep 60")
         self.merge_lands(tree, 2, head)
@@ -2652,7 +2711,8 @@ class Landing(Lane):
         self.assertTrue(answer["post_merge"].startswith("make post-merge skipped: the main checkout did not "
                                                         "fast-forward (fast-forward skipped: the main checkout is on "
                                                         "elsewhere"), answer["post_merge"])
-        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]), (f"Post-merge: {answer['post_merge']}", "followup"))
+        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]),
+                         (f"Post-merge: {answer['post_merge']}\nMerged at {'c0ffee' * 6 + 'c0ff'}", "followup"))
 
     def test_a_variable_the_lanes_environment_omits_never_reaches_the_post_merge(self) -> None:
         """sd:7051: `{**os.environ, **environ}` put back what the caller dropped, such as a GIT_DIR naming
@@ -4744,6 +4804,162 @@ class PostMergeOwed(RefusingHub):
         self.assertEqual((self.runs(), self.noted(), self.entries()[0]["post_merge"]["ran"]),
                          (1, [], f"make post-merge passed in {self.repo}"))
 
+    def open_followups(self) -> list[int]:
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            return [row[0] for row in connection.execute(
+                "SELECT id FROM note WHERE kind = 'followup' AND resolved_at IS NULL ORDER BY id")]
+        finally:
+            connection.close()
+
+    def an_earlier_failure(self) -> int:
+        """An open lane followup on another item of this repository, for a merge the pinned checkout holds."""
+        import sd_db
+        self.assertEqual(self.register_items(1), [1])  # the queued entry's item, in this repository
+        held = git(self.repo, "rev-parse", "HEAD")
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            earlier = sd_db.create_item(connection, kind="task", title="earlier", status="done", repo=str(self.repo))
+            failed = sd_db.add_note(connection, earlier, "followup",
+                                    f"Post-merge: make post-merge failed (exit 2)\nMerged at {held}",
+                                    session=sd_lane.LANE_SESSION)
+            connection.commit()
+        finally:
+            connection.close()
+        return failed
+
+    def git_cannot(self, *verb: str) -> Any:
+        """`publish_git` with no answer for `git <verb> ...`, as a timeout gives; every other read is real."""
+        real = sd_lane.publish_git
+        return mock.patch.object(sd_lane, "publish_git", lambda root, *args: (
+            None if args[:len(verb)] == verb else real(root, *args)))
+
+    def test_a_git_that_cannot_say_what_a_pass_holds_keeps_the_settle_for_the_next_run(self) -> None:
+        """Failure table, coverage (sd:10407 class pass: an unknown read as an answer): a git that could not
+        answer was read as "not held", and the settle mark was cleared with the followup still open."""
+        failed = self.an_earlier_failure()
+        for verb in (("cat-file",), ("merge-base",)):
+            with self.subTest(verb=verb), self.git_cannot(*verb):
+                answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+                self.assertIn("earlier post-merge followups stay open", answer["post_merge"])
+                self.assertEqual((self.runs(), self.open_followups()), (1, [failed]))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertNotIn("settle", self.entries()[0]["post_merge"])
+
+    def test_a_target_whose_commit_git_cannot_read_does_not_start_and_stays_owed(self) -> None:
+        """Failure table, pass commit (sd:10529): with HEAD unread before the target, a pass would have no
+        commit to settle against. The target does not start; it stays owed and runs in the next run."""
+        failed = self.an_earlier_failure()
+        with self.git_cannot("rev-parse", "--verify", "HEAD"):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertTrue(answer["post_merge"].startswith(sd_lane.NOT_STARTED), answer["post_merge"])
+        self.assertEqual((self.runs(), self.open_followups(), self.entries()[0]["post_merge"]),
+                         (0, [failed], sd_lane.POST_MERGE_OWED))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+
+    def test_a_failed_rerun_keeps_the_settle_an_earlier_pass_owed(self) -> None:
+        """Failure table, rerun (sd:10529, sd:10407 round 3): a pass whose HEAD read timed out after the target
+        stored only `owed`; the rerun failed, recorded a failure and no settle, and the followup the pass
+        covered stayed open for good. The pass settles at the commit it started from."""
+        failed = self.an_earlier_failure()
+        self.assertEqual(self.open_followups(), [failed])
+        real, out = sd_lane.publish_git, self.repo / "post-merge.out"
+        with mock.patch.object(sd_lane, "publish_git", lambda root, *args: (
+                None if args[:1] == ("rev-parse",) and out.exists() else real(root, *args))):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        (self.repo / "Makefile").write_text("post-merge:\n\t@echo ran >> post-merge.out; exit 2\n", encoding="utf-8")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+
+    def test_a_settle_mark_that_is_no_commit_is_left_alone(self) -> None:
+        """Stored data, not trusted: a mark that names no full commit settles nothing and is not cleared."""
+        for mark in ("HEAD", "", "--all", 7, None, "ab" * 19):
+            with self.subTest(mark=mark):
+                self.assertIsNone(sd_lane.unsettled({"post_merge": {"ran": "x", "settle": mark}}))
+        self.assertIsNone(sd_lane.unsettled({"post_merge": "owed"}))
+        self.assertEqual(sd_lane.unsettled({"post_merge": {"settle": "ab" * 20}}), "ab" * 20)
+
+    def test_the_settle_runs_git_with_no_hub_write_lock_and_keeps_a_mark_set_meanwhile(self) -> None:
+        """Failure table, settle git (sd:10529 review): the settle ran `cat-file` and `merge-base` for each
+        followup inside the hub's `BEGIN IMMEDIATE`, so a slow git held every hub writer. Git now runs
+        between a read and a write; a mark another run set meanwhile is a new pass, left for its own settle."""
+        failed = self.an_earlier_failure()
+        real, locked, newer = sd_lane.read_git, [], "cd" * 20
+
+        def git_free_of_the_lock(tree: Any, *args: str, **kwargs: Any) -> Any:
+            if args[0] in ("cat-file", "merge-base"):
+                probe = sqlite3.connect(sd_lane.hub_database(self.environ), timeout=0)
+                try:
+                    probe.execute("BEGIN IMMEDIATE")
+                    probe.execute("ROLLBACK")
+                    locked.append(False)
+                except sqlite3.OperationalError:
+                    locked.append(True)
+                finally:
+                    probe.close()
+                if args[0] == "merge-base" and len(locked) == 2:  # another run's pass lands meanwhile
+                    sd_lane.update(self.store(), lambda rows: [row["post_merge"].update(settle=newer) for row in rows
+                                                               if isinstance(row.get("post_merge"), dict)])
+            return real(tree, *args, **kwargs)
+
+        with mock.patch.object(sd_lane, "read_git", git_free_of_the_lock):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(locked, [False, False])
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertEqual((self.open_followups(), self.entries()[0]["post_merge"].get("settle")), ([], newer))
+
+    def test_a_followup_filed_while_git_ran_keeps_the_settle_for_the_next_run(self) -> None:
+        """Failure table, settle write (sd:10529 class pass: a value read, then used after it changed): a
+        followup filed between the read and the write had no ancestry answer, yet the write cleared the
+        pass's mark, so no later run settled it. A mark with an unchecked followup stays."""
+        import sd_db
+        parent = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "a later merge")  # the pin holds two merges
+        failed = self.an_earlier_failure()
+        real, late = sd_lane.read_git, []
+
+        def a_followup_lands_meanwhile(tree: Any, *args: str, **kwargs: Any) -> Any:
+            if args[0] == "merge-base" and not late:
+                connection = sd_db.connect(home=self.tmp)
+                try:
+                    late.append(sd_db.add_note(connection, 1, "followup",
+                                               f"Post-merge: make post-merge failed (exit 2)\nMerged at {parent}",
+                                               session=sd_lane.LANE_SESSION))
+                    connection.commit()
+                finally:
+                    connection.close()
+            return real(tree, *args, **kwargs)
+
+        with mock.patch.object(sd_lane, "read_git", a_followup_lands_meanwhile):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertEqual((self.open_followups(), "settle" in self.entries()[0]["post_merge"]), (late, True))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{late[0]}", answer["post_merge"])
+        self.assertNotIn("settle", self.entries()[0]["post_merge"])
+
+    def test_a_settle_the_hub_refused_is_done_by_the_next_run_without_running_the_target(self) -> None:
+        """Failure table, settle (sd:10407 round 2): the pass was recorded, then the write that resolves the
+        followups it answered failed; no entry owed the target again, so no later run resolved them."""
+        from sd_db import workflow
+        failed = self.an_earlier_failure()
+        locked = sqlite3.OperationalError("database is locked")
+        with mock.patch.object(workflow, "resolve_post_merge", side_effect=locked):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn("stay open", answer["post_merge"])
+        self.assertEqual((self.runs(), self.open_followups()), (1, [failed]))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(("post_merge" in answer, self.runs()), (False, 1))
+
     def test_a_merge_the_next_run_applies_from_a_hub_stop_record_runs_the_target_there(self) -> None:
         """Failure table, hub stop (sd:4184): the outcome write was refused, then the run died before the target."""
         self.killed_before_the_target(self.upgrade_after("merge"))
@@ -5772,6 +5988,53 @@ class CancelMerged(SharedQueue):
         self.assertEqual((cancelled["status"], [row["status"] for row in self.entries()]), ("cancelled", ["cancelled"]))
         self.assertIn(f"sd:1 is done; its receipt merged at {'1' * 40}", cancelled["reason"])
 
+    def test_a_done_items_imported_entry_without_a_receipt_is_cancelled(self) -> None:
+        """sd:10381: the old file queue kept no ship receipt, and a satellite merge writes none on the hub.
+        A done item's imported entry is cancelled; an open item's, or a done item's own entry, refuses."""
+        import sd_db
+        self.prepared()
+
+        def refused() -> None:
+            before = self.rows()
+            with self.assertRaisesRegex(sd_lane.LaneError, "no merged ship receipt"):
+                sd_lane.cancel(self.repo, 1, self.environ)
+            self.assertEqual(self.rows(), before)
+
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from="queue.json"))
+        refused()  # the item is open
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("INSERT OR REPLACE INTO item(id, kind, title, status, created_at, updated_at) VALUES "
+                               "(1, 'task', 'one', 'done', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z')")
+            connection.commit()
+        finally:
+            connection.close()
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from=None))
+        refused()  # done, but an entry this lane queued has a receipt to show
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from="queue.json"))
+        cancelled = sd_lane.cancel(self.repo, 1, self.environ)
+        self.assertEqual((cancelled["status"], [row["status"] for row in self.entries()]), ("cancelled", ["cancelled"]))
+        self.assertIn("sd:1 is done; the old file queue kept no ship receipt", cancelled["reason"])
+
+    def test_a_done_items_imported_entry_whose_receipt_excludes_its_head_is_refused(self) -> None:
+        """sd:10381 review: a receipt this clone reads, at a head that does not hold the queued one, says
+        other work merged; the done item's file-queue fallback is only for an item with no receipt."""
+        import sd_db
+        self.prepared()
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from="queue.json"))
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("INSERT OR REPLACE INTO item(id, kind, title, status, created_at, updated_at) VALUES "
+                               "(1, 'task', 'one', 'done', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z')")
+            connection.commit()
+        finally:
+            connection.close()
+        self.merged_receipt("main", 1, git(self.repo, "rev-parse", "main"))
+        before = self.rows()
+        with self.assertRaisesRegex(sd_lane.LaneError, "no merged ship receipt"):
+            sd_lane.cancel(self.repo, 1, self.environ)
+        self.assertEqual(self.rows(), before)
+
     def test_an_unreadable_receipt_proves_no_merge_and_blocks_no_other_cancel(self) -> None:
         """Failures: a receipt that cannot be read is no proof, so it refuses, and a pending cancel is as before."""
         import sd_db
@@ -6095,6 +6358,199 @@ class Importing(SharedQueue):
         [kept] = self.imported_files()
         self.assertEqual((kept.read_bytes(), self.file.exists()), (original, False))
 
+    def test_lane_list_reads_and_leaves_the_file_to_the_runner(self) -> None:
+        """sd:10420: a view changes no ref, file or row; only the runner imports."""
+        import argparse  # noqa: PLC0415
+        tree = self.worktree("topic")
+        original = self.write_file(self.old(1, tree))
+        bodies = sorted(path.name for path in self.bodies.iterdir())
+        refs = git(self.origin, "for-each-ref")
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        with contextlib.chdir(self.repo), mock.patch.dict(os.environ, self.environ), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", "list"])), 0)
+        self.assertEqual(json.loads(said.getvalue())["entries"], [])
+        self.assertEqual((self.file.read_bytes(), self.imported_files(), self.rows()), (original, [], []))
+        self.assertEqual((sorted(path.name for path in self.bodies.iterdir()), self.git_verbs), (bodies, []))
+        self.assertEqual(git(self.origin, "for-each-ref"), refs)
+
+    def test_a_writing_verb_still_imports_so_a_legacy_entry_can_be_held_or_cancelled(self) -> None:
+        """sd:10420 review: only views skip the import; hold and cancel reach a file entry before the runner."""
+        import argparse  # noqa: PLC0415
+        self.write_file(self.old(1, self.worktree("one")), self.old(2, self.worktree("two")))
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        for argv in (["hold", "1"], ["cancel", "2"]):
+            with self.subTest(argv=argv), contextlib.chdir(self.repo), mock.patch.dict(os.environ, self.environ), \
+                    contextlib.redirect_stdout(io.StringIO()) as said:
+                self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", *argv])), 0, said.getvalue())
+        self.assertEqual([(row["item"], row["status"], bool(row.get("held"))) for row in self.entries()],
+                         [(1, "pending", True), (2, "cancelled", False)])
+        self.assertFalse(self.file.exists())
+
+    def writers(self) -> list[list[str]]:
+        """Every lane verb that looks for item 1's entry; `lane_main` imports before each. `enqueue` adds one,
+        so it misses nothing (`test_an_enqueue_proceeds_and_the_import_cancels_the_files_duplicate`)."""
+        return [["retry", "1"], ["cancel", "1"], ["move", "1", "top"], ["hold", "1"], ["release", "1"]]
+
+    def refused_writers(self, why: str) -> None:
+        """Each writing verb refuses, names the file and `why`, and leaves the file and the rows as they were."""
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        original = self.file.read_bytes()
+        for argv in self.writers():
+            with self.subTest(verb=argv[0]), contextlib.chdir(self.feature), \
+                    mock.patch.dict(os.environ, self.environ), contextlib.redirect_stdout(io.StringIO()) as said:
+                code = sd_lane.lane_main(parser.parse_args(["lane", *argv]))
+                answer = json.loads(said.getvalue())
+                self.assertEqual((code, answer["ok"], answer.get("code")), (3, False, None), answer)
+                self.assertIn(str(self.file), answer["error"])
+                self.assertIn(why, answer["error"])
+                self.assertEqual((self.file.read_bytes(), self.rows()), (original, []))
+
+    def test_a_writer_refuses_while_a_runner_lock_holds_the_import_back(self) -> None:
+        """sd:10420 review, failure table: import skipped; a writer would miss the file's entry."""
+        self.write_file(self.old(1, self.feature))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.refused_writers("a runner holds the lock")
+
+    def lane(self, *argv: str) -> tuple[int, dict]:
+        """`lane_main` on `argv` from the feature worktree: its exit code and answer."""
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        with contextlib.chdir(self.feature), mock.patch.dict(os.environ, self.environ), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            code = sd_lane.lane_main(parser.parse_args(["lane", *argv]))
+        return code, json.loads(said.getvalue())
+
+    def test_an_unreadable_file_blocks_no_writer_on_a_queued_entry(self) -> None:
+        """sd:10420 review: the runner claims a queued entry past a corrupt file, so cancel and hold reach it."""
+        sd_lane.enqueue_entry(self.feature, 3, "fix: t", self.body, self.environ, claim="deliver")
+        self.file.parent.mkdir(parents=True, exist_ok=True)
+        for text in ("{", '{"entries": 7}', "[]"):
+            with self.subTest(text=text):
+                self.file.write_text(text, encoding="utf-8")
+                for argv in (["hold", "3"], ["release", "3"], ["move", "3", "top"]):
+                    code, answer = self.lane(*argv)
+                    self.assertEqual(code, 0, answer)
+                self.assertEqual(self.file.read_text(encoding="utf-8"), text)
+        code, answer = self.lane("cancel", "3")
+        self.assertEqual((code, self.statuses()), (0, [(3, "cancelled")]), answer)
+
+    def test_a_writer_on_an_item_the_unimported_file_does_not_hold_proceeds(self) -> None:
+        """sd:10420 review: an import a runner lock holds back blocks only the items the file holds."""
+        sd_lane.enqueue_entry(self.feature, 3, "fix: t", self.body, self.environ, claim="deliver")
+        self.write_file(self.old(1, self.feature))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane("cancel", "3")
+        self.assertEqual((code, self.statuses()), (0, [(3, "cancelled")]), answer)
+
+    def leftover(self) -> None:
+        """Item 1 imported and then cancelled, with the file back as a kill before the rename left it."""
+        original = self.write_file(self.old(1, self.feature))
+        self.import_now()
+        sd_lane.cancel(self.repo, 1, self.environ)
+        self.file.write_bytes(original)
+
+    def test_a_leftover_file_names_no_entry_its_import_already_wrote(self) -> None:
+        """sd:10420 class pass: a reader skips a file entry by its import id, as the import does, so a row the
+        operator cancelled is not shown as waiting and holds no writer back."""
+        self.leftover()
+        code, answer = self.lane("list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("sd:1", answer["legacy"])
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane("hold", "1")
+        self.assertEqual(code, 3)
+        self.assertNotIn(str(self.file), answer["error"])  # the queue's own answer, not the file's
+        self.assertEqual(self.statuses(), [(1, "cancelled")])
+
+    def test_an_enqueue_proceeds_and_the_import_cancels_the_files_duplicate(self) -> None:
+        """sd:10420 class pass: an enqueue held off the import adds the live entry; the file's is then a
+        duplicate, so a build's recovery is never refused for a head the file queued."""
+        self.write_file(self.old(1, self.feature))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane("enqueue", "--item", "1", "--title", "fix: t", "--body-file", str(self.body),
+                                     "--deliver")
+        self.assertEqual((code, self.statuses()), (0, [(1, "pending")]), answer)
+        self.import_now()
+        self.assertEqual([(row["item"], row["status"], row.get("code")) for row in self.entries()],
+                         [(1, "pending", None), (1, "cancelled", "duplicate_on_import")])
+
+    def test_an_enqueue_of_a_head_the_file_ended_refuses_imported_or_not(self) -> None:
+        """sd:10420 review: the file failed sd:1 at this head; an enqueue of it would run that delivery again,
+        so it refuses whether its import writes the entry or a runner lock holds the import back."""
+        head = git(self.feature, "rev-parse", "HEAD")
+        enqueue = ("enqueue", "--item", "1", "--title", "fix: t", "--body-file", str(self.body), "--deliver",
+                   "--expected-head", head)
+        self.write_file(self.old(1, self.feature, status="failed"))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane(*enqueue)
+        self.assertEqual((code, self.statuses()), (3, []), answer)
+        self.assertIn("already ran in this lane", answer["error"])
+        code, answer = self.lane(*enqueue)
+        self.assertEqual((code, self.statuses()), (3, [(1, "failed")]), answer)
+        self.assertEqual(self.lane(*enqueue[:-2])[0], 0)  # the worktree's head, once imported: an operator retry
+
+    def test_an_enqueue_refuses_a_head_a_runner_imported_ended_at_any_point(self) -> None:
+        """sd:10420 class pass: a build's lookup read no entry, then the lane runner imported the file's failed
+        entry at this head. The enqueue refuses on the queue it writes to, in its own transaction: an import
+        before the call, or between its first read and its write, never lets the ended head run again."""
+        head = git(self.feature, "rev-parse", "HEAD")
+        asks = {"claim": "deliver", "expected_head": head}
+        self.write_file(self.old(1, self.feature, status="failed"))
+        self.import_now()  # the scheduled runner, after the build's `lane list`
+        with self.assertRaisesRegex(sd_lane.LaneError, "already ran in this lane"):
+            sd_lane.enqueue_entry(self.feature, 1, "fix: t", self.body, self.environ, **asks)
+        self.write_file(self.old(2, self.feature, status="failed"))
+        published = sd_lane.require_published
+
+        def runner_imports_then(*args: Any, **kwargs: Any) -> None:
+            self.import_now()  # after the enqueue's first read of the queue
+            published(*args, **kwargs)
+        with mock.patch.object(sd_lane, "require_published", runner_imports_then), \
+                self.assertRaisesRegex(sd_lane.LaneError, "already ran in this lane"):
+            sd_lane.enqueue_entry(self.feature, 2, "fix: t", self.body, self.environ, **asks)
+        self.assertEqual(self.statuses(), [(1, "failed"), (2, "failed")])
+        code, answer = self.lane("retry", "1")  # the operator's way to run it again stays open
+        self.assertEqual((code, self.statuses()[-1]), (0, (1, "pending")), answer)
+        self.write_file(self.old(3, self.feature, body=False))  # the import fails it unrun: `no_body`
+        self.import_now()
+        sd_lane.enqueue_entry(self.feature, 3, "fix: t", self.body, self.environ, **asks)
+        self.assertEqual(self.statuses()[-2:], [(3, "failed"), (3, "pending")])
+
+    def test_lane_list_names_the_files_waiting_entries(self) -> None:
+        """sd:10420 review: the view shows what the next runner pass imports, never an empty lane alone."""
+        self.write_file(self.old(1, self.feature), self.old(2, self.feature, status="merged"))
+        code, answer = self.lane("list")
+        self.assertEqual((code, answer["entries"]), (0, []))
+        self.assertIn("sd:1", answer["legacy"])
+        self.assertNotIn("sd:2", answer["legacy"])
+        self.assertNotIn("legacy_entries", answer)  # the line stands in for no entry (sd:10420 class pass)
+        self.file.write_text("{", encoding="utf-8")
+        self.assertIn("is not imported: cannot read", self.lane("list")[1]["legacy"])
+        self.file.unlink()
+        self.assertNotIn("legacy", self.lane("list")[1])
+
+    def test_a_writer_refuses_when_a_pending_head_was_not_published(self) -> None:
+        """sd:10420 review, failure table: import stopped on an unknown publish answer; nothing was written."""
+        self.write_file(self.old(1, self.feature))
+        with mock.patch.object(sd_lane, "publish_head", side_effect=sd_lane.LaneError("origin gave no answer")):
+            self.refused_writers("origin gave no answer")
+
     def test_a_busy_runner_lock_skips_the_import(self) -> None:
         """An older runner mid-entry holds the lock and keeps its file until the next pass."""
         self.write_file(self.old(1, self.feature))
@@ -6249,6 +6705,149 @@ class Watch(Lane):
         self.assertEqual(code, 1)
         self.assertEqual(lines, ["pack sd:3 merged at merged-3", "pack sd:4 none: no lane entry that is not cancelled",
                                  "pack sd:5 none: no lane entry that is not cancelled"])
+
+    def build(self, item: int, status: str, result: str | None = None, ended: str | None = None) -> int:
+        """A build assignment of `item`, as the build dispatcher writes one."""
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            with connection:
+                return connection.execute(
+                    "INSERT INTO assignment (item, role, status, scope, result, ended) "
+                    "VALUES (?, 'build', ?, 'build', ?, ?)", (item, status, result, ended)).lastrowid
+        finally:
+            connection.close()
+
+    def end_build(self, assignment: int, status: str, result: str) -> None:
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            with connection:
+                connection.execute("UPDATE assignment SET status = ?, result = ?, ended = ? WHERE id = ?",
+                                   (status, result, "2999-01-01T00:00:00+00:00", assignment))
+        finally:
+            connection.close()
+
+    def test_watch_item_waits_on_a_running_build_and_ends_on_its_block(self) -> None:
+        """sd:10908: a build that blocked after round 3 sat parked; no lane watch saw it."""
+        [item] = self.register_items(1)
+        assignment = self.build(item, "running")
+        pauses: list[int] = []
+
+        def pause() -> None:
+            pauses.append(len(pauses))
+            if len(pauses) == 2:
+                self.end_build(assignment, "blocked", "3 review rounds left blockers:\nround 3")
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, pauses), (1, [0, 1]))
+        self.assertEqual(lines, [f"pack sd:{item} build blocked: 3 review rounds left blockers: round 3"])
+
+    def test_watch_item_waits_on_a_build_then_on_the_entry_it_enqueued(self) -> None:
+        [item] = self.register_items(1)
+        assignment = self.build(item, "queued")
+
+        def pause() -> None:
+            self.end_build(assignment, "done", "build run r1 enqueued in the lane")
+            sd_lane.enqueue_entry(self.feature, item, "fix: one", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (0, [f"pack sd:{item} merged at merged-{item}"]))
+
+    def test_watch_item_follows_a_bundle_member_to_the_entry_that_closes_it(self) -> None:
+        """Review of sd:10908: a bundle's entry is keyed by its lead; a member rides in `closes`."""
+        lead, member = self.register_items(2)
+        builds = [self.build(lead, "running"), self.build(member, "running")]
+
+        def pause() -> None:
+            for assignment in builds:
+                self.end_build(assignment, "done", "build run r1 enqueued in the lane")
+            sd_lane.enqueue_entry(self.feature, lead, "fix: both", self.body, self.environ, manual=True,
+                                  claim="deliver", closes=(member,))
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, member)
+        self.assertEqual((code, lines), (0, [f"pack sd:{member} merged at merged-{lead}"]))
+
+    def test_watch_item_names_the_newer_of_a_blocked_build_and_an_ended_entry(self) -> None:
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            self.answers[(item, "prepare")] = {"ok": False, "phase": "review_blocked", "error": "a finding"}
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.build(one, "blocked", "a retried build blocked", "2999-01-01T00:00:00+00:00")
+        self.build(two, "blocked", "an older build blocked", "2000-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual(code, 1)
+        self.assertEqual(lines, [f"pack sd:{one} build blocked: a retried build blocked",
+                                 f"pack sd:{two} failed: a finding"])
+
+    def test_watch_items_exit_when_one_items_build_blocks(self) -> None:
+        """Review of sd:10908: a blocked build sat behind another item's running one."""
+        one, two = self.register_items(2)
+        assignment, _ = self.build(one, "running"), self.build(two, "running")
+        pauses: list[int] = []
+
+        def pause() -> None:
+            pauses.append(len(pauses))
+            if len(pauses) == 1:
+                self.end_build(assignment, "blocked", "round 3 left blockers")
+            if len(pauses) > 3:
+                raise AssertionError("waited on the other item")
+        with mock.patch.object(sd_lane, "watch_pause", pause):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (1, [f"pack sd:{one} build blocked: round 3 left blockers"]))
+
+    def test_watch_item_names_a_blocked_build_over_a_pending_entry(self) -> None:
+        """Review of sd:10908: a pending entry hid the build that blocked after it."""
+        [item] = self.register_items(1)
+        sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                              claim="deliver")
+        self.build(item, "blocked", "a fix round blocked", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (1, [f"pack sd:{item} build blocked: a fix round blocked"]))
+
+    def test_watch_item_reports_a_merge_over_a_build_cancelled_after_it(self) -> None:
+        """Review of sd:10908: a build cancelled after the merge made a landed item exit 1."""
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+            self.build(item, "cancelled", "the item merged", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (0, [f"pack sd:{one} merged at merged-{one}",
+                                             f"pack sd:{two} merged at merged-{two}"]))
+
+    def test_watch_item_names_a_build_blocked_after_a_partial_merge(self) -> None:
+        """Review of sd:10908: an associate-only merge is an earlier pull request, not the item's end."""
+        one, two = self.register_items(2)
+        for item in (one, two):
+            sd_lane.enqueue_entry(self.feature, item, "fix: part", self.body, self.environ, manual=True,
+                                  claim="associate-only")
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.build(one, "blocked", "the last part blocked", "2999-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, one, two)
+        self.assertEqual((code, lines), (1, [f"pack sd:{one} build blocked: the last part blocked",
+                                             f"pack sd:{two} merged at merged-{two}"]))
+
+    def test_watch_item_names_a_build_blocked_in_the_second_of_the_enqueue(self) -> None:
+        """Review of sd:10908: stamps hold whole seconds; a tie waited on the pending entry."""
+        [item] = self.register_items(1)
+        with mock.patch.object(sd_lane, "stamp_now", return_value="2030-01-01T00:00:00Z"):
+            sd_lane.enqueue_entry(self.feature, item, "fix: it", self.body, self.environ, manual=True,
+                                  claim="deliver")
+        self.build(item, "blocked", "blocked that second", "2030-01-01T00:00:00+00:00")
+        with mock.patch.object(sd_lane, "watch_pause", side_effect=AssertionError("waited")):
+            code, lines = self.watch_items(self.repo, item)
+        self.assertEqual((code, lines), (1, [f"pack sd:{item} build blocked: blocked that second"]))
 
     def test_watch_item_reads_again_after_a_hub_fault(self) -> None:
         """A read the hub did not answer is unknown, not an end."""

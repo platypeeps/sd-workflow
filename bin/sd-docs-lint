@@ -19,7 +19,9 @@ Five tree rules and one body rule. Numbers are stable: rules 5, 6 and 8 retired.
 7. Work refs     -- every `docs/work/` path tracked markdown names resolves.
 PR privacy        -- a pull request body is public, so no line of it matches
                     the operator's privacy-pattern file (sd:2999). The body
-                    carries no required or refused line.
+                    carries no required or refused line. A match that
+                    lies wholly inside this repo's own short name is
+                    not a leak (sd:10720).
 Rules 1 to 4 and 7 read the tree; the privacy rule needs `--pr-body`.
 A `mode: minimal` repository keeps `docs/work` local, so rules 1, 2 and 7 skip.
 A checkout with no `docs/work` skips rules 1, 2 and 7 too.
@@ -352,7 +354,63 @@ def privacy_file() -> pathlib.Path:
     return pathlib.Path(os.environ.get("SYSTEM_TOOLS_CONFIG") or os.path.join(config, "system")) / "privacy-patterns"
 
 
-def check_pr_privacy(body: str | None, report: Report) -> None:
+def own_segment(repo: pathlib.Path) -> re.Pattern[str] | None:
+    """This repo's own short name, as a whole leading segment of a token:
+    `shop` in `shop`, `shop-web:scan` and `shop-website`, never in `shops`
+    or `my-shop`.
+
+    The name is `origin`'s on GitHub, the one a pull request publishes;
+    a checkout's folder name is local and frees nothing. None without one,
+    or when its first segment is not plain letters and digits."""
+    match = sd_lib.GITHUB_ORIGIN.fullmatch(sd_lib.git_output(["remote", "get-url", "origin"], repo) or "")
+    segment = re.split(r"[-_.]", match[2])[0] if match else ""
+    if not re.fullmatch(r"[A-Za-z0-9]+", segment):
+        return None
+    return re.compile(rf"(?<![\w.-]){segment}(?![\w.])")
+
+
+def own_only(line: bytes, flags: list[str], own: re.Pattern[str]) -> bool:
+    """Whether every privacy match on `line` lies wholly inside this repo's
+    own short name (sd:10720): a site repo's image names carry it.
+
+    The patterns and the text reach grep as written; nothing is cut from
+    either, since a cut hid a match that ran past the name. `grep -o -b`
+    names each match by byte offset, and one that leaves the name fails the
+    line. It steps over a match that starts inside another, so the first
+    byte of the leftmost match found becomes `_`, a word character like the
+    one it replaces, and the line is read again until no match is left.
+    One byte a read: blanking every match found at once could erase a
+    skipped match that crosses two of them (`hop/shop` in `shop/shop`,
+    sd:10778). Each match is then the leftmost of some read. Anything
+    unexpected fails: no offset, an empty match, a read that changes nothing."""
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    spans = [(len(text[:found.start()].encode("utf-8")), len(text[:found.end()].encode("utf-8")))
+             for found in own.finditer(text)]
+    work = bytearray(line)
+    for _ in range(len(line) + 1):
+        done = subprocess.run(["grep", "-o", "-b", "-E", *flags], input=bytes(work) + b"\n",
+                              capture_output=True, timeout=60, check=False)
+        if done.returncode == 1:
+            return True
+        starts = []
+        for row in done.stdout.splitlines():
+            offset, _, found = row.partition(b":")
+            if done.returncode != 0 or not offset.isdigit() or not found:
+                return False
+            start = int(offset)
+            if not any(low <= start and start + len(found) <= high for low, high in spans):
+                return False
+            starts.append(start)
+        if done.returncode != 0 or not starts or work[starts[0]] == 0x5F:
+            return False
+        work[starts[0]] = 0x5F
+    return False
+
+
+def check_pr_privacy(body: str | None, report: Report, repo: pathlib.Path | None = None) -> None:
     """The body rule (sd:2999): a public pull request body matches no privacy pattern.
 
     `grep -E` matches, as `local-leak-guard` does, and a failure names line
@@ -386,9 +444,16 @@ def check_pr_privacy(body: str | None, report: Report) -> None:
     if done.returncode not in (0, 1):
         report.fail(str(path), "grep -E refused the privacy patterns: " + done.stderr.decode("utf-8", "replace").strip())
         return
+    own = own_segment(repo) if repo is not None else None
+    raw, flags, freed = body.encode("utf-8").split(b"\n"), argv[3:], 0
     for match in done.stdout.splitlines():
         number = match.split(b":", 1)[0].decode()
+        if own is not None and number.isdigit() and own_only(raw[int(number) - 1], flags, own):
+            freed += 1
+            continue
         report.fail("pull request body", f"line {number} matches a privacy pattern in {path}")
+    if own is not None and freed:
+        report.note(f"PR privacy: {freed} line(s) match only inside this repo's own name, {own.pattern}")
     if not done.stdout:
         report.note(f"PR privacy: {len(patterns)} pattern(s) from {path}, no match")
 
@@ -639,13 +704,13 @@ def run(
             report.fail("--body-only", "needs --pr-body; the privacy rule reads it")
             return report
         report.warn("rules 1-4, 7: --body-only, not run")
-        check_pr_privacy(pr_body, report)
+        check_pr_privacy(pr_body, report, repo)
         return report
     if keeps_work_local(repo, report):
         report.warn(f"rules 1-2, 7: mode: minimal keeps {work_dir} local; not run")
         check_decisions(repo / decisions_dir, report)
         check_spec_index(repo / spec_dir, report)
-        check_pr_privacy(pr_body, report)
+        check_pr_privacy(pr_body, report, repo)
         return report
     if not work_root.is_dir():
         if work_dir_named:
@@ -655,7 +720,7 @@ def run(
         report.warn(f"rules 1-2: no {work_dir}; nothing to lint")
         check_decisions(repo / decisions_dir, report)
         check_spec_index(repo / spec_dir, report)
-        check_pr_privacy(pr_body, report)
+        check_pr_privacy(pr_body, report, repo)
         # With no work root, a `docs/work` path a page names is another
         # repository's, as the vault's notes cite them (sd:6673).
         report.warn(f"rule 7 work references: no {work_dir} in this checkout, nothing to check")
@@ -665,7 +730,7 @@ def run(
         check_work_items(repo, work_dir, report, history)
     check_decisions(repo / decisions_dir, report)
     check_spec_index(repo / spec_dir, report)
-    check_pr_privacy(pr_body, report)
+    check_pr_privacy(pr_body, report, repo)
     check_work_references(repo, work_dir, report)
     return report
 

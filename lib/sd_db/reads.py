@@ -1320,6 +1320,7 @@ class Usage:
     spent: float
     held: float
     unbilled: float | None = None
+    areas: tuple[dict, ...] = ()
 
     def document(self) -> dict:
         """The plain shape both faces serialise; the JSON is the same bytes."""
@@ -1328,8 +1329,17 @@ class Usage:
             "bills": [asdict(bill) for bill in self.bills],
             "roles": list(self.roles), "bound": list(self.bound),
             "meter": list(self.meter), "spent": self.spent, "held": self.held,
-            "unbilled": self.unbilled,
+            "unbilled": self.unbilled, "areas": list(self.areas),
         }
+
+
+# The area a cost row is spent in (sd:10307), from its role and its
+# assignment's scope: a specification draft is an author run on a `draft`
+# assignment and is design, not coding. A row on no assignment keeps its
+# role's area.
+_AREA = ("CASE WHEN cost.role = 'reviewer' THEN 'review' "
+         "WHEN cost.role = 'author' AND assignment.scope = 'draft' THEN 'design' "
+         "WHEN cost.role = 'author' THEN 'coding' ELSE 'other' END")
 
 
 def month_of(month: str | None = None, *, now: str | None = None) -> str:
@@ -1453,9 +1463,25 @@ def _usage_reads(
         "AND window_minutes IS latest.window_minutes AND substr(timestamp, 1, 7) = ? "
         "ORDER BY timestamp DESC, id DESC LIMIT 1) ORDER BY provider, window_minutes",
         (month, month)).fetchall()
+    # Summed in SQL per bill, provider and role, as `roles` is, then folded
+    # here: one SQLite SUM across providers can pass 64-bit range and raise
+    # `integer overflow`, which took the whole report down (sd:10307 review).
+    areas: dict[str, dict] = {}
+    for row in connection.execute(
+        f"SELECT {_AREA} AS area, COUNT(*) AS calls, "
+        "COALESCE(SUM(CASE WHEN source IN ('run', 'bound') THEN usd END), 0.0) AS spent, "
+        "COALESCE(SUM(CASE WHEN source IN ('reserved', 'sending') THEN usd END), 0.0) AS held, "
+        "COALESCE(SUM(tokens_in), 0) AS tokens_in, COALESCE(SUM(tokens_out), 0) AS tokens_out "
+        "FROM cost LEFT JOIN assignment ON assignment.id = cost.assignment "
+        "WHERE source != 'meter' AND (source IN ('reserved', 'sending') "
+        "OR substr(cost.timestamp, 1, 7) = ?) GROUP BY area, cost.bill, cost.provider, cost.role",
+            (month,)):
+        total = areas.setdefault(row["area"], dict.fromkeys(("calls", "spent", "held", "tokens_in", "tokens_out"), 0))
+        for key in total:
+            total[key] += row[key]
     return Usage(
         month=month, days=days, today=today, bills=tuple(bills),
-        roles=tuple(dict(row) for row in roles), bound=tuple(dict(row) for row in bound),
+        roles=tuple(dict(row) for row in roles), areas=tuple({"area": name, **areas[name]} for name in sorted(areas)), bound=tuple(dict(row) for row in bound),
         meter=tuple(dict(row) for row in meter),
         spent=round(sum(bill.spent for bill in bills) + (unbilled or 0.0), 6),
         held=round(sum(bill.held for bill in bills), 6), unbilled=unbilled,
@@ -1705,10 +1731,117 @@ __all__ += ["build_runs", "item_lane_entries", "lane_delivered", "lane_entries",
 
 
 def ref_items(connection: sqlite3.Connection, prefix: str) -> list[sqlite3.Row]:
-    """The `external_id` and `status` of each `task-ref` item whose ref starts with `prefix` (sd:9505, the sweep)."""
+    """The `id`, `external_id` and `status` of each `task-ref` item whose ref starts with `prefix` (sd:9505, the
+    sweep; sd:10915, the Queue view's advisory filter)."""
     return connection.execute(
-        "SELECT external_id, status FROM item WHERE source IS 'task-ref' AND substr(external_id, 1, ?) IS ?"
+        "SELECT id, external_id, status FROM item WHERE source IS 'task-ref' AND substr(external_id, 1, ?) IS ?"
         " ORDER BY id", (len(prefix), prefix)).fetchall()
 
 
 __all__ += ["ref_items"]
+
+
+#: The build steps a run reaches only past a clean review (sd:10401).
+PAST_REVIEW = ("enqueuing", "enqueued", "checking", "cleaning")
+
+
+def _number(value: Any) -> float:
+    """A cost figure a receipt holds, or 0: bool, text, NaN and inf are none."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value \
+        and abs(value) != float("inf") else 0.0
+
+
+def review_costs(connection: sqlite3.Connection, items: Iterable[int] | None = None) -> dict[int, dict[str, Any]]:
+    """Per item, every review round its runs went through and what they cost (sd:10401), from data already held.
+
+    Build rounds, per build run of a bundle the item was in: `runner_run.review_round`, the rounds that left
+    blockers, less what a loss or usage-limit retry carried over (it resumes the same builder session), plus one
+    clean round for a run that got past review to the lane, unless it resumed one that already had. Lane rounds:
+    each pass of the item's ship receipts, those a restart set aside too. Cost: the build runs' `run` and `bound`
+    cost rows, as `build.run_spent` sums them, and each lane pass's reviewer cost; a bundle's run counts for each of
+    its items. The builder's own review records no cost (sd:10400)."""
+    from .runner import ALONE
+
+    wanted = None if items is None else set(items)
+    # Per lead, its members with the last run each is in: a member cancelled on its own (`ALONE`) is in the
+    # released runs up to its `run_count` and no later one, as `build.run` reads a run's bundle (lane review).
+    leads: dict[int, list[tuple[int, int | None]]] = {}
+    for row in connection.execute("SELECT id, item, parent, result, run_count FROM assignment WHERE scope = 'build'"):
+        if wanted is None or row["item"] in wanted:
+            alone = row["parent"] is not None and (row["result"] or "").startswith(ALONE)
+            leads.setdefault(row["parent"] or row["id"], []).append(
+                (row["item"], (row["run_count"] or 0) if alone else None))
+    spent = {row["pass"]: row for row in connection.execute(
+        "SELECT pass, SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out, SUM(usd) AS usd FROM cost "
+        "WHERE source IN ('run', 'bound') AND pass IS NOT NULL GROUP BY pass")}
+    out: dict[int, dict[str, Any]] = {}
+
+    def entry(item: int) -> dict[str, Any]:
+        return out.setdefault(item, {"item": item, "runs": 0, "blocking": 0, "clean": 0, "lane": 0, "rounds": 0,
+                                     "tokens_in": 0, "tokens_out": 0, "usd": 0.0})
+
+    prev: sqlite3.Row | None = None
+    for run in connection.execute(
+            "SELECT id, assignment, run, review_round, session_id, step, released_at FROM runner_run "
+            "WHERE assignment IN (SELECT id FROM assignment WHERE scope = 'build') ORDER BY assignment, run"):
+        last = prev if prev is not None and prev["assignment"] == run["assignment"] \
+            and run["session_id"] is not None and run["session_id"] == prev["session_id"] else None
+        blocking = max(0, (run["review_round"] or 0) - ((last["review_round"] or 0) if last is not None else 0))
+        clean = run["step"] in PAST_REVIEW and not (last is not None and last["step"] in PAST_REVIEW)
+        prev = run
+        cost = spent.get(run["id"])
+        for item, last_run in leads.get(run["assignment"], ()):
+            if last_run is not None and (run["released_at"] is None or run["run"] > last_run):
+                continue
+            row = entry(item)
+            row["runs"] += 1
+            row["blocking"] += blocking
+            row["clean"] += int(clean)
+            if cost is not None:
+                row["tokens_in"] += cost["tokens_in"] or 0
+                row["tokens_out"] += cost["tokens_out"] or 0
+                row["usd"] += cost["usd"] or 0.0
+    for (body,) in connection.execute(
+            "SELECT state.body FROM state JOIN (SELECT MAX(id) AS last FROM state WHERE kind = 'checkpoint' "
+            "AND key LIKE 'ship:%' GROUP BY key) AS keys ON state.id = keys.last"):
+        try:
+            receipt = json.loads(body)
+        except (TypeError, ValueError, RecursionError):
+            continue
+        owner = receipt.get("item") if isinstance(receipt, dict) else None
+        if type(owner) is not int or (wanted is not None and owner not in wanted):
+            continue
+        restarts = receipt.get("superseded_reviews")
+        passes = [*(receipt.get("passes") or [] if isinstance(receipt.get("passes"), list) else []),
+                  *(entry_ for restart in (restarts if isinstance(restarts, list) else []) if isinstance(restart, dict)
+                    and isinstance(restart.get("passes"), list) for entry_ in restart["passes"])]
+        row = entry(owner)
+        for each in passes:
+            if not isinstance(each, dict):
+                continue
+            row["lane"] += 1
+            report = each.get("report")
+            outcomes = report.get("outcomes") if isinstance(report, dict) else None
+            for outcome in outcomes if isinstance(outcomes, list) else []:
+                cost = outcome.get("cost") if isinstance(outcome, dict) else None
+                if isinstance(cost, dict):
+                    row["tokens_in"] += int(_number(cost.get("input_tokens")))
+                    row["tokens_out"] += int(_number(cost.get("output_tokens")))
+                    row["usd"] += _number(cost.get("usd"))
+    for row in out.values():
+        row["rounds"] = row["blocking"] + row["clean"] + row["lane"]
+        row["usd"] = round(row["usd"], 2)
+    return out
+
+
+def review_generation(connection: sqlite3.Connection) -> int:
+    """The newest `ship:` or `ship-adjudication:` checkpoint's id, 0 for none: a review saved, run again or
+    adjudicated moves it, so a reader that kept a review's answer knows to read it again (sd:10814).
+    Not in `ship`: `adjudicator_binding` hashes that file, so a read there voids adjudications."""
+    row = connection.execute("SELECT max(id) FROM state WHERE kind = 'checkpoint' AND (key >= 'ship:' "
+                             "AND key < 'ship;' OR key >= 'ship-adjudication:' "
+                             "AND key < 'ship-adjudication;')").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+__all__ += ["review_generation"]

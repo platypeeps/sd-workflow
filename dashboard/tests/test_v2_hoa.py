@@ -51,7 +51,7 @@ ANALOG = "date,samples,aquifer_ft_min,aquifer_ft_mean,aquifer_ft_max,tank_ft_min
 PUMP = "date,a2_starts,a2_runtime_hours,a2_gallons,a2_flow_gpm_running,a2_gallons_metered,hours_reported\n" + "".join(
     f"2026-08-{d:02d},{d % 3},{10 + d / 10:.1f},{90000 + d},60,,24\n" for d in range(1, 32)) + "2026-09-04,0,16.9,91119,60,,24\n"
 ALARMS = ("datetime,kind,event,notified,minutes\n"
-          "2026-07-01 08:00:00,other,A2 VSD Alarm,N,4\n"          # older than 30 days before the newest row: not carried
+          "2026-07-01 08:00:00,other,A2 VSD Alarm,N,4\n"          # older than 30 days before today: not carried
           "2026-08-20 09:00:00,generator,Generator Running,N,15\n"
           "2026-09-01 10:00:00,other,A2 VSD Alarm,N,3\n"
           "2026-09-01 10:30:00,other,A2 VSD Normal,,0\n"
@@ -194,6 +194,23 @@ class TheDocument(Fixture):
         self.assertIn("no repo named hoa", doc["items"]["error"])
         self.assertEqual((doc["mission"]["analog"], doc["assets"]["features"], doc["items"]["rows"]), ([], [], []))
 
+    def test_the_status_is_the_documents_status_without_the_trends(self):
+        """sd:10610: /api/hoa/status names what runs and nothing of the map or the export."""
+        doc = self.doc()
+        got = hoa_screen.status(self.connection, now=NOW, jobs=self.jobs)
+        self.assertEqual(set(got), {"read", "running", "parts"})
+        self.assertEqual({k: got[k] for k in ("running", "parts")}, doc["status"])
+        self.assertLess(len(json.dumps(got)), 2000)
+        state = self.root / "downloads" / "mission"
+        state.mkdir(parents=True)
+        (state / "lock").write_text("2026-09-06T08:00:00+00:00")
+        with mock.patch.object(hoa_download, "_held", lambda folder: "2026-09-06T08:00:00+00:00"):
+            moved = hoa_screen.status(self.connection, now=NOW, jobs=self.jobs)
+        self.assertTrue(moved["running"])
+        self.assertNotEqual(moved["parts"], got["parts"])
+        self.assertEqual(self.bare("/work/other")["status"], {"running": False, "parts": {
+            "jobs": {}, "sweep": [False, "no checkout: no repo named hoa is registered", None], "downloads": {}}})
+
     def test_the_trends_are_every_row_of_the_export_and_its_age(self):
         """sd:6689: the 6m, 1y and All chips need every daily row, not the last 30."""
         m = self.doc()["mission"]
@@ -201,23 +218,68 @@ class TheDocument(Fixture):
         self.assertEqual([f["rows"] for f in m["files"]], [48, 32, 5])
         self.assertEqual((len(m["analog"]), m["analog"][0]["date"], m["analog"][-1]["date"], m["pump"][-1]["date"]),
                          (48, "2026-07-20", "2026-09-05", "2026-09-04"))
-        self.assertEqual((m["latest"], m["age_days"], m["stale"]), ("2026-09-05", 1, False))
-        # 30 days back from the newest alarm: the July row is gone, oldest first.
+        # sd:10589: the oldest daily feed dates the export, so the pump file's day-old lag shows.
+        self.assertEqual((m["latest"], m["age_days"], m["state"], m["stale"]), ("2026-09-04", 2, "current", False))
+        # 30 days back from today: the July row is gone, oldest first (sd:10599).
         self.assertEqual([a["event"] for a in m["alarms"]], ["Generator Running", "A2 VSD Alarm", "A2 VSD Normal", "Tank Low Alarm"])
         self.assertEqual(m["alarms_today"], {"count": None, "reason": "the export ends 2026-09-05", "acked": 0})
 
     def test_an_export_more_than_two_days_old_is_stale(self):
         self.assertEqual(hoa_screen.STALE_DAYS, 2)
         m = hoa_screen.document(self.connection, now="2026-09-08T12:00:00Z")["mission"]
-        self.assertEqual((m["age_days"], m["stale"]), (3, True))
-        m = hoa_screen.document(self.connection, now="2026-09-07T12:00:00Z")["mission"]
+        self.assertEqual((m["age_days"], m["stale"]), (4, True))
+        m = hoa_screen.document(self.connection, now="2026-09-06T12:00:00Z")["mission"]
         self.assertEqual((m["age_days"], m["stale"]), (2, False))
+
+    def test_each_daily_feed_is_current_stale_or_unknown_on_its_own(self):
+        """sd:10589: a fresh analog file does not make a late pump file current."""
+        m = hoa_screen.document(self.connection, now="2026-09-07T12:00:00Z")["mission"]
+        self.assertEqual([(f["name"], f["state"], f["age_days"]) for f in m["files"]],
+                         [("analog-daily.csv", "current", 2), ("pump-daily.csv", "stale", 3), ("alarm-events.csv", None, 2)])
+        self.assertEqual((m["state"], m["stale"], m["latest"], m["age_days"]), ("stale", True, "2026-09-04", 3))
+
+    def test_a_missing_daily_feed_makes_the_export_unknown_not_current(self):
+        """sd:10589: an unread required feed is unknown; the fresh analog file cannot stand in for it."""
+        for pump in (None, "date,a2_starts\n2026-09-01,1\n", PUMP.splitlines(True)[0]):
+            checkout(self.hoa, pump=pump)
+            m = self.doc()["mission"]
+            files = {f["name"]: f["state"] for f in m["files"]}
+            self.assertEqual((files["analog-daily.csv"], files["pump-daily.csv"]), ("current", "unknown"), pump)
+            self.assertEqual((m["state"], m["stale"], m["latest"], m["age_days"]), ("unknown", False, "", None), pump)
 
     def test_alarms_today_count_only_real_alarms_on_a_day_the_export_reaches(self):
         alarms = ALARMS + ("2026-09-06 01:00:00,other,A2 VSD Alarm,N,2\n2026-09-06 01:10:00,other,A2 VSD Normal,,0\n"
                            "2026-09-06 02:00:00,generator,Generator Running,N,15\n")
         checkout(self.hoa, alarms=alarms)
         self.assertEqual(self.doc()["mission"]["alarms_today"], {"count": 1, "reason": "", "acked": 0})
+
+    def in_denver(self, now: str) -> dict:
+        """The document read at `now` on a machine in a zone west of UTC."""
+        import time
+
+        with mock.patch.dict(os.environ, {"TZ": "America/Denver"}):
+            time.tzset()
+            try:
+                return hoa_screen.document(self.connection, now=now, jobs=self.jobs)
+            finally:
+                self.addCleanup(time.tzset)
+
+    def test_today_is_the_hoas_calendar_date_not_utcs(self):
+        """sd:10599: 03:00 UTC on 2026-09-07 is still 2026-09-06 locally: that day's alarms are today's, and
+        due days and the export's age count from it."""
+        alarms = ALARMS + "2026-09-06 18:00:00,other,Tank Low Alarm,N,5\n"
+        checkout(self.hoa, alarms=alarms)
+        doc = self.in_denver("2026-09-07T03:00:00Z")
+        self.assertEqual(doc["mission"]["alarms_today"], {"count": 1, "reason": "", "acked": 0})
+        # The oldest daily feed ends 2026-09-04 (sd:10589): 2 local days, not UTC's 3.
+        self.assertEqual(doc["mission"]["age_days"], 2)
+        self.assertEqual({r["id"]: r["due_days"] for r in doc["items"]["rows"]}[self.late], -5)
+
+    def test_the_alarm_window_is_the_last_30_calendar_days_not_30_before_the_newest_row(self):
+        """sd:10599: an export that stopped weeks ago carried a month of alarms as if current; the window
+        ends today, so an alarm older than 30 days before today is not carried."""
+        m = hoa_screen.document(self.connection, now="2026-10-01T12:00:00Z")["mission"]
+        self.assertEqual([a["event"] for a in m["alarms"]], ["A2 VSD Alarm", "A2 VSD Normal", "Tank Low Alarm"])
 
     def test_a_file_that_does_not_parse_is_its_error_and_the_rest_still_answer(self):
         checkout(self.hoa, pump="date,a2_starts\n2026-09-01,1\n", alarms=None, assets="{not json")
@@ -358,6 +420,10 @@ class ThePage(BrowserSession):
         status, _, body = self.request("/api/hoa", headers=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["config"]["state"], "missing")
+        # sd:10610: the poll's status route is behind the same session.
+        self.assertEqual(self.request("/api/hoa/status")[0], 403)
+        status, _, body = self.request("/api/hoa/status", headers=cookie)
+        self.assertEqual((status, json.loads(body)["running"]), (200, False))
 
     def test_the_rail_opens_hoa_at_its_page(self):
         self.assertEqual(v2.SECTIONS["HOA"], "/hoa")
@@ -440,7 +506,7 @@ window.shell.view.current = () => 'tasks'; read(); await flush(); R.tasks = ELS.
         tips = dict(re.findall(r'data-cell="(\w+)"[^>]*data-tip="([^"]+)"', out["R"]["lamps"]))
         self.assertEqual(sorted(tips), ["alarms", "aquifer", "mission", "pumps", "tank", "tasks", "water"])
         self.assertIn("From Mission&#39;s alarm export.", tips["alarms"])
-        self.assertEqual(tips["mission"], "How old the newest Mission data is.")
+        self.assertEqual(tips["mission"], "How old each daily Mission feed is: the oldest one dates the export.")
         self.assertEqual([k for k, tip in tips.items() if re.search(r"\.csv|\.py|CLI:", tip)], [])
         self.assertNotIn('id="refresh"', out["R"]["lamps"], "sd:6697: Read again is the one re-read")
 
@@ -453,18 +519,21 @@ window.shell.view.current = () => 'tasks'; read(); await flush(); R.tasks = ELS.
         self.assertRegex(lamps, r'data-cell="pumps" data-open="day:2026-09-04" data-state="ok".*?<b>16.9</b> h A2.*?0 starts · 91,119 gal · 09-04')
         self.assertRegex(lamps, r'data-cell="alarms"[^>]*data-state="unknown".*?the export ends 2026-09-05.*?2 alarms in 30 d · 1 generator test')
         self.assertRegex(lamps, rf'data-cell="tasks" data-open="{self.late}" data-state="warning".*?Tasks.*?<b>1</b> overdue.*?5 open · 1 due within a week')
-        self.assertRegex(lamps, r'data-cell="mission" data-open="source:mission" data-state="ok".*?<b>1 d</b> old')
-        self.assertIn("3 mapped assets, 4 lot and tract outlines; Mission export through 2026-09-05", out["R"]["sub"])
+        self.assertRegex(lamps, r'data-cell="mission" data-open="source:mission" data-state="ok".*?<b>2 d</b> old.*?analog current · pump current')
+        self.assertIn("3 mapped assets, 4 lot and tract outlines; Mission export through 2026-09-04", out["R"]["sub"])
         self.assertEqual(out["attention"][-1], {"state": "warning", "n": 1, "what": "HOA annunciator cells"})
         self.assertIsNone(out["states"][-1])
 
     def test_an_unread_mission_lamp_opens_the_export_row_that_says_why(self):
         # sd:5298: a lamp unknown for want of the Mission export opens its evidence, the export's source row and its job.
         doc = self.doc()
-        doc["mission"].update(analog=[], pump=[], latest=None, error="cannot read analog-daily.csv")
+        checkout(self.hoa, analog=None)
+        doc = self.doc()
         lamps = self.run_page("R.lamps = ELS.annunciator.html;", doc)["R"]["lamps"]
-        for cell in ("tank", "pumps", "aquifer", "mission"):
+        for cell in ("tank", "aquifer", "mission"):
             self.assertRegex(lamps, rf'data-cell="{cell}" data-open="source:mission" data-state="unknown"', cell)
+        # sd:10589: the pump file still reads on its own.
+        self.assertRegex(lamps, r'data-cell="pumps" data-open="day:2026-09-04" data-state="ok"')
         # No reader at all is no evidence: Water stays a lamp that says so.
         self.assertRegex(lamps, r'data-cell="water" data-state="unknown"')
 
@@ -479,7 +548,8 @@ window.shell.view.current = () => 'tasks'; read(); await flush(); R.tasks = ELS.
         cases = []
         for alarms, stale, rows in ((None, False, None), (2, True, None), (0, True, []), (1, False, [])):
             doc = self.doc()
-            doc["mission"]["alarms_today"]["count"], doc["mission"]["stale"] = alarms, stale
+            doc["mission"]["alarms_today"]["count"] = alarms
+            doc["mission"]["state"] = "stale" if stale else "current"
             if rows is not None:
                 doc["items"]["rows"] = [dict(row, state="caution") for row in doc["items"]["rows"]]
             doc["attention"] = hoa_screen._attention(doc["mission"], doc["items"])
@@ -555,7 +625,7 @@ for (let i = 0; i < 3; i++) ELS['zoom-in'].listeners.click[0]();
 R.near = ELS.map.html;""", self.tract_doc())
         self.assertEqual(len(re.findall(r'class="hoa-mark"', out["R"]["far"])), 1)
         self.assertEqual(len(re.findall(r'class="hoa-mark"', out["R"]["near"])), 0)
-        self.assertEqual(len(re.findall(r'<path class="lot k-tract" data-tract="[^"]+" data-owned', out["R"]["near"])), 2)
+        self.assertEqual(len(re.findall(r'<path class="lot k-tract" data-tract="[^"]+"[^>]* data-owned', out["R"]["near"])), 2)
 
     def test_the_ring_key_shows_only_while_a_ring_is_drawn(self):
         out = self.run_page("""R.far = ELS.legend.html;
@@ -677,6 +747,28 @@ shellRun(cmd('item.email'), OBJ.get('{self.late}')); await flush();""", doc)
                      "2026-09-20 · in 14 days", f'href="/tasks?row={self.task}">Open on Tasks</a>', "from /api/hoa."):
             self.assertIn(part, r["det"])
 
+    def test_a_tasks_details_show_its_latest_decision_above_the_fields(self):
+        """sd:10600: the filing evidence came after every editable field; the latest decision now sits under
+        the title, its markup inert, and an item with no decision shows none."""
+        notes = [{"id": 3, "kind": "decision", "body": "Hire the first painter", "at": "2026-09-01T10:00:00Z"},
+                 {"id": 9, "kind": "decision", "body": "Use the <b>second</b> painter's quote", "at": "2026-09-03T10:00:00Z"},
+                 {"id": 12, "kind": "comment", "body": "Asked for a date", "at": "2026-09-04T10:00:00Z"}]
+        detail = {"item": {"id": self.task, "body": None}, "notes": notes, "history": [], "assignments": [],
+                  "documents": [], "revision": "e" * 64}
+        pre = (f"ANSWER = (path, body) => path === '/api/hoa' ? [STATUS, DOC] : path === '/api/tasks/{self.task}' "
+               f"? [200, {json.dumps(detail)}] : [404, {{ error: 'no answer' }}];")
+        click = f"ELS['ob-body'].listeners.click[0]({{ target: {{ closest: s => s === 'tr[data-id]' ? {{ dataset: {{ id: '{self.task}' }} }} : null }} }}); "
+        det = self.run_page(click + "await flush(); await flush(); R.det = ELS.details.html;", pre=pre)["R"]["det"]
+        head = det[:det.index('<dl class="fields">')]
+        self.assertIn("Use the &lt;b&gt;second&lt;/b&gt; painter&#39;s quote", head)
+        self.assertLess(head.index("<h2>Paint the pump house</h2>"), head.index("Use the &lt;b&gt;second"))
+        self.assertNotIn("Hire the first painter", head)
+        self.assertNotIn("Asked for a date", head)
+        detail["notes"] = notes[2:]
+        pre = pre.replace(json.dumps({**detail, "notes": notes}), json.dumps(detail))
+        det = self.run_page(click + "await flush(); await flush(); R.det = ELS.details.html;", pre=pre)["R"]["det"]
+        self.assertNotIn("decision", det[:det.index('<dl class="fields">')].lower())
+
     def test_one_followup_one_task_and_one_blocked_task_show_and_kind_narrows(self):
         kind = "ELS['ob-kinds'].listeners.click[0]({ target: { closest: s => s === 'button[data-kind]' ? { dataset: { kind: 'K' } } : null } }); "
         rows = "re = () => [...ELS['ob-body'].html.matchAll(/data-id=\"(\\d+)\"/g)].map(m => +m[1]); "
@@ -707,6 +799,25 @@ shellRun(cmd('item.email'), OBJ.get('{self.late}')); await flush();""", doc)
         self.assertIn("<dt>AIN</dt><dd>TEST-0002</dd>", det)
         self.assertIn("2026-09-05", det)
 
+    def test_a_lot_and_a_tract_are_named_keyboard_stops_that_enter_and_space_select(self):
+        """sd:10612: a parcel is a keyboard stop with a name, as an asset is; its key selects it as a tap does."""
+        key = ("const press = (k, attr, v) => { const e = { key: k, prevented: 0, preventDefault() { this.prevented++; }, "
+               "stopPropagation() {}, target: { closest: s => s === `[${attr}]` ? { dataset: attr === 'data-lot' ? { lot: v } "
+               ": { tract: v } } : null } }; ELS.map.listeners.keydown[0](e); return e.prevented; };\n")
+        out = self.run_page(key + """R.map = ELS.map.html;
+R.other = press('a', 'data-lot', '1'); R.none = ELS.details.html;
+R.enter = press('Enter', 'data-lot', '1'); R.lot = ELS.details.html;
+R.space = press(' ', 'data-tract', '0001'); R.tract = ELS.details.html;
+R.empty = press('Enter', 'data-nothing', '');""")
+        self.assertRegex(out["R"]["map"], r'<path class="lot k-lot" data-lot="0" tabindex="0" role="button" '
+                                          r'aria-label="100 Example St, lot"')
+        self.assertRegex(out["R"]["map"], r'<path class="lot k-tract" data-tract="0001" tabindex="0" role="button" '
+                                          r'aria-label="[^"]+, (HOA-owned )?tract"')
+        self.assertEqual((out["R"]["other"], out["R"]["enter"], out["R"]["space"], out["R"]["empty"]), (0, 1, 1, 0))
+        self.assertNotIn("<h2>102 Example St</h2>", out["R"]["none"])
+        self.assertIn("<h2>102 Example St</h2>", out["R"]["lot"])
+        self.assertIn('<span class="label">Tract</span>', out["R"]["tract"])
+
     def test_lot_data_not_fetched_is_a_partial_read_and_the_lot_says_why(self):
         self.lot_data.unlink()
         tap = "ELS.map.listeners.click[0]({ target: { closest: s => s === '[data-lot]' ? { dataset: { lot: '0' } } : null } }); "
@@ -732,6 +843,22 @@ shellRun(cmd('item.email'), OBJ.get('{self.late}')); await flush();""", doc)
         self.assertRegex(out["R"]["lamps"], r'data-cell="pumps" data-open="source:mission" data-state="unknown".*?pump-daily.csv has no')
         self.assertRegex(out["R"]["lamps"], r'data-cell="tank"[^>]*data-state="ok"')
         self.assertIn("<b>▨ Not read.</b> pump-daily.csv has no", out["R"]["trends"])
+
+    def test_the_mission_lamp_and_source_show_each_feeds_state(self):
+        """sd:10589: a late pump file lights the Mission lamp while the analog file is current; a missing one is unknown."""
+        late = hoa_screen.document(self.connection, now="2026-09-07T12:00:00Z", jobs=self.jobs)
+        out = self.run_page("R.lamps = ELS.annunciator.html; document.dispatchEvent(new CustomEvent('shell:open', "
+                            "{ detail: 'source:mission' })); R.det = ELS.details.html;", late)
+        self.assertRegex(out["R"]["lamps"], r'data-cell="mission"[^>]*data-state="caution".*?<b>3 d</b> old.*?analog current · pump stale')
+        self.assertIn("analog-daily.csv</dt><dd>current · latest 2026-09-05 · 2 d old · 48 rows", out["R"]["det"])
+        self.assertIn("pump-daily.csv</dt><dd>stale · latest 2026-09-04 · 3 d old · 32 rows", out["R"]["det"])
+        self.assertIn("stale · every daily feed through 2026-09-04 · 3 d old", out["R"]["det"])
+        checkout(self.hoa, pump=None)
+        out = self.run_page("R.lamps = ELS.annunciator.html; R.sub = ELS.subhead.html; document.dispatchEvent(new CustomEvent("
+                            "'shell:open', { detail: 'source:mission' })); R.det = ELS.details.html;")
+        self.assertRegex(out["R"]["lamps"], r'data-cell="mission"[^>]*data-state="unknown".*?analog current · pump unknown')
+        self.assertIn("pump-daily.csv</dt><dd>unknown: pump-daily.csv is not in the export folder", out["R"]["det"])
+        self.assertIn("Mission export with a daily feed unknown", out["R"]["sub"])
 
     def test_a_document_that_does_not_arrive_leaves_no_row_and_says_so(self):
         out = self.run_page("""R.before = ELS['ob-body'].html;
@@ -1179,6 +1306,7 @@ class TheAcknowledgeRoute(BrowserSession):
         self.addCleanup(tmp.cleanup)
         hoa = checkout(Path(tmp.name) / "hoa")
         self.repo(str(hoa))
+        self.enterContext(mock.patch.object(server.Dashboard, "clock", staticmethod(lambda: NOW)))  # window: sd:10599
         status, _, body = self.post("/api/hoa/alarm", {"key": "hoa-alarm/2026-09-05 06:00:00 Tank High Alarm", "acked": True})
         self.assertEqual(status, 409)
         self.assertTrue(body["reload"])
@@ -1193,6 +1321,7 @@ class TheAcknowledgeRoute(BrowserSession):
         self.addCleanup(tmp.cleanup)
         hoa = checkout(Path(tmp.name) / "hoa")
         self.repo(str(hoa))
+        self.enterContext(mock.patch.object(server.Dashboard, "clock", staticmethod(lambda: NOW)))  # window: sd:10599
         gone = "hoa-alarm/2026-09-05 06:00:00 Tank High Alarm"
         status, _, body = self.post("/api/hoa/alarms", {"keys": [gone], "acked": True})
         self.assertEqual(status, 409)
@@ -1407,6 +1536,30 @@ await flush(); R.timers = TIMERS;"""
         # A running download reads HOA again, so the row follows the session to the download and its end.
         self.assertEqual(out["R"]["timers"], [15000])
 
+    def test_a_running_download_polls_the_status_and_reads_the_document_only_on_a_change(self):
+        """sd:10610: each poll reads /api/hoa/status; the whole document, its trends near a megabyte, only when the
+        status moved, the run ended, or the status did not read."""
+        doc = self.download_doc(running=True, state="running", phase="waiting", started="2026-09-06T08:00:00+00:00")
+        doc["status"] = hoa_screen._status(doc["sources"], doc["sweep"], doc["downloads"])
+        self.assertTrue(doc["status"]["running"])
+        out = self.run_page("""const reads = () => OUT.gets.filter(p => !p.startsWith('/api/tasks/'));
+let S2 = { running: true, parts: DOC.status.parts };
+ANSWER = path => path === '/api/hoa' ? [200, DOC] : path === '/api/hoa/status' ? [200, S2] : [404, { error: 'no' }];
+const tick = async () => { await RUN.shift()(); await flush(); return reads(); };
+R.same = await tick();
+S2 = { running: true, parts: { ...DOC.status.parts, downloads: { mission: [true, 'running', 'downloading', '', ''] } } };
+R.moved = await tick();
+S2 = { running: false, parts: DOC.status.parts };
+R.ended = await tick();
+ANSWER = path => path === '/api/hoa' ? [200, DOC] : [503, { error: 'down' }];
+R.unread = await tick();
+R.left = RUN.length;""", doc, pre="var TIMERS = [], RUN = []; setTimeout = (f, ms) => { TIMERS.push(ms); RUN.push(f); return TIMERS.length; };")
+        status, full = "/api/hoa/status", "/api/hoa"
+        self.assertEqual(out["R"]["same"], [full, status])
+        self.assertEqual(out["R"]["moved"], [full, status, status, full])
+        self.assertEqual(out["R"]["ended"], [full, status, status, full, status, full])
+        self.assertEqual(out["R"]["unread"], [full, status, status, full, status, full, status, full])
+
     # sd:5678: Run now on a source row with a Download is that Download: its job exits 3 on a login page, the Download
     # waits for the login. The same off reason, CLI line and post, so the download's lock refuses both alike.
     RUN_NOW = """const c = cmd('jobs.retry'), d = cmd('download.mission'), v = OBJ.get('source:mission'), o = OBJ.get('download:mission');
@@ -1493,10 +1646,23 @@ R.cli = c.cli(m); C.run(c, m); await flush();""", self.job_doc())
         doc = self.download_doc(state="failed", reason="sh tools/mission/mission.sh export exited 1: boom",
                                 error="tools/mission/mission.sh is not in the hoa checkout /hoa, so the Mission download has no procedure there")
         out = self.run_page(self.DOWNLOAD, doc, pre=TIMERS)
-        self.assertRegex(out["R"]["src"], re.compile(r'data-id="source:mission".*?class="detail hide-sm">last download failed: sh tools/mission/mission.sh export exited 1: boom<', re.S))
+        self.assertRegex(out["R"]["src"], re.compile(r'data-id="source:mission".*?class="detail hide-sm">Mission download failed · no good download on record · Download from Mission tries again<', re.S))
         self.assertNotRegex(out["R"]["src"], re.compile(r'data-id="source:mission"(?:(?!data-id=).)*?1 d old · ', re.S))
         self.assertEqual(out["R"]["when"], doc["downloads"]["mission"]["error"])
         self.assertEqual(out["posts"], [])
+
+    def test_a_failed_download_names_the_last_good_one_and_the_retry_and_keeps_the_reason_in_details(self):
+        """sd:10616: the row says what failed, when the last good download was and what tries again; the parser's
+        reason is in Details, under Technical details."""
+        doc = self.download_doc(state="failed", reason="sh tools/mission/mission.sh export exited 1: <b>boom</b>",
+                                last_done="2026-09-05T08:00:00+00:00")
+        out = self.run_page(self.DOWNLOAD + "\nwindow.PAGE_LIST.select('source:mission'); R.det = ELS.details.html;", doc, pre=TIMERS)
+        row = re.search(r'data-id="source:mission".*?</tr>', out["R"]["src"], re.S)[0]
+        self.assertIn("Mission download failed · last good download 2026-09-05 08:00 UTC · Download from Mission tries again", row)
+        self.assertNotIn("boom", row)
+        self.assertIn("<dt>Last good download</dt><dd>2026-09-05 08:00 UTC</dd>", out["R"]["det"])
+        self.assertIn("<dt>Technical details</dt><dd>sh tools/mission/mission.sh export exited 1: &lt;b&gt;boom&lt;/b&gt;</dd>",
+                      out["R"]["det"])
 
     def test_a_source_that_is_not_listed_has_no_download_button(self):
         doc = self.download_doc()
@@ -1577,8 +1743,8 @@ R.when = ['mission', 'acme'].map(k => c.when(OBJ.get(`source:${k}`)));""", self.
 
 
 class TheRegistration(Registers, unittest.TestCase):
-    page, section, route, api = "hoa", "HOA", "/hoa", ("/api/hoa", "/api/hoa/alarm", "/api/hoa/alarms", "/api/hoa/sweep",
-                                              "/api/hoa/sweep/status", "/api/hoa/download", "/api/hoa/attachments",
+    page, section, route, api = "hoa", "HOA", "/hoa", ("/api/hoa", "/api/hoa/status", "/api/hoa/alarm", "/api/hoa/alarms",
+                                              "/api/hoa/sweep", "/api/hoa/sweep/status", "/api/hoa/download", "/api/hoa/attachments",
                                               "/api/hoa/attachments/picture", "/api/hoa/attach", "/api/hoa/vote", "/api/hoa/briefs",
                                               "/api/hoa/reports", "/api/hoa/votes")
 

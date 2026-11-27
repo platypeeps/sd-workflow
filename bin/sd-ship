@@ -2529,6 +2529,7 @@ class Ship(SharedReview):
         if not self.args.no_item:
             sd_ship_body.refuse_teammate_held(self.connection, (self.args.item, *named))
             sd_ship_body.refuse_left(self.connection, self.branch, (self.args.item, *named))
+            sd_ship_body.refuse_design_waiting(self.connection, (self.args.item, *named))
 
     def title_left_open(self, title: str, closing: list[int], deliver: bool) -> list[str]:
         """One warning when a delivering title names items this merge leaves open (sd:3704)."""
