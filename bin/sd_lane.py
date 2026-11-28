@@ -278,7 +278,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Collection, Iterable, Iterator
 
 import sd_lib
 import sd_release
@@ -1015,6 +1015,154 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
             (chunk.strip("\n").partition("\x1f") for chunk in raw.split("\x1e")) if sha.strip()]
 
 
+def _changed(worktree: pathlib.Path, sha: str) -> list[str]:
+    """The files commit `sha` changed; none for a failed read. NUL-separated: git quotes a name with a tab or a
+    non-ASCII byte otherwise."""
+    files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
+    return [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
+
+
+def listed_sides(worktree: pathlib.Path, commits: list[tuple[str, str]]) -> dict[str, int]:
+    """Each commit a merge listed by a hand-written revert in `commits` brought in, on either side since the
+    merge base (pack sd:10108), with the index in `commits` of the oldest revert listing it. Which side a
+    revert undid is read per commit (`_undone`), not from the whole merge: a revert that also edits another
+    file matches neither side (reviews of build/sd-1654). A listed commit that is no merge, an ambiguous
+    prefix (git refuses one) or a failed read reads nothing."""
+    import sd_ship_body  # noqa: PLC0415
+    sides: dict[str, int] = {}
+    for index, (_, message) in enumerate(commits):
+        if not sd_ship_body.REVERT_SUBJECT.match(message):
+            continue
+        for prefix in sd_ship_body._listed_undone(message):  # noqa: SLF001
+            named = [sha for sha, _ in commits if sha.startswith(prefix)]
+            # ponytail: the first two parents; an octopus merge's further sides are not read, so they keep
+            # their citations. Read `^@` against the octopus merge base if one ever lists such a merge.
+            if len(named) != 1:
+                continue
+            listed = publish_git(worktree, "rev-list", f"{named[0]}^1...{named[0]}^2")
+            for sha in listed.stdout.split() if listed and listed.returncode == 0 else ():
+                sides[sha] = index  # newest first, so the last revert to list it is the oldest
+    return sides
+
+
+def _patch(worktree: pathlib.Path, commit: str, names: Iterable[str] = ()) -> bytes | None:
+    """`commit`'s change against its first parent, to `names` when given, as bytes: a file that is not UTF-8
+    must not fail the read. None for a failed read."""
+    try:
+        diff = subprocess.run(["git", "--literal-pathspecs", "diff", "--binary", "--no-ext-diff", "--no-color",
+                               f"{commit}^", commit, "--", *names], cwd=worktree, capture_output=True,
+                              timeout=PUBLISH_SECONDS, check=False, env=sd_lib.without_fsmonitor(os.environ))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return diff.stdout if diff.returncode == 0 else None
+
+
+def _lines(patch: bytes, sign: bytes) -> set[bytes]:
+    """The lines `patch` adds (`sign` "+") or takes out ("-"), stripped, less blank ones and file headers."""
+    return {line[1:].strip() for line in patch.splitlines()
+            if line.startswith(sign) and not line.startswith(sign * 3 + b" ") and line[1:].strip()}
+
+
+def _held(worktree: pathlib.Path, commit: str, names: Iterable[str]) -> set[bytes] | None:
+    """The stripped lines the files `names` hold at `commit`, pooled as `_lines` pools a patch's; a file
+    absent there holds none. None for a failed read."""
+    held: set[bytes] = set()
+    for name in names:
+        try:
+            show = subprocess.run(["git", "show", f"{commit}:{name}"], cwd=worktree, capture_output=True,
+                                  timeout=PUBLISH_SECONDS, check=False, env=sd_lib.without_fsmonitor(os.environ))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if show.returncode == 0:
+            held |= {text.strip() for text in show.stdout.splitlines() if text.strip()}
+    return held
+
+
+def _present(worktree: pathlib.Path, patch: bytes, commit: str) -> bool | None:
+    """Whether `commit`'s tree holds `patch`'s change: True when it applies in reverse there, False when it
+    applies forward, None when neither does or a read fails. A scratch index, so no checkout moves."""
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {**sd_lib.without_fsmonitor(os.environ), "GIT_INDEX_FILE": str(pathlib.Path(scratch) / "index")}
+            if subprocess.run(["git", "read-tree", commit], cwd=worktree, capture_output=True,
+                              timeout=PUBLISH_SECONDS, check=False, env=env).returncode != 0:
+                return None
+            for flags, answer in ((["-R"], True), ([], False)):
+                if subprocess.run(["git", "apply", "--cached", "--check", *flags], cwd=worktree, input=patch,
+                                  capture_output=True, timeout=PUBLISH_SECONDS, check=False,
+                                  env=env).returncode == 0:
+                    return answer
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[str, str]],
+            line: Collection[str]) -> bool | None:
+    """Whether side commit `sha`'s own change is gone at the head. Gone needs proof: the listing revert at
+    `since` took its patch out whole (there before, absent after), and no commit of the head's first-parent
+    `line` since put it back for good: the whole patch, or one of its lines in one of its files, added or
+    taken out again, with no later commit taking that restore out again. So a file the side shared, an
+    unrelated edit in the revert, and a fix put back, changed or not, and then moved, each keep it (class passes, review of build/sd-1654). A commit off that line, a branch
+    an `ours` merge discarded, restores nothing.
+    None when nothing is proved: no patch (a merge, an empty commit), or it reads neither way at the revert.
+    ponytail: a restore is matched by line, so a fix rewritten in every line reads as new work, which cites
+    its own item; one common line added to the file reads as a restore, and the item closes as on the base."""
+    patch = _patch(worktree, sha) if len(publish_parents(worktree, sha)) == 1 else None
+    if not patch:
+        return None
+    revert = commits[since][0]
+    if _present(worktree, patch, f"{revert}^") is not True or _present(worktree, patch, revert) is not False:
+        return None
+    names = _changed(worktree, sha)
+    gone = True
+    # Oldest first, so the last restore or undo decides: a restore taken out again leaves the fix gone
+    # (review of build/sd-1654, sd_lane.py:1098).
+    for commit, message in reversed(commits[:since]):
+        later = _patch(worktree, commit, names) if commit in line else None
+        if not later:
+            continue
+        if gone:
+            gone = not _puts_back(worktree, patch, later, commit)
+        elif (taken := _takes_out(worktree, patch, later, commit, names)) is not None:
+            import sd_ship_body  # noqa: PLC0415
+            gone = taken[0] and (bool(sd_ship_body.REVERT_SUBJECT.match(message)) or taken[1])
+    return gone
+
+
+def _puts_back(worktree: pathlib.Path, patch: bytes, later: bytes, commit: str) -> bool:
+    """Whether `commit`, whose change to the side's files is `later`, puts the side's `patch` back: a line
+    of it, added or taken out again, or the whole patch: a deletion adds no line, and a binary or mode-only
+    change has none to match (ruling round, review of build/sd-1654)."""
+    return bool(_lines(patch, b"+") & _lines(later, b"+") or _lines(patch, b"-") & _lines(later, b"-")
+                or (_present(worktree, patch, f"{commit}^") is False and _present(worktree, patch, commit)))
+
+
+def _takes_out(worktree: pathlib.Path, patch: bytes, later: bytes, commit: str,
+               names: list[str]) -> tuple[bool, bool] | None:
+    """How `commit` takes a restored side `patch` out again, as (none of it is left, it adds nothing
+    anywhere); None when it takes nothing of it out. It undoes the restore when none is left and it is a
+    revert or adds nothing. It takes a line of the fix out, or the whole patch; or puts back a line the fix
+    took out. One line is no proof of the rest (last round, review of build/sd-1654, sd_lane.py:1113): the
+    files must then hold no line the fix added and every line it took out again (a mixed fix needs both).
+    ponytail: a commit that takes the fix out and adds other lines reads as a move, and a fix line the file
+    holds elsewhere reads as kept, so the item closes as restored."""
+    whole = _patch(worktree, commit) or b""
+    added, cut = _lines(patch, b"+"), _lines(patch, b"-")
+    if _present(worktree, patch, f"{commit}^") is True and _present(worktree, patch, commit) is False:
+        return True, not _lines(whole, b"+" if added else b"-")
+    if not (cut & _lines(later, b"+") or added & _lines(later, b"-")):
+        return None
+    held = _held(worktree, commit, names)
+    rest = held is not None and not added & held and cut <= held
+    return rest, not _lines(whole, b"+" if added & _lines(later, b"-") else b"-")
+
+def publish_parents(worktree: pathlib.Path, sha: str) -> list[str]:
+    """The parents of `sha`; none for a failed read."""
+    read = publish_git(worktree, "rev-list", "--parents", "-n", "1", sha)
+    return read.stdout.split()[1:] if read and read.returncode == 0 else []
+
+
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """`commits` (newest first) less each cited one a later hand-written revert undid (sd:8373).
 
@@ -1022,19 +1170,32 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     system sd:8242 closed though the branch undid its commit and fixes. A
     commit with a `Closes:` line counts as undone when a later commit's
     subject is a revert and the files it changed read at `head` as before
-    it. A read that fails keeps the commit, as before this check.
+    it. A cited commit a merge a revert lists brought in (`listed_sides`,
+    pack sd:10108) is undone only on proof (`_undone`): that revert took
+    its patch out and nothing put a line of it back for good. With no proof it is
+    read as on the base: a `Closes:` commit by its files, and one cited
+    only by a `Lane review fix` line stays, as it does on any other
+    commit, where a later revert may keep the fix in another file
+    (review of build/sd-1654).
+    A read that fails keeps the commit, as before this check.
     """
     import sd_ship_body  # noqa: PLC0415
+    sides = listed_sides(worktree, commits)
+    first = publish_git(worktree, "rev-list", "--first-parent", f"--max-count={len(commits)}", head) if sides else None
+    line = set(first.stdout.split()) if first and first.returncode == 0 else {sha for sha, _ in commits}
     kept = []
     for index, (sha, message) in enumerate(commits):
-        if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
-            # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
-            files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
-            names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
-            same = names and publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", f"{sha}^", head,
-                                         "--", *names)
-            if same and same.returncode == 0:
-                continue
+        names: list[str] = []
+        undone = (_undone(worktree, sha, sides[sha], commits, line)
+                  if sha in sides and sd_ship_body.cited_ids("", [(sha, message)]) else None)
+        if undone:
+            continue
+        if (undone is None and "Closes:" in message
+                and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index])):
+            names = _changed(worktree, sha)
+        same = names and publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", f"{sha}^", head, "--", *names)
+        if same and same.returncode == 0:
+            continue
         kept.append((sha, message))
     return kept
 
