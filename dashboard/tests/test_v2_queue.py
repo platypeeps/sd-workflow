@@ -1043,6 +1043,24 @@ class TheMove(Lane, BrowserSession):
                 self.assertIsNotNone(self.rebuild()["review"], "the hub answered again: Reject is back")
                 self.assertEqual(len(self.adjudicated()), 1)
 
+    def test_a_kept_refusal_is_asked_again_after_its_time(self):
+        """sd:10997 review, the class: a refusal says `retryable: false` for an outage too (a locked store, a
+        failed read is a plain refusal), so no refusal is kept for good: after `REFUSAL_SECONDS` it is asked
+        again, and Reject is back once the command answers."""
+        with mock.patch.dict(os.environ, {"QUEUE_TEMPLATE_REFUSE": "database is locked"}):
+            self.assertIsNone(self.failed()["review"])
+        self.log.write_text("")
+        self.assertIsNone(self.rebuild()["review"])
+        self.assertEqual(self.adjudicated(), [], "inside its time the refusal is kept")
+        later = time.monotonic() + queue_screen.REFUSAL_SECONDS + 1
+        with mock.patch.object(queue_screen.time, "monotonic", return_value=later):
+            self.assertIsNotNone(self.rebuild()["review"], "the command answered again: Reject is back")
+        self.assertEqual(len(self.adjudicated()), 1)
+        self.log.write_text("")
+        with mock.patch.object(queue_screen.time, "monotonic", return_value=later + 86400):
+            self.assertIsNotNone(self.rebuild()["review"])
+        self.assertEqual(self.adjudicated(), [], "an answer that exited 0 is kept past any time")
+
     def test_only_the_newest_entry_of_an_item_runs_adjudicate(self):
         """sd:10997: an older failed entry superseded by a newer one offers no Reject; it asks nothing."""
         self.failed()

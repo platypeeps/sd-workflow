@@ -394,9 +394,13 @@ def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[st
 #: sd:10814: each failed row's review fields, keyed by its lane, item, head, prepare log (path, mtime) and the store's
 #: review generation (`_review_generation`): a retry writes a new log, and a review run again or an adjudication
 #: from the CLI writes a `ship` checkpoint; `forget` drops them after a page write. A template that answered is kept,
-#: a refusal too when it is not retryable (`_final`, sd:10997: a superseded entry's refusal ran on every load); one
-#: that gave no answer, timed out, crashed or met a hub outage is asked again on the next build.
-_REVIEWS: dict[tuple, dict] = {}
+#: a refusal too when it is not retryable (`_final`, sd:10997: a superseded entry's refusal ran on every load), but
+#: only for `REFUSAL_SECONDS`; one that gave no answer, timed out, crashed or met a hub outage is asked again on
+#: the next build. The value: the fields and the monotonic time they serve until, None for an answer that exited 0.
+_REVIEWS: dict[tuple, tuple[dict, float | None]] = {}
+#: How long a kept refusal serves before it is asked again: an outage can read as a plain refusal (a locked store,
+#: a failed read), which says `retryable: false`, so none is kept for good; Reject is back within this of recovery.
+REFUSAL_SECONDS = 60.0
 #: The most `_REVIEWS` keeps before it starts again: a lane holds a few failed rows.
 REVIEWS_KEPT = 512
 
@@ -422,13 +426,13 @@ def _review_fields(entry: dict, lane: Path, generation: int | None = None) -> di
            log, mtime, generation)
     # A worktree gone since is no row to rebut: `_here` is read on every build, the kept answer only beside it.
     kept = _REVIEWS.get(key) if mtime is not None and _here(entry) else None
-    if kept is not None:
-        return copy.deepcopy(kept)
-    fields, answered = _read_review_fields(entry, lane)
-    if mtime is not None and answered:
+    if kept is not None and (kept[1] is None or time.monotonic() < kept[1]):
+        return copy.deepcopy(kept[0])
+    fields, keep = _read_review_fields(entry, lane)
+    if mtime is not None and keep:
         if len(_REVIEWS) >= REVIEWS_KEPT:
             _REVIEWS.clear()
-        _REVIEWS[key] = copy.deepcopy(fields)
+        _REVIEWS[key] = (copy.deepcopy(fields), None if keep is True else time.monotonic() + keep)
     return fields
 
 
@@ -440,11 +444,12 @@ def _final(answer: dict) -> bool:
     return "exit" in answer and isinstance(blocker, dict) and blocker.get("retryable") is False
 
 
-def _read_review_fields(entry: dict, lane: Path) -> tuple[dict, bool]:
+def _read_review_fields(entry: dict, lane: Path) -> tuple[dict, bool | float]:
     """A failed row's review key, and each finding it covers whole, for Reject's dialog; none for a review this
     host cannot rebut: none named, a worktree on another host, or a template `shown_review` cannot print
     (sd:9966). `held`: whether that review already holds recorded dispositions, which a `lane retry` reuses:
-    False only when adjudicate's template says none, so Retry asks first only then; None when not read here."""
+    False only when adjudicate's template says none, so Retry asks first only then; None when not read here.
+    With them, how long `_review_fields` may keep them: True for good, seconds for a refusal, False not at all."""
     tree = _here(entry)
     if not (tree and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
         return {"review": None, "review_findings": [], "held": None, "reviewed_head": None}, False
@@ -455,7 +460,7 @@ def _read_review_fields(entry: dict, lane: Path) -> tuple[dict, bool]:
                     LIST_SECONDS)
     recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
     held = None if recorded is False else recorded is not None
-    answered = template.get("exit") == 0 or _final(template)
+    answered = template.get("exit") == 0 or (REFUSAL_SECONDS if _final(template) else False)
     shown = shown_review(review, template) if review else None
     if shown:  # `reviewed_head`: the head Reject's CLI line adjudicates at (sd:10246)
         return {"review": shown[1], "review_findings": shown[0], "held": held, "reviewed_head": review[0]}, answered
