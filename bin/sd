@@ -1961,6 +1961,75 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     return found
 
 
+def ends_outside_a_fence(lines: list[str]) -> bool:
+    """Whether the reader is outside every code fence after `lines`: a heading below them is read."""
+
+    return (len(lines), "end") in note_heading_lines([*lines, "## end"], 0)
+
+
+def fenced_headings_only(lines: list[str]) -> bool:
+    """Whether every `## ` line of section text is code wherever the note renders (sd:10784).
+
+    A line scan is not the renderer, so the text passes only where the two
+    cannot disagree (last-round class pass); anything else refuses:
+
+    - an indented fence line, anywhere: it may sit in a list item, whose end
+      closes its fence, or close a fence the scan would hold open;
+    - outside a fence, a line starting `<`, `$$` or `%%`: an HTML block, a
+      math block or an Obsidian comment takes the fence lines below it as
+      its own text, and what follows them renders as a heading;
+    - a `## ` line outside a fence, or a fence the text leaves open, which
+      would hide the note's later headings.
+
+    A column-0 fence line outside those blocks opens or closes a top-level
+    fence for the renderer as for `note_heading_lines`: a list item or a
+    quote continues only by indentation or `>`. The risky lines are read
+    as headings and one sentinel heading follows the text, so the text
+    passes only when the sentinel is the one heading found.
+    """
+
+    if any(line[:1] == " " and CODE_FENCE.match(line) for line in lines):
+        return False
+    marked = ["## risky" if line.lstrip().startswith(("<", "$$", "%%")) else line for line in lines]
+    return note_heading_lines([*marked, "## end"], 0) == [(len(lines), "end")]
+
+
+def refuse_moved_headings(before: str, after: str, created: list[str]) -> None:
+    """Refuse a write that changes which lines of a body read as `## ` headings.
+
+    `parse_sections` vets each section's text alone, but a fence is read with
+    the whole body: a fence one section leaves open hides the headings below
+    it, and the next section's opener closes it, so that section's fenced
+    `## ` line reads as a heading and a later edit deletes the real one
+    (final-round class pass, sd:10784). `created` names the headings the
+    write adds itself.
+    """
+
+    was, now = (sorted(title for _, title in note_heading_lines(body.splitlines(), 0)) for body in (before, after))
+    if now != sorted([*was, *created]):
+        raise Refusal(
+            "the section text would change which lines read as `## ` headings:"
+            " a code fence is left open, or closes another section's;"
+            " close each fence in the section that opens it")
+
+
+def edit_sections(body: str, filled: dict[str, str], order: list[str]) -> str:
+    """`body` with each section of `filled` edited, its headings where the reader found them."""
+
+    held = {title for _, title in note_heading_lines(body.splitlines(), 0)}
+    # An edited section starts at a heading the reader found, so outside a fence. A created one may be
+    # appended, and a row stored before the fence check can end inside a fence (ruling round).
+    if any(section not in held for section in filled) and not ends_outside_a_fence(body.splitlines()):
+        raise Refusal(
+            "the row's body ends inside an open code fence, so no section can be added below it;"
+            " close the fence in the section that opens it first")
+    edited = body
+    for section, text in filled.items():
+        edited = edit_section(edited, section, text, order)
+    refuse_moved_headings(body, edited, [section for section in filled if section not in held])
+    return edited
+
+
 def section_span(lines: list[str], headings: list[tuple[int, str]],
                  name: str) -> tuple[int, int] | None:
     """`(heading, end)` for one section, ends excluded, or `None` when absent.
@@ -2228,16 +2297,22 @@ def parse_sections(pairs: list[str]) -> dict[str, str]:
             raise UsageError(f"{pair!r} names no section")
         if name in filled:
             raise UsageError(f"section {name!r} is given twice")
-        for line in text.splitlines():
-            # `^ {0,3}## `, not `startswith`. CommonMark renders a heading
-            # indented by up to three spaces, so `   ## Score` reaches Obsidian
-            # as a heading while `body_headings` -- which reads column 0 -- does
-            # not see it. Refusing the wider shape keeps the two from
-            # disagreeing about what the note contains.
-            if SMUGGLED_HEADING.match(line):
+        # `^ {0,3}## `, not `startswith`. CommonMark renders a heading
+        # indented by up to three spaces, so `   ## Score` reaches Obsidian
+        # as a heading while `body_headings` -- which reads column 0 -- does
+        # not see it. A `## ` line is text only where `fenced_headings_only`
+        # can tell it renders as code (sd:10784).
+        lines = text.splitlines()
+        if any(SMUGGLED_HEADING.match(line) for line in lines):
+            if not fenced_headings_only(lines):
                 raise Refusal(
                     f"section {name!r} carries its own `## ` heading;"
                     " section text is the body under a heading, not more headings")
+        # Every text closes the fences it opens: one left open hides the headings below it, and the
+        # next section's opener closes it, so that section's fenced `## ` line reads as a heading
+        # (ruling round, sd:10784).
+        if not ends_outside_a_fence(lines):
+            raise Refusal(f"section {name!r} leaves a code fence open; close it in the section text")
         filled[name] = text
     return filled
 
@@ -2356,13 +2431,19 @@ def rendered_body(kind: dict[str, object], root: pathlib.Path, args: argparse.Na
     template = sections.get("template")
     if template is None:
         raise Refusal("the kind declares no `sections.template`, so there is nothing to render")
+    titled = fill_placeholders(read_template(root, str(template)), args.title)
     body = fill_sections(
-        fill_placeholders(read_template(root, str(template)), args.title),
+        titled,
         parse_sections(
             resolve_pair_files(args.section or [], "--section-file", sequences=False)))
 
     order = declared_sections(kind)
-    rendered = body_headings(body)
+    # The fill moves no heading: a fence one section leaves open would hide or expose another's.
+    refuse_moved_headings(titled, body, [])
+    # The template's own headings, read before the fill and with no fence model: section text may hold
+    # a fenced `## ` line, which `parse_sections` has vetted, and a `## ` line of the template counts
+    # fenced or not, as it did before sd:10784.
+    rendered = body_headings(titled)
     if order and rendered != order:
         # The first thing in this rollout that gives `sections.order` a
         # consequence. `validate_sections` never opens the template, so until
@@ -2479,9 +2560,7 @@ def store_set(args: argparse.Namespace) -> int:
         refuse_human_only(kind, stage, DB_HUMAN)
     with db_store(name) as (records, rules, connection):
         row = records.get_row(connection, kind=name, title=args.title)
-        body = row["body"]
-        for section, text in filled.items():
-            body = edit_section(body, section, text, order)
+        body = edit_sections(row["body"], filled, order)
         done = records.edit_row(connection, row["id"], rules, revision=read_revision(args, row), who=STORE_WHO,
                                 stage=stage, fields=scalars, body=body if filled else None)
     if done["revision"] == row["revision"]:
@@ -2544,9 +2623,7 @@ def store_set_section(args: argparse.Namespace) -> int:
     filled, order = section_request(args, kind)
     with db_store(name) as (records, rules, connection):
         row = records.get_row(connection, kind=name, title=args.title)
-        body = row["body"]
-        for section, text in filled.items():
-            body = edit_section(body, section, text, order)
+        body = edit_sections(row["body"], filled, order)
         done = records.edit_row(connection, row["id"], rules, revision=read_revision(args, row), who=STORE_WHO,
                                 stage=None, fields={}, body=body)
     if done["revision"] == row["revision"]:

@@ -364,6 +364,24 @@ class AddRefusalTests(StoreFixture):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("its own `## ` heading", done.stderr)
 
+    def test_a_heading_after_a_list_items_fence_counts_in_the_order_check(self) -> None:
+        """Review of sd:10784: a fence opened in a list item ends with the item, so `## Extra` below it
+        renders as a heading; read as fenced, the order check passed a note with a heading it omits."""
+
+        self.build(template="\n# {{title}}\n\n## Tip\n\n- x\n  ```\n## Extra\n  ```\n\n## Score\n")
+        done = self.run_sd("store", "add", "pp.tip", "T", "--field", "score=9")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("but the template renders ['Tip', 'Extra', 'Score']", done.stderr)
+
+    def test_a_heading_after_an_indented_closer_counts_in_the_order_check(self) -> None:
+        """Last-round class pass on sd:10784: ` ``` ` closes a fence, so `## Extra` below it renders as a
+        heading; with indented fence lines read as text the order check took it for code."""
+
+        self.build(template="\n# {{title}}\n\n## Tip\n\n```\n ```\n## Extra\n```\n\n## Score\n")
+        done = self.run_sd("store", "add", "pp.tip", "T", "--field", "score=9")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("but the template renders ['Tip', 'Extra', 'Score']", done.stderr)
+
     def test_a_misspelled_placeholder_is_refused_rather_than_shipped(self) -> None:
         """Left in place it would reach every note written from that template
         as literal text, and be noticed by a reader rather than an author."""
@@ -587,6 +605,16 @@ class EditSectionTests(unittest.TestCase):
         self.assertEqual(
             self.edit(text, "Score", "x"),
             "## Tip\n\nkeep me\n\n## Score\n\nx\n\n## Provenance\n\nkeep me too\n")
+
+    def test_a_section_is_not_created_inside_a_fence_the_body_leaves_open(self) -> None:
+        """Ruling round: a row stored before the fence check may end inside an open fence. A section
+        appended there sits in that fence, its own opener closes it, and its fenced `## ` line reads
+        as the heading."""
+        stored = "# T\n\n## Tip\n\n```\nopen\n"
+        with self.assertRaises(sd_module().Refusal) as caught:
+            sd_module().edit_sections(stored, {"Score": "Keep.\n```\n## Score\n```"}, self.ORDER)
+        self.assertIn("ends inside an open code fence", str(caught.exception))
+        self.assertEqual(sd_module().edit_sections(stored, {"Tip": "closed"}, self.ORDER), "# T\n\n## Tip\n\nclosed\n")
 
     def test_a_fenced_heading_does_not_end_the_section_it_sits_in(self) -> None:
         text = "## Tip\n\nRun it:\n\n```markdown\n## Score\nnot a heading\n```\n\n## Score\n\nreal score\n"

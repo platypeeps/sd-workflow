@@ -48,6 +48,7 @@ from sd_db import (
     writes,
 )
 from sd_db.database import connect
+from sd_db.errors import SdDbError
 from sd_db.migrate import initialise
 from sd_db.ship import this_host
 from sd_db.workflow import item_state
@@ -852,10 +853,58 @@ class Supervise(Case):
         self.assertEqual(json.loads(row["final"])["result"], "built (pass)")
         cost = self.db.execute("SELECT * FROM cost WHERE assignment = ?", (row["assignment"],)).fetchone()
         self.assertEqual((cost["source"], cost["usd"], cost["tokens_in"], cost["tokens_out"]), ("run", 0.42, 10, 20))
+        self.assertEqual((cost["provider"], cost["bill"]), (None, None), "no registry: attribution stays unknown")
         note = self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE '%report%'", (self.items[0],))
         self.assertIn("built (pass)", note.fetchone()["body"])
         self.assertEqual(self.remote_branches(), "main", "the fake lane pushed nothing; the supervisor neither")
         self.assertIsNone(self.latest()["cancel_requested"])
+
+    def test_a_builder_cost_row_names_its_provider_and_bill(self):
+        """sd:10400: the builder is `claude -p`, so its row names the claude entry and the bill the registry gives it."""
+        shutil.copy(Path(__file__).resolve().parents[2] / "providers.yaml", self.database.parent / "providers.yaml")
+        self.press(1)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        cost = self.db.execute("SELECT provider, bill FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()
+        self.assertEqual((cost["provider"], cost["bill"]), ("claude", "anthropic"))
+
+    #: Registry files `registry.parse` does not refuse by name: bytes that are not UTF-8 (`UnicodeDecodeError`)
+    #: and a shape it reads as a key (`TypeError`).
+    UNREADABLE = {"not UTF-8": b"\xff\xfe", "a list for a bill name": (
+        b'bills:\n  a: { cost: subscription }\nproviders:\n  claude: { start: "claude -p", vendor: a, bill: [x],'
+        b' roles: [author] }\nroles:\n  author: [claude]\n')}
+
+    def test_an_unreadable_registry_leaves_the_cost_row_unattributed(self):
+        """Class pass: attribution is optional, so no registry file may end a passing run before its result."""
+        self.press(1)
+        for name, body in self.UNREADABLE.items():
+            with self.subTest(name):
+                (self.database.parent / "providers.yaml").write_bytes(body)
+                self.assertEqual(self.supervisor().attribution(), (None, None))
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.assertEqual(self.supervisor().run(), {"run": self.bundle["id"], "outcome": None, "step": "enqueued"})
+        cost = self.db.execute("SELECT provider, bill, usd FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()
+        self.assertEqual(tuple(cost), (None, None, 0.42))
+
+    def test_a_row_gone_before_the_write_leaves_the_cost_row_unattributed(self):
+        """Class pass: a `provider` or `bill` row removed after the lookup read it is no refused cost row."""
+        self.press(1)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        with mock.patch.object(build_run.Supervisor, "attribution", return_value=("claude", "anthropic")):
+            ended = self.supervisor().run()
+        self.assertEqual(ended, {"run": self.bundle["id"], "outcome": None, "step": "enqueued"})
+        cost = self.db.execute("SELECT provider, bill, usd FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchall()
+        self.assertEqual([tuple(row) for row in cost], [(None, None, 0.42)])
+
+    def test_a_declaration_read_refused_is_unread_runtime_data(self):
+        """Fix-up of sd:10400's cherry-pick: it dropped the `SdDbError` import `runtime_data` catches, so a
+        refused declaration read raised `NameError` instead of reading as unknown (None)."""
+        self.press(1)
+        with mock.patch.object(build_run.repos, "declarations", side_effect=SdDbError("refused")):
+            self.assertIsNone(self.supervisor().runtime_data())
 
     def test_a_skipped_member_is_not_delivered(self):
         """Review round 2: only the members a branch commit's `Closes:` trailer cites are enqueued and done; the
@@ -1923,6 +1972,8 @@ class Supervise(Case):
             "src/use_string.py": size.format("QUOTED"),
             "src/comment.py": "NOTED = {\n    'a': 1,  # see a)\n    'count': 3,\n}\n",
             "src/use_comment.py": size.format("NOTED"),
+            "src/hashed.py": "HASHED = {\n    'close': ')',\n# a note\n    'count': 3,\n}\n",
+            "src/use_hashed.py": size.format("HASHED"),
             "src/text.py": "TEXT = \"\"\"\n    three\n\"\"\"\n",
             "src/use_text.py": "import text\n\ndef size():\n    return int(text.TEXT)\n",
             "src/slash.py": "TOTAL = 1 + \\\n    2\n",
@@ -1939,6 +1990,9 @@ class Supervise(Case):
                                       "src/use_string.py", 4, "a name"),
             "a bracket in a comment": ("src/comment.py", "NOTED = {\n    'a': 1,  # see a)\n    'count': '',\n}\n",
                                        "src/use_comment.py", 4, "a name"),
+            "a column-0 comment in a table": ("src/hashed.py",
+                                              "HASHED = {\n    'close': ')',\n# a note\n    'count': '',\n}\n",
+                                              "src/use_hashed.py", 4, "a name"),
             "a string over lines": ("src/text.py", "TEXT = \"\"\"\n    none\n\"\"\"\n", "src/use_text.py", 4, "a name"),
             "a backslash": ("src/slash.py", "TOTAL = 1 + \\\n    ''\n", "src/use_slash.py", 4, "a name"),
             "a table's later entry": ("src/count.py", "def count_of():\n    return ''\n",
@@ -7916,6 +7970,15 @@ class Drafts(Case):
         prompt = self.calls("claude")[0]["argv"][1]
         self.assertIn(f"sd:{self.items[0]}", prompt)
         self.assertIn("The capture's one line.", prompt)
+
+    def test_a_draft_run_survives_an_unreadable_registry(self):
+        """Class pass: the draft walk shares `cost`, so it ends done with an unattributed row too."""
+        (self.database.parent / "providers.yaml").write_bytes(b"\xff\xfe")
+        run = self.claimed()
+        self.plan(claude=["draft"])
+        self.assertEqual(self.drafter(run["id"]).run(), {"run": run["id"], "outcome": "done", "questions": 1})
+        cost = self.db.execute("SELECT provider, bill, usd FROM cost WHERE pass = ?", (run["id"],)).fetchone()
+        self.assertEqual(tuple(cost), (None, None, 0.31))
 
     def test_a_draft_run_denies_write_tools(self):
         """Failure table, Drafting: the run holds the read tools only, and a denial writes nothing."""
