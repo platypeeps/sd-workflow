@@ -73,6 +73,11 @@ AREA_FIELDS = frozenset({"area"})
 #: `item.fields.blocked_by`, a sorted list of ids. `edit_item` sets the whole
 #: set and clears it; a build reads it (`build._item`) and nothing writes on a done.
 DEPENDENCY_FIELDS = frozenset({"blocked_by"})
+#: `work_kind` (sd:10758), kept as `item.fields.work_kind`: `mechanical` makes
+#: the item half a bundle slot (`build._slots`); `normal` drops the key. A
+#: design run's `design` is its own and is not set or replaced here.
+WORK_KIND_FIELDS = frozenset({"work_kind"})
+WORK_KINDS = ("mechanical", "normal")
 AREAS = ("home", "hoa", "personal")
 #: A realm id, as the dashboard's `places.parse_realms` takes one.
 AREA_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -338,7 +343,7 @@ def _fields(connection: sqlite3.Connection, changes: dict) -> dict:
     if not isinstance(changes, dict) or any(not isinstance(key, str) for key in changes):
         raise WorkflowError("changes must be an object with named fields")
     unknown = (set(changes) - USER_FIELDS - RECURRENCE_FIELDS - BRANCH_FIELDS - PARK_FIELDS - AREA_FIELDS
-               - DEPENDENCY_FIELDS)
+               - DEPENDENCY_FIELDS - WORK_KIND_FIELDS)
     if unknown:
         raise WorkflowError(f"fields cannot be edited here: {', '.join(sorted(unknown))}")
     result = dict(changes)
@@ -355,6 +360,8 @@ def _fields(connection: sqlite3.Connection, changes: dict) -> dict:
         known = areas(connection)
         if not isinstance(result["area"], str) or result["area"] not in known:
             raise WorkflowError(f"area must be one of {', '.join(known)}, or null")
+    if "work_kind" in result and result["work_kind"] not in WORK_KINDS:
+        raise WorkflowError(f"work_kind must be one of {', '.join(WORK_KINDS)}")
     if "blocked_by" in result and result["blocked_by"] is not None:
         named = result["blocked_by"]
         if not isinstance(named, list) or not all(is_item_id(value) for value in named):
@@ -614,6 +621,7 @@ def edit_item(
         values = _area(item, row, values)
         area_moved = "fields" in values
         values, waits = _blocked_by(connection, item, row, values, who=who)
+        values, kind_moved = _work_kind(item, row, values)
         if "body" in values and row["kind"] not in ("task", "followup"):
             raise WorkflowError("body text can only be edited here for task and followup items")
         if "repo" in values and row["kind"] == "work" and values["repo"] != row["repo"]:
@@ -639,9 +647,10 @@ def edit_item(
             if "parked_at" in changed:
                 lines.append(f"{'Unparked' if changed['parked_at'] is None else 'Parked'} by {who}"
                              + (f": {park_reason}" if park_reason else ""))
-            # `fields` carries `area` (`_area`) and `blocked_by` (`_blocked_by`), so the note names each.
-            fields = sorted(({key for key in changed if key != "fields"} | ({"area"} if area_moved else set()))
-                            - {"kind", "parked_at"})
+            # `fields` carries `area` (`_area`), `blocked_by` (`_blocked_by`) and `work_kind` (`_work_kind`),
+            # so the note names each.
+            fields = sorted(({key for key in changed if key != "fields"} | ({"area"} if area_moved else set())
+                             | ({"work_kind"} if kind_moved else set())) - {"kind", "parked_at"})
             if fields:
                 lines.append(f"Updated {', '.join(fields)} by {who}")
             if waits is not None:
@@ -676,6 +685,36 @@ def _area(item: int, row: Any, values: dict) -> dict:
         fields["area"] = area
     values["fields"] = json.dumps(fields, sort_keys=True) if fields else None
     return values
+
+
+def _work_kind(item: int, row: Any, values: dict) -> tuple[dict, bool]:
+    """`values` with `work_kind` folded into the row's `fields`, and whether it moved (sd:10758).
+
+    `normal` drops the key. Refused on unreadable fields and on a design
+    item, whose `design` a design run set and a build reads (sd:10096).
+    """
+    if "work_kind" not in values:
+        return values, False
+    values = dict(values)
+    kind = values.pop("work_kind")
+    base = values["fields"] if "fields" in values else row["fields"]
+    try:
+        fields = json.loads(base or "{}")
+    except (TypeError, ValueError, RecursionError):
+        fields = None
+    if not isinstance(fields, dict):
+        raise WorkflowError(f"item {item} has unreadable fields; its work kind cannot be set here")
+    if fields.get("work_kind") == "design":
+        raise WorkflowError(f"item {item} is a design item; its design run owns its work kind")
+    wanted = None if kind == "normal" else kind
+    if fields.get("work_kind") == wanted:
+        return values, False  # no change: no write, no note, the revision holds
+    if wanted is None:
+        del fields["work_kind"]
+    else:
+        fields["work_kind"] = wanted
+    values["fields"] = json.dumps(fields, sort_keys=True) if fields else None
+    return values, True
 
 
 def _blocked_by(connection: sqlite3.Connection, item: int, row: Any, values: dict, *,

@@ -21,8 +21,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from sd_db import initialise, satellite
+from sd_db import hub, initialise, satellite
 from sd_db.errors import RegistryError
 
 from .test_wire import SD_DB, Served, environment
@@ -150,6 +151,98 @@ class TheSatelliteCheck(unittest.TestCase):
         self.assertEqual(json.loads(self.config.read_text()), {"hub": "127.0.0.1", "port": port})
         again = self.check(port)
         self.assertIn(f"  ok      {self.config} names 127.0.0.1:{port}", again)
+
+    def test_address_writes_the_ip_beside_the_name_and_a_change_differs(self):
+        port = closed_port()
+        out = io.StringIO()
+        satellite.run("127.0.0.1", port, apply=True, home=self.home, out=out, address="127.0.0.1")
+        self.assertEqual(json.loads(self.config.read_text()),
+                         {"hub": "127.0.0.1", "port": port, "address": "127.0.0.1"})
+        out = io.StringIO()
+        satellite.run("127.0.0.1", port, home=self.home, out=out, address="127.0.0.2")
+        self.assertIn(f"  DIFFERS {self.config} names 127.0.0.1:{port} at 127.0.0.1, "
+                      f"not 127.0.0.1:{port} at 127.0.0.2", out.getvalue().splitlines())
+
+    def name(self, **data) -> None:
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps(data))
+
+    def test_a_rerun_without_address_keeps_the_recorded_one(self):
+        """Review of build/sd-2295: the documented command, rerun with no --address, read the recorded IP as
+        drift and --apply erased it."""
+        port = closed_port()
+        self.name(hub="127.0.0.1", port=port, address="127.0.0.1")
+        lines = self.check(port, apply=True)
+        self.assertIn(f"  ok      {self.config} names 127.0.0.1:{port} at 127.0.0.1", lines)
+        self.assertEqual(json.loads(self.config.read_text())["address"], "127.0.0.1")
+
+    def test_a_rerun_without_address_dials_the_recorded_one(self):
+        port, dialled = closed_port(), []
+        self.name(hub="127.0.0.1", port=port, address="127.0.0.2")
+
+        def connect(*args, **options):
+            dialled.append(options.get("address"))
+            raise satellite.remote.HubUnreachable("127.0.0.1", port, "fixture")
+        with mock.patch.object(satellite.remote, "connect", connect):
+            self.check(port)
+        self.assertEqual(dialled, ["127.0.0.2"])
+
+    def test_a_new_address_keeps_the_token_file(self):
+        """Class pass: an address-only change rewrote hub.json and dropped its loopback token_file."""
+        port = closed_port()
+        self.name(hub="127.0.0.1", port=port, token_file="/nonexistent/token")
+        out = io.StringIO()
+        satellite.run("127.0.0.1", port, apply=True, home=self.home, out=out, address="127.0.0.1")
+        self.assertEqual(json.loads(self.config.read_text()),
+                         {"hub": "127.0.0.1", "port": port, "token_file": "/nonexistent/token",
+                          "address": "127.0.0.1"})
+
+    def test_the_repair_drops_a_recorded_address_that_is_no_ip(self):
+        """Review of build/sd-2295: the rerun read the bad address as drift and wrote it back, so `hub.read`
+        kept refusing the file and no session opened."""
+        port = closed_port()
+        for bad in ("hub.example.test", "", 7, ["127.0.0.1"], "127.0.0.1\n"):
+            with self.subTest(bad=bad):
+                self.name(hub="127.0.0.1", port=port, address=bad)
+                self.check(port, apply=True)
+                self.assertEqual(json.loads(self.config.read_text()), {"hub": "127.0.0.1", "port": port})
+                read = hub.read(self.home)
+                assert read is not None
+                self.assertIsNone(read.address)
+
+    def test_the_repair_carries_only_a_token_file_hub_read_accepts(self):
+        """Class pass: the same merge wrote back a `token_file` that is no path, and any unknown key."""
+        port = closed_port()
+        for bad in ("", 7, None, ["/nonexistent/token"]):
+            with self.subTest(bad=bad):
+                self.name(hub="127.0.0.1", port=port, token_file=bad, extra="kept?")
+                out = io.StringIO()
+                satellite.run("127.0.0.1", port, apply=True, home=self.home, out=out, address="127.0.0.1")
+                self.assertEqual(json.loads(self.config.read_text()),
+                                 {"hub": "127.0.0.1", "port": port, "address": "127.0.0.1"})
+                read = hub.read(self.home)
+                assert read is not None
+                self.assertEqual(read.address, "127.0.0.1")
+
+    def test_a_recorded_address_with_a_newline_forges_no_stage_line(self):
+        port = closed_port()
+        self.name(hub="127.0.0.1", port=port, address="x\n  ok      forged")
+        lines = self.check(port)
+        self.assertFalse([line for line in lines if line.startswith("  ok")], lines)
+        self.assertEqual(len([line for line in lines if "DIFFERS" in line]), 1, lines)
+
+    def test_another_hub_keeps_no_recorded_address_or_token(self):
+        port = closed_port()
+        self.name(hub="other.example.test", port=port, address="192.0.2.10", token_file="/nonexistent/token")
+        self.check(port, apply=True)
+        self.assertEqual(json.loads(self.config.read_text()), {"hub": "127.0.0.1", "port": port})
+
+    def test_an_address_that_is_not_an_ip_is_refused_and_nothing_written(self):
+        out = io.StringIO()
+        self.assertEqual(satellite.run("127.0.0.1", closed_port(), apply=True, home=self.home,
+                                       out=out, address="hub.example.test"), 2)
+        self.assertIn("is not an IP address", out.getvalue())
+        self.assertFalse(self.config.exists())
 
     def test_a_hub_json_naming_another_hub_differs(self):
         port = closed_port()

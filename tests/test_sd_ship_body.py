@@ -726,7 +726,7 @@ class CitedIdTests(unittest.TestCase):
     def test_a_listed_merge_leaves_its_sides_to_the_file_check(self) -> None:
         """pack sd:9666 review, round 8: a listed merge with no `This reverts commit` trailer names no
         mainline, and the first-parent guess undid the wrong side of a `-m 2` revert. The merge alone is
-        undone here; `sd_lane.unreverted` reads each side's files at the head. With the trailer, `-m 1`
+        undone here; `sd_lane.unreverted` reads each side commit by its own patch. With the trailer, `-m 1`
         drops the side commit."""
         base, side, main, merge = (c * 40 for c in "abce")
         work = [(merge, "Merge branch 'side'"), (main, "fix: mainline\n\nCloses: sd:4"),

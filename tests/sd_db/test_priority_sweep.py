@@ -47,6 +47,16 @@ class Sweep(unittest.TestCase):
         self.assertNotIn(done["batch"], [item["id"] for item in priority_sweep.unranked(self.db)],
                          "the batch's own row is the queue, not unranked work")
 
+    def test_a_review_finding_item_is_unranked_work_and_a_batch_is_not(self):
+        # sd:10981: only a filed batch's header makes a row a batch; a `review:<slug>` finding item is work to rank.
+        finding = self.item("UX terms", filed="2026-10-20T09:00:00+00:00")
+        self.db.execute("UPDATE item SET source = 'task-ref', external_id = 'review:mws-ux-terms' WHERE id = ?",
+                        (finding,))
+        done = priority_sweep.sweep(self.db, who="sweep", now=NOW)
+        unranked = [item["id"] for item in priority_sweep.unranked(self.db)]
+        self.assertIn(finding, unranked)
+        self.assertNotIn(done["batch"], unranked)
+
     def test_a_question_asked_once_is_not_asked_again_and_its_ruling_sets_the_rank(self):
         young = self.item("Young", filed="2026-10-20T09:00:00+00:00", kind="followup")
         first = priority_sweep.sweep(self.db, who="sweep", now=NOW)

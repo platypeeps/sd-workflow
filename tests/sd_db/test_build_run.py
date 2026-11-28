@@ -1304,6 +1304,31 @@ class Supervise(Case):
         self.assertIn(f"build run {ident} hit the usage limit on work", rows[0]["result"])
         self.assertIn("move its lane back to work", rows[0]["result"])
 
+    def test_a_usage_limit_resume_checks_the_worktree_branch_first(self):
+        """Review of build/sd-1654 (build.py:1934): the claim after a usage limit resumes at its step, past the
+        `worktree` step and its branch check. A worktree moved to another branch while the bundle waited had
+        the builder resume there. The resumed run checks the branch first and blocks, as a fresh claim does."""
+        self.press()
+        self.write_pr()
+        ident = self.bundle["id"]
+        self.assertEqual(self.supervisor().worktree(), "building")
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="building", session_id="session-limited",
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        support.git(Path(self.bundle["work_path"]), "checkout", "-q", "-b", "elsewhere")
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual(build.run(self.db, again["id"])["step"], "building")
+        self.plan(claude=["pass"], sd_review=["clean"])
+        ended = self.supervisor(again["id"]).run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn("is on elsewhere, not build/sd-", ended["blocked"])
+        self.assertEqual(self.calls("claude"), [], "no builder ran on the wrong branch")
+
     def test_a_fault_inside_the_usage_limit_end_writes_nothing_and_the_next_end_finishes(self):
         """Pack sd:9907, failure table row 2: the outcome, the release, the requeue and the hold are one
         transaction. A fault at its last write leaves the run open and its bundle running, as the
@@ -6225,7 +6250,7 @@ class Tick(Case):
     def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
                                    outsider=None, left_out=False, reverted=None, rebundled=False,
                                    other_failed=False, claimed=False, newer=False, imported=False,
-                                   retried=False, jammed=False, made=False):
+                                   retried=False, jammed=False, made=False, branchless=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -6251,6 +6276,11 @@ class Tick(Case):
                                        **({"imported_from": "queue.json"} if imported else {})}
         self.tick()
         self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        if branchless:  # the lane kept the imported entry with no branch: its worktree was gone (sd:10960)
+            with self.db:
+                self.db.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                                ("lane:v1:example/repo:e1", build.clock(),
+                                 json.dumps({k: v for k, v in self.stored("e1").items() if k != "branch"})))
         if trimmed:  # the operator drops the failed branch's commit after the failure; the entry still names it
             support.git(self.repo, "branch", "-f", run["branch"], f"{head}~1")
             head = support.git(self.repo, "rev-parse", run["branch"])
@@ -6375,6 +6405,24 @@ class Tick(Case):
         assert failed is not None
         self.assertIn("cancelled", build.take_over(self.db, failed, self.bundle["id"]))
         self.assertEqual(self.stored("e1"), before)
+
+    def test_a_rebuild_never_adopts_a_branchless_imported_failed_entry(self):
+        """sd:10960: an imported failed entry names head H and no branch (its worktree was gone). The rebuild
+        starts at H, `take_over` finds no entry on the failed branch, and the lookup took the branchless entry
+        as the rebuild's own: marked enqueued with nothing submitted, then failed from the stale entry. A
+        branchless entry is never a rebuild's own: the run submits its head, and the lane's refusal of a head
+        an import ended blocks it by name, with the Retry that recovers it."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True, imported=True, branchless=True)
+        self.assertEqual(self.stored("e1")["status"], "failed", "take_over found no entry on the failed branch")
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("already ran in this lane", ended["blocked"])
+        self.assertNotEqual(build.run(self.db, self.bundle["id"])["step"], "enqueued")
 
     def test_a_rebuild_hands_back_only_the_entry_its_failed_run_recorded(self):
         """Lead review of build/sd-1808: a lane Retry of the failed entry e1 queued e2 on the same branch, which
@@ -9397,8 +9445,9 @@ class HubFaults(Case):
         """The `fixing` step normally resumes at its review; a held builder is the fix's own continuation."""
         self.plan(claude=["pass"], sd_review=["clean"])
         supervisor = self.supervisor()
-        build.write(self.db, self.bundle["id"], step="fixing", session_id="session-fixture")
         supervisor.logs.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(supervisor.worktree(), "building")  # a run at `fixing` has its worktree
+        build.write(self.db, self.bundle["id"], step="fixing", session_id="session-fixture")
         supervisor.held = {"name": "claude", "argv": [], "exit": 0, "offset": 0, "session": False,
                            "descendants": False, "pid": 1, "as": "fix:0"}
         with mock.patch.object(supervisor, "fix", return_value={"run": "r"}) as fix:
