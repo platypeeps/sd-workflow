@@ -806,7 +806,7 @@ class DispositionTests(unittest.TestCase):
             with self.subTest(name=name), patch.object(pathlib.Path, "read_bytes", changed):
                 self.operation().check_review(self.head)
 
-    @patch.object(importlib.import_module("sd_lib"), "TOOL_CHANGES_KEEP_REVIEWS", False)
+    @patch.object(importlib.import_module("sd_lib"), "tool_changes_keep_reviews", lambda *_: False)
     def test_review_tool_adjudicator_tool_and_policy_changes_refuse(self):
         self.blocked()
         self.accepted()

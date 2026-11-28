@@ -849,8 +849,9 @@ class SharedReview:
         `save=False` only answers: the held-review path records its result first, and a rebind saved
         before it would strand that result if the process stopped between the two writes."""
         changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
-        if (not sd_lib.TOOL_CHANGES_KEEP_REVIEWS or manifest is None or not changed
-                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
+        if (manifest is None or not changed
+                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)
+                or not sd_lib.tool_changes_keep_reviews()):
             return False
         # A normalizer move reports alone and hides the policy entries, so policy is compared here too.
         current = manifest(self.root)

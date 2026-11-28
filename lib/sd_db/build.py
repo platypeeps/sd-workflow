@@ -1243,7 +1243,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     every other item is the Build press (`queue`), a `planning` one set ready first: the one verb that starts a
     build, so a task just filed builds with no status step (sd:9063). One transaction, so one refusal writes
     nothing, the ready step included (pack sd:8785).
-    A `finding` is Send to builder on a Retry or a Fix; a fresh build has no builder to send it to (pack sd:8792)."""
+    A `finding` is Send to builder (pack sd:8792): a Retry's or Fix's builder reads it, and a fresh build's builder
+    reads it from the note written after its queue note (sd:10320)."""
     if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
         raise BuildRefused("select one or more distinct items")
     finding = finding.strip()
@@ -1319,9 +1320,13 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 named.setdefault(lead, set()).add(item)
             else:
                 fresh.append(item)
-        if finding and fresh:
-            raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
-                               "would be a fresh build, with no builder to send it to")
+        # A design item with no design runs a design run first (`queue`), which reads no finding, and its code
+        # build's window opens after that: the finding would be lost unsaid (lane review of build/sd-1782).
+        drafts = [item for item in fresh if work_kind(connection, item) == DESIGN_KIND
+                  and draft_design(connection, item) is None] if finding else []
+        if drafts:
+            raise BuildRefused(f"--finding: {', '.join(f'sd:{item}' for item in drafts)} would start a design run, "
+                               "which reads no finding; note it on the item for the design, or build without it")
         # One named item is the row's Retry of its whole bundle; two or more name the part to retry (pack sd:9581).
         queued = []
         for lead in leads:
@@ -1356,7 +1361,11 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     _answered(connection, item, since)
                     transition(connection, item, "ready", who=who, reason="Build after its bundle ended")
         fresh = list(dict.fromkeys(fresh))
-        return queued + (queue(connection, fresh, who=who) if fresh else [])
+        built = queue(connection, fresh, who=who) if fresh else []
+        # After the queue's note, where a fresh build's brief starts its findings (sd:10320).
+        for item in fresh if finding else []:
+            add_note(connection, item, "comment", FINDING + finding)
+        return queued + built
 
 
 def _build_blocked(connection, item: int) -> str | None:

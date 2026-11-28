@@ -128,14 +128,14 @@ def recorded_key(operation: Any, bindings: dict) -> str:
     return "ship-adjudication:lead:" + where.split(":", 1)[1] if bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE else where
 
 
-#: The `context` entries a tool change moves; under `sd_lib.TOOL_CHANGES_KEEP_REVIEWS` a recorded
+#: The `context` entries a tool change moves; under `sd.review_tool_changes` keep a recorded
 #: rebuttal survives them (operator 2026-11-27). A policy change still re-reviews, so a new report
 #: (its digest and `passes_digest`) voids the rebuttal there.
 TOOL_BINDINGS = ("review_binding", "adjudicator_binding")
 
 
 def same_bindings(stored: object, current: dict) -> bool:
-    if sd_lib.TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict):
+    if isinstance(stored, dict) and sd_lib.tool_changes_keep_reviews():
         return digest({k: v for k, v in stored.items() if k not in TOOL_BINDINGS}) == digest(
             {k: v for k, v in current.items() if k not in TOOL_BINDINGS})
     return digest(stored) == digest(current)
