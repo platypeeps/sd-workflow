@@ -924,8 +924,8 @@ def ruled(connection: Any, repository: str, item: int, branch: str, head: str) -
         passes = receipt.get("passes") if isinstance(receipt.get("passes"), list) else []
         last = passes[-1] if passes and isinstance(passes[-1], dict) else {}
         reviewed = last["head"] if isinstance(last.get("head"), str) else head
-        proposal = ruling.get("proposal") if isinstance(ruling.get("proposal"), dict) else {}
-        bindings = proposal.get("bindings") if isinstance(proposal.get("bindings"), dict) else {}
+        proposal = got if isinstance(got := ruling.get("proposal"), dict) else {}
+        bindings = bound if isinstance(bound := proposal.get("bindings"), dict) else {}
         try:
             seen = sd_ship_dispositions.digest(receipt.get("passes"))
         except Refusal:  # passes no digest reads: no ruling can name them
