@@ -619,6 +619,81 @@ class EditSectionTests(unittest.TestCase):
         after = self.edit(text, "Score", "written")
         self.assertEqual(after, "## Tip\n\n```` `x` ````\n\n## Score\n\nwritten\n")
 
+    # sd:10962: where a renderer may end a fence sooner than the line scan,
+    # a heading the scan reads as code would be overwritten by an edit of
+    # the section above it. The scan refuses then instead of guessing.
+    RISKY_FENCES = {
+        "an unclosed fence in a list item, which ends with the item":
+            "## Tip\n\n1. step\n   ```sh\n   run\n## Score\n\nreal\n",
+        "a fence on a list marker's line, whose closer the scan reads as an opener":
+            "## Tip\n\n- ```\n  code\n  ```\n\n## Score\n\nreal\n",
+        "an HTML block that ends at a blank line":
+            "## Tip\n\n<div>\n```\n\n## Score\n\nreal\n\n```\n",
+        "a math block that holds the opener":
+            "## Tip\n\n$$\n```\n$$\n\n## Score\n\nreal\n\n```\n",
+        "an Obsidian comment that holds the opener":
+            "## Tip\n\nsee %%\n```\n%%\n\n## Score\n\nreal\n\n```\n",
+    }
+
+    def test_a_heading_a_risky_fence_hides_refuses_the_edit(self) -> None:
+        sd = sd_module()
+        for why, text in self.RISKY_FENCES.items():
+            with self.subTest(why):
+                with self.assertRaises(sd.Refusal) as refused:
+                    self.edit(text, "Tip", "replaced")
+                self.assertIn("line ", str(refused.exception))
+                with self.assertRaises(sd.Refusal):
+                    sd.note_heading_lines(text.splitlines(keepends=True), 0)
+
+    def test_a_hidden_heading_beside_any_risky_block_refuses_over_random_notes(self) -> None:
+        """The invariant the cases above sample, over 20,000 notes built from block
+        pieces: beside any fence run not at column 0, or a `<`, `$$` or `%%` line
+        before the first fence line, every heading-shaped line is read as a
+        heading, or the read refuses."""
+        sd = sd_module()
+        pieces = ["## Score", "##\tTab", "##", "  ## Two", "text", "", "```", "~~~", "````", "   ```",
+                  "- ```", "1. step", "   ```sh", "\t```", "    ```", "<div>", "$$", "see %%", "> ```",
+                  "```md", "- item", "é ## not", "## Ünïcode"]
+        rng = random.Random(10962)
+        for _ in range(20000):
+            lines = [rng.choice(pieces) + "\n" for _ in range(rng.randint(1, 9))]
+            fences = [i for i, line in enumerate(lines) if "```" in line or "~~~" in line]
+            risky = any(not lines[i].startswith(("```", "~~~")) for i in fences) or any(
+                line.lstrip().startswith("<") or "$$" in line or "%%" in line
+                for line in lines[:fences[0] if fences else len(lines)])
+            shaped = [i for i, line in enumerate(lines) if sd.SMUGGLED_HEADING.match(line)]
+            try:
+                found = [i for i, _ in sd.note_heading_lines(lines, 0)]
+            except sd.Refusal:
+                continue
+            if risky:
+                self.assertEqual(found, shaped, "".join(lines))
+
+    def test_a_closed_list_item_fence_edits_as_before(self) -> None:
+        text = "## Tip\n\n1. step\n   ```sh\n   run\n   ```\n\n## Score\n\nreal\n"
+        self.assertEqual(self.edit(text, "Tip", "replaced"), "## Tip\n\nreplaced\n\n## Score\n\nreal\n")
+
+    def test_a_column_zero_fence_still_hides_its_heading_beside_a_list(self) -> None:
+        text = "## Tip\n\n- one\n- two\n\n```\n## Score\n```\n\n## Score\n\nreal\n"
+        after = self.edit(text, "Score", "written")
+        self.assertIn("```\n## Score\n```\n\n## Score\n\nwritten\n", after)
+
+    def test_a_tab_or_nothing_after_the_hashes_is_a_heading(self) -> None:
+        """CommonMark ends the marker with a space, a tab or the line's end: the
+        scan read `##\tScore` and a bare `##` as text, and an edit of the section
+        above deleted them with everything under them."""
+        for heading in ("##\tScore", "##", "##\r", " ##\t Score"):
+            with self.subTest(heading=heading):
+                text = f"## Tip\n\nmine\n\n{heading}\n\nkept\n"
+                self.assertEqual(self.edit(text, "Tip", "replaced"),
+                                 f"## Tip\n\nreplaced\n\n{heading}\n\nkept\n")
+
+    def test_section_text_with_a_tab_or_bare_heading_is_refused(self) -> None:
+        sd = sd_module()
+        for line in ("##\tScore", "##", "  ##"):
+            with self.subTest(line=line), self.assertRaises(sd.Refusal):
+                sd.parse_sections([f"Tip=before\n{line}\nafter"])
+
     def test_an_indented_heading_is_the_section_it_looks_like(self) -> None:
         text = "## Tip\n\nt\n\n   ## Score\n\nindented\n"
         after = self.edit(text, "Score", "written")

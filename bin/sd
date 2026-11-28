@@ -1677,9 +1677,21 @@ def frontmatter_span(text: str) -> tuple[list[str], int, int]:
 PLACEHOLDER = re.compile(r"\{\{([^{}]*)\}\}")
 
 #: A Markdown H2 as a *renderer* sees it: CommonMark permits up to three
-#: leading spaces. `body_headings` deliberately reads column 0 only, so this is
-#: the wider pattern used to refuse section text, not to find headings.
-SMUGGLED_HEADING = re.compile(r"^ {0,3}## ")
+#: leading spaces, and ends the `##` with a space, a tab or the line's end
+#: (sd:10962: `##\tScore` and a bare `##` render as headings). `body_headings`
+#: deliberately reads column 0 only; this is the pattern that refuses section
+#: text and that `note_heading_lines` finds headings by, so the two agree.
+SMUGGLED_HEADING = re.compile(r"^ {0,3}##(?:[ \t]|[\r\n]*$)")
+
+#: A fence run on a line that does not start with it: an indented fence, one
+#: on a list marker's or a quote's line. A renderer reads such a fence by the
+#: block it sits in, which a line scan does not model (sd:10962).
+NESTED_FENCE = re.compile(r"^[ \t>*+\-0-9.)]*?[ \t>*+\-0-9.)](?:`{3,}|~{3,})")
+
+#: Outside a fence, a line that starts a block which takes fence lines as its
+#: own text: an HTML block (`<`), a math block (`$$`) or an Obsidian comment
+#: (`%%`, which may open anywhere on a line).
+FENCE_HIDING_BLOCK = re.compile(r"^ {0,3}<|\$\$|%%")
 
 #: A fenced code block's delimiter: three or more backticks or tildes, indented
 #: by up to three spaces, with an optional info string. The **run length** is
@@ -1804,14 +1816,28 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     then *create* a second `## Score` below the one already on screen.
     `parse_sections` refuses the same wider shape in incoming text for exactly
     this reason.
+
+
+    A heading this scan reads as code is trusted only where no renderer can
+    end the fence sooner (sd:10962): a section edit ends at the next heading
+    it finds, so a heading it missed is overwritten with the section above.
+    A fence in a list item ends with the item, and an HTML block, a math
+    block or an Obsidian comment takes fence lines as its own text. This is
+    a line scan, not a renderer, so when the note holds a fenced heading
+    line and any such block (`NESTED_FENCE`, `FENCE_HIDING_BLOCK`), it
+    refuses and names the line rather than guess.
     """
 
     found: list[tuple[int, str]] = []
+    hidden: list[int] = []          # heading lines read as code
+    risky: list[int] = []           # lines a renderer may read another way
     fence = ""                      # the exact opening run, "" when outside one
     for index in range(start, len(lines)):
         line = lines[index]
         if match := CODE_FENCE.match(line):
             run, info = match.group("marker"), match.group("info")
+            if line[:1] != run[0]:
+                risky.append(index)
             if not fence:
                 # A backtick fence's info string may not itself hold a
                 # backtick; that line is not an opener at all.
@@ -1821,8 +1847,20 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
                 fence = ""
             # A fence line is never a heading, opener, closer or neither.
             continue
-        if not fence and SMUGGLED_HEADING.match(line):
-            found.append((index, line.lstrip()[3:].strip()))
+        if NESTED_FENCE.match(line) or (not fence and FENCE_HIDING_BLOCK.search(line)):
+            risky.append(index)
+        if SMUGGLED_HEADING.match(line):
+            if fence:
+                hidden.append(index)
+            else:
+                found.append((index, line.lstrip()[2:].strip()))
+    if hidden and risky:
+        raise Refusal(
+            f"line {hidden[0] + 1} reads as a `## ` heading inside a code fence,"
+            f" and line {risky[0] + 1} starts a block a renderer may end that"
+            " fence by (an indented or list-item fence, an HTML, `$$` or `%%`"
+            " block); refusing to guess where the section ends: edit the note"
+            " by hand so each fence starts at column 0")
     return found
 
 
