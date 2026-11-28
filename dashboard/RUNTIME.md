@@ -282,6 +282,9 @@ Its lock is `deep-<checkout hash>.lock` beside the codex one, so one deep review
 A `source` review (sd:5101) runs codex on one research ledger row; its runner fetches the row's link first, one GET bounded at 20 s and 2 MB, so a source review reaches the network from the server's process, and a failed fetch is written into the input as not known.
 Jev ordering is off for these runs unless the server starts with `JEV_ADVERSARIAL_GATE` set: it would send finding text to a third party.
 
+Regenerate on Management > Deploys (sd:5405, `upload_link.py`) signs a new shared upload link with `local-shared-upload/shared_upload.py`.
+It reads `<config>/shared-upload/.env` and runs `aws configure export-credentials` for the signing profile, bounded at 30 seconds; `aws` must be on the LaunchAgent's PATH.
+The link is the workflow database setting row `dashboard.shared_upload_link`; the request answers its expiry, and no log line holds the link.
 
 Run sweep on HOA (sd:5095, `sd_dashboard/sweep.py`) runs the hoa checkout's `tools/sweep.py run`, detached, from that checkout.
 `POST /api/hoa/sweep` answers 202 at once; a second while a run holds `~/.local/state/system/hoa-sweep/lock` is a 409.
