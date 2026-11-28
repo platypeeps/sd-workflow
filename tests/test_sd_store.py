@@ -364,6 +364,15 @@ class AddRefusalTests(StoreFixture):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("its own `## ` heading", done.stderr)
 
+    def test_a_tab_heading_in_section_text_is_refused_too(self) -> None:
+        """`##<tab>Score` renders as a heading, so section text may not carry it."""
+
+        self.build()
+        done = self.run_sd(
+            "store", "add", "pp.tip", "T", "--field", "score=9",
+            "--section", "Tip=text\n##\tScore\nsmuggled")
+        self.assertNotEqual(done.returncode, 0)
+
     def test_a_misspelled_placeholder_is_refused_rather_than_shipped(self) -> None:
         """Left in place it would reach every note written from that template
         as literal text, and be noticed by a reader rather than an author."""
@@ -588,6 +597,14 @@ class EditSectionTests(unittest.TestCase):
             self.edit(text, "Score", "x"),
             "## Tip\n\nkeep me\n\n## Score\n\nx\n\n## Provenance\n\nkeep me too\n")
 
+    def test_a_tab_after_the_marker_is_a_heading_that_ends_the_section(self) -> None:
+        """CommonMark ends `##` with a space or a tab: editing Tip must keep a
+        saved `##<tab>Score` section (lead review of build/sd-2304)."""
+        text = "## Tip\n\nold\n\n##\tScore\n\nreal\n"
+        after = self.edit(text, "Tip", "updated")
+        self.assertIn("##\tScore\n\nreal\n", after)
+        self.assertNotIn("old", after)
+
     def test_a_fenced_heading_does_not_end_the_section_it_sits_in(self) -> None:
         text = "## Tip\n\nRun it:\n\n```markdown\n## Score\nnot a heading\n```\n\n## Score\n\nreal score\n"
         after = self.edit(text, "Tip", "replaced")
@@ -654,8 +671,12 @@ class EditSectionTests(unittest.TestCase):
         # after `##` passed the guard, which reads the line as written, and the reader's tab-expanded copy
         # took it for a heading, so the saved section ended early.
         sd = sd_module()
-        texts = ["##\tScore", " ##\tScore\nmore", "- a\n  ##\tScore", "- a\n\t##\tScore", "x\n   ##\tProvenance\ny",
-                 "-\t##\tScore", "##\t", "\t## Score", " \t## Score", "- a\n\t## Score\n\t```\n\t## Score",
+        # A tab ends the marker as a space does, so the guard refuses these (build/sd-2304 lead review).
+        for text in ["##\tScore", " ##\tScore\nmore", "- a\n  ##\tScore", "x\n   ##\tProvenance\ny", "##\t"]:
+            with self.subTest(refused=text), self.assertRaises(sd.Refusal):
+                sd.parse_sections([f"Tip={text}"])
+        texts = ["- a\n\t##\tScore",
+                 "-\t##\tScore", "\t## Score", " \t## Score", "- a\n\t## Score\n\t```\n\t## Score",
                  # An item's fence the text leaves open ends at the next section's column-0 heading.
                  "- ```", "-\t```\n\tx", "1. ~~~\n   y", "- a\n  - b\n\t```"]
         for text in texts:
