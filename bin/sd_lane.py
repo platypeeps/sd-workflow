@@ -908,6 +908,7 @@ def ruled(connection: Any, repository: str, item: int, branch: str, head: str) -
     a later report at the same head is not ruled by an earlier one's ruling. An unreadable receipt or ruling
     is no ruling."""
     import sd_ship_dispositions  # noqa: PLC0415
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
     from sd_db import ship  # noqa: PLC0415
     from sd_db.workflow import WorkflowError  # noqa: PLC0415
     from sd_ship_remote import Refusal  # noqa: PLC0415
