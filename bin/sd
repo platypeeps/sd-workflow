@@ -1688,10 +1688,41 @@ SMUGGLED_HEADING = re.compile(r"^ {0,3}##(?:[ \t]|[\r\n]*$)")
 #: block it sits in, which a line scan does not model (sd:10962).
 NESTED_FENCE = re.compile(r"^[ \t>*+\-0-9.)]*?[ \t>*+\-0-9.)](?:`{3,}|~{3,})")
 
-#: Outside a fence, a line that starts a block which takes fence lines as its
-#: own text: an HTML block (`<`), a math block (`$$`) or an Obsidian comment
-#: (`%%`, which may open anywhere on a line).
-FENCE_HIDING_BLOCK = re.compile(r"^ {0,3}<|\$\$|%%")
+#: A code span: a backtick run closed by a run of the same length. Its text
+#: is literal, so a `%%`, `$$` or fence run inside one opens nothing.
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
+
+#: CommonMark's kind 6 HTML block: a block-level tag name, open or closing.
+HTML_BLOCK_TAG = re.compile(
+    r"^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption"
+    r"|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption"
+    r"|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe"
+    r"|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p"
+    r"|param|search|section|source|summary|table|tbody|td|tfoot|th|thead|title"
+    r"|tr|track|ul)(?:[ \t>]|/>|$)", re.IGNORECASE)
+
+#: CommonMark's kind 7: any complete open or closing tag alone on its line.
+#: An autolink (`<https://x>`) or a `<` in prose is neither kind.
+HTML_LONE_TAG = re.compile(
+    r"^ {0,3}(?:<[A-Za-z][A-Za-z0-9-]*"
+    r"(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*"
+    r"\s*/?>|</[A-Za-z][A-Za-z0-9-]*\s*>)\s*$")
+
+
+def outside_code_spans(line: str) -> str:
+    return CODE_SPAN.sub("", line)
+
+
+def hides_fence(line: str) -> bool:
+    """Outside a fence, whether `line` starts a block that takes fence lines as
+    its own text: an HTML block, a math block (`$$`) or an Obsidian comment
+    (`%%`, which may open anywhere on a line but inside a code span).
+    """
+
+    if raw_html_start(line):
+        return True
+    rest = outside_code_spans(line)
+    return "$$" in rest or "%%" in rest
 
 #: An HTML block's start, and what ends it, as CommonMark reads them: a comment,
 #: a `script`/`pre`/`style`/`textarea` block, a processing instruction, CDATA and
@@ -1702,8 +1733,18 @@ RAW_HTML_STARTS = (
     (re.compile(r"^ {0,3}<\?"), "?>"),
     (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
     (re.compile(r"^ {0,3}<![A-Za-z]"), ">"),
-    (re.compile(r"^ {0,3}<"), ""),
+    (HTML_BLOCK_TAG, ""),
+    (HTML_LONE_TAG, ""),
 )
+
+
+def raw_html_start(line: str) -> tuple[re.Match[str], str] | None:
+    """The HTML block `line` starts, as `(match, end)`; `None` for inline HTML."""
+
+    for start, end in RAW_HTML_STARTS:
+        if match := start.match(line):
+            return match, end
+    return None
 
 
 def raw_block_start(line: str) -> tuple[str, int] | None:
@@ -1715,13 +1756,14 @@ def raw_block_start(line: str) -> tuple[str, int] | None:
     one it opens (`<!-- x -->`, `%%c%%`).
     """
 
-    for start, end in RAW_HTML_STARTS:
-        if match := start.match(line):
-            end = end.format(*match.groups()).lower()
-            if end and end in line[match.end():].lower():
-                return None
-            return end, match.end()
-    toggles = sorted((line.find(token), token) for token in ("%%", "$$") if line.count(token) % 2)
+    if html := raw_html_start(line):
+        match, end = html
+        end = end.format(*match.groups()).lower()
+        if end and end in line[match.end():].lower():
+            return None
+        return end, match.end()
+    rest = outside_code_spans(line)
+    toggles = sorted((rest.find(token), token) for token in ("%%", "$$") if rest.count(token) % 2)
     return (toggles[0][1], 0) if toggles else None
 
 
@@ -1910,7 +1952,7 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     A fence in a list item ends with the item, and an HTML block, a math
     block or an Obsidian comment takes fence lines as its own text. This is
     a line scan, not a renderer, so when the note holds a fenced heading
-    line and any such block (`NESTED_FENCE`, `FENCE_HIDING_BLOCK`), it
+    line and any such block (`NESTED_FENCE`, `hides_fence`), it
     refuses and names the line rather than guess.
 
     The other direction too (review of sd:10962): a `## ` line inside a raw
@@ -1936,7 +1978,7 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
             fence = after
             # A fence line is never a heading, opener, closer or neither.
             continue
-        if NESTED_FENCE.match(line) or (not fence and FENCE_HIDING_BLOCK.search(line)):
+        if NESTED_FENCE.match(outside_code_spans(line)) or (not fence and hides_fence(line)):
             risky.append(index)
         if SMUGGLED_HEADING.match(line):
             if fence:

@@ -732,6 +732,44 @@ class EditSectionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(self.edit(text, "Score", "new").endswith("## Score\n\nnew\n"))
 
+    # Lane review of sd:10962: inline Markdown is no raw-block opener. Each
+    # entry is one opener the scan matched on inline text; the edit and the
+    # risky-fence check must read past it as a renderer does.
+    INLINE_NOT_OPENERS = {
+        "an autolink": "<https://example.com>",
+        "an email autolink": "<operator@example.test>",
+        "a less-than sign": "< 5 items",
+        "an inline tag with text after it": "<span>x</span> more",
+        "%% inside a code span": "use `%%` here",
+        "$$ inside a code span": "costs ``$$`` here",
+        "a list item's inline code": "- ```x``` inline",
+    }
+
+    def test_inline_markdown_opens_no_raw_block(self) -> None:
+        for why, line in self.INLINE_NOT_OPENERS.items():
+            with self.subTest(why):
+                text = f"## Tip\n\n{line}\n## Score\n\nold\n"
+                self.assertEqual(self.edit(text, "Score", "new"),
+                                 f"## Tip\n\n{line}\n## Score\n\nnew\n")
+                fenced = f"## Tip\n\n{line}\n\n```\n## Score\n```\n\n## Score\n\nold\n"
+                self.assertTrue(self.edit(fenced, "Score", "new").endswith("## Score\n\nnew\n"))
+
+    # The real openers the class pass keeps: an HTML block of CommonMark's
+    # kind 6 or 7, and a %% or $$ outside a code span.
+    REAL_OPENERS = {
+        "a block tag": "<div class=\"x\">",
+        "a block closing tag": "</section>",
+        "any tag alone on its line": "<my-box data-x='1'/>",
+        "%% after a code span": "`a` %% open",
+    }
+
+    def test_a_real_opener_still_hides_the_heading_after_it(self) -> None:
+        sd = sd_module()
+        for why, line in self.REAL_OPENERS.items():
+            with self.subTest(why):
+                with self.assertRaises(sd.Refusal):
+                    self.edit(f"## Tip\n\n{line}\n## Score\n%%\n", "Score", "new")
+
     def test_a_closed_list_item_fence_edits_as_before(self) -> None:
         text = "## Tip\n\n1. step\n   ```sh\n   run\n   ```\n\n## Score\n\nreal\n"
         self.assertEqual(self.edit(text, "Tip", "replaced"), "## Tip\n\nreplaced\n\n## Score\n\nreal\n")
