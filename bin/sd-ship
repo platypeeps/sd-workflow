@@ -9,6 +9,7 @@ Merge independently rechecks GitHub ownership, protection and exact-head checks.
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib as hashlib
 import json
 import os
@@ -23,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import sd_lane
@@ -552,13 +554,117 @@ def without_closes(message: str) -> str:
 ANCESTOR_CLEARANCE = "an ancestor of the merge head"
 
 
+def edited_waivers(claim: object, stored: object) -> list[int]:
+    """The decision notes whose edit alone tells `claim` from `stored`, or [] when anything else differs.
+
+    `waiver` keeps each note's body and session in the claim, so an edit
+    that keeps the `Waive:` line still changes the claim (sd:9335).
+    """
+    def bare(value: object) -> object:
+        if not isinstance(value, dict) or not isinstance(value.get("criteria"), list):
+            return value
+        rows = [{**row, "waived": {k: v for k, v in row["waived"].items() if k != "note"}}
+                if isinstance(row, dict) and isinstance(row.get("waived"), dict) else row for row in value["criteria"]]
+        return {**value, "criteria": rows}
+
+    # Equal bare claims that differ raw are both dicts with a criteria list: only `bare` rewrites one.
+    if claim == stored or bare(claim) != bare(stored) or not isinstance(claim, dict) or not isinstance(stored, dict):
+        return []
+    return sorted({row["waived"]["decision"] for row, old in zip(claim["criteria"], stored["criteria"], strict=True)
+                   if isinstance(row.get("waived"), dict) and row != old})
+
+
+def fold(text: str) -> str:
+    """Text in its Unicode compatibility form with its spacing collapsed (sd:9268 round 8)."""
+    return " ".join(unicodedata.normalize("NFKC", text).split())
+
+
+def keyed_leaves(value: object, path: tuple = ()):
+    """Each text a value holds with the object keys above it, folded; a list adds no key (sd:9268 round 11).
+
+    A number or a flag reads as its JSON form; a blank text and a null
+    hold nothing.
+    """
+    if isinstance(value, str):
+        if fold(value):
+            yield path, fold(value)
+    elif isinstance(value, dict):
+        for key, inner in value.items():
+            yield from keyed_leaves(inner, (*path, fold(str(key))))
+    elif isinstance(value, (list, tuple)):
+        for inner in value:
+            yield from keyed_leaves(inner, path)
+    elif value is not None:
+        yield path, json.dumps(value, sort_keys=True, default=str)
+
+
+def leaves(value: object) -> list[str]:
+    """The text a value holds, whatever its shape: each leaf once, folded, in sorted order (sd:9268 round 10)."""
+    return sorted({leaf for _, leaf in keyed_leaves(value)})
+
+
+def same_proof(value: object, other: object) -> bool:
+    """Whether two values hold the same proof (sd:9268 rounds 10 and 11).
+
+    They must hold the same `leaves`, so spacing, order, nesting, a repeat
+    or a renamed key tells no two apart; and each key both name must hold
+    the same text, so results moved between named checks are new proof.
+    """
+    if leaves(value) != leaves(other):
+        return False
+    paths, others = collections.defaultdict(set), collections.defaultdict(set)
+    for path, leaf in keyed_leaves(value):
+        paths[path].add(leaf)
+    for path, leaf in keyed_leaves(other):
+        others[path].add(leaf)
+    return all(paths[path] == others[path] for path in paths.keys() & others.keys() if path)
+
+
+def same_evidence(row: object, old: object) -> bool:
+    """Whether an acceptance row proves only what `old` did: its evidence, result and waiver.
+
+    Any other field, such as a comment, and the waiving note's body, which
+    the claim copies from the database, prove nothing (sd:9268 review).
+    Nor does the criterion's name, and evidence and a waiver's reason are
+    compared by `same_proof` (sd:9268 rounds 8, 10 and 11).
+    """
+    if not isinstance(row, dict) or not isinstance(old, dict):
+        return isinstance(row, dict) == isinstance(old, dict) and same_proof(row, old)
+    waived, before = row.get("waived"), old.get("waived")
+    if isinstance(waived, dict) and isinstance(before, dict):
+        waiver = (waived.get("decision") == before.get("decision")
+                  and same_proof(waived.get("reason"), before.get("reason")))
+    else:
+        waiver = waived == before
+    return waiver and row.get("passed") == old.get("passed") and same_proof(row.get("evidence"), old.get("evidence"))
+
+
+def stale_criteria(claim: object, stored: object) -> list[str]:
+    """The criteria of `claim` when not one of its rows proves anything `stored`'s did not, or [] (sd:9268 review).
+
+    A renewal binds the item's new scope to its evidence, so evidence the old
+    claim already held proves only the old requirements; rows that differ
+    outside `same_evidence` hold the same evidence. A claim with no rows, such
+    as a task's merge alone, has no evidence to go stale.
+    """
+    if not isinstance(claim, dict) or not isinstance(stored, dict):
+        return []
+    rows, old = claim.get("criteria") or [], stored.get("criteria") or []
+    if not all(any(same_evidence(row, before) for before in old) for row in rows):
+        return []
+    return [str(row.get("criterion")) for row in rows if isinstance(row, dict)]
+
+
 def acceptance_row_answered(row: object) -> bool:
     """An acceptance row that names its criterion and evidence and either passed or says it was waived (sd:3704).
 
     A passed row may not also claim a waiver, and a waived criterion must be
     text: delivery records only the waived rows, by their criterion.
+    Evidence with no text in it, such as a list of blanks, names none
+    (sd:9268 round 10).
     """
-    if not isinstance(row, dict) or not row.get("criterion") or not row.get("evidence"):
+    if (not isinstance(row, dict) or not row.get("criterion") or not row.get("evidence")
+            or not leaves(row["evidence"])):
         return False
     if row.get("passed") is True:
         return "waived" not in row
@@ -583,6 +689,10 @@ def settled_followups(connection: sqlite3.Connection, item: int) -> set[int]:
 
 
 class Ship(SharedReview):
+    #: True while a prepare publishes a pending claim (`claimed`, sd:9268).
+    publishing = False
+    #: The running lane entry `lane_started` counted this prepare as, when no lane mark did (sd:9335).
+    lane_row: dict | None = None
     #: What the last `merge_ownership` read found: the authority record when
     #: the repository row overrode co-ownership, `None` when ownership alone
     #: answered. A per-process value on purpose. It reaches the receipt at
@@ -772,12 +882,344 @@ class Ship(SharedReview):
                       code="delivery_claim_required", boundary="input", state="operator_decision",
                       next_action="Rerun prepare with --deliver or --associate-only.")
 
-    def assert_scope(self) -> None:
-        if not self.args.no_item and self.state.get("deliver"):
+    def assert_scope(self, claim: dict | None = None, *, merging: bool = False, merged: str | None = None) -> None:
+        """Refuse a delivery claim made for another version of the item.
+
+        `claim`, a claim `renewal` let stand, replaces the stored one here
+        (sd:9268). Every later check reads the stored claim, so a change
+        after the renewal still refuses. The advice is the phase's: before a
+        merge a prepare by hand renews the claim; once `merged` landed no
+        prepare can, so the item is delivered by hand.
+        """
+        if not self.args.no_item and self.claimed("deliver"):
             item = self.store.identity(self.connection, self.args.item)["item"]
             scope = digest({key: item[key] for key in ("title", "body", "path")})
-            if self.state.get("acceptance", {}).get("item_scope") != scope:
-                raise Refusal("item acceptance scope changed after the delivery claim")
+            if (claim or self.claimed("acceptance") or {}).get("item_scope") == scope:
+                return
+            renew = f"`{self.renew_command()}` by hand, with --acceptance-file for a work item"
+            if merged:
+                advice = (f"the pull request merged at {merged[:12]}, so no prepare renews it and the delivery "
+                          f"is not recorded: check the merged change against the item as it reads now, then "
+                          f"{self.by_hand(merged)}")
+            elif merging and self.state.get("phase") == "merge_dispatch":
+                # Prepare routes this phase to reconcile, which refuses an unmerged pull request: no command renews.
+                advice = ("a merge was dispatched and did not land (phase merge_dispatch), and no prepare renews "
+                          "the claim from that phase: renew by hand by setting the item's title, body and path "
+                          "back to what they read when the claim was made, then merge again")
+            elif merging:
+                advice = f"nothing merged: renew it with {renew}, then merge or enqueue again"
+            else:
+                advice = f"a lane prepare does not renew it: run {renew}, then enqueue again"
+            raise Refusal(f"item acceptance scope changed after the delivery claim; {advice}")
+
+    def renew_command(self) -> str:
+        """The prepare that renews this receipt's claim: every item of its closing set, or a prepare run as
+        printed would close none of them (sd:9335)."""
+        stored = (self.claimed("closing") or {}).get("items")
+        bundle = stored if stored is not None else getattr(self.args, "closes", None) or ()
+        items = " ".join(f"--item {number}" for number in dict.fromkeys((self.args.item, *bundle)))
+        if self.branch == self.checkout_branch:
+            return f"sd-ship prepare {items} --deliver"
+        # A merge with --branch runs in another checkout: the prepare runs in the branch's (sd:9268 review).
+        try:
+            blocks = git(self.root, "worktree", "list", "--porcelain").split("\n\n")
+        except (Refusal, OSError):
+            blocks = []  # a hint, never the refusal: no checkout read names none
+        found = [block.splitlines()[0].removeprefix("worktree ") for block in blocks
+                 if f"branch refs/heads/{self.branch}" in block.splitlines()]
+        where = shlex.quote(found[0]) if found else f"<a checkout of {self.branch}>"
+        return f"sd-ship -C {where} prepare {items} --deliver"
+
+    def claimed(self, key: str):
+        """The receipt's `deliver`, `acceptance` or `closing`: the published one, or, while this prepare
+        publishes, the pending one it saved (sd:9268)."""
+        pending = self.state.get("pending") if self.publishing else None
+        return pending.get(key) if pending else self.state.get(key)
+
+    def merge_scope(self) -> None:
+        """`assert_scope` for a merge, then refuse one while a prepare's `pending` set waits.
+
+        That prepare did not finish. It saved a title, body or claim, may have
+        pushed a newer head, and did not publish them, so the published ones
+        may not describe the head merge would land, in any mode, `--no-item`
+        too (sd:9268 review). Reconcile reads the published ones.
+
+        A pending set equal to the published one is no proof the prepare owed
+        nothing: the Copilot request is outside the set, and one GitHub
+        refused leaves no request for the clearance to wait on. So an equal
+        set merges only with `--abandon-copilot-review`, the operator's
+        recorded word that this head waits for no Copilot review, which itself
+        refuses without a request receipt.
+        """
+        self.assert_scope(merging=True)
+        # An owed Copilot request holds the merge by itself: it is saved before `pending`, and a prepare
+        # stopped between the two left a receipt that read as owing nothing (sd:10207).
+        pending, owes = self.state.get("pending"), bool(self.state.get("copilot_review_owed"))
+        if (pending or owes) and (self.args.abandon_copilot_review is None
+                                  or any(self.state.get(key) != value for key, value in (pending or {}).items())):
+            owed = ("; that prepare asks again for the Copilot review an earlier one could not request, and "
+                    "`--copilot-review skip` withdraws it" if owes else "")
+            raise Refusal("the last prepare did not finish, as one whose Copilot request failed: it saved a "
+                          "title, body or delivery claim and did not publish them; "
+                          f"nothing merged: prepare again, then merge{owed}", code="prepare_required",
+                          state="operator_decision",
+                          next_action="Run sd-ship prepare again with the same identity, then merge.")
+
+    def opened_at(self, head: str | None, opening: bool = False) -> dict:
+        """The fields that keep an opened, unpublished pull request's heads: every head a prepare pushed to it.
+
+        Each one passed `check_review` before its push, and `reviewed_head`
+        moves with every later review, so reconcile reads these (sd:9268
+        round 13). Recorded before the push: a head whose push failed is one
+        GitHub never shows. No head clears the record, at publication.
+        """
+        if not (opening or self.state.get("opened_pull_request")):
+            return {}
+        if head is None:
+            return {"opened_pull_request": None, "opened_heads": None}
+        return {"opened_heads": list(dict.fromkeys([*(self.state.get("opened_heads") or []), head]))}
+
+    def promoted(self) -> dict:
+        """The fields `ready_to_send` saves: the pending claim, now published, and no pending one."""
+        pending, publishing, self.publishing = self.state.get("pending"), self.publishing, False
+        return {**(pending if publishing and pending else {}), **({"pending": None} if pending else {})}
+
+    def renewal(self, claim: dict | None, basis: tuple[str | None, str | None]) -> tuple[dict | None, dict | None, str | None]:
+        """The claim to save, the one `assert_scope` reads in place of the stored one, and the line saying so.
+
+        Only a prepare the lane did not start renews a claim the item
+        outgrew (sd:9335): the lane passes the enqueue's `--deliver` and
+        acceptance text to every prepare, retries included, so its claim may
+        predate the change. A lane prepare then refuses in `assert_scope`.
+
+        A renewed claim keeps `renewed`. A retry of an entry enqueued before
+        the renewal carries the old evidence and the old --item args, and
+        the scope now matches, so a lane prepare whose evidence or items
+        differ from a renewed claim refuses before anything is saved:
+        a retry with the old items would close one the renewal dropped.
+        """
+        stored = self.state.get("acceptance") or {}
+        if not (self.args.deliver and claim and self.state.get("deliver")):
+            return claim, None, None
+        changed = stored.get("item_scope") != claim["item_scope"]
+        if not (changed or stored.get("renewed")):
+            return claim, None, None
+        if self.lane_started():
+            return self.lane_renewal(claim, stored, changed, basis), None, None
+        claim = {**claim, "renewed": True}
+        if not changed:
+            return claim, None, None
+        self.refuse_stale_evidence(claim, stored)
+        return claim, claim, (f"--deliver renews the delivery claim of sd:{self.args.item}: item scope "
+                              f"{str(stored.get('item_scope'))[:12]} is now {claim['item_scope'][:12]}")
+
+    def lane_renewal(self, claim: dict, stored: dict, changed: bool, basis: tuple[str | None, str | None]) -> dict:
+        """The claim a lane prepare saves, or a refusal when its entry is older than a renewal by hand.
+
+        A retry of an entry enqueued before the renewal carries the old
+        items, evidence and body; the scope now matches, so each must equal
+        the renewal's, or the retry would publish what it replaced (sd:9335).
+        The body is the entry's own (`body_basis`), not the text this prepare
+        publishes. The title is `assert_title_matches`'s.
+        """
+        self.refuse_held_by_lane_row(changed)
+        items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
+        other_items = set(items) != set((self.state.get("closing") or {}).get("items") or [])
+        if stored.get("renewed") and not changed and other_items:
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
+                          f"names other items, as a retry of an entry enqueued before the renewal does; "
+                          f"the renewal stands as `{self.renew_command()}`: enqueue again with those "
+                          f"items and its acceptance file", code="delivery_claim_renewed", boundary="input",
+                          state="operator_decision",
+                          next_action="Enqueue the item again with the items and acceptance file the "
+                                      "renewal used.")
+        if stored.get("renewed") and not changed and claim.get("claim") != stored.get("claim"):
+            if notes := edited_waivers(claim.get("claim"), stored.get("claim")):
+                named = ", ".join(f"#{note}" for note in notes)
+                raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and since then only "
+                              f"decision note {named} changed; its `Waive:` line still holds, so this entry's "
+                              f"acceptance file stands: refresh the claim by hand with `{self.renew_command()} "
+                              f"--acceptance-file FILE`, the same file, then "
+                              f"`sd-ship lane retry {self.args.item}`", code="delivery_claim_renewed",
+                              boundary="input",
+                              state="operator_decision",
+                              next_action="Rerun prepare --deliver by hand with the same acceptance file, "
+                                          "then retry the lane entry.")
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
+                          f"carries other acceptance evidence, as a retry of an entry enqueued before "
+                          f"the renewal does; enqueue again with the renewal's acceptance file",
+                          code="delivery_claim_renewed", boundary="input", state="operator_decision",
+                          next_action="Enqueue the item again with the acceptance file the renewal used.")
+        if stored.get("renewed") and not changed:
+            self.refuse_other_body(*basis)
+        return {**claim, "renewed": True} if stored.get("renewed") else claim
+
+    def refuse_other_body(self, basis: str | None, entry: str | None) -> None:
+        """Refuse a lane prepare on a renewed claim whose entry was enqueued with another body than the renewal's.
+
+        `entry` is the entry's own body (`body_basis`), None when no row
+        gave it. It is the renewal's when it is the published body itself, as
+        an entry enqueued with that body is, or when its words are the
+        recorded basis of the published body. A published body with no
+        recorded basis, one a prepare took from a pull request edited on
+        GitHub or from a receipt older than the record, is not guessed at:
+        the entry proceeds only when the lane recorded drawing exactly that
+        body from an entry of these words (`drawn_by_lane`).
+        """
+        if entry is None:
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this prepare's body is "
+                          f"not the body of the one running lane entry its runner holds for the item on this "
+                          f"host, the lane's Screenshots section apart, so it cannot be checked against the "
+                          f"renewal's; nothing was saved: `sd-ship lane retry {self.args.item}` once no other "
+                          f"prepare of the item runs", code="lane_unknown", boundary="runtime",
+                          state="retryable_failure")
+        published = self.normal(self.state.get("body"))
+        recorded = (self.state.get("body_bases") or {}).get(digest(published))
+        if entry == published or (basis == recorded if recorded else self.drawn_by_lane(entry, published)):
+            return
+        raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry was "
+                      f"enqueued with another body, as a retry of an entry enqueued before the renewal is; "
+                      f"the renewal's body stands: enqueue again with the renewal's body file or the body it "
+                      f"published, or make this entry's body the renewal's with `{self.renew_command()} "
+                      f"--body-file FILE` by hand, then `sd-ship lane retry {self.args.item}`",
+                      code="delivery_claim_renewed", boundary="input", state="operator_decision",
+                      next_action="Enqueue the item again with the body the renewal published, or prepare by "
+                                  "hand with this entry's body, then retry.")
+
+    def drawn_by_lane(self, entry: str, published: str) -> bool:
+        """Whether `published` is a body the lane recorded making from an entry whose body is `entry`.
+
+        Each ended entry's row keeps the PNGs its run drew (`shots`), so the
+        body that run gave prepare is its body with `sd_lane.with_shots` of
+        them: a record, where the section's shape is a guess that also fits
+        a bullet someone edited on GitHub. No such row is no match.
+        """
+        return any(published == self.normal(sd_lane.with_shots(str(row.get("body") or ""), row["shots"]))
+                   for row in self.lane_entries()[0]
+                   if isinstance(row.get("shots"), list) and row["shots"] and self.normal(row.get("body")) == entry)
+
+    def bases_with(self, body: str, basis: str | None) -> dict:
+        """The receipt's `body_bases` with this prepare's body: the digest of each text a prepare published, to
+        the digest of the words it was made from (`body_basis`), None when nothing recorded them."""
+        return {**(self.state.get("body_bases") or {}), digest(self.normal(body)): basis}
+
+    def normal(self, body: object) -> str:
+        """`body` as `sd_ship_body.normalize` leaves it: no owned line, no trailing space; "" when it refuses."""
+        try:
+            return sd_ship_body.normalize(re.sub(r"\r\n?", "\n", str(body or "")), self.args.item)[0]
+        except Refusal:
+            return ""
+
+    def body_basis(self, body: str) -> tuple[str | None, str | None]:
+        """The digest of the words this prepare's body was made from, and its lane entry's own body when the
+        entry's row gave them.
+
+        A published body is no record of its author's words: a lane prepare
+        appends a Screenshots section drawn at that run, and the pull request
+        keeps the body it was opened with. Text alone cannot tell the lane's
+        section from an entry's copy of one, and an equal text is no proof of
+        an equal author, so each answer here is a record (sd:9335 class pass).
+
+        A lane prepare's words are its running entry's body, read from the
+        queue row. The row is this prepare's when its holder, the runner, is
+        this prepare's parent, and this prepare's body is that body with
+        nothing but the lane's section after it; a prepare that outlived its
+        runner has neither, and borrows no newer entry's row.
+
+        Any other lane prepare, one no row vouches for or whose queue does
+        not read, records no words: its body file may hold the lane's section.
+
+        A body file by hand is its text, whatever an earlier prepare
+        published. A body this prepare took from the pull request or the
+        receipt has the words recorded for that text (`body_bases`), and None
+        when no prepare recorded any, as on a receipt older than the record.
+        Where None is recorded, `refuse_other_body` asks the lane's own
+        record of its runs, and never guesses.
+        """
+        if self.args.no_item:
+            return None, None
+        given = self.normal(body)
+        try:
+            lane = self.lane_started()
+            rows = self.running_entries() if lane else []
+        except Refusal:  # a queue that does not read: `renewal` refuses where the answer matters
+            lane, rows = True, []
+        rows = [row for row in rows if (row.get("holder") or {}).get("pid") == os.getppid()]
+        if len(rows) == 1:
+            entry = self.normal(rows[0].get("body"))
+            if given.startswith(entry) and sd_lane.only_shots(given[len(entry):]):
+                return digest(entry), entry
+        if lane:  # the lane's body file may hold its section, and no row says which words are the entry's
+            return None, None
+        if self.body_source == "file":
+            return digest(given), None
+        return (self.state.get("body_bases") or {}).get(digest(given)), None
+
+    def refuse_held_by_lane_row(self, changed: bool) -> None:
+        """Refuse a scope change in a prepare `lane_started` counted by a running row, naming that row.
+
+        No lane mark means this may be the operator's prepare, so the refusal
+        names the row and how to release it, not the lane (sd:9335).
+        """
+        if changed and self.lane_row is not None:
+            raise Refusal(f"item acceptance scope changed after the delivery claim; a running lane entry "
+                          f"for sd:{self.args.item} (step {self.lane_row.get('step')}, pid "
+                          f"{(self.lane_row.get('holder') or {}).get('pid')}) holds the item on this host, so "
+                          f"this prepare counts as the lane's and does not renew it: let that entry end, or, "
+                          f"when its runner is gone, release it with `sd-ship lane cancel {self.args.item}` (a "
+                          f"cancel refuses a live runner), then run `{self.renew_command()}` by hand",
+                          code="lane_entry_running", boundary="input", state="operator_decision",
+                          next_action="Let the running lane entry end, or cancel it once its runner is gone, "
+                                      "then prepare by hand.")
+
+    def refuse_stale_evidence(self, claim: dict, stored: dict) -> None:
+        """Refuse a renewal whose evidence is the old claim's (`stale_criteria`), before anything is saved."""
+        if stale := stale_criteria(claim.get("claim"), stored.get("claim")):
+            raise Refusal(f"sd:{self.args.item} changed since its delivery claim, and the acceptance file is the "
+                          f"old claim's evidence, so it proves the old requirements; no criterion has a fresh "
+                          f"row: {'; '.join(stale)}", code="delivery_evidence_stale", boundary="input",
+                          state="operator_decision",
+                          next_action="Check each criterion against the item as it reads now, write the new "
+                                      "evidence to the acceptance file, then prepare --deliver again.")
+
+    def lane_started(self) -> bool:
+        """Whether this repository's lane runner started this prepare (sd:9335).
+
+        The runner marks each `sd-ship` it starts at launch
+        (`sd_lane.LANE_CHILD`). A parent pid is no mark: a lane prepare leads
+        its own process group, so a forced runner stop leaves it running
+        under pid 1, and it read as a prepare by hand and renewed.
+
+        A runner started before that mark marks no child: its running entry
+        for this item on this host still counts, whatever its holder's pid,
+        so a prepare by hand while the lane runs the item renews nothing. A
+        read that fails is no answer, so it refuses and nothing renews.
+        """
+        if os.environ.get(sd_lane.LANE_CHILD):
+            return True
+        rows = self.running_entries()
+        self.lane_row = rows[0] if rows else None
+        return self.lane_row is not None
+
+    def running_entries(self) -> list[dict]:
+        """This item's running lane entries held on this host; a queue that does not read refuses `lane_unknown`."""
+        rows, host = self.lane_entries()
+        return [row for row in rows if row.get("status") == "running"
+                and (row.get("holder") or {}).get("host") == host]
+
+    def lane_entries(self) -> tuple[list[dict], str]:
+        """This item's lane entries, ended ones too, and this host's name; a queue that does not read refuses
+        `lane_unknown`."""
+        sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
+        from sd_db.errors import SdDbError
+        try:
+            rows, host = sd_lane.stored(self.connection, self.repository), sd_lane.this_host()
+        except (SdDbError, sqlite3.Error, ValueError, sd_lane.LaneError) as error:
+            raise Refusal(f"the lane queue could not be read ({error}), so whether the lane started this "
+                          f"prepare is unknown, and sd:{self.args.item}'s delivery claim is not renewed; prepare "
+                          f"again once the queue reads", code="lane_unknown", boundary="database",
+                          state="retryable_failure") from None
+        return [row for row in rows if row.get("item") == self.args.item], host
 
     def body_input(self, default: str) -> tuple[str, str]:
         """The body to publish and where it came from (sd:1870).
@@ -1081,24 +1523,42 @@ class Ship(SharedReview):
         return copilot.get("automatic") is True
 
     def persist_copilot_direction(self) -> None:
+        """Record the operator's explicit direction before any step that can fail.
+
+        `request` stays owed until a request is recorded: a prepare whose
+        request GitHub refused is retried without the flag, as merge advises,
+        and that retry must not choose again and publish without the review
+        (sd:9268 review). `skip` withdraws it.
+        """
         suppressed = self.state.get("copilot_review_suppressed", False)
         if type(suppressed) is not bool:
             raise Refusal("Copilot review suppression receipt is malformed")
-        if self.args.copilot_review == "skip" and not suppressed:
-            self.save(copilot_review_suppressed=True)
+        owed = self.args.copilot_review == "request"
+        # One save: a stop between two left a skip's suppression beside the request it withdraws (sd:10207).
+        direction = {**({"copilot_review_suppressed": True}
+                        if self.args.copilot_review == "skip" and not suppressed else {}),
+                     **({"copilot_review_owed": owed} if self.args.copilot_review != "auto"
+                        and bool(self.state.get("copilot_review_owed")) != owed else {})}
+        if direction:
+            self.save(**direction)
 
     def clear_copilot_suppression(self) -> None:
         suppressed = self.state.get("copilot_review_suppressed", False)
         if type(suppressed) is not bool:
             raise Refusal("Copilot review suppression receipt is malformed")
-        if self.args.copilot_review == "request" and suppressed:
+        owed = bool(self.state.get("copilot_review_owed"))  # recorded now, so paid, with what it was to lift
+        if (self.args.copilot_review == "request" or owed) and suppressed:
             self.save(copilot_review_suppressed=False)
+        if owed:
+            self.save(copilot_review_owed=False)
 
     def copilot_selection(self, pull: dict, mode: str) -> tuple[str, bool, dict | None]:
         selection = self.args.copilot_review
         suppressed = self.state.get("copilot_review_suppressed", False)
         if type(suppressed) is not bool:
             raise Refusal("Copilot review suppression receipt is malformed")
+        if selection == "auto" and self.state.get("copilot_review_owed"):
+            selection = "request"  # the explicit request an earlier prepare could not record
         if selection == "skip":
             return selection, False, {"decision": "skipped", "reason": "task-scoped suppression"}
         if selection == "auto" and suppressed:
@@ -1615,9 +2075,14 @@ class Ship(SharedReview):
             self.assert_title_matches(title)
             if not self.args.no_item and self.state.get("deliver") != deliver:
                 raise Refusal("existing PR delivery claim differs; reconcile the prepared scope first")
-        self.assert_scope()
+        basis = self.body_basis(body)
+        claim, renewed, renewal_line = self.renewal(claim, basis)
+        self.assert_scope(renewed)
         closing: dict | None = None
         closing_warnings: list[str] = []
+        if renewal_line:
+            print(f"sd-ship: {renewal_line}", file=sys.stderr)
+            closing_warnings.append(renewal_line)
         if not self.args.no_item:
             # The items named with --item after the first: the confirmation on this head (sd:3704).
             named = tuple(dict.fromkeys(self.args.closes))
@@ -1630,13 +2095,26 @@ class Ship(SharedReview):
         if not self.state:
             self.save(repository=self.repository, branch=self.branch, item=self.args.item, phase="new")
         self.persist_copilot_direction()
-        fields = {} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing}
-        self.save(title=title, body=body, base=base, invoker=self.invoker(), **fields)
+        fields = {"title": title, "body": body,
+                  **({} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing,
+                                                   "body_bases": self.bases_with(body, basis[0])})}
+        # Once a pull request is published, what merge squashes and closes with stays in force until this
+        # prepare publishes again: its title, body, claim and closing set wait as `pending`, which only
+        # `ready_to_send` promotes, so merge, reconcile and every other reader see the published ones after
+        # a prepare whose lint, review or push fails (sd:9268 lane review). This prepare reads the pending
+        # ones (`claimed`). The base stays active: this prepare's review reads it, and merge refuses one
+        # the repository's default branch no longer is. An opened pull request a Copilot failure left
+        # unpublished binds the same way: reconcile reads its claim once it merges (sd:9268 round 14).
+        if self.state.get("pull_request") or self.state.get("opened_pull_request"):
+            fields, self.publishing = {"pending": fields}, True
+        self.save(base=base, invoker=self.invoker(), **fields)
         pushed_from = head
         if rebase:
             head = self.rebase_branch(base, head)
             self.assert_current_base(base, head)
-            if closing is not None:
+            if closing is not None and self.publishing:
+                self.save(pending={**self.state["pending"], "closing": {**closing, "head": head}})
+            elif closing is not None:
                 self.save(closing={**closing, "head": head})
         # Rules 5 and 8 read the pull request body, and the body is built by
         # now. Without it the rules report themselves not run and CI is the
@@ -1665,14 +2143,15 @@ class Ship(SharedReview):
         if mode == "guest":
             if not self.args.no_item and not local_work:
                 body = body.replace(f"\n\n{sd_lib.WORK_TRAILER} sd:{self.args.item}\n", "")
-                self.save(body=body)
+                self.save(**({"pending": {**self.state["pending"], "body": body}} if self.publishing
+                             else {"body": body}))
             if self.planning_artifacts(f"origin/{base}", head):
                 raise Refusal("guest destination cannot receive local planning artifacts")
         self.check_review(head)
         if current_head(self.root) != head:
             raise Refusal("HEAD moved before push")
         lease = self.lease(head, pushed_from) if rebase else []
-        self.save(phase="push_dispatch", head=head)
+        self.save(phase="push_dispatch", head=head, **self.opened_at(head))
         git(self.root, "push", *lease, "origin", f"{head}:refs/heads/{self.branch}")
         if current_head(self.root) != head:
             raise Refusal("HEAD moved during push; remote still contains only the reviewed commit")
@@ -1719,10 +2198,16 @@ class Ship(SharedReview):
                      "url": f"https://github.com/{self.repository}/pull/{number}"}
         if str(pull.get("html_url", "")).lower() != reference["url"]:
             raise Refusal("GitHub pull-request URL does not match the prepared repository")
-        self.save(pull_request=reference, phase="ready_to_send")
+        # Every step that can still refuse runs before the publishing save: a failed Copilot request leaves
+        # a renewal's scope pending, and a first prepare's pull request unrecorded, so merge refuses (sd:9268).
+        if not self.state.get("pull_request"):
+            # Recorded apart: merge reads only `pull_request`, so it still refuses this one, while reconcile
+            # finds it once it merges after a failed Copilot step (sd:9268 round 12).
+            self.save(opened_pull_request=reference, **self.opened_at(head, opening=True))
         copilot = self.prepare_copilot_review(number, pull, head, mode)
-        if copilot.get("warning"):
-            self.save(warnings=list(self.state.get("warnings") or []) + [copilot["warning"]])
+        warned = {"warnings": list(self.state.get("warnings") or []) + [copilot["warning"]]} if copilot.get(
+            "warning") else {}
+        self.save(pull_request=reference, phase="ready_to_send", **warned, **self.promoted(), **self.opened_at(None))
         return self.result("ready_to_send", copilot_review=copilot, invoker=self.state["invoker"],
                            body_source=self.body_source, normalized=list(self.body_normalized),
                            closes=self.closes_now(self.state.get("closing") or {}, bool(self.state.get("deliver"))))
@@ -2057,7 +2542,7 @@ class Ship(SharedReview):
         body = ""
         if not self.args.no_item:
             body += f"{sd_lib.ITEM_TRAILER} sd:{self.args.item}\n"
-            delivered = ([self.args.item] if self.state.get("deliver") else []) + list(self.co_delivered())
+            delivered = ([self.args.item] if self.claimed("deliver") else []) + list(self.co_delivered())
             # Each co-delivered item, from a later `--item`, gets the
             # `Delivers:` its close and every git reader require (sd:3704).
             for number in delivered:
@@ -2085,10 +2570,10 @@ class Ship(SharedReview):
         """
         if self.args.no_item:
             return ()
-        stored = self.state.get("closing")
+        stored = self.claimed("closing")
         if stored is not None:
             return tuple(stored["items"])
-        return self.closing(sd_ship_body.title_ids(self.state.get("title") or ""), bool(self.state.get("deliver")))
+        return self.closing(sd_ship_body.title_ids(self.state.get("title") or ""), bool(self.claimed("deliver")))
 
     def check_closes(self, named: tuple[int, ...], deliver: bool) -> None:
         """Refuse a co-delivered item the merge could not close, before anything is published (`sd_ship_body.refuse_unclosable`)."""
@@ -2135,6 +2620,36 @@ class Ship(SharedReview):
         named = (tuple(stored["items"]) if stored is not None
                  else sd_ship_body.title_ids(self.state.get("title") or "") if deliver else ())
         self.check_closes(named, deliver)
+
+    def refuse_unbound_closing(self, head: str, commit: str) -> None:
+        """Refuse to deliver or close at `commit` when the published closing set was read at another head.
+
+        A reprepare that pushed and reviewed `head`, then refused, left its own
+        set pending; a merge on GitHub at `head` lands what the published set
+        and claim do not describe (sd:9268 round 8). The merge is recorded.
+
+        A hand delivery of the claimed item at `commit` is the operator's
+        answer, as for a scope change after the merge. No prepare can read the
+        set again once the pull request merged, so the answer binds an empty
+        set to `head`: reconcile closes none of the items it could not vouch
+        for, an item the operator left open stays open, and the receipt
+        settles (owed closes, cleanup).
+        """
+        stored = self.state.get("closing")
+        if self.args.no_item or stored is None or stored.get("head") == head:
+            return
+        if not (self.state.get("deliver") or stored.get("items")):
+            return
+        if self.state.get("deliver") and self.delivered_at(commit):
+            self.save(closing={"head": head, "items": []})
+            return
+        raise Refusal(f"the pull request merged at {commit[:12]} from head {head[:12]}, and the published closing "
+                      f"set and delivery claim were read at {str(stored.get('head'))[:12]}; nothing is delivered "
+                      f"or closed: check the merged change against each item, then {self.by_hand(commit)}, "
+                      f"close each item it delivers the same way, then run `sd-ship reconcile`, which closes no "
+                      f"other item", code="closing_set_stale", boundary="input", state="operator_decision",
+                      next_action="Deliver or close each item the merged change delivers by hand, then run "
+                                  "sd-ship reconcile.")
 
     def item_status(self, number: int) -> str | None:
         row = self.connection.execute("SELECT status FROM item WHERE id = ?", (number,)).fetchone()
@@ -2430,7 +2945,7 @@ class Ship(SharedReview):
         # instead of failing to match "guest" and passing (sd:930).
         if sd_lib.written_mode(self.root) == "guest":
             raise Refusal("guest mode has no merge authority")
-        self.assert_scope()
+        self.merge_scope()
         self.api.ci = sd_lib.repo_ci(self.connection, self.root)
         # Under `repo.ci = local` no remote check is coming, and `gh pr checks
         # --watch` fails on a pull request that has none; the local gate
@@ -2892,10 +3407,18 @@ class Ship(SharedReview):
                 "review_preflight_error": self.state.get("review_preflight_error"),
                 "local_gate": self.state.get("local_gate")}
 
-    def reconcile(self) -> dict:
-        reference = self.state.get("pull_request")
+    def merged_pull(self) -> tuple[dict, dict, str]:
+        """The receipt's pull request, GitHub's view of it and its merge commit, once GitHub says it merged.
+
+        A first prepare whose Copilot step failed recorded the pull request
+        it opened apart, so merge refuses it; once merged, it is this
+        receipt's (sd:9268 round 12).
+        """
+        published = self.state.get("pull_request")
+        reference = published or self.state.get("opened_pull_request")
         if not reference:
             raise Refusal("there is no durable pull-request receipt to reconcile")
+        heads = [self.state.get("reviewed_head"), *([] if published else self.state.get("opened_heads") or [])]
         pull = self.api.pull(reference["number"])
         if pull.get("merged") is not True:
             raise Refusal("GitHub has not confirmed this pull request merged; database completion stays open")
@@ -2903,8 +3426,17 @@ class Ship(SharedReview):
         if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
                 or str(pull.get("html_url", "")).lower() != reference["url"]
                 or pull.get("base", {}).get("ref") != reference["base"]
-                or pull.get("head", {}).get("sha") != self.state.get("reviewed_head")):
+                or pull.get("head", {}).get("sha") not in [head for head in heads if head]):
             raise Refusal("merged PR evidence does not match the prepared receipt")
+        if not published:
+            # `head` too: a failed reprepare left it at a head GitHub never merged, and the lane settles its
+            # entry by the reported head (sd:9268 round 14).
+            merged = pull["head"]["sha"]
+            self.save(pull_request=reference, reviewed_head=merged, head=merged, **self.opened_at(None))
+        return reference, pull, commit
+
+    def reconcile(self) -> dict:
+        reference, pull, commit = self.merged_pull()
         metadata = self.api.api(self.api.prefix)
         if metadata.get("default_branch") != reference["base"]:
             raise Refusal("the current default branch differs from the prepared base")
@@ -2919,6 +3451,7 @@ class Ship(SharedReview):
         self.save(phase="merged", merge_commit=commit, evidence=evidence)
         if not self.args.no_item:
             self.store.note_merge(self.connection, self.args.item, evidence)
+        self.refuse_unbound_closing(pull["head"]["sha"], commit)
         # GitHub squashes onto the base it holds at the `PUT`, and no request
         # field pins that base. `ready` and `still_gated` saw the reviewed head
         # contain the base; a squash parent outside it means the base advanced
@@ -2932,7 +3465,9 @@ class Ship(SharedReview):
         self.settle_closes(held, commit, evidence)
         if not self.args.no_item and self.state.get("deliver"):
             from sd_db.errors import SdDbError
-            self.assert_scope()
+            # A hand delivery at this commit is the operator's answer to a scope change after the merge.
+            if not self.delivered_at(commit):
+                self.assert_scope(merged=commit)
             try:
                 self.record_delivery(commit, f"origin/{reference['base']}")
             except (SdDbError, sqlite3.Error, ValueError) as error:

@@ -399,6 +399,11 @@ class ShipCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        # The lane marks the sd-ship it starts (sd:9335); a suite the lane's gate runs inherits that mark.
+        lane = patch.dict(os.environ)
+        lane.start()
+        self.addCleanup(lane.stop)
+        os.environ.pop("SD_LANE_CHILD", None)
         self.directory = pathlib.Path(self.temp.name).resolve()
         # The three repositories come from one template per process, copied;
         # `fixture_template` below builds it the way this setUp used to.
@@ -2355,7 +2360,8 @@ roles:
             self.prepare("--copilot-review", "request")
         state = self.operation().state
         self.assertTrue(state["copilot_review_suppressed"])
-        self.assertEqual(state["phase"], "ready_to_send")
+        # The prepare did not finish, so its phase says where it stopped and merge refuses (sd:9268).
+        self.assertEqual(state["phase"], "push_dispatch")
         self.assertEqual(state["pull_request"]["number"], 1)
         self.assertEqual(self.double.copilot_requests, [])
 
@@ -4723,6 +4729,1189 @@ roles:
         with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed"):
             self.prepare()
         self.assertEqual(self.operation().state, before)
+
+    def test_an_explicit_deliver_renews_a_claim_the_item_outgrew(self):
+        """sd:9268. A retitled item's next `--deliver` prepare makes a new claim on the new scope.
+
+        A plain prepare still refuses, and the renewed claim refuses a later change the same way.
+        """
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]["item_scope"]
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed"):
+            self.prepare()
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "rechecked on the new scope"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        renewed = self.operation().state["acceptance"]["item_scope"]
+        self.assertNotEqual(renewed, old)
+        set_item_fields(self.connection, self.item, body="newer scope")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed"):
+            self.prepare()
+
+    def test_a_lane_prepare_never_renews_a_claim_the_item_outgrew(self):
+        """sd:9335. The lane passes the enqueue's `--deliver` and acceptance text to every prepare, retries
+        included, so a lane prepare after a retitle refuses; a prepare by hand renews and says so."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]["item_scope"]
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        # The runner's mark on the entry it runs: `running`, its host and pid; it starts sd-ship as its child.
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "prepare",
+                 "holder": {"host": sd_lane.this_host(), "pid": os.getppid(), "token": "t"}}
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), entry)
+        self.connection.commit()
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*by hand"):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertEqual(self.operation().state["acceptance"]["item_scope"], old)
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), {**entry, "status": "failed"})
+        self.connection.commit()
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "rechecked on the new scope"}]}))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        renewed = self.operation().state["acceptance"]["item_scope"]
+        self.assertNotEqual(renewed, old)
+        self.assertIn(f"renews the delivery claim of sd:{self.item}: item scope {old[:12]} is now {renewed[:12]}",
+                      stderr.getvalue())
+
+    def test_a_hand_prepare_held_by_a_running_lane_row_names_that_row(self):
+        """Round 8 of sd:9268 (advisory): with no lane mark, a running entry for the item on this host still
+        counts the prepare as the lane's, and the refusal told the operator, who had run it by hand, to run it
+        by hand. It names the running entry and how to release it."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "merge",
+                 "holder": {"host": sd_lane.this_host(), "pid": 4242, "token": "t"}}
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), entry)
+        self.connection.commit()
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "rechecked on the new scope"}]}))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                ship.Refusal, rf"running lane entry for sd:{self.item} \(step merge, pid 4242\).*"
+                              rf"when its runner is gone, release it with `sd-ship lane cancel {self.item}`"):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        # The class pass of build/sd-1636: the cancel it offered refuses a live runner, and no test followed
+        # either way out. Once the entry ended, the prepare by hand renews.
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), {**entry, "status": "failed"})
+        self.connection.commit()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertTrue(self.operation().state["acceptance"].get("renewed"))
+
+    def test_an_orphaned_lane_prepare_never_renews(self):
+        """Lead review of sd:9335: a lane prepare leads its own process group, so a forced runner stop leaves it
+        running under pid 1. Its parent no longer matches the entry's holder, and the parent-pid check took it
+        for a prepare by hand and renewed the claim. The lane marks its children at launch; that mark holds."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]["item_scope"]
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "prepare",
+                 "holder": {"host": sd_lane.this_host(), "pid": 2 ** 22 + 7, "token": "t"}}
+        for status in ("running", "pending"):  # the runner is gone; the reap may have put the entry back
+            with self.subTest(status=status):
+                sd_lane.store(self.connection, ship.slug(REMOTE_URL), {**entry, "status": status})
+                self.connection.commit()
+                with self.as_lane():
+                    with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*by hand"):
+                        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+                self.assertEqual(self.operation().state["acceptance"]["item_scope"], old)
+
+    def test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses(self):
+        """sd:9335 round 5. A retry keeps its entry's acceptance text, and the scope matches once a hand prepare
+        renewed the claim; a lane prepare whose evidence differs from the renewed claim refuses and changes
+        nothing, and one enqueued again with the renewal's evidence passes."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+
+        def evidence(name, text):
+            path = self.directory / name
+            path.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+                {"criterion": "actual scope", "passed": True, "evidence": text}]}))
+            return str(path)
+
+        queued, renewal = evidence("queued.json", "fixture-check-pass"), evidence("renewal.json", "renewed-pass")
+        self.prepare("--deliver", "--acceptance-file", queued)
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", renewal)
+        before = self.operation().state["acceptance"]
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "prepare",
+                 "body": self.operation().state["body"],  # an entry holds the body it was enqueued with
+                 "holder": {"host": sd_lane.this_host(), "pid": os.getppid(), "token": "t"}}
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), entry)
+        self.connection.commit()
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*enqueue again"):
+            self.prepare("--deliver", "--acceptance-file", queued)
+        self.assertEqual(self.operation().state["acceptance"], before)
+        self.prepare("--deliver", "--acceptance-file", renewal)
+        self.assertEqual(self.operation().state["acceptance"]["claim"], before["claim"])
+
+    def test_a_lane_retry_after_only_the_waiver_note_changed_says_so(self):
+        """Lead review of sd:9335: after a renewal by hand, an edit of the decision note that waived a row, its
+        `Waive:` line kept, made the lane's claim differ from the stored one, and the refusal said to enqueue
+        again with the renewal's file: this entry's file. It names the note and says to refresh by hand."""
+        from sd_db import set_item_fields
+        from sd_db.writes import set_note_body
+        note = self.decision("Ruling: no rig here.\nWaive: runs offline")
+        acceptance = str(self.waiver_file(self.waived_row("runs offline", note)))
+        self.prepare("--deliver", "--acceptance-file", acceptance)
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        acceptance = str(self.waiver_file({"criterion": "rechecked", "passed": True, "evidence": "new scope"},
+                                          self.waived_row("runs offline", note)))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", acceptance)
+        before = self.operation().state["acceptance"]
+        set_note_body(self.connection, note, "Ruling: no rig here, still.\nWaive: runs offline")
+        with self.as_lane():
+            with self.assertRaisesRegex(ship.Refusal, rf"only decision note #{note} changed.*by hand") as caught:
+                self.prepare("--deliver", "--acceptance-file", acceptance)
+        self.assertNotIn("enqueue again", str(caught.exception))
+        self.assertEqual(self.operation().state["acceptance"], before)
+        # Re-review of sd:9335: the printed retry named no item, which `lane retry` requires.
+        retry = re.search(r"`(sd-ship lane retry[^`]*)`", str(caught.exception))[1]
+        self.assertEqual(ship.parser().parse_args(shlex.split(retry)[1:]).item, self.item)
+        self.prepare("--deliver", "--acceptance-file", acceptance)  # the refresh by hand
+        with self.as_lane():
+            self.prepare("--deliver", "--acceptance-file", acceptance)  # the retried entry, same file
+        self.assertIn("still.", self.operation().state["acceptance"]["claim"]["criteria"][2]["waived"]["note"]["body"])
+
+    def test_a_scope_change_before_the_merge_says_nothing_merged(self):
+        """Lead review of sd:9335: `merge` refused a scope change with the prepare step's words, "a lane prepare
+        does not renew it"; it says nothing merged and to renew by hand, then merge."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled before the merge")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged.*then merge") as caught:
+            self.merge()
+        self.assertNotIn("lane prepare", str(caught.exception))
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+        # The class pass of build/sd-1636: the printed way out, followed, merges.
+        command = shlex.split(re.search(r"`(sd-ship [^`]*)`", str(caught.exception))[1])
+        self.assertEqual(ship.parser().parse_args(command[1:]).command, "prepare")
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "rechecked on the new title"}]}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare(*command[2:], "--acceptance-file", str(acceptance))
+        self.assertEqual(self.merge()["phase"], "merged")
+
+    def test_a_lane_retry_with_the_items_a_renewal_dropped_refuses(self):
+        """Re-review of sd:9335: a lane retry carries its enqueue's --item args, so with the renewal's evidence it
+        overwrote the closing set a renewal by hand had narrowed, and closed the item the operator dropped. A lane
+        prepare against a renewed claim proceeds only when its evidence and its items both match."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(kept))  # the renewal by hand drops one
+        with self.as_lane():
+            with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other items") as caught:
+                self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+            self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+            self.assertIn(f"`sd-ship prepare --item {self.item} --item {kept} --deliver`", str(caught.exception))
+            self.assertEqual(self.operation().state["closing"]["items"], [kept])
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
+        self.assertEqual(self.operation().state["closing"]["items"], [kept])
+
+    def lane_runs(self, body: str, status: str = "running", pid: int | None = None, entry: str = "e-running",
+                  shots: tuple[str, ...] = ()) -> None:
+        """The entry the lane holds while it prepares this item, with the `body` it was enqueued with; its
+        runner is this prepare's parent, as the lane's is, or `pid`. An ended entry keeps the `shots` its run
+        drew, as the lane's does."""
+        sd_lane = ship.sd_lane
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), {
+            "id": entry, "position": 1, "item": self.item, "status": status, "step": "prepare",
+            "body": body, "holder": {"host": sd_lane.this_host(), "pid": pid or os.getppid(), "token": "t"},
+            **({"shots": list(shots)} if shots else {})})
+        self.connection.commit()
+
+    @contextlib.contextmanager
+    def as_lane(self, body: str | None = None, shots: tuple[str, ...] = ()):
+        """A prepare inside is the lane's: the runner's mark and its running entry, enqueued with `body`, or
+        with the published body. The entry is a new one each time, as a retry's is, and ends with the block,
+        as a runner's does, the `shots` its run drew on its row."""
+        body = (self.operation().state.get("body") or "") if body is None else body
+        self.lane_entries = getattr(self, "lane_entries", 0) + 1
+        entry = f"e-{self.lane_entries}"
+        self.lane_runs(body, entry=entry)
+        try:
+            with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+                yield
+        finally:
+            self.lane_runs(body, "failed", entry=entry, shots=shots)
+
+    def lane_prepare(self, entry: str, shots: tuple[str, ...] = ()) -> dict:
+        """A lane prepare of an entry enqueued with body `entry`, the lane having drawn `shots`."""
+        body = self.directory / "lane-body.md"
+        body.write_text(ship.sd_lane.with_shots(entry, list(shots)) if shots else entry)
+        with self.as_lane(entry, shots), contextlib.redirect_stderr(io.StringIO()):
+            return self.prepare("--deliver", "--body-file", str(body))
+
+    def renewed_by_hand(self, first: str, renewal: str | None, lane: bool = False) -> None:
+        """A task published with body `first`, retitled, then renewed by hand with body `renewal`; with None
+        the lane published it, as with `lane`, and the renewal has no body file, so it takes the pull
+        request's own body."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        body = self.directory / "hand-body.md"
+        body.write_text(first)
+        if lane or renewal is None:  # the lane opens the pull request, its Screenshots section in the body
+            self.assertEqual(self.lane_prepare(first, ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        else:
+            self.prepare("--deliver", "--body-file", str(body))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        body.write_text(renewal or "")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", *(("--body-file", str(body)) if renewal is not None else ()))
+        state = self.operation().state
+        self.assertTrue(state["acceptance"].get("renewed"))
+        self.assertTrue(renewal is not None or "## Screenshots" in state["body"])
+
+    def test_a_stale_entry_cannot_restore_the_screenshots_a_renewal_removed(self):
+        """Review of build/sd-1636, the class: the check told the lane's section from the entry's words by the
+        text, so an entry enqueued with a copy of a published body, section and all, passed against a renewal
+        that had removed the section, and published it again. The entry's body is read from its queue row, and
+        every byte of it is the entry's."""
+        copy = ship.sd_lane.with_shots("Body B.\n", ["queue-dark-1280.png"])
+        self.renewed_by_hand(copy, "Body B.\n")
+        published = self.operation().state["body"]
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
+            self.lane_prepare(copy)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+        state = self.operation().state
+        self.assertEqual((state["body"], state.get("pending")), (published, None))
+
+    def test_a_retry_of_the_renewals_body_proceeds_whatever_the_lane_draws(self):
+        """Review of build/sd-1636, the class: a lane prepare saved its Screenshots section in the published body,
+        so a retry of the same entry refused when the capture failed or drew other variants. The basis is the
+        entry's body, which no capture changes."""
+        self.renewed_by_hand("Body A.\n", "Body B.\n")
+        for shots in (("queue-dark-1280.png",), (), ("queue-light-390.png", "health-dark-1280.png")):
+            with self.subTest(shots=shots):
+                self.assertEqual(self.lane_prepare("Body B.\n", shots)["phase"], "ready_to_send")
+
+    def test_a_renewal_of_a_body_the_lane_published_keeps_the_entrys_basis(self):
+        """The class, from the code: the scope refusal advises `sd-ship prepare --deliver` by hand, with no body
+        file, so the renewal publishes the pull request's body, the lane's section in it. The entry that
+        published it still retries: a body published again keeps the basis it was published from."""
+        self.renewed_by_hand("Body B.\n", None)
+        for shots in ((), ("queue-dark-1280.png",)):
+            with self.subTest(shots=shots):
+                self.assertEqual(self.lane_prepare("Body B.\n", shots)["phase"], "ready_to_send")
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A.\n")
+
+    def test_a_lane_prepare_whose_body_is_not_its_running_entrys_refuses(self):
+        """The class, from the code: the entry's body is read from the queue, so a prepare that outlived its
+        runner must not borrow a newer entry's. Its own body has to be that entry's, the lane's section apart."""
+        self.renewed_by_hand("Body A.\n", "Body B.\n")
+        self.lane_runs("Body B.\n")  # a newer entry's row, while an orphaned prepare still carries body A
+        stale = self.directory / "stale.md"
+        for text in ("Body A.\n", "Body B.\n\nMore words.\n"):
+            stale.write_text(text)
+            with self.subTest(text=text), patch.dict(os.environ, {"SD_LANE_CHILD": "1"}), \
+                    self.assertRaisesRegex(ship.Refusal, "not the body of the one running lane entry") as caught:
+                self.prepare("--deliver", "--body-file", str(stale))
+            self.assertEqual(caught.exception.workflow["blocker"]["code"], "lane_unknown")
+        # The class pass of build/sd-1636: the retry it names, once that entry ended, proceeds.
+        self.assertIn(f"`sd-ship lane retry {self.item}`", str(caught.exception))
+        self.lane_runs("Body B.\n", "failed")
+        self.assertEqual(self.lane_prepare("Body B.\n")["phase"], "ready_to_send")
+
+    def test_an_explicit_renewal_of_a_published_text_holds_against_the_entry_that_drew_it(self):
+        """Review of build/sd-1636, the class (equal content read as a record): a renewal by hand whose body
+        file held the very text the lane had published took that publication's basis, the entry's words, so
+        the entry retried, drew nothing, and removed the section the operator had supplied. A body file is
+        its author's words, whatever text an earlier prepare published."""
+        decorated = ship.sd_lane.with_shots("Body B.\n", ["queue-dark-1280.png"])
+        self.renewed_by_hand("Body B.\n", decorated, lane=True)
+        published = self.operation().state["body"]
+        self.assertIn("## Screenshots", published)
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
+            self.lane_prepare("Body B.\n")
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+        self.assertEqual(self.operation().state["body"], published)
+        self.assertEqual(self.lane_prepare(decorated)["phase"], "ready_to_send")
+
+    def test_an_unchanged_retry_proceeds_on_a_receipt_older_than_the_body_record(self):
+        """Review of build/sd-1636, the class: a text with no recorded basis was taken as its own words, so on
+        a receipt saved before `body_bases` a renewal that took the pull request's body, the lane's section in
+        it, refused the unchanged entry that had published it. No record is no words: the entry then has to
+        be the published body, the lane's section apart."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        self.operation().save(body_bases=None)  # as a prepare before this record left it
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver")
+        state = self.operation().state
+        self.assertTrue(state["acceptance"].get("renewed"))
+        self.assertIn("## Screenshots", state["body"])
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A.\n")
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-light-390.png",))["phase"], "ready_to_send")
+
+    def test_a_section_edited_on_the_pull_request_is_not_the_lanes(self):
+        """Review of build/sd-1636, the class (a missing record answered by a guess): a renewal took a body
+        edited on GitHub, which no prepare had recorded, and the check then read any bullets under the lane's
+        heading as the lane's, so the old entry retried and replaced the operator's edit. With no record of
+        the body's words, the entry proceeds only when the published body is that entry with the very
+        Screenshots section a lane run recorded drawing for it."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        pull = self.remote.pull(1)
+        self.assertIn("- queue: dark 1280", pull.body)
+        pull.body = pull.body.replace("- queue: dark 1280", "- queue: dark 1280, checked by hand")
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver")
+        state = self.operation().state
+        self.assertTrue(state["acceptance"].get("renewed"))
+        self.assertIn("checked by hand", state["body"])
+        for shots in ((), ("queue-dark-1280.png",)):
+            with self.subTest(shots=shots), self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+                self.lane_prepare("Body B.\n", shots)
+        self.assertIn("checked by hand", self.operation().state["body"])
+
+    def test_a_lane_body_no_row_vouched_for_is_recorded_as_nobodys_words(self):
+        """The class, from the code: a lane prepare whose queue read failed recorded its body file, the lane's
+        section in it, as its own words, so a later renewal took that record and refused the unchanged entry.
+        A lane's body is its entry's words only when a row says so; with none, nothing is recorded, and the
+        lane's own record of the run answers."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        with patch.object(ship.sd_lane, "stored", side_effect=ValueError("queue down")):
+            self.assertEqual(self.lane_prepare("Body B.\n", ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        state = self.operation().state
+        self.assertEqual(list(state["body_bases"].values()), [None])
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver")
+        self.assertTrue(self.operation().state["acceptance"].get("renewed"))
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-light-390.png",))["phase"], "ready_to_send")
+
+    def test_an_entry_enqueued_with_the_published_body_proceeds(self):
+        """Review of build/sd-1636, the class: the refusal says to enqueue the renewal's body again, and a
+        renewal that took the pull request's body published the lane's section with a basis of the entry's
+        words, so an entry enqueued with that very body compared unequal and refused. An entry whose words
+        are the published body is not older than it."""
+        self.renewed_by_hand("Body B.\n", None)
+        published = self.operation().state["body"]
+        self.assertIn("## Screenshots", published)
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A.\n")
+        self.assertEqual(self.lane_prepare(published)["phase"], "ready_to_send")
+
+    def test_a_lane_prepare_its_runner_does_not_hold_the_entry_of_refuses(self):
+        """The class, from the code: a prepare was tied to the running entry by its body alone, so one that
+        outlived its runner, its body a newer entry's plus a copied Screenshots section, took that entry's
+        words as its own. The entry's holder is the runner; a prepare is its entry's when that runner is its
+        parent."""
+        self.renewed_by_hand("Body A.\n", "Body B.\n")
+        self.lane_runs("Body B.\n", pid=os.getppid() + 1)  # a newer runner's entry
+        stale = self.directory / "stale.md"
+        stale.write_text(ship.sd_lane.with_shots("Body B.\n", ["queue-dark-1280.png"]))
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}), \
+                self.assertRaisesRegex(ship.Refusal, "not the body of the one running lane entry") as caught:
+            self.prepare("--deliver", "--body-file", str(stale))
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "lane_unknown")
+        self.assertNotIn("## Screenshots", self.operation().state["body"])
+
+    def test_a_merge_after_a_failed_explicit_copilot_request_refuses(self):
+        """Review of build/sd-1636, the class: merge read a pending set equal to the published one as a
+        prepare that owed nothing, and the one step outside the set is the Copilot request, so a prepare whose
+        explicit request GitHub refused still merged, with no request for the clearance to wait on. A pending
+        set says the prepare did not finish; only an abandoned Copilot wait merges past an equal one."""
+        self.prepare()
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged") as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
+        with self.assertRaisesRegex(ship.Refusal, "no locally recorded Copilot review request"):
+            self.merge("--abandon-copilot-review", "the request failed")
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+        self.double.lose_copilot_request = False
+        self.assertEqual(self.prepare("--copilot-review", "request")["phase"], "ready_to_send")
+
+    def test_a_plain_retry_after_a_failed_explicit_copilot_request_still_owes_it(self):
+        """Review of build/sd-1636, the class: a refusal whose printed recovery defeated its own guard. Merge
+        said to prepare again; that prepare, without the flag, chose `not_selected`, cleared the pending set and
+        let the merge go without the review the operator asked for. The explicit request stays owed on the
+        receipt until it is recorded, on a first prepare too, and over a suppression it was to lift."""
+        self.owed_copilot_request()
+
+    def test_an_owed_copilot_request_outlasts_the_suppression_it_was_to_lift(self):
+        self.owed_copilot_request("--copilot-review", "skip")
+        self.assertFalse(self.operation().state["copilot_review_suppressed"])
+
+    def owed_copilot_request(self, *first: str) -> None:
+        self.prepare(*first)
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare()
+        self.assertTrue(self.operation().state["pending"])
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged"):
+            self.merge()
+        self.double.lose_copilot_request = False
+        result = self.prepare()
+        self.assertEqual((result["phase"], result["copilot_review"]["selection"]), ("ready_to_send", "explicit"))
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.prepare()  # paid: the next plain prepare asks for nothing more
+        self.assertEqual(len(self.double.copilot_requests), 1)
+
+    def test_a_first_prepare_whose_explicit_copilot_request_failed_still_owes_it(self):
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare()
+        self.assertNotIn("pull_request", self.operation().state)
+        self.double.lose_copilot_request = False
+        self.assertEqual(self.prepare()["copilot_review"]["selection"], "explicit")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+
+    def test_a_merge_of_a_first_prepares_pull_request_whose_copilot_request_failed_reconciles(self):
+        """Round 12 of sd:9268: a first prepare's Copilot request failed after GitHub opened the pull request,
+        so the receipt named none, and once it merged reconcile refused for good. The opened one is recorded
+        before the Copilot step; merge still refuses it, reconcile reads it."""
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        self.assertNotIn("pull_request", self.operation().state)
+        with self.assertRaisesRegex(ship.Refusal, "prepare this branch before merging"):
+            self.merge()
+        self.remote.merge(1)
+        with patch.object(ship.time, "sleep"):
+            result = self.operation("reconcile").reconcile()
+        self.assertEqual(result["phase"], "merged")
+        self.assertEqual(self.operation().state["merge_commit"], self.remote.pull(1).merge_commit_sha)
+
+    def opened_then_copilot_failed(self) -> str:
+        """A first prepare whose Copilot request failed after GitHub opened pull request 1: its head."""
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        return self.operation().state["reviewed_head"]
+
+    def reconciled(self) -> dict:
+        with patch.object(ship.time, "sleep"):
+            return self.operation("reconcile").reconcile()
+
+    def test_a_reprepare_whose_review_blocks_leaves_the_opened_pull_request_reconcilable(self):
+        """Round 13 of sd:9268, the class: the merged check read `reviewed_head`, which each later prepare's
+        review moves, so a reprepare that failed left the opened pull request, merged at the head an earlier
+        prepare reviewed and pushed, unreconcilable. The check reads the heads prepare pushed to it."""
+        opened = self.opened_then_copilot_failed()
+        (self.root / "src.py").write_text("value = 3\n")
+        _git(self.root, "commit", "-qam", "a later change\n\nAuthored-with: human")
+        self.blocking_review()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "local review blocking"):
+            self.prepare()
+        self.assertIsNone(self.operation().state["reviewed_head"])
+        self.remote.merge(1)
+        self.assertEqual(self.reconciled()["phase"], "merged")
+        self.assertEqual(self.operation().state["reviewed_head"], opened)
+
+    def test_a_reprepare_that_stops_before_its_push_leaves_the_opened_pull_request_reconcilable(self):
+        """The same class: the review passed at a newer head that never reached GitHub."""
+        opened = self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        with patch.object(ship.Ship, "check_review", side_effect=ship.Refusal("stopped before the push")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "stopped before"):
+            self.prepare()
+        self.assertNotEqual(self.operation().state["reviewed_head"], opened)
+        self.remote.merge(1)
+        self.assertEqual(self.reconciled()["phase"], "merged")
+
+    def test_a_second_pushed_head_of_an_opened_pull_request_stays_reconcilable(self):
+        """The same class: the second prepare pushed a newer head and Copilot failed again; a third blocked."""
+        self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "transport failed"):
+            self.prepare()
+        pushed = self.operation().state["reviewed_head"]
+        (self.root / "src.py").write_text("value = 3\n")
+        _git(self.root, "commit", "-qam", "a later change\n\nAuthored-with: human")
+        self.blocking_review()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "local review blocking"):
+            self.prepare()
+        self.remote.merge(1)
+        self.assertEqual(self.reconciled()["phase"], "merged")
+        self.assertEqual(self.operation().state["reviewed_head"], pushed)
+
+    def test_reconcile_of_an_opened_pull_request_reports_the_head_github_merged(self):
+        """Round 14 of sd:9268: the receipt's `head` stayed at the newer head a failed reprepare saved, and the
+        lane settles the entry by that field, so it marked an unmerged head merged."""
+        opened = self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        real = ship.git
+
+        def lost_push(root, *args, **kwargs):
+            if args[:1] == ("push",):
+                raise ship.Refusal("push lost")
+            return real(root, *args, **kwargs)
+
+        with patch.object(ship, "git", lost_push), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "push lost"):
+            self.prepare()
+        self.assertNotEqual(self.operation().state["head"], opened)
+        self.remote.merge(1)
+        reconciled = self.reconciled()
+        self.assertEqual((reconciled["head"], reconciled["reviewed_head"]), (opened, opened))
+
+    def test_a_failed_renewal_leaves_an_opened_pull_requests_claim_in_force(self):
+        """Round 14 of sd:9268: a reprepare of an opened, unpublished pull request saved its claim as the active
+        one before lint, so a lint refusal left reconcile reading a claim no prepare finished."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--deliver", "--copilot-review", "request")
+        before = {key: self.operation().state.get(key) for key in ("title", "body", "acceptance", "closing")}
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
+            self.prepare("--deliver", "--title", "a renewed title")
+        state = self.operation().state
+        self.assertEqual({key: state.get(key) for key in before}, before)
+        self.assertIsNotNone(state.get("pending"))
+
+    def test_a_head_no_prepare_pushed_to_an_opened_pull_request_never_reconciles(self):
+        """The guard the class fix keeps: a head pushed by hand was reviewed by no prepare."""
+        self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "pushed by hand\n\nAuthored-with: human")
+        _git(self.root, "push", "-q", "origin", "HEAD:refs/heads/topic")
+        self.remote.merge(1)
+        with self.assertRaisesRegex(ship.Refusal, "merged PR evidence does not match the prepared receipt"):
+            self.reconciled()
+        self.assertNotIn("pull_request", self.operation().state)
+
+    def test_a_published_prepare_keeps_no_record_of_the_opened_pull_request(self):
+        self.opened_then_copilot_failed()
+        self.double.lose_copilot_request = False
+        self.assertEqual(self.prepare()["phase"], "ready_to_send")
+        state = self.operation().state
+        self.assertEqual((state.get("opened_pull_request"), state["pull_request"]["number"]), (None, 1))
+
+    def stopped_at_save(self, count: int, *extra) -> None:
+        """A prepare with `extra` that stops at its `count`th save of the receipt, which is not written."""
+        real, seen = ship.Ship.save, []
+
+        def save(operation, **fields):
+            seen.append(fields)
+            if len(seen) == count:
+                raise KeyboardInterrupt
+            return real(operation, **fields)
+
+        with patch.object(ship.Ship, "save", save), contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(KeyboardInterrupt):
+            self.prepare(*extra)
+
+    def test_a_prepare_stopped_after_it_recorded_an_owed_copilot_request_holds_the_merge(self):
+        """The class, last round of sd:9268: a prepare records what it owes in more than one save, and merge
+        read one of them. Stopped between `copilot_review_owed` and `pending`, the receipt read as owing
+        nothing, and merge went without the review the operator asked for."""
+        self.prepare()
+        self.stopped_at_save(2, "--copilot-review", "request")
+        state = self.operation().state
+        self.assertEqual((state.get("copilot_review_owed"), state.get("pending")), (True, None))
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged.*`--copilot-review skip` withdraws it") as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "recorded")  # the retry pays it
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertFalse(self.operation().state.get("copilot_review_owed"))
+
+    def test_a_skip_stopped_halfway_never_leaves_the_request_it_withdraws_owed(self):
+        """The same class: `skip` saved its suppression, then withdrew the owed request in a second save. A
+        stop between left both, and the plain retry asked for the paid review the operator had skipped."""
+        self.prepare()
+        self.stopped_at_save(2, "--copilot-review", "request")
+        self.stopped_at_save(2, "--copilot-review", "skip")
+        state = self.operation().state
+        self.assertEqual((state.get("copilot_review_suppressed"), bool(state.get("copilot_review_owed"))),
+                         (True, False))
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "skipped")
+        self.assertEqual(self.double.copilot_requests, [])
+        self.assertEqual(self.merge()["phase"], "merged")
+
+    def test_a_prepare_stopped_after_its_copilot_request_was_recorded_asks_no_second_one(self):
+        """The same class, a guard that held: the request is recorded in one save and no longer owed in the
+        next. A stop between holds the merge, and the retry reads the recorded request, charging none."""
+        self.prepare()
+        with patch.object(ship.Ship, "clear_copilot_suppression", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            self.prepare("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged"):
+            self.merge()
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "already_recorded")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertFalse(self.operation().state.get("copilot_review_owed"))
+
+    def test_an_explicit_skip_withdraws_an_owed_copilot_request(self):
+        """The way out when Copilot stays down: the operator's `skip` withdraws the request, and merge goes."""
+        self.prepare()
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged.*`--copilot-review skip` withdraws it"):
+            self.merge()
+        self.assertEqual(self.prepare("--copilot-review", "skip")["phase"], "ready_to_send")
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "skipped")
+        self.assertEqual(self.double.copilot_requests, [])
+        self.assertEqual(self.merge()["phase"], "merged")
+
+    def test_a_lane_retry_with_the_body_a_renewal_replaced_refuses(self):
+        """Review of build/sd-1636: a task's claim has no evidence rows, so a lane retry of an entry enqueued with
+        body A passed the evidence and item checks against a renewal by hand with body B, published body A
+        again, and merge squashed it. A lane prepare on a renewed claim also needs the renewal's body."""
+        self.renewed_by_hand("Body A, the enqueue's.\n", "Body B, the renewal's.\n")
+        published = self.operation().state["body"]
+        self.assertIn("Body B", published)
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
+            self.lane_prepare("Body A, the enqueue's.\n")
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+        state = self.operation().state
+        self.assertEqual((state["body"], state.get("pending")), (published, None))
+        self.lane_prepare("Body B, the renewal's.\n")  # an entry with the renewal's body proceeds
+        self.assertEqual(self.operation().state["body"], published)
+        # The class pass of build/sd-1636: the refusal's other way out, a prepare by hand with the entry's
+        # body, then a retry of that entry.
+        self.assertRegex(str(caught.exception), r"--body-file FILE` by hand, then `sd-ship lane retry \d+`")
+        body = self.directory / "hand-body.md"
+        body.write_text("Body A, the enqueue's.\n")
+        self.prepare("--deliver", "--body-file", str(body))
+        self.lane_prepare("Body A, the enqueue's.\n")
+        self.assertIn("Body A", self.operation().state["body"])
+
+    def test_a_lane_body_differs_from_a_renewals_in_any_byte_but_the_lanes_own_section(self):
+        """Review of build/sd-1636: the body check stripped every Screenshots-shaped block, fenced examples too,
+        and folded blank-line runs, so a stale entry that differed only there passed. The entry's body is
+        compared whole; only what the lane appended to it at this run is not the entry's."""
+        with_shots = ship.sd_lane.with_shots
+        fence = "Before\n\n```\n" + with_shots("x\n\ny", ["queue-dark-1280.png"]) + "```\n\nAfter\n"
+        self.renewed_by_hand("Body A.\n", fence)
+        for stale in (fence.replace("queue: dark 1280", "queue: light 390"), fence.replace("x\n\ny", "x\n\n\ny"),
+                      with_shots(fence, ["queue-dark-1280.png"])):
+            with self.subTest(stale=stale), self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+                self.lane_prepare(stale, ("queue-dark-1280.png",))
+        self.assertEqual(self.lane_prepare(fence, ("queue-dark-1280.png",))["phase"], "ready_to_send")
+
+    def test_a_lane_entry_with_the_renewals_body_and_the_lanes_screenshots_proceeds(self):
+        """Review of build/sd-1636: the lane appends a Screenshots section to a dashboard change's body before
+        prepare, so an entry enqueued with the renewal's exact body refused as another body, and the advice to
+        enqueue again failed the same way. The lane's section is not the entry's body; the body the renewal
+        published, given back as the body file, is the renewal's too."""
+        self.renewed_by_hand("Body A, the enqueue's.\n", "Body B, the renewal's.\n")
+        republished = self.operation().state["body"]
+        shots = ("queue-dark-1280.png", "queue-light-390.png")
+        for entry in ("Body B, the renewal's.\n", republished):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.lane_prepare(entry, shots)["phase"], "ready_to_send")
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A, the enqueue's.\n", shots)
+
+    def test_a_lane_retry_with_the_renewals_items_in_another_order_proceeds(self):
+        """Lead review of sd:9268: the lane compared the closing lists in order, so a retry naming the renewal's
+        items in another order refused. A closing set is a set."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        first, second, third = self.closes_items()[:3]
+        self.prepare("--deliver", "--item", str(first), "--item", str(second), "--item", str(third))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(first), "--item", str(second))
+        with self.as_lane(), contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(second), "--item", str(first))
+        self.assertEqual(sorted(self.operation().state["closing"]["items"]), sorted([first, second]))
+
+    def test_a_renewal_with_the_old_claims_evidence_refuses(self):
+        """Lead review of sd:9268: a renewal by hand took the old acceptance file as evidence for the changed
+        requirements. It refuses, names each criterion, and saves nothing; fresh evidence renews."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        rows = [{"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"},
+                {"criterion": "second criterion", "passed": True, "evidence": "second-check-pass"}]
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": rows}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]
+        set_item_fields(self.connection, self.item, body="changed requirements")
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": rows[::-1]}))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                ship.Refusal, "no criterion has a fresh row: second criterion; actual scope") as caught:
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_evidence_stale")
+        self.assertEqual(self.operation().state["acceptance"], old)
+        self.assertIsNone(self.operation().state.get("pending"))
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {**rows[0], "evidence": "checked against the changed requirements"}, rows[1]]}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertNotEqual(self.operation().state["acceptance"]["item_scope"], old["item_scope"])
+
+    def test_a_renewal_whose_rows_differ_only_outside_the_evidence_refuses(self):
+        """Lead review of sd:9268 at 50b91b935: a renewal took any change of a row as fresh evidence, so an
+        added `comment` field passed the old evidence off as new. Only a row's criterion, evidence, result or
+        waiver counts; the same rows with other fields refuse."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        rows = [{"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": rows}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]
+        set_item_fields(self.connection, self.item, body="changed requirements")
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "note": "rechecked",
+                                          "criteria": [{**rows[0], "comment": "unchanged"}]}))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                ship.Refusal, "no criterion has a fresh row: actual scope") as caught:
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_evidence_stale")
+        self.assertEqual(self.operation().state["acceptance"], old)
+
+    def test_a_renewal_whose_evidence_differs_only_in_spacing_or_its_criterion_name_refuses(self):
+        """Round 8 of sd:9268: a trailing space, a line break or a renamed criterion over the same evidence
+        counted as fresh. Evidence text is compared with its spacing folded, and the criterion's name is not
+        proof; changed evidence, a changed result or a changed waiver still is."""
+        old = {"criteria": [{"criterion": "actual scope", "passed": True, "evidence": "fixture check pass"}]}
+
+        def renewed(**row):
+            return {"criteria": [{**old["criteria"][0], **row}]}
+
+        for stale in (renewed(evidence="fixture check pass "), renewed(evidence="fixture\ncheck  pass"),
+                      renewed(evidence="\uff46ixture check pass"), renewed(criterion="the renamed scope")):
+            with self.subTest(stale=stale):
+                self.assertTrue(ship.stale_criteria(stale, old))
+        for fresh in (renewed(evidence="fixture check pass at 2b7e5560"), renewed(passed=False),
+                      renewed(waived={"reason": "out of scope", "decision": 7})):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(ship.stale_criteria(fresh, old), [])
+
+    def test_structured_evidence_respaced_reordered_or_rewrapped_is_the_old_evidence(self):
+        """Round 10 of sd:9268: the fold read evidence text only, so a list, a nested value or a text wrapped
+        in a list passed whatever its spacing or order. Evidence is compared as its set of folded leaves."""
+        old = {"criteria": [{"criterion": "actual scope", "passed": True,
+                             "evidence": ["fixture check pass", {"run": "suite ok", "count": 3}]}]}
+
+        def renewed(evidence):
+            return {"criteria": [{**old["criteria"][0], "evidence": evidence}]}
+
+        for stale in (["fixture check pass ", {"run": "suite ok", "count": 3}],
+                      [{"count": 3, "run": "suite\nok"}, "fixture check pass"],
+                      [["fixture check pass"], [{"log": "suite ok"}], 3, "fixture  check pass", " "],
+                      ("\uff46ixture check pass", "suite ok", "3")):
+            with self.subTest(stale=stale):
+                self.assertTrue(ship.stale_criteria(renewed(stale), old))
+        text = {"criteria": [{"criterion": "actual scope", "passed": True, "evidence": "fixture check pass"}]}
+        self.assertTrue(ship.stale_criteria(renewed(["fixture check pass "]), text))
+        for fresh in (["fixture check pass", {"run": "suite ok", "count": 4}],
+                      ["fixture check pass", "suite ok", 3, "at 2b7e5560"]):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(ship.stale_criteria(renewed(fresh), old), [])
+
+    def test_results_moved_between_named_checks_are_fresh_evidence(self):
+        """Round 11 of sd:9268: the leaves dropped an object's keys, so the same results under other checks
+        read as the old evidence. A key both claims name must hold the same text; a renamed key does not."""
+        old = {"criteria": [{"criterion": "actual scope", "passed": True,
+                             "evidence": {"lint": "pass", "tests": "fail"}}]}
+
+        def renewed(evidence):
+            return {"criteria": [{**old["criteria"][0], "evidence": evidence}]}
+
+        for fresh in ({"lint": "fail", "tests": "pass"}, [{"tests": "pass"}, {"lint": "fail"}]):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(ship.stale_criteria(renewed(fresh), old), [])
+        for stale in ({"tests": "fail ", "lint": "pass"}, {"linter": "pass", "suite": "fail"}, ["pass", "fail"]):
+            with self.subTest(stale=stale):
+                self.assertTrue(ship.stale_criteria(renewed(stale), old))
+
+    def test_a_waiver_reason_respaced_inside_a_structure_is_the_old_waiver(self):
+        """The waiver's reason folds the same way as evidence, whatever shape the row gives it."""
+        def waived(reason):
+            return {"criteria": [{"criterion": "actual scope", "passed": False, "evidence": "none",
+                                  "waived": {"reason": reason, "decision": 7}}]}
+
+        self.assertTrue(ship.stale_criteria(waived(["out of  scope "]), waived(["out of scope"])))
+        self.assertEqual(ship.stale_criteria(waived(["descoped by the operator"]), waived(["out of scope"])), [])
+
+    def test_evidence_with_no_text_in_it_does_not_answer_a_criterion(self):
+        """Blank evidence in a structure was truthy, so it answered a row and read as proof the old claim
+        did not hold."""
+        for blank in (" ", [" "], [[], {"log": "\n"}], {"log": ""}, [None]):
+            with self.subTest(blank=blank):
+                self.assertFalse(ship.acceptance_row_answered(
+                    {"criterion": "actual scope", "passed": True, "evidence": blank}))
+        for held in ("fixture check pass", ["fixture check pass"], 3, [0], {"exit": 0}):
+            with self.subTest(held=held):
+                self.assertTrue(ship.acceptance_row_answered(
+                    {"criterion": "actual scope", "passed": True, "evidence": held}))
+
+    def test_a_renewal_whose_claim_has_no_evidence_still_renews(self):
+        """A task's claim is the verified merge alone, so its renewal has no evidence to go stale."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.prepare("--deliver")
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.prepare("--deliver")
+        self.assertIn("renews the delivery claim", stderr.getvalue())
+
+    def test_a_renewal_whose_prepare_fails_never_authorizes_the_old_pull_request(self):
+        """Lane review of sd:9268: a renewal saves its claim and closing set before lint, review and publication;
+        when lint then failed, merge ran on the old pull request with the new claim. The old pull request's own
+        claim stays in force, so merge refuses its scope; once a prepare finishes, it merges the new set."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
+                self.prepare("--deliver", "--item", str(kept))
+        self.assertEqual(self.operation().state["closing"]["items"], [kept, dropped])
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged"):
+            self.merge()
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(kept))
+        with patch.object(ship.time, "sleep"):
+            self.assertFalse(self.merge()["delivery_pending"])
+        self.assertEqual((self.status_of(kept), self.status_of(dropped)), ("done", "planning"))
+
+    def copilot_refusal_keeps_the_published_scope(self, failing) -> None:
+        """A renewal by hand that drops an item, whose explicit Copilot step refuses under `failing`: the
+        published closing set stays, merge refuses the scope and nothing merges."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with failing, contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "copilot"):
+            self.prepare("--deliver", "--item", str(kept), "--copilot-review", "request")
+        state = self.operation().state
+        self.assertEqual(state["closing"]["items"], [kept, dropped])
+        self.assertNotEqual(state.get("phase"), "ready_to_send")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged"):
+            self.merge()
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+
+    def test_a_failed_copilot_request_never_publishes_a_renewal(self):
+        """Lane review of sd:9268: prepare published the renewed scope before the Copilot request; when that
+        request failed, merge closed the renewed set on the local review alone."""
+        self.copilot_refusal_keeps_the_published_scope(patch.object(
+            ship.GitHub, "request_copilot_review", side_effect=ship.Refusal("copilot request failed")))
+
+    def test_a_failed_copilot_review_read_never_publishes_a_renewal(self):
+        real = ship.GitHub.pages
+
+        def pages(api, path, *args, **kwargs):
+            if path.endswith("/reviews"):
+                raise ship.Refusal("copilot reviews unread")
+            return real(api, path, *args, **kwargs)
+
+        self.copilot_refusal_keeps_the_published_scope(patch.object(ship.GitHub, "pages", pages))
+
+    def test_a_malformed_copilot_receipt_never_publishes_a_renewal(self):
+        self.copilot_refusal_keeps_the_published_scope(patch.object(
+            ship.Ship, "copilot_entries", side_effect=ship.Refusal("copilot review receipt is malformed")))
+
+    def test_a_copilot_limit_never_publishes_a_renewal(self):
+        self.copilot_refusal_keeps_the_published_scope(patch.object(
+            ship.Ship, "require_copilot_capacity", side_effect=ship.Refusal("copilot review limit")))
+
+    def test_a_first_prepare_whose_copilot_request_fails_records_no_pull_request(self):
+        """The same step on a first prepare: no pull request is recorded, so merge refuses to merge."""
+        with patch.object(ship.GitHub, "request_copilot_review", side_effect=ship.Refusal("copilot failed")):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "copilot"):
+                self.prepare("--copilot-review", "request")
+        self.assertNotIn("pull_request", self.operation().state)
+        with self.assertRaisesRegex(ship.Refusal, "prepare this branch before merging"):
+            self.merge()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.prepare("--copilot-review", "request")["phase"], "ready_to_send")
+
+    def reconciled_closing(self, passes: bool) -> tuple[list, int, int]:
+        """The closing set a reconcile settles for a pull request merged on GitHub after a renewal by hand that
+        dropped one item, whose prepare `passes` or fails at lint."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        lint = (contextlib.nullcontext() if passes else
+                patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")))
+        with lint, contextlib.redirect_stderr(io.StringIO()), contextlib.suppress(ship.Refusal):
+            self.prepare("--deliver", "--item", str(kept))
+        self.remote.merge(self.operation().state["pull_request"]["number"])
+        read, settle = [], ship.Ship.settle_closes
+
+        def reading(operation, *args, **kwargs):
+            read.append(list(operation.co_delivered()))
+            return settle(operation, *args, **kwargs)
+
+        with patch.object(ship.Ship, "settle_closes", reading), patch.object(ship.time, "sleep"), \
+                contextlib.suppress(ship.Refusal):
+            self.operation("reconcile").reconcile()
+        return read, kept, dropped
+
+    def test_a_reconcile_after_a_failed_renewal_reads_the_published_closing_set(self):
+        """Review of sd:9268: the merge guard was read only by `merge`, so a reconcile of a pull request merged on
+        GitHub recorded the failed renewal's closing set. It reads the published one, the old pull request's."""
+        read, kept, dropped = self.reconciled_closing(passes=False)
+        self.assertEqual(read, [[kept, dropped]])
+
+    def test_a_reconcile_after_a_renewal_that_passed_reads_its_new_closing_set(self):
+        read, kept, _ = self.reconciled_closing(passes=True)
+        self.assertEqual(read, [[kept]])
+
+    def test_a_reconcile_of_a_head_the_published_closing_set_was_not_read_at_refuses(self):
+        """Round 8 of sd:9268: a reprepare that dropped an item pushed and reviewed a newer tip, then Copilot refused, so its
+        closing set stayed pending. The pull request merged on GitHub at that tip, and reconcile closed the
+        published set, read at the old head, with the item the new tip dropped. It refuses and closes none."""
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        published = self.operation().state["closing"]["head"]
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        with patch.object(ship.GitHub, "request_copilot_review", side_effect=ship.Refusal("copilot failed")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "copilot"):
+            self.prepare("--deliver", "--item", str(kept), "--copilot-review", "request")
+        state = self.operation().state
+        self.assertNotEqual(state["reviewed_head"], published)
+        self.remote.merge(state["pull_request"]["number"])
+        with patch.object(ship.time, "sleep"), \
+                self.assertRaisesRegex(ship.Refusal, "closing set .* read at .*nothing is delivered"):
+            self.operation("reconcile").reconcile()
+        status = "SELECT status FROM item WHERE id = ?"
+        self.assertEqual([self.connection.execute(status, (number,)).fetchone()[0] != "done"
+                          for number in (self.item, kept, dropped)], [True, True, True])
+
+    def test_a_hand_delivery_settles_a_reconcile_of_an_unbound_closing_set(self):
+        """Review of build/sd-1636, the class: a refusal whose printed recovery could not clear it. The refusal
+        of a merge at a head the closing set was not read at said to deliver by hand, had no hand-delivery
+        escape, and nothing could bind the set again, so reconcile refused for good: no owed close paid, no
+        cleanup. A hand delivery at the commit answers for the whole set; reconcile closes none of it."""
+        from sd_db.workflow import change_status
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        with patch.object(ship.GitHub, "request_copilot_review", side_effect=ship.Refusal("copilot failed")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "copilot"):
+            self.prepare("--deliver", "--item", str(kept), "--copilot-review", "request")
+        self.remote.merge(self.operation().state["pull_request"]["number"])
+        with patch.object(ship.time, "sleep"), \
+                self.assertRaisesRegex(ship.Refusal, "nothing is delivered.*then run `sd-ship reconcile`"):
+            self.operation("reconcile").reconcile()
+        commit = self.operation().state["merge_commit"]
+        for number in (self.item, kept):  # the operator's answer: the merged change delivers these two
+            change_status(self.connection, number, "done", who="operator",
+                          reason=f"delivered at {commit} on origin/main")
+        with patch.object(ship.time, "sleep"):
+            result = self.operation("reconcile").reconcile()
+        self.assertFalse(result["delivery_pending"], result)
+        self.assertEqual(result["cleanup"]["removed"], ["origin/topic"])
+        state = self.operation().state  # bound to the merged head, so no later reconcile refuses it again
+        self.assertEqual(state["closing"], {"head": state["reviewed_head"], "items": []})
+        status = "SELECT status FROM item WHERE id = ?"
+        self.assertEqual([self.connection.execute(status, (number,)).fetchone()[0] == "done"
+                          for number in (self.item, kept, dropped)], [True, True, False])
+
+    def test_a_renewal_hint_from_another_checkout_names_the_branchs_checkout(self):
+        """Review of sd:9268: `merge --branch X` from another checkout printed a bare prepare, which would run in
+        that checkout. The hint names the branch's checkout with -C, and it parses."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled before the merge")
+        lane = self.directory / "lane-checkout"
+        _git(self.root, "worktree", "add", "-q", "-b", "lane-side", str(lane))
+        head = _git(self.root, "rev-parse", "HEAD")
+        args = ship.parser().parse_args(["merge", "--item", str(self.item), "--json", "--manual",
+                                         "--expected-head", head, "--branch", "topic"])
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged") as caught:
+            ship.Ship(lane, self.connection, self.database, args).merge()
+        command = shlex.split(re.search(r"`(sd-ship [^`]*)`", str(caught.exception))[1])
+        self.assertEqual(command[1:3], ["-C", str(self.root)])
+        self.assertEqual(ship.parser().parse_args(command[1:]).command, "prepare")
+
+    def test_a_failed_renewal_never_squashes_its_unpublished_body(self):
+        """Lead review of sd:9268: a renewal saved its body to the receipt before lint; when lint failed, merge
+        squashed that unlinted body. It waits as pending, and merge refuses while it does (review of
+        50b91b935): a prepare that saved one and did not publish it may have pushed a head the published body
+        does not describe. A prepare that publishes, then merge, squashes the body it published."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        published = self.directory / "published.md"
+        published.write_text("The published body.\n")
+        self.prepare("--deliver", "--body-file", str(published))
+        title = self.connection.execute("SELECT title FROM item WHERE id = ?", (self.item,)).fetchone()[0]
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        unlinted = self.directory / "unlinted.md"
+        unlinted.write_text("The unlinted body.\n")
+        with patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
+                self.prepare("--deliver", "--body-file", str(unlinted))
+        set_item_fields(self.connection, self.item, title=title)
+        with self.assertRaisesRegex(ship.Refusal, "did not publish them; nothing merged") as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--body-file", str(published))
+        with patch.object(ship.time, "sleep"):
+            self.merge()
+        message = [call.body["commit_message"] for call in self.remote.calls if call.method == "PUT"][-1]
+        self.assertIn("The published body.", message)
+        self.assertNotIn("unlinted", message)
+
+    def renewal_hint(self, lane_branch: str, then=None, **patches) -> str:
+        """The renewal a scope refusal prints when `merge --branch topic` runs from a checkout on `lane_branch`,
+        after `then` moves the fixture's checkouts."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.prepare("--deliver")
+        set_item_fields(self.connection, self.item, title="retitled before the merge")
+        if then:
+            then()
+        lane = self.directory / "lane-checkout"
+        _git(self.root, "worktree", "add", "-q", "-b", lane_branch, str(lane))
+        args = ship.parser().parse_args(["merge", "--item", str(self.item), "--json", "--manual", "--expected-head",
+                                         _git(self.root, "rev-parse", "HEAD"), "--branch", "topic"])
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged") as caught:
+            with patch.multiple(ship, **patches) if patches else contextlib.nullcontext():
+                ship.Ship(lane, self.connection, self.database, args).merge()
+        return re.search(r"`(sd-ship [^`]*)`", str(caught.exception))[1]
+
+    def test_a_renewal_hint_matches_the_branch_line_exactly(self):
+        """Lead review of sd:9268: the checkout lookup matched `branch refs/heads/topic` as a substring, so a
+        worktree on `topic-2` named the wrong checkout. Only the whole line matches."""
+        hint = self.renewal_hint("lane-side", then=lambda: _git(self.root, "checkout", "-q", "-b", "topic-2"))
+        self.assertIn("-C <a checkout of topic> prepare", hint)
+
+    def test_a_worktree_read_that_fails_keeps_the_scope_refusal(self):
+        """Lead review of sd:9268: a failed `git worktree list` must not replace the scope refusal."""
+        real = ship.git
+
+        def failing(root, *args):
+            if args[:2] == ("worktree", "list"):
+                raise ship.Refusal("git worktree list failed")
+            return real(root, *args)
+
+        self.assertIn("-C <a checkout of topic> prepare", self.renewal_hint("lane-side", git=failing))
+
+    def test_a_renewal_command_names_every_item_of_the_bundle(self):
+        """Re-review of sd:9335: the printed renewal named the claimed item alone, and a prepare run as printed
+        empties the closing set. It names every --item; run as printed, it renews and keeps the bundle."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        others = list(self.closes_items()[:2])
+        bundle = [arg for number in others for arg in ("--item", str(number))]
+        self.prepare("--deliver", *bundle)
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        for step in ("lane prepare", "merge"):
+            with self.subTest(step=step), self.as_lane():
+                with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed") as caught:
+                    self.prepare("--deliver", *bundle) if step == "lane prepare" else self.merge()
+                command = re.search(r"`(sd-ship prepare [^`]*)`", str(caught.exception))[1]
+                self.assertEqual(shlex.split(command)[2:], ["--item", str(self.item), *bundle, "--deliver"])
+        args = ship.parser().parse_args([*shlex.split(command)[1:], "--json"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            ship.Ship(self.root, self.connection, self.database, args).prepare()
+        self.assertEqual(self.operation().state["closing"]["items"], others)
+
+    def test_a_scope_change_after_a_merge_that_did_not_land_gives_advice_that_works(self):
+        """Re-review of sd:9335: after a merge was dispatched and did not land, merge advised a prepare, which
+        routes that phase to reconcile and refuses. It names the phase and the way that works; followed, the
+        merge gets past the refusal."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        title = self.connection.execute("SELECT title FROM item WHERE id = ?", (self.item,)).fetchone()[0]
+        operation = self.operation()
+        operation.state["phase"] = "merge_dispatch"
+        operation.save()
+        set_item_fields(self.connection, self.item, title="retitled while the merge was out")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*merge_dispatch.*title, body and path") \
+                as caught:
+            self.merge()
+        self.assertNotIn("sd-ship prepare", str(caught.exception))
+        set_item_fields(self.connection, self.item, title=title)
+        with patch.object(ship.time, "sleep"):
+            self.assertFalse(self.merge()["delivery_pending"])
+
+    def test_a_lane_queue_that_does_not_read_is_the_named_cause(self):
+        """Re-review of sd:9335: the refusal led with a scope change, which a renewed claim with an unchanged
+        scope also reaches; the cause is the queue read, and it says so first."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with patch.object(ship.sd_lane, "stored", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaisesRegex(ship.Refusal, r"^the lane queue could not be read \(database is locked\)"):
+                self.prepare("--deliver", "--acceptance-file", str(acceptance))
+
+    def test_a_scope_change_after_the_merge_gives_the_merged_advice(self):
+        """Lead review of sd:9335: once the merge landed, the refusal still said to prepare again, which a merged
+        pull request cannot do. It names the merge and the hand delivery, and a hand delivery settles it."""
+        from sd_db import set_item_fields
+        from sd_db.progress import deliver_work
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        settle = ship.Ship.settle_closes
+
+        def retitled(operation, *args, **kwargs):
+            set_item_fields(self.connection, self.item, title="retitled during the merge")
+            return settle(operation, *args, **kwargs)
+
+        with patch.object(ship.Ship, "settle_closes", retitled), patch.object(ship.time, "sleep"):
+            with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*merged at.*deliver the item by hand") \
+                    as caught:
+                self.merge()
+        self.assertNotIn("sd-ship prepare", str(caught.exception))
+        commit = self.operation().state["merge_commit"]
+        deliver_work(self.connection, self.item, commit, who="operator", verification_root=self.root)
+        with patch.object(ship.time, "sleep"):
+            self.assertFalse(self.merge()["delivery_pending"])
 
     def test_author_assignment_cannot_borrow_manual_merge_authority(self):
         from sd_db.workflow import WorkflowError

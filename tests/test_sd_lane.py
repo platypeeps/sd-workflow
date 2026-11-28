@@ -8601,6 +8601,19 @@ class ShipProcess(Lane):
         self.assertEqual((answer["ok"], answer["entries"]), (True, []))
         self.assertTrue(log.read_text(encoding="utf-8").startswith(f"$ sd-ship -C {self.repo} lane list\n{{"))
 
+    def test_every_sd_ship_it_starts_carries_the_lane_mark(self) -> None:
+        """Lead review of sd:9335: `sd-ship` told a lane prepare from one by hand by its parent pid, which a
+        forced runner stop changes. The runner marks each child at launch instead."""
+        from unittest import mock
+        seen = {}
+
+        def run_group(argv, cwd, env, timeout):
+            seen.update(env)
+            return mock.Mock(stdout="{}", stderr="")
+        with mock.patch.object(sd_lane.sd_lib, "run_group", run_group):
+            sd_lane.ship_process(["prepare", "--json"], self.tmp / "logs/step.log", 120)
+        self.assertEqual(seen.get("SD_LANE_CHILD"), "1")
+
     def test_the_timeout_ends_what_sd_ship_started(self) -> None:
         """sd:3480. The timeout killed `sd-ship` alone; its gate's children ran on and held the gate slot."""
         fake, child = self.tmp / "bin", self.tmp / "child.pid"
