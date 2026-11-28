@@ -240,6 +240,17 @@ class RebuttedFindingTests(RepeatFixture):
         self.adjudication(("recorded later", "rebutted", "x"), days=-1, key="later")
         self.assertNotEqual(self.prompts()[1]["request_sha256"], first["request_sha256"])
 
+    def test_a_read_capped_at_the_pass_asks_what_the_pass_asked(self) -> None:
+        """Advisory sweep, pack sd:9973 (PR #1938): sd-ship's replay read receipts recorded after the pass,
+        so its digest differed and a moved binding spent a pass. `--rebutted-through` caps the read."""
+        self.adjudication(("lane claim", "rebutted", "x"))
+        with contextlib.closing(self.library.connect(self.database())) as connection:
+            through = connection.execute("SELECT MAX(id) FROM state").fetchone()[0]
+        first = self.prompts(rebutted_through=through)[1]
+        self.adjudication(("recorded later", "rebutted", "x"), days=-1, key="later")
+        self.assertEqual(self.prompts(rebutted_through=through)[1]["request_sha256"], first["request_sha256"])
+        self.assertNotEqual(self.prompts()[1]["request_sha256"], first["request_sha256"])
+
 
 def row(severity: str = "high", **extra: Any) -> dict[str, Any]:
     return {"path": "src.py", "line": 1, "severity": severity, "summary": "defect", "family": "correctness"} | extra

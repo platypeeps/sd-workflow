@@ -458,6 +458,42 @@ class TheSections(TodayCase):
         self.assertEqual(today.OWNING, (*workflow.ACTIVE_ASSIGNMENTS, "in_session"))
 
 
+class TheStrandedItems(TodayCase):
+    """Pack sd:10167: items sat in_progress for days after a bundle drop, with no build and no lane entry left to
+    move them, and nothing listed them. Attention lists each, naming its last assignment and last lane status."""
+
+    def stuck(self, title, hours=3, assignment="blocked"):
+        number = self.item(title, repo=APP)
+        since = (datetime.datetime(2026, 9, 6, 12, tzinfo=datetime.timezone.utc)
+                 - datetime.timedelta(hours=hours)).isoformat(timespec="seconds")
+        self.connection.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (number,))
+        self.connection.execute("DELETE FROM note WHERE item = ?", (number,))  # its filing note is stamped now
+        self.connection.execute("INSERT INTO note (item, timestamp, kind, body) VALUES (?, ?, 'status_change', ?)",
+                                (number, since, "ready -> in_progress by build"))
+        if assignment:
+            create_assignment(self.connection, role="author", status=assignment, item=number)
+        return number
+
+    def listed(self):
+        return {row["id"]: row["why"] for row in today.sections(self.connection, now=NOW)["attention"]}
+
+    def test_an_item_nothing_moves_is_listed_with_its_last_assignment_and_lane_status(self):
+        dropped, failed = self.stuck("Dropped from a bundle"), self.stuck("Its lane entry failed")
+        self.lane("example-owner/app", "e1", item=failed, status="failed")
+        found = self.listed()
+        self.assertEqual(sorted(found), sorted([dropped, failed]))
+        self.assertRegex(found[dropped], r"^in_progress 3 h, .*last assignment \d+ blocked, no lane entry$")
+        self.assertTrue(found[failed].endswith("last lane status failed"), found[failed])
+
+    def test_a_moving_recent_or_hand_worked_item_is_not_listed(self):
+        building = self.stuck("Building", assignment="running")
+        recent = self.stuck("Just claimed", hours=1)
+        by_hand = self.stuck("A session holds it", assignment=None)
+        landing, member = self.stuck("In the lane"), self.stuck("Bundled in the lane")
+        self.lane("example-owner/app", "e2", item=landing, status="pending", closes=[member])
+        self.assertFalse({building, recent, by_hand, landing, member} & set(self.listed()))
+
+
 class TheOperations(TodayCase):
     """pack sd:5432: the open report lines that name this machine, every repository's, and the gate."""
 

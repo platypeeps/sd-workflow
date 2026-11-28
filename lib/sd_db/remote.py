@@ -737,32 +737,37 @@ def _socks_connect(proxy_host: str, proxy_port: int, address: bytes, where: str,
     return sock
 
 
-def dial(host: str, port: int, timeout: float | None) -> tuple[socket.socket, str | None]:
+def dial(host: str, port: int, timeout: float | None,
+         address: str | None = None) -> tuple[socket.socket, str | None]:
     """A socket to `host:port`, and the SOCKS5 proxy it went through (`ALL_PROXY`), or None.
+
+    `address`, the hub's IP that `hub.json` names, is dialled in place of
+    the name when given (sd:10979): a sandbox proxy may allow only an IP.
 
     `timeout` bounds each proxy connect and its handshake as it bounds a
     direct connect. A `socks5://` name is tried at each address it
     resolves to, as `create_connection` tries them, and the last refusal
     is raised. Every failure is an `OSError` whose text names the proxy.
     """
-    proxy = socks_proxy(host)
+    target = address or host
+    proxy = socks_proxy(target)
     if proxy is None:
-        return socket.create_connection((host, port), timeout=timeout), None
+        return socket.create_connection((target, port), timeout=timeout), None
     proxy_host, proxy_port, by_name = proxy
     where = f"through the SOCKS5 proxy {proxy_host}:{proxy_port}"
     try:
-        addresses = _socks_addresses(host, port, by_name)
+        addresses = _socks_addresses(target, port, by_name)
     except ProxyRefused:
         raise
     except OSError as error:
         raise ProxyRefused(f"{where}: {error.strerror or error}") from error
     refused: ProxyRefused | None = None
-    for address in addresses:
+    for connect in addresses:
         try:
-            return _socks_connect(proxy_host, proxy_port, address, where, timeout), where
+            return _socks_connect(proxy_host, proxy_port, connect, where, timeout), where
         except ProxyRefused as error:
             refused = error
-    raise refused or ProxyRefused(f"{where}: {host} resolves to no address")
+    raise refused or ProxyRefused(f"{where}: {target} resolves to no address")
 
 
 class Connection:
@@ -779,9 +784,11 @@ class Connection:
 
     def __init__(self, host: str, port: int, *, path: Path | str | None, write: bool,
                  create: bool, busy_timeout: int, token,
-                 timeout: float | None = None, answer_timeout: float | None = None) -> None:
+                 timeout: float | None = None, answer_timeout: float | None = None,
+                 address: str | None = None) -> None:
         self.host = host
         self.port = port
+        self.address = address
         self.row_factory = sqlite3.Row
         self.in_transaction = False
         self.outcomes: list[tuple[str, str]] = []
@@ -808,7 +815,7 @@ class Connection:
         """Dial the hub and send `open`, for a new connection or a reopened session."""
         token = self._token
         try:
-            self._socket, proxy = dial(self.host, self.port, self._timeout)
+            self._socket, proxy = dial(self.host, self.port, self._timeout, self.address)
         except OSError as error:
             raise HubUnreachable(self.host, self.port, error.strerror or str(error)) from error
         self._socket.settimeout(self._answer_timeout)
@@ -1129,14 +1136,16 @@ class Connection:
 
 def connect(host: str, port: int, target: Path | str | None, *, token, write: bool = True,
             create: bool = False, busy_timeout: int = 5000,
-            timeout: float | None = None, answer_timeout: float | None = None) -> Connection:
+            timeout: float | None = None, answer_timeout: float | None = None,
+            address: str | None = None) -> Connection:
     """Open a session on the hub at `host:port`.
 
     `token` is the content of the server's `<database>.serve.token`, which
     only the server's owner can read, or a callable that reads it once the
     socket is up. A `target` of `None` opens the hub's own database.
     `timeout` bounds the connect, `answer_timeout` each wait for an answer.
+    `address`, when given, is the IP dialled in place of `host` (sd:10979).
     """
     return Connection(host, port, path=target, write=write, create=create,
                       busy_timeout=busy_timeout, token=token, timeout=timeout,
-                      answer_timeout=answer_timeout)
+                      answer_timeout=answer_timeout, address=address)

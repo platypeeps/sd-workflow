@@ -311,6 +311,22 @@ class SharedBindingTests(unittest.TestCase):
         self.assertEqual([row["changed"] for row in kept], [[["sd_route.py", "verdict"]]])
         self.assertEqual(kept[0]["request_sha256"], "asked")
 
+    def test_a_replay_reads_the_rebuttal_receipts_the_pass_read(self):
+        """Advisory sweep, pack sd:9973: the replay read receipts recorded since the pass, so its digest
+        differed and a pass was spent. It caps the read at the newest receipt the pass read."""
+        stored = {key: self.operation.state[key] for key in ("binding", "binding_manifest")}
+        for through, expected in ((41, ["--rebutted-through", "41"]), (None, [])):
+            self.operation.state.update(stored)
+            self.operation.state["passes"][-1]["review_request"] = {"sha256": "asked", "verify": None, "resume": None,
+                                                                    "rebutted_through": through}
+            calls = self.replaying("asked")
+            with self.subTest(through=through), self.edited(bindings.BIN / "sd_route.py"):
+                self.operation.review_inputs(self.head)
+            argv = calls[0]
+            found = argv[argv.index("--rebutted-through"):argv.index("--rebutted-through") + 2] \
+                if "--rebutted-through" in argv else []
+            self.assertEqual(found, expected)
+
     def test_a_moved_binding_whose_request_replays_differently_still_refuses(self):
         self.operation.state["passes"][-1]["review_request"] = {"sha256": "asked", "verify": None, "resume": None}
         for answer, exit_code in (("asked differently", 0), ("asked", 1)):
