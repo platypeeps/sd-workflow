@@ -1023,8 +1023,8 @@ class Ship(SharedReview):
             return claim, None, None
         if self.lane_started():
             return self.lane_renewal(claim, stored, changed, basis), None, None
-        claim = {**claim, "renewed": True, "superseded": self.superseded(stored),
-                 "superseded_bodies": self.superseded_bodies(stored)}
+        claim = {**claim, "renewed": True, "superseded": self.replaced_evidence(stored),
+                 "superseded_bodies": self.replaced_bodies(stored)}
         if not changed:
             return claim, None, None
         self.refuse_stale_evidence(claim, stored)
@@ -1076,7 +1076,7 @@ class Ship(SharedReview):
             self.refuse_other_body(*basis)
         return {**claim, "renewed": True} if stored.get("renewed") else claim
 
-    def superseded(self, stored: dict) -> list[str]:
+    def replaced_evidence(self, stored: dict) -> list[str]:
         """The `evidence_key`s a renewal by hand replaces: the stored claim's, those an earlier renewal listed,
         and each of the item's delivering lane entries', as a retry copies them (pack sd:9580). A queue that does
         not read refuses `lane_unknown`, and nothing renews."""
@@ -1104,10 +1104,10 @@ class Ship(SharedReview):
             self.refuse_other_body(*basis)
         return True
 
-    def superseded_bodies(self, stored: dict) -> list[str]:
+    def replaced_bodies(self, stored: dict) -> list[str]:
         """The digests of the bodies a renewal by hand replaces, as `body_basis` gives an entry's: the published
         body, the words it was made from, those an earlier renewal listed, and each of the item's lane entries'
-        (review of build/sd-2328). `superseded` has read the queue, so a queue that does not read refused."""
+        (review of build/sd-2328). `replaced_evidence` has read the queue, so a queue that does not read refused."""
         published = digest(self.normal(self.state.get("body")))
         keys = {published, *(stored.get("superseded_bodies") or []),
                 *(digest(self.normal(row.get("body"))) for row in self.lane_entries()[0])}
