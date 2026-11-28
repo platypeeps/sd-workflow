@@ -191,6 +191,54 @@ class TheWrites(DbStoreFixture):
         again = self.ok("store", "set-section", "pp.tip", "First tip", "--section", "Notes=Seen twice.")
         self.assertIn("already holds", again.stdout)
 
+    def test_a_fenced_heading_line_in_section_text_is_text(self) -> None:
+        """sd:10784: a shell comment `## ...` in a fenced example refused, though the
+        reader skips fences and reads the text back as one section."""
+        code = "Run it:\n```sh\n## build first\nmake\n```"
+        self.add("First tip", "--section", f"Tip={code}")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Tip").stdout, code + "\n")
+        self.ok("store", "set-section", "pp.tip", "First tip", "--section", f"Notes={code}")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout, code + "\n")
+        inside = "```html\n<div>\n$$\n## a comment\n```"  # a risky start inside the fence is code too
+        self.ok("store", "set-section", "pp.tip", "First tip", "--section", f"Notes={inside}")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout, inside + "\n")
+        for text in ("x\n## Notes", "```\n## Notes", "```\n```\n## Notes", "~~~\n## Notes\n```",
+                     "- item\n  ```\n## Notes\n  ```", " ```\n## Notes\n ```",
+                     # Last-round class pass: each a place a line scan and the renderer disagree on a fence.
+                     "```\n ```\n## Notes\n```", "````\n ```\n````\n```\n   ```\n## Notes\n```",
+                     "<!--\n```\n-->\n## Notes\n```", "<div>\n```\n\n## Notes\n```",
+                     "  <pre>\n```\n</pre>\n## Notes\n```", "$$\n```\n$$\n## Notes\n```",
+                     "%%\n```\n%%\n## Notes\n```"):
+            with self.subTest(text=text):
+                self.refused("store", "set-section", "pp.tip", "First tip", "--section", f"Tip={text}",
+                             says="its own `## ` heading")
+
+    def test_a_fence_one_section_opens_never_moves_the_headings(self) -> None:
+        """Final-round class pass: section text is vetted alone, but its fences are read with the
+        whole body. A fence one section leaves open is closed by the next section's opener, so that
+        section's fenced `## ` line reads as a heading, and a later edit deleted the real one."""
+        opened, fenced = "```sh\necho hello", "Keep this explanation.\n```\n## Example\n```"
+        self.refused("store", "add", "pp.tip", "Both at once", "--field", "score=7",
+                     "--section", f"Tip={opened}", "--section", f"Notes={fenced}", says="leaves a code fence open")
+        self.refused("store", "add", "pp.tip", "Open alone", "--field", "score=7",
+                     "--section", f"Tip={opened}", says="leaves a code fence open")
+        # Ruling round: a fenced `## Notes` stood in for the real one in a compare of sorted titles.
+        twin = "Keep this explanation.\n```\n## Notes\n```"
+        self.refused("store", "add", "pp.tip", "A twin heading", "--field", "score=7",
+                     "--section", "Tip=```", "--section", f"Notes={twin}", says="leaves a code fence open")
+        self.add("First tip", "--section", f"Notes={fenced}")
+        before = self.ok("store", "get", "pp.tip", "First tip").stdout
+        for verb in ("set", "set-section"):
+            with self.subTest(verb=verb):
+                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Tip={opened}",
+                             says="leaves a code fence open")
+                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Notes={twin}",
+                             "--section", "Tip=```", says="leaves a code fence open")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip").stdout, before)
+        self.ok("store", "set-section", "pp.tip", "First tip", "--section", "Tip=```sh\necho hello\n```")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout,
+                         fenced + "\n")
+
     def test_a_missing_row_refuses(self) -> None:
         self.refused("store", "set", "pp.tip", "No such tip", "score", "8", says="no tip row has the title")
 
