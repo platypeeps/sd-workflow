@@ -1269,14 +1269,18 @@ def _done(items: dict, item: int) -> bool:
     return item in items and items[item]["status"] == "done"
 
 
-def queue_again(connection, items: list[int], *, who: str, finding: str = "") -> list[dict]:
+def queue_again(connection, items: list[int], *, who: str, finding: str = "",
+                expected_branch: str | None = None) -> list[dict]:
     """`sd assignments build`: an item whose latest build bundle ran and ended blocked or cancelled is Retry of that
     bundle (`retry`, its assignments and worktree kept); one whose lane entry failed is Fix (`lane_fix`, pack sd:8791);
     every other item is the Build press (`queue`), a `planning` one set ready first: the one verb that starts a
     build, so a task just filed builds with no status step (sd:9063). One transaction, so one refusal writes
     nothing, the ready step included (pack sd:8785).
     A `finding` is Send to builder (pack sd:8792): a Retry's or Fix's builder reads it, and a fresh build's builder
-    reads it from the note written after its queue note (sd:10320)."""
+    reads it from the note written after its queue note (sd:10320).
+    `expected_branch` is the branch the caller read: every assignment the press queued must build on it, each
+    selected item among them, read in the write's transaction, or the press refuses and writes nothing
+    (sd:10897, `_bound`)."""
     if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
         raise BuildRefused("select one or more distinct items")
     finding = finding.strip()
@@ -1419,7 +1423,10 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         # After the queue's note, where a fresh build's brief starts its findings (sd:10320).
         for item in fresh if finding else []:
             add_note(connection, item, "comment", FINDING + finding)
-        return queued + built
+        queued += built
+        if expected_branch is not None:
+            _bound(connection, items, queued, expected_branch)
+        return queued
 
 
 def _build_blocked(connection, item: int) -> str | None:
@@ -1472,6 +1479,23 @@ def _blocking_run(connection, lead: int, reason: str) -> int | None:
     row = named and connection.execute("SELECT run FROM runner_run WHERE id = ? AND assignment = ?",
                                        (named.group(1), lead)).fetchone()
     return row["run"] if row else None
+
+
+def _bound(connection, items: list[int], queued: list[dict], expected: str) -> None:
+    """Refuse unless every assignment the press queued builds on `expected`, its lead's branch, and every item in
+    `items` is among them: read from what was queued, not predicted, since a Retry's split or a fresh press
+    queues on another branch (review of build/sd-2260). The caller's transaction undoes the press."""
+    on = {}
+    for entry in queued:
+        row = connection.execute("SELECT id, parent FROM assignment WHERE id = ?", (entry["id"],)).fetchone()
+        on[entry["item"]] = branch(row["parent"] or row["id"])
+    for item, built in on.items():
+        if built != expected:
+            raise BuildRefused(f"sd:{item} would build on {built}, not the expected branch {expected}; read it "
+                               "again")
+    for item in items:
+        if item not in on:
+            raise BuildRefused(f"sd:{item} queues no build on the expected branch {expected}; read it again")
 
 
 def _part(connection, lead: int, status: str, selected: Collection[int]) -> set[int] | None:

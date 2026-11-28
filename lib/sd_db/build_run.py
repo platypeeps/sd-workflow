@@ -104,6 +104,9 @@ TITLE_MAX = 63
 READ_SECONDS = 120
 # Ignored folders that `git worktree remove` may delete: tools rebuild them (pack sd:6979).
 DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache"})
+#: Ignored build output, by folder name, and the manifest beside it that rebuilds it: the names repo-sync's
+#: `hyg_not_build` in the system repo drops. With no manifest there, the folder is data and keeps the worktree.
+BUILD_OUTPUT = {"node_modules": "package.json", "target": "Cargo.toml"}
 #: The pack checkout this module runs from: its `dashboard/dashboard.sh` is the health check.
 PACK = Path(__file__).resolve().parents[2]
 #: The `heartbeat` state row the tick writes first; a satellite's tick writes `<key>@<host>` (pack sd:7933).
@@ -637,7 +640,7 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
 
 
 def kept_files(git: Collection[str], work: str, *, env: dict | None = None,
-               generated: Collection[str] = ()) -> str:
+               generated: Collection[str] = (), build_output: bool = False) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
     files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go.
 
@@ -645,13 +648,21 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None,
     is no kept line. This only reads. `git worktree remove` is the one delete, so a declared file goes with
     its tree or not at all: a tree git refuses (locked, a submodule) or a later check keeps loses nothing.
     A line git quotes, or an ignored folder git lists whole, is never a declared file.
+
+    With `build_output`, the sweep's read alone (sd:10830): also less a `BUILD_OUTPUT` folder beside its
+    manifest. Every other caller keeps the plain read, where such a folder is still a file the run holds.
     """
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
+    def rebuilt(line: str) -> bool:
+        # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
+        parts = line[3:].strip('"').split("/")[:-1]
+        return any(part in DISPOSABLE or (build_output and part in BUILD_OUTPUT
+                                          and Path(work, *parts[:at], BUILD_OUTPUT[part]).is_file())
+                   for at, part in enumerate(parts))
     # `split`, not `splitlines`: git ends a line at "\n" alone, and U+2028 in a name is part of it.
     return "\n".join(line for line in lines.split("\n") if line.strip() and not (
-        # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
-        line.startswith("!! ") and (DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1]) or (
+        line.startswith("!! ") and (rebuilt(line) or (
             not line.startswith('!! "') and not line.endswith("/") and _declared(line[3:], generated)))))
 
 
@@ -687,7 +698,7 @@ def holds_on(connection, work: str, *, exclude: tuple[str, ...] = ()) -> str:
 
 
 def remove_unheld(connection, git: Collection[str], repo: str, work: str, *, exclude: tuple[str, ...] = (),
-                  generated: Collection[str] = (), env: dict | None = None) -> str:
+                  generated: Collection[str] = (), build_output: bool = False, env: dict | None = None) -> str:
     """`git worktree remove` `work` unless a session holds it or it is not clean: "" when removed, else why not.
 
     The hold check and the delete are one step only under a lock, and no lock lasts a slow delete: a hub
@@ -718,7 +729,8 @@ def remove_unheld(connection, git: Collection[str], repo: str, work: str, *, exc
         # ponytail: a beat whose hook found `work` before the move but commits only after this read is
         # missed; closing that needs a lock over the delete, which no hub transaction lasts.
         holds = holds_on(connection, work, exclude=exclude)
-        dirty = holds or kept_files(git, aside, env=env, generated=generated).split("\n")[0]
+        dirty = holds or kept_files(git, aside, env=env, generated=generated,
+                                     build_output=build_output).split("\n")[0]
         if not dirty:
             _read([*git, "-C", repo, "worktree", "remove", aside], env=env)
         return dirty
@@ -1022,8 +1034,10 @@ def statement(lines: list[str], index: int) -> list[str]:
     # The count reads text, so a `)` in a string or a comment ends it early, and a string or a backslash
     # over lines opens nothing: an indented line belongs to the last line above that is not indented, and
     # the statement runs on over indented lines, blank ones and closing brackets (class pass, sd:10286).
+    # A comment at column 0 is no statement's first line, so the walk steps over it (sd:10806).
     if lines[start].strip() and lines[start][:1].isspace():
-        start = next((row for row in range(start, -1, -1) if lines[row].strip() and not lines[row][:1].isspace()), 0)
+        start = next((row for row in range(start, -1, -1) if lines[row].strip() and not lines[row][:1].isspace()
+                      and not lines[row].startswith("#")), 0)
     stop = end
     while end < len(lines) and (not lines[end].strip() or lines[end][:1].isspace()
                                 or lines[end].startswith((")", "]", "}", '"""', "'''"))):
@@ -1141,8 +1155,9 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
     may land the same items; the lane squash-merges, so the branch reads
     unpushed forever (pack sd:6909). Kept: an unreleased run on the path, an
     item of any run on it not done, a dirty or unread worktree, one holding an
-    ignored or untracked file outside a `DISPOSABLE` cache that its repository
-    does not declare generated (sd:10752, `kept_files`), a locked one, a
+    ignored or untracked file outside a `DISPOSABLE` cache, a `BUILD_OUTPUT`
+    folder beside its manifest (sd:10830) or a path its repository declares
+    generated (sd:10752, `kept_files`), a locked one, a
     live session other than a builder's. The paths removed.
 
     An item marked done is no proof its commits landed: a squash merge leaves
@@ -1187,7 +1202,7 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
             continue
         generated = repos.generated_paths(connection, repo)
         try:
-            if kept_files(git, work, generated=generated):
+            if kept_files(git, work, generated=generated, build_output=True):
                 continue
         except Unread:
             continue
@@ -1201,7 +1216,7 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
             continue
         try:
             if remove_unheld(connection, git, repo, work, exclude=tuple(filter(None, entry["sessions"])),
-                             generated=generated):
+                             generated=generated, build_output=True):
                 continue  # a session or a file came while the checks ran: the tree stays, its head at `kept`
         except Unread:
             continue

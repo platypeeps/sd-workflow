@@ -1752,9 +1752,14 @@ roles:
         `Reviewed-base: <base> ~2` on the tip, and force-pushes it with a lease; the merge lands both
         commits by rebase and reconcile delivers the item at the landed tip."""
         base = self.rebase_branch()
+        queued = _git(self.root, "rev-parse", "HEAD")
         self.delivering()
         head = _git(self.root, "rev-parse", "HEAD")
         self.assertEqual(_git(self.remote.path, "rev-parse", "topic"), head)
+        # sd:10223: the receipt names the head prepare rewrote, so the lane can follow the rewrite exactly.
+        stored = receipts.read(self.connection, receipts.receipt_key(self.remote.slug, "topic", self.item))[1]
+        self.assertEqual({key: stored["rebase_tip"].get(key) for key in ("commit", "from")},
+                         {"commit": head, "from": queued})
         self.assertEqual(_git(self.root, "rev-list", "--count", f"{base}..{head}"), "2")
         with patch.object(ship.time, "sleep"):
             result = self.merge()
@@ -3437,6 +3442,44 @@ roles:
         self.assertEqual(cleanup["removed"], ["origin/builder"])
         self.assertEqual(cleanup["kept"], {str(tree): ship.MERGE_CHECKOUT,
                                            "builder": "a kept worktree has it checked out"})
+
+    def test_a_merge_cleanup_removes_a_worktree_holding_nextjs_build_output(self):
+        """sd:10985. A Next.js build leaves `.next/` and `*.tsbuildinfo`; both kept every merged worktree.
+
+        A name that only contains the suffix, `notes.tsbuildinfo.bak`, is still data and keeps it."""
+        head = _git(self.root, "rev-parse", "HEAD")
+        with (self.root / ".git/info/exclude").open("a") as stream:
+            stream.write("target/\n.next/\n*.tsbuildinfo\n*.bak\n")
+        tree = self.merged_worktree("nextjs")
+        (tree / ".next/cache").mkdir(parents=True)
+        (tree / ".next/cache/page.js").write_text("output")
+        (tree / "web").mkdir()
+        (tree / "web/tsconfig.tsbuildinfo").write_text("{}")
+        self.assertEqual(ship.clean_up_merged(self.root, "nextjs", head),
+                         {"removed": [str(tree), "nextjs", "origin/nextjs"], "kept": {}})
+        kept = self.merged_worktree("nextbak")
+        (kept / "notes.tsbuildinfo.bak").write_text("data")
+        self.assertEqual(ship.clean_up_merged(self.root, "nextbak", head)["kept"].get(str(kept)),
+                         "it holds ignored notes.tsbuildinfo.bak")
+
+    def test_a_merge_cleanup_keeps_an_ignored_directory_named_like_typescript_build_state(self):
+        """sd:10985 review. The suffix names a file TypeScript writes; a directory that only ends in it
+        holds whatever the builder put there, at the top or below a folder, and keeps the worktree."""
+        head = _git(self.root, "rev-parse", "HEAD")
+        with (self.root / ".git/info/exclude").open("a") as stream:
+            stream.write("target/\n*.tsbuildinfo\n.next\n")
+        named = self.merged_worktree("nextfile")
+        (named / ".next").write_text("a file, not a build folder")
+        self.assertEqual(ship.clean_up_merged(self.root, "nextfile", head)["kept"].get(str(named)),
+                         "it holds ignored .next")
+        for number, folder in enumerate(("saved.tsbuildinfo", "web/saved.tsbuildinfo")):
+            with self.subTest(folder=folder):
+                tree = self.merged_worktree(f"tsdir{number}")
+                (tree / folder).mkdir(parents=True)
+                (tree / folder / "notes.txt").write_text("data")
+                cleanup = ship.clean_up_merged(self.root, f"tsdir{number}", head)
+                self.assertEqual(cleanup["kept"].get(str(tree)), f"it holds ignored {folder}/", cleanup)
+                self.assertTrue((tree / folder / "notes.txt").exists())
 
     def test_a_merge_cleanup_keeps_a_worktree_holding_ignored_data_that_is_not_build_output(self):
         """Review of sd:3013: `git status --porcelain` hides ignored files, and

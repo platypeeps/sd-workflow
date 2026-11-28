@@ -1972,6 +1972,8 @@ class Supervise(Case):
             "src/use_string.py": size.format("QUOTED"),
             "src/comment.py": "NOTED = {\n    'a': 1,  # see a)\n    'count': 3,\n}\n",
             "src/use_comment.py": size.format("NOTED"),
+            "src/hashed.py": "HASHED = {\n    'close': ')',\n# a note\n    'count': 3,\n}\n",
+            "src/use_hashed.py": size.format("HASHED"),
             "src/text.py": "TEXT = \"\"\"\n    three\n\"\"\"\n",
             "src/use_text.py": "import text\n\ndef size():\n    return int(text.TEXT)\n",
             "src/slash.py": "TOTAL = 1 + \\\n    2\n",
@@ -1988,6 +1990,9 @@ class Supervise(Case):
                                       "src/use_string.py", 4, "a name"),
             "a bracket in a comment": ("src/comment.py", "NOTED = {\n    'a': 1,  # see a)\n    'count': '',\n}\n",
                                        "src/use_comment.py", 4, "a name"),
+            "a column-0 comment in a table": ("src/hashed.py",
+                                              "HASHED = {\n    'close': ')',\n# a note\n    'count': '',\n}\n",
+                                              "src/use_hashed.py", 4, "a name"),
             "a string over lines": ("src/text.py", "TEXT = \"\"\"\n    none\n\"\"\"\n", "src/use_text.py", 4, "a name"),
             "a backslash": ("src/slash.py", "TOTAL = 1 + \\\n    ''\n", "src/use_slash.py", 4, "a name"),
             "a table's later entry": ("src/count.py", "def count_of():\n    return ''\n",
@@ -6285,6 +6290,17 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
+    def test_fix_bound_to_another_branch_is_refused(self):
+        """sd:10897: a Fix bound to a branch read before another writer moved the bundle refuses, writing nothing."""
+        run = self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.assertRaisesRegex(build.BuildRefused, "not the expected branch build/sd-0"):
+            build.queue_again(self.db, self.items, who="operator", finding="x", expected_branch="build/sd-0")
+        self.assertFalse(self.stored("e1").get("handed_back"))
+        build.queue_again(self.db, self.items, who="operator", finding="x", expected_branch=run["branch"])
+        self.assertTrue(self.stored("e1").get("handed_back"))
+
     def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
                                    outsider=None, left_out=False, reverted=None, rebundled=False,
                                    other_failed=False, claimed=False, newer=False, imported=False,
@@ -7089,6 +7105,42 @@ class Sweep(Case):
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn(kept, note["body"])
 
+    def test_ignored_build_output_does_not_keep_the_worktree(self):
+        """sd:10830: node_modules/ and target/ rebuild, as repo-sync's hygiene reads them, but only beside the
+        manifest that rebuilds them (package.json, Cargo.toml): a folder of that name with none is data, as is
+        an ignored file of that name. The same `kept_files` decides the sweep, the cleaning step and the
+        split check."""
+        work = self.blocked()
+        self.done()
+        exclude = Path(support.git(self.repo, "rev-parse", "--git-common-dir"))
+        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        exclude.write_text("node_modules\ntarget\n.env\n")
+        (work / "target").write_text("data")
+        self.assertEqual(build_run.sweep(self.db), [], "a file named target is data")
+        (work / "target").unlink()
+        for folder in ("node_modules/left-pad", "target/debug", "web/node_modules/x"):
+            (work / folder).mkdir(parents=True)
+            (work / folder / "index.js").write_text("x")
+        self.assertEqual(build_run.sweep(self.db), [], "no manifest: nothing rebuilds them")
+        every = ["!! node_modules/left-pad/index.js", "!! target/debug/index.js", "!! web/node_modules/x/index.js"]
+        self.assertEqual(sorted(build_run.kept_files(["git"], str(work), build_output=True).splitlines()), every)
+        for manifest in ("package.json", "Cargo.toml"):
+            (work / manifest).write_text("{}")
+        self.assertEqual([line for line in build_run.kept_files(["git"], str(work), build_output=True).splitlines()
+                          if line.startswith("!!")], ["!! web/node_modules/x/index.js"],
+                         "web/ has no package.json of its own")
+        (work / "web" / "package.json").write_text("{}")
+        support.git(work, "add", "package.json", "Cargo.toml", "web/package.json")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "chore: manifests")
+        # Review of build/sd-2260, round 2: only the sweep, whose items are all done and whose head is kept,
+        # reads build output as rebuildable. The cleaning step and the split check call `kept_files` plain:
+        # there an ignored folder is still work a builder would inherit, or a file the run must not lose.
+        self.assertEqual(sorted(build_run.kept_files(["git"], str(work)).splitlines()), every)
+        self.assertEqual(build_run.kept_files(["git"], str(work), build_output=True), "")
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(work.exists())
+
     def test_a_head_off_its_branch_is_not_removed(self):
         """A worktree whose HEAD left its branch holds commits the branch's ref would not keep."""
         work = self.blocked()
@@ -7331,9 +7383,10 @@ class Sweep(Case):
         self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(),
                          sorted(f"!! {target}/{path}" for target in ("crates/one/target", "target")
                                 for path in rows))
-        self.assertEqual(build_run.sweep(self.db), [])
-        for path in rows:
-            self.assertTrue((work / "target" / path).is_file(), path)
+        # sd:10830, operator ruling 2026-11-27: the sweep alone, once every item is done and the head is
+        # kept at refs/sd-swept, reads a target/ beside its Cargo.toml as rebuildable and removes the tree.
+        self.assertEqual(build_run.kept_files(("git",), str(work), build_output=True), "")
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
 
     def test_a_folder_only_named_like_build_output_keeps_the_tree(self):
         """Review of build/sd-1867, the class: a folder's name alone made its ignored files disposable, so local

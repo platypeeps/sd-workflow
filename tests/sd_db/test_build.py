@@ -1386,6 +1386,20 @@ class Reap(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
                          "blocked")
 
+    def test_a_branch_bound_build_refuses_what_queues_on_another_branch(self):
+        """Review of build/sd-2260: the branch check read the bundle the press would retry, not what it queued.
+        Retry frees a member the lead waits on to build fresh, on a new branch: bound to the bundle's branch,
+        the press refuses and writes nothing."""
+        from sd_db.workflow import edit_item
+        self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        before = self.db.execute("SELECT COUNT(*) FROM assignment").fetchone()[0]
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{self.items[1]} .*not the expected branch "
+                                                        f"{self.bundle['branch']}"):
+            build.queue_again(self.db, [self.items[0]], who="operator", expected_branch=self.bundle["branch"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment").fetchone()[0], before,
+                         "one refusal writes nothing")
+
     def test_build_of_a_member_that_waits_on_its_lead_is_refused_not_skipped(self):
         """Review of build/sd-1742 (build.py:2091): Build presses a member that waits on its lead. Retry parks
         it and queues the lead, so Build reported success with the selected item unbuilt. It refuses, naming
@@ -1554,6 +1568,23 @@ class Reap(Case):
             build.queue_again(self.db, [design], who="operator", finding="check the parser")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment WHERE item = ?", (design,)).fetchone()[0],
                          0, "one refusal writes nothing")
+
+    def test_build_with_a_stale_expected_branch_is_refused(self):
+        """sd:10897: the open-PR sweep reads a branch, then presses an item; a press bound to a branch the item's
+        bundle no longer builds on refuses and writes nothing."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        with self.assertRaisesRegex(build.BuildRefused, "expected branch build/sd-0"):
+            build.queue_again(self.db, [self.items[0]], who="operator", finding="check the parser",
+                              expected_branch="build/sd-0")
+        self.assertEqual(self.statuses(self.items), ["blocked", "blocked"], "one refusal writes nothing")
+        fresh = self.item()
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{fresh} .*not the expected branch"):
+            build.queue_again(self.db, [fresh], who="operator", expected_branch=row["branch"])
+        queued = build.queue_again(self.db, [self.items[0]], who="operator", finding="check the parser",
+                                   expected_branch=row["branch"])
+        self.assertEqual({entry["status"] for entry in queued}, {"queued"})
 
     def test_a_plain_retry_of_a_review_parked_run_sends_its_blockers(self):
         """pack sd:9498: Retry of a run parked after REVIEW_ROUNDS dropped the last round's blockers, which only

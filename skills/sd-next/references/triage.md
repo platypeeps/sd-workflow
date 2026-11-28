@@ -1,7 +1,7 @@
 # Triage
 
 Run when the operator says "triage" or "park review".
-Triage every stalled item in this repo and its companion repos, then queue a build for each one that ends up ready.
+Triage every stalled or suggested item in this repo and its companion repos, then queue a build for each one that ends up ready.
 Budget: about 45 minutes. Follow `references/decide-ask-record.md` to decide, ask, record and report; this run's tag is `triage`.
 
 0. Report what the previous triage's items became, as that file says.
@@ -9,6 +9,7 @@ Budget: about 45 minutes. Follow `references/decide-ask-record.md` to decide, as
 
 1. Collect
    - every planning, ready or blocked item, each with its open question notes;
+   - every suggested item, the dashboard Queue's Suggested rows: in `sd today --here --all`, the `Queues` rows whose Queue is `ready`, the items due today or before, `Planned` and `Unscheduled`;
    - every parked item, with its open question notes: `sd store items --parked --belongs-to <repo>` for each repo, plus blocked items whose reason says Parked;
    - every assignment in `sd assignments list` for these repos that is blocked, cancelled, or running with no recent beat;
    - every open review advisory: the weekly "Open review advisories" items and any advisory finding a review report names but no item holds yet;
@@ -21,6 +22,8 @@ Budget: about 45 minutes. Follow `references/decide-ask-record.md` to decide, as
    - Nothing it needs is missing (the item it waits on is done, the date has passed, the measurement now passes): unpark it if parked (`sd task edit N --unpark`), and set it ready (`sd task status N ready`).
      Add `--if-revision <revision>` to the item's first write, the `revision:` line of the `sd task show N` you decided from:
      a refusal means the item changed since, so read it again and decide again.
+   - A suggested planning item that waits on nothing (no unfinished waits-on item, no future date, no failed review or build): set it ready (`sd task status N ready`), with `--if-revision` as above, so step 3 builds it.
+     A suggested item is work the operator wants built; leave it planning only with a note naming what it still lacks.
    - It failed review or a build: fix it or split it, then retry it with `sd assignments build N`, the dashboard's Retry; do not set it ready first, which would start a fresh build.
      Past round 3, record fix, file or reject for each blocker with `sd task note N "<fix, file or reject: reason>" --kind decision`.
    - A stale assignment: retry it with `sd assignments build N` if its item is still wanted; if the item is done or superseded, cancel it with `sd assignments cancel <assignment> --if-revision <revision>` and put the reason in `sd task note N "<reason>"`.

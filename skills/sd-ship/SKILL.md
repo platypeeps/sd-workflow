@@ -279,6 +279,7 @@ They cannot waive missing depth, incomplete transport, failed checks, or changed
 Fixes still require verification on their new head.
 A rejection that still stands after one review pass is recorded with `sd-ship adjudicate` before the next fix is pushed.
 A rebuttal needs a reason a reader can check, not operator acceptance.
+Past 3 review rounds of an item, `lane retry` and `lane enqueue` refuse `unruled_blockers` for the head a lane review blocked until each blocker is adjudicated (sd:10287).
 Before recording dispositions, read `skills/sd-ship/references/adjudication.md` in the sd-workflow checkout.
 
 ## Remote findings

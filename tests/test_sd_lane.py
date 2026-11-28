@@ -320,6 +320,20 @@ class QueueOutlivesTheProcess(Lane):
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertEqual(json.loads(done.stdout)["expected_head"], head)
 
+    def test_retry_expected_branch_refuses_another_branch(self) -> None:
+        """sd:10897. The open-PR sweep reads a PR's branch, then retries an item; an entry on another branch,
+        such as one a second writer queued between the read and the write, is refused with `stale_head`."""
+        sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        branch = self.entries()[0]["branch"]
+        done = self.sd_ship(self.repo, "retry", "7", "--expected-branch", "build/sd-0")
+        answer = json.loads(done.stdout)
+        self.assertEqual((done.returncode, answer["ok"], answer["code"]), (3, False, sd_lane.STALE_HEAD), done.stdout)
+        self.assertIn(branch, answer["error"])
+        self.assertEqual([row["status"] for row in self.entries()], ["prepared"])
+        done = self.sd_ship(self.repo, "retry", "7", "--manual", "--expected-branch", branch)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
     def test_retry_takes_a_cancelled_entry_and_its_help_says_so(self) -> None:
         """sd:3389. The system Queue page re-queues a cancelled row; it reads `cancelled` in the help to offer it."""
         sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
@@ -375,6 +389,120 @@ class Enqueue(Lane):
         sd_lane.cancel(self.repo, 3, self.environ)
         self.assertEqual(sd_lane.run_lane(self.repo, self.environ, self.ship), {"ran": []})
         self.assertEqual(self.calls, [])
+
+
+class RoundCap(Lane):
+    """sd:10287. Past 3 counted review rounds of an item, a re-prepare of the head a lane review blocked is
+    refused until the lead rules each blocker with `sd-ship adjudicate`; the next prepare then runs the gate
+    alone against those rulings. A fix, a new head, is no re-prepare and queues."""
+
+    def blocked(self, passes: int, catch_up: bool = False) -> tuple[str, str]:
+        """Item 7's lane entry, failed `review_blocking`, and a ship receipt of `passes` lane passes, the last
+        at the entry's head, or with `catch_up` at prepare's merge of main onto it in the worktree: the
+        receipt's key and the reviewed head."""
+        self.answers[(7, "prepare")] = {"ok": False, "phase": "reviewed", "error": "blocking findings",
+                                        "workflow": {"blocker": {"code": "review_blocking"}}}
+        sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        [entry] = self.entries()
+        self.assertEqual((entry["status"], entry.get("code")), ("failed", "review_blocking"))
+        reviewed = None
+        if catch_up:
+            git(self.feature, "commit", "-q", "--allow-empty", "-m", "Merge origin/main")
+            reviewed = git(self.feature, "rev-parse", "HEAD")
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            key = "ship:example/pack:feature:7"
+            ship.save(connection, key, 0, {"item": 7, "repository": "example/pack", "branch": "feature",
+                                           "passes": [{"head": "a" * 40}] * (passes - 1)
+                                           + [{"head": reviewed or entry["expected_head"]}]})
+        finally:
+            connection.close()
+        return key, reviewed or entry["expected_head"]
+
+    def receipt(self, key: str) -> dict:
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            return ship.read(connection, key)[1]
+        finally:
+            connection.close()
+
+    def add_pass(self, key: str, head: str) -> None:
+        """A new lane review at `head`: another report, which an earlier ruling did not see."""
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            revision, value = ship.read(connection, key)
+            ship.save(connection, key, revision, {**value, "passes": [*value["passes"], {"head": head}]})
+        finally:
+            connection.close()
+
+    def rule(self, key: str, head: str) -> None:
+        """An accepted adjudication bound, as `sd-ship adjudicate` binds one, to `head` and the receipt's passes."""
+        import sd_db
+        import sd_ship_dispositions
+        from sd_db import ship
+        passes = self.receipt(key)["passes"]
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            where = "ship-adjudication:" + key.removeprefix("ship:")
+            ship.save(connection, where, ship.read(connection, where)[0],
+                      {"decision": "accepted", "proposal": {"bindings": {
+                          "head": head, "passes_digest": sd_ship_dispositions.digest(passes)}}})
+        finally:
+            connection.close()
+
+    def test_retry_past_round_three_refuses_until_each_blocker_is_ruled(self) -> None:
+        key, head = self.blocked(4)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.retry(self.repo, 7, self.environ)
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        self.assertIn(f"sd-ship adjudicate --item 7 --expected-head {head}", str(caught.exception))
+        self.assertEqual([row["status"] for row in self.entries()], ["failed"])
+        self.rule(key, "b" * 40)  # a ruling of another head is not this review's
+        with self.assertRaises(sd_lane.LaneError):
+            sd_lane.retry(self.repo, 7, self.environ)
+        self.rule(key, head)
+        self.assertEqual(sd_lane.retry(self.repo, 7, self.environ)["status"], "pending")
+
+    def test_enqueue_of_the_blocked_head_refuses_and_a_fix_queues(self) -> None:
+        self.blocked(4)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        git(self.feature, "commit", "-q", "--allow-empty", "-m", "fix: the blocker")
+        self.assertEqual(sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ,
+                                               claim="deliver")["status"], "pending")
+
+    def test_enqueue_of_the_blocked_catch_up_head_refuses(self) -> None:
+        """Review of build/sd-2260: prepare reviewed its catch-up of the entry's head; enqueueing that catch-up
+        is the same blocked review again, not a fix."""
+        _, caught_up = self.blocked(4, catch_up=True)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        self.assertIn(caught_up, str(caught.exception))
+
+    def test_a_ruling_of_an_older_report_at_the_same_head_is_no_ruling(self) -> None:
+        """Review of build/sd-2260: a later review blocked the same head again; the ruling bound the passes it
+        saw, so it rules nothing of the new report."""
+        key, head = self.blocked(4)
+        self.rule(key, head)
+        self.add_pass(key, head)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.retry(self.repo, 7, self.environ)
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        self.rule(key, head)
+        self.assertEqual(sd_lane.retry(self.repo, 7, self.environ)["status"], "pending")
+
+    def test_three_rounds_retry_as_before(self) -> None:
+        self.blocked(3)
+        self.assertEqual(sd_lane.retry(self.repo, 7, self.environ)["status"], "pending")
 
 
 class Runner(Lane):
@@ -7062,6 +7190,138 @@ class AnyHost(SharedQueue):
                 self.repo_row(None)
                 sd_lane.cancel(self.repo, item, self.environ)  # before the check, so a failure leaves no entry behind
                 self.assertEqual((entry["item"], entry["status"], entry["expected_head"]), (item, "pending", queued))
+
+    def saved_rebase(self, branch: str, item: int, commit: str, rewrote: str | None) -> None:
+        """The ship receipt a rebase policy's prepare leaves: the tip it wrote and, `rewrote`, the head it rewrote."""
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            key = ship.receipt_key("example/pack", branch, item)
+            saved = {"commit": commit, "message": "the tip\n", **({"from": rewrote} if rewrote else {})}
+            ship.save(connection, key, ship.read(connection, key)[0],
+                      {"repository": "example/pack", "branch": branch, "item": item, "phase": "push_dispatch",
+                       "head": commit, "rebase_tip": saved})
+        finally:
+            connection.close()
+
+    def test_a_put_back_after_a_pushed_rebase_is_queued_at_the_rewrite(self) -> None:
+        """sd:10223: a rebase policy's prepare force-pushed its rewrite, and a put-back kept the old head.
+
+        A retryable refusal and a move each put the entry back; `expected_head` follows the rewrite the
+        receipt names for that queued head. A receipt of another head, or one with no `from`, moves nothing.
+        """
+        retryable = {"ok": False, "phase": "prepare", "passes_spent": 0, "error": "no timing plan",
+                     "workflow": {"blocker": {"code": "timing_plan_invalid", "retryable": True}}}
+        for case in ("retryable", "moved", "other_head", "no_from"):
+            with self.subTest(case=case):
+                item = {"retryable": 1, "moved": 2, "other_head": 3, "no_from": 4}[case]
+                tree = self.worktree(f"rebased{item}")
+                self.commit_file(tree, f"work{item}.txt")
+                queued = sd_lane.enqueue_entry(tree, item, "fix: one", self.body, self.environ, manual=True,
+                                               claim="deliver")["expected_head"]
+                if case == "moved":
+                    self.answers[(item, "merge")] = {"ok": False, "phase": "merge", "error": "runs on build-2",
+                                                     "workflow": {"blocker": {"code": "lane_elsewhere"}}}
+                rewrites: list[str] = []
+
+                def prepare(argv: list[str], log: pathlib.Path, tree: pathlib.Path = tree, case: str = case,
+                            item: int = item, queued: str = queued, rewrites: list[str] = rewrites) -> dict:
+                    if argv[2] == "prepare":
+                        self.commit_file(self.repo, f"base{item}.txt")
+                        git(self.repo, "push", "-q", "origin", "main")
+                        git(tree, "rebase", "-q", "main")
+                        git(tree, "commit", "-q", "--amend", "-m", f"the tip\n\nDelivers: sd:{item}")
+                        rewrites.append(git(tree, "rev-parse", "HEAD"))
+                        git(tree, "push", "-q", "--force", "origin", f"HEAD:refs/heads/rebased{item}")
+                        rewrote = {"other_head": "f" * 40, "no_from": None}.get(case, queued)
+                        self.saved_rebase(f"rebased{item}", item, rewrites[0], rewrote)
+                        if case != "moved":
+                            self.calls.append(argv)
+                            return retryable
+                    return self.ship(argv, log)
+                sd_lane.run_lane(self.repo, self.environ, prepare)
+                entry = self.entries()[-1]
+                sd_lane.cancel(self.repo, item, self.environ)
+                want = rewrites[0] if case in ("retryable", "moved") else queued
+                self.assertEqual((entry["item"], entry["status"], entry["expected_head"]), (item, "pending", want))
+
+    def rewritten(self, tree: pathlib.Path, branch: str, item: int) -> str:
+        """`tree` rebased on a main that moved and force-pushed to `branch`, as a rebase policy's prepare does."""
+        self.commit_file(self.repo, f"moved-main-{item}.txt")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(tree, "rebase", "-q", "main")
+        git(tree, "commit", "-q", "--amend", "--allow-empty", "-m", f"the tip\n\nDelivers: sd:{item}")
+        git(tree, "push", "-q", "--force", "origin", f"HEAD:refs/heads/{branch}")
+        return git(tree, "rev-parse", "HEAD")
+
+    def test_a_claim_follows_the_rebase_its_prepare_pushed(self) -> None:
+        """sd:10312: a rewrite prepare pushed before a reclaim, or on another host, skipped `head_moved`.
+
+        The claim reads the receipt's `rebase_tip`, so it runs at the rewrite without the queued commit:
+        in the builder's own worktree prepare left there, and in a lane clone from origin. A receipt of
+        another head still skips.
+        """
+        for case in ("own", "elsewhere", "other_head"):
+            with self.subTest(case=case):
+                item = {"own": 1, "elsewhere": 2, "other_head": 3}[case]
+                branch = f"claimed{item}"
+                if case == "own":
+                    tree, [queued] = self.committed(branch, "work")
+                    sd_lane.enqueue_entry(tree, item, "fix: t", self.body, self.environ, manual=True,
+                                          claim="deliver")
+                else:
+                    [queued] = self.enqueued_elsewhere(item, branch, "work")
+                    tree = self.tmp / f"scratch{item}"
+                    git(self.repo, "worktree", "add", "-q", "--detach", str(tree), queued)
+                rewrite = self.rewritten(tree, branch, item)
+                if case != "own":
+                    git(self.repo, "worktree", "remove", "--force", str(tree))
+                self.saved_rebase(branch, item, rewrite, "f" * 40 if case == "other_head" else queued)
+                seen: list[str] = []
+
+                def ship(argv: list[str], log: pathlib.Path, seen: list[str] = seen) -> dict:
+                    seen.append(git(pathlib.Path(argv[1]), "rev-parse", "HEAD"))
+                    return self.ship(argv, log)
+                self.calls.clear()
+                sd_lane.run_lane(self.repo, self.environ, ship)
+                entry = self.entries()[-1]
+                if case == "other_head":
+                    self.assertEqual((entry["status"], entry.get("code"), seen), ("skipped", sd_lane.HEAD_MOVED, []))
+                else:
+                    self.assertEqual((entry["status"], entry["expected_head"], seen[:1]), ("merged", rewrite, [rewrite]))
+
+    def test_a_followed_rebase_whose_next_read_fails_stays_at_the_rewrite(self) -> None:
+        """sd:10312, class pass: the row moved to the rewrite, then the checkout read failed; the put-back
+        wrote the pre-prepare head back from the claim's stale copy."""
+        tree, [queued] = self.committed("refollow", "work")
+        sd_lane.enqueue_entry(tree, 1, "fix: t", self.body, self.environ, manual=True, claim="deliver")
+        rewrite = self.rewritten(tree, "refollow", 1)
+        self.saved_rebase("refollow", 1, rewrite, queued)
+        real, calls = sd_lane.checkout_for, []
+
+        def checkout_for(*args: Any) -> dict:
+            calls.append(args)
+            if len(calls) == 2:
+                raise sd_lane.LaneError("git rev-parse failed", code=sd_lane.PUBLISH_UNKNOWN)
+            return real(*args)
+        with mock.patch.object(sd_lane, "checkout_for", checkout_for):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        entry = self.entries()[0]
+        self.assertEqual((entry["status"], entry["expected_head"], self.calls), ("pending", rewrite, []))
+
+    def test_a_claim_whose_rebase_receipt_cannot_be_read_stays_pending(self) -> None:
+        """sd:10312, unknown reads: the receipt read failed; the moved entry is not skipped."""
+        tree, _ = self.committed("unread", "work")
+        sd_lane.enqueue_entry(tree, 1, "fix: t", self.body, self.environ, manual=True, claim="deliver")
+        self.rewritten(tree, "unread", 1)
+
+        def unread(*args: Any) -> bool:
+            raise sd_lane.LaneError("the hub database did not answer", code=sd_lane.HUB_UNAVAILABLE)
+        with mock.patch.object(sd_lane, "prepared_rebase", unread):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        entry = self.entries()[0]
+        self.assertEqual((entry["status"], "holder" in entry, self.calls), ("pending", False, []))
 
     def test_an_own_worktree_that_moved_on_its_branch_skips_head_moved(self) -> None:
         """sd:3413. The builder committed or amended after enqueue; the run never advises removing its branch."""

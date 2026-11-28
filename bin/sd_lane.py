@@ -207,8 +207,8 @@ transaction, and so does
 the before-merge write: after a move the entry in flight goes back to
 pending at its place, with `moved_off`, and the run stops; a merge that
 answers `lane_elsewhere` counts as the same move. Such a put-back moves
-`expected_head` only to a catch-up merge prepare pushed
-(`pushed_catch_up`). The same scheduled job runs on every machine: `lane
+`expected_head` only to a catch-up merge or a rebase prepare pushed
+(`pushed_catch_up`, sd:10223). The same scheduled job runs on every machine: `lane
 run --hosted` runs each lane this machine hosts, side by side, and
 skips one whose runner is busy; a lane that gets work while the run lasts
 starts then (sd:5809). For every other checkout here it imports the file
@@ -373,6 +373,9 @@ STALE_HEAD = "stale_head"
 #: A last entry the dashboard's Fix (`sd_db.build.lane_fix`, pack sd:8584) cancelled and handed to a builder: its
 #: worktree is the builder's, so `retry` refuses it.
 HANDED_BACK = "handed_back"
+#: sd:10287. Past `ROUND_CAP` counted review rounds of an item (`reads.review_costs`: build and lane rounds
+#: together), a re-prepare of the head a lane review blocked waits on the lead's rulings: refused `UNRULED`.
+ROUND_CAP, UNRULED = 3, "unruled_blockers"
 #: An entry on a build bundle's branch would deliver a member the operator cancelled on its own (sd:9222).
 MEMBER_LEFT = "member_cancelled_alone"
 #: A `Closes:` trailer cites a blocked item that no `--item` names and no `Refs:` keeps (sd:9918).
@@ -836,6 +839,7 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
     closes = tuple(dict.fromkeys(number for number in closes if number != item))
     def checked(connection: Any) -> str | None:
         check_item(connection, worktree, item, body, claim, closes, title, branch)
+        refuse_unruled(connection, queue.repository, item, newest_entry(connection, queue.repository, item), head)
         return forwarded_to(connection, queue)
     forwarded = on_hub(queue, checked)
     entry = {"id": entry_id(), "repository": queue.repository, "item": item, "branch": branch, "expected_head": head,
@@ -873,6 +877,66 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
     return add_entry(queue, entry, (lambda entries: refuse_ran(entries, item, head)) if expected_head else None)
+
+
+def refuse_unruled(connection: Any, repository: str, item: int, last: dict[str, Any] | None,
+                   head: str | None = None) -> None:
+    """Refuse `UNRULED` a re-prepare of a head the lane's review blocked, past `ROUND_CAP` rounds (sd:10287).
+
+    `last` is the item's newest entry; it counts only when a review blocked it (`review_blocking`). The
+    blocked review is the last pass of the item's ship receipt on `last`'s branch, at `last`'s head or at
+    prepare's catch-up of it. `head`, the head queued now (None: a retry, at `last`'s head), counts when it
+    is either one; another head is a fix, which queues. An accepted adjudication of that very review lets it
+    through (`ruled`), and prepare then runs the gate alone.
+    """
+    if last is None or last.get("code") != "review_blocking" or last.get("status") not in BLOCKED:
+        return
+    require_sd_db()
+    from sd_db import reads  # noqa: PLC0415
+    rounds = reads.review_costs(connection, [item]).get(item, {}).get("rounds", 0)
+    if rounds <= ROUND_CAP:
+        return
+    reviewed, done = ruled(connection, repository, item, str(last.get("branch")), str(last.get("expected_head")))
+    if head is not None and head not in (last.get("expected_head"), reviewed):
+        return
+    if not done:
+        raise LaneError(f"sd:{item} has had {rounds} review rounds, past {ROUND_CAP}, and its lane review blocked "
+                        f"at {reviewed}; nothing was queued. Rule each blocker with `sd-ship adjudicate --item "
+                        f"{item} --expected-head {reviewed} --json`, or fix it on a new head", code=UNRULED)
+
+
+def ruled(connection: Any, repository: str, item: int, branch: str, head: str) -> tuple[str, bool]:
+    """The head `item`'s newest ship receipt on `branch` last reviewed (`head` when none says), and whether an
+    accepted adjudication binds that review: its head and its passes, as `sd-ship adjudicate` binds them, so
+    a later report at the same head is not ruled by an earlier one's ruling. An unreadable receipt or ruling
+    is no ruling."""
+    import sd_ship_dispositions  # noqa: PLC0415
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+    from sd_db import ship  # noqa: PLC0415
+    from sd_db.workflow import WorkflowError  # noqa: PLC0415
+    from sd_ship_remote import Refusal  # noqa: PLC0415
+    for (key,) in connection.execute("SELECT key FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship:%' "
+                                     "GROUP BY key ORDER BY MAX(id) DESC").fetchall():
+        try:
+            receipt = ship.read(connection, key)[1]
+            if (receipt.get("item") != item or receipt.get("branch") != branch
+                    or str(receipt.get("repository") or "").lower() != repository.lower()):
+                continue
+            ruling = ship.read(connection, "ship-adjudication:" + key.removeprefix("ship:"))[1]
+        except WorkflowError:
+            continue
+        passes = receipt.get("passes") if isinstance(receipt.get("passes"), list) else []
+        last = passes[-1] if passes and isinstance(passes[-1], dict) else {}
+        reviewed = last["head"] if isinstance(last.get("head"), str) else head
+        proposal = got if isinstance(got := ruling.get("proposal"), dict) else {}
+        bindings = bound if isinstance(bound := proposal.get("bindings"), dict) else {}
+        try:
+            seen = sd_ship_dispositions.digest(receipt.get("passes"))
+        except Refusal:  # passes no digest reads: no ruling can name them
+            return reviewed, False
+        return reviewed, (ruling.get("decision") == "accepted" and bindings.get("head") == reviewed
+                          and bindings.get("passes_digest") == seen)
+    return head, False
 
 
 def refuse_ran(entries: list[dict[str, Any]], item: int, head: str) -> None:
@@ -1934,7 +1998,7 @@ def worktree_unmoved(last: dict[str, Any]) -> None:
 
 
 def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: bool = False,
-          expected_head: str | None = None) -> dict[str, Any]:
+          expected_head: str | None = None, expected_branch: str | None = None) -> dict[str, Any]:
     """Queue `item`'s last entry again when it stopped short of a merge (sd:3254).
 
     A new entry with the old one's branch, title, claim, texts and worktree
@@ -1952,6 +2016,8 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
     is made again: another head refuses `STALE_HEAD`, a newer entry
     `SUPERSEDED` (`check_successor`). An entry Fix handed back to its
     builder (`HANDED_BACK`, pack sd:8584) is refused at both reads.
+    `expected_branch` is the branch the caller read: a last entry on
+    another refuses `STALE_HEAD` at both reads too (sd:10897).
 
     What enqueue refuses as a moved head (sd:5989), retry refuses too, before
     the publish (sd:6057): a worktree here that moved past the head
@@ -1970,10 +2036,14 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
         if expected_head is not None and latest.get("expected_head") != expected_head:
             raise LaneError(f"sd:{item}'s last entry is at {latest.get('expected_head')}, not the expected head "
                             f"{expected_head}; read it again with `sd-ship lane list`", code=STALE_HEAD)
+        if expected_branch is not None and latest.get("branch") != expected_branch:
+            raise LaneError(f"sd:{item}'s last entry is on {latest.get('branch')}, not the expected branch "
+                            f"{expected_branch}; read it again with `sd-ship lane list`", code=STALE_HEAD)
         if latest.get("handed_back"):
             handed = latest["handed_back"] if isinstance(latest["handed_back"], dict) else {}
             raise LaneError(f"sd:{item}'s last entry was handed back to its builder (build run "
                             f"{handed.get('run')}); the builder enqueues its new head", code=HANDED_BACK)
+        refuse_unruled(connection, queue.repository, item, latest)
         return latest
 
     def still_newest(connection: Any) -> None:
@@ -4883,7 +4953,7 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
     """
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
     found = prepared_head(tree, branch, entry["expected_head"], train["head"]) if train else \
-        pushed_catch_up(tree, branch, entry["expected_head"])
+        pushed_catch_up(tree, branch, entry["expected_head"], queue, entry["item"])
     expected = found or str(entry["expected_head"])
     elsewhere: list[str] = []
 
@@ -5054,20 +5124,56 @@ def at_head(tree: pathlib.Path, expected: str) -> bool:
     return head == expected or catch_up_of(tree, head, expected)
 
 
-def pushed_catch_up(tree: pathlib.Path, branch: str, expected: str) -> str:
+def pushed_catch_up(tree: pathlib.Path, branch: str, expected: str, queue: Queue | None = None,
+                    item: Any = None) -> str:
     """`origin/<branch>` when it is the catch-up merge of `expected` that prepare pushed, else `expected` (sd:3283).
 
-    A put-back reads `origin` only for this, so `expected_head` always names a
+    Given the `queue` and the entry's `item`, also when it is the rebase of
+    `expected` its prepare pushed (`prepared_rebase`, sd:10223). A put-back
+    reads `origin` only for this, so `expected_head` always names a
     published commit. A catch-up only in the worktree, or a read that fails,
     keeps `expected`; this host's worktree rule (`checkout_for`) accepts that
-    catch-up.
+    catch-up, and the claim reads the receipt again.
     """
     listed = publish_git(tree, "ls-remote", "origin", f"refs/heads/{branch}") if branch else None
     tip = (listed.stdout.split() or [""])[0] if listed is not None and listed.returncode == 0 else ""
     try:
-        return tip if tip and catch_up_of(tree, tip, expected) else expected
+        if tip and catch_up_of(tree, tip, expected):
+            return tip
+        return tip if queue is not None and prepared_rebase(queue, branch, item, expected, tip) else expected
     except LaneError:  # unknown keeps the published head
         return expected
+
+
+def prepared_rebase(queue: Queue, branch: str, item: Any, expected: str, tip: str) -> bool:
+    """Whether `tip` is the rewrite of `expected` that `sd-ship prepare` saved for `item` on `branch` (sd:10223).
+
+    A rebase policy's prepare rewrites the branch and force-pushes it; its
+    ship receipt keeps `rebase_tip`, the commit it wrote and the head it
+    rewrote (`from`). That record is the proof, so no tree is compared and
+    the queued commit need not be on this disk (sd:10312). A receipt with
+    no `from`, an older prepare's, proves nothing. A read that fails raises
+    `LaneError`: unknown, not a skip.
+    """
+    try:
+        number = int(str(item))
+    except ValueError:
+        return False
+    if not (branch and tip and expected and tip != expected):
+        return False
+    require_sd_db()
+    from sd_db import ship  # noqa: PLC0415
+    from sd_db.workflow import WorkflowError  # noqa: PLC0415
+
+    def rebase_receipt(connection: Any) -> Any:
+        try:
+            return ship.read(connection, ship.receipt_key(queue.repository, branch, number))[1]
+        except WorkflowError as error:
+            raise LaneError(f"sd:{number}'s ship receipt for {branch} cannot be read ({error}), so whether "
+                            f"{tip} is its prepare's rebase is unknown", code=PUBLISH_UNKNOWN) from None
+    found = on_hub(queue, rebase_receipt, write=False)
+    saved = found.get("rebase_tip") if isinstance(found, dict) else None
+    return isinstance(saved, dict) and saved.get("commit") == tip and saved.get("from") == expected
 
 
 def back_to_pending(row: dict[str, Any], expected: str, **fields: Any) -> None:
@@ -5361,8 +5467,8 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     never failed: main may hold its train, and its delivery is owed (sd:9923).
     It keeps its place, and `hub_fault` or `retryable_fault` says what failed
     where; a later outcome writes its own fields beside it. Its
-    `expected_head` moves only to a catch-up merge prepare pushed
-    (`pushed_catch_up`, sd:3283).
+    `expected_head` moves only to a catch-up merge or a rebase prepare
+    pushed (`pushed_catch_up`, sd:3283, sd:10223).
     """
     hub, retryable = outcome.pop("hub_fault", False), outcome.pop("retryable", False)
     waited = outcome.pop("slot_wait", False)
@@ -5371,7 +5477,8 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     if not (hub or retryable or waited) or (retryable and retries >= (math.inf if landed else RETRYABLE_RETRIES)):
         return None
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
-    expected = pushed_catch_up(tree, branch, entry["expected_head"])  # a fenced lead's copy is at its fenced head
+    # a fenced lead's copy is at its fenced head
+    expected = pushed_catch_up(tree, branch, entry["expected_head"], queue, entry["item"])
     fault: dict[str, Any] = {key: outcome[key] for key in ("step", "reason", "prepare_log", "merge_log", "log_host")
                              if key in outcome}
     fields = (hub_fields(retries, fault) if hub else
@@ -5729,6 +5836,8 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
     try:
         entry = sent_train_settled(queue, settle_mark(queue, entry, token, root), token, root)
         found = train_reconciled(entry) or checkout_for(root, queue, entry)
+        if found.get("code") == HEAD_MOVED:
+            entry, found = followed_rebase(root, queue, entry, token, found)
     except Stop as stop:
         return None, record_hub_stop(queue, token, stop, entry)
     except LaneError as error:
@@ -5745,6 +5854,31 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
         # interrupt) may have merged with its delivery pending, so the worktree stays: the next claim reuses it.
         if tree is not None and found.get("made") and ran[0] is not None and not delivery_owed(ran[0], entry):
             drop_lane_worktree(sd_lib.main_worktree_root(root), tree, found.get("branch_made"), made=True)
+
+
+def followed_rebase(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: str,
+                    skipped: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The claimed `entry` moved to the rebase its prepare pushed, and where it runs; else `skipped` (sd:10312).
+
+    A put-back with no answer from the hub, or a reclaim, leaves the row at
+    the pre-prepare head while `origin/<branch>` holds prepare's rewrite of
+    it. The ship receipt's `rebase_tip` proves that rewrite
+    (`prepared_rebase`), so the queued commit need not be fetchable. A read
+    that fails raises `PUBLISH_UNKNOWN`: unknown is not a skip.
+    """
+    branch, expected = str(entry.get("branch") or ""), str(entry["expected_head"])
+    tip = fetched_tip(sd_lib.main_worktree_root(root), branch)
+    try:
+        rewritten = prepared_rebase(queue, branch, entry["item"], expected, tip)
+    except Stop:
+        raise
+    except LaneError as error:
+        raise LaneError(str(error), code=PUBLISH_UNKNOWN) from None
+    if not rewritten:
+        return entry, skipped
+    runner_write(queue, lambda entries: held(entries, entry, token).update(expected_head=tip))
+    entry["expected_head"] = tip  # the claim's copy too, so a put-back after a failed read keeps the rewrite
+    return entry, checkout_for(root, queue, entry)
 
 
 def delivery_owed(row: dict[str, Any], entry: dict[str, Any]) -> bool:
@@ -5822,7 +5956,7 @@ def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token:
             outcome = processed()
             if outcome.get("moved"):
                 put_back(queue, entry, token, pushed_catch_up(tree, str(entry.get("branch") or ""),
-                                                              entry["expected_head"]),
+                                                              entry["expected_head"], queue, entry["item"]),
                          moved_off={"host": this_host(), "at": stamp_now(), "step": "merge"})
                 return ({"item": entry["item"], **outcome, "status": "pending"},
                         f"{outcome['moved']} sd:{entry['item']} is pending again at its place, for that host.")
@@ -6451,6 +6585,8 @@ def add_lane_verbs(commands: Any) -> None:
                                                  f"and {SUPERSEDED} after a newer entry; a cancelled entry needs it, "
                                                  f"and refuses {HEAD_MOVED} when its branch moved and "
                                                  f"{ALREADY_MERGED} at a merged head (sd:3389)")
+    retrier.add_argument("--expected-branch", help=f"refuse with {STALE_HEAD} unless the item's newest entry is on "
+                                                   "this branch, checked in the write's transaction (sd:10897)")
     canceller = verbs.add_parser("cancel", help="mark a pending entry cancelled, release a stuck running one, "
                                                     "clear a prepared one a ship receipt shows merged, or clear "
                                                     "the newest failed or skipped ones")
@@ -6524,7 +6660,8 @@ def lane_main(args: Any) -> int:
                       **({"legacy": said} if (said := legacy_waiting(
                           queue_path(root, environ), {str(row.get("id")) for row in entries})) else {})}
         elif args.lane_command == "retry":
-            result = retry(root, args.item, environ, manual=args.manual, expected_head=args.expected_head)
+            result = retry(root, args.item, environ, manual=args.manual, expected_head=args.expected_head,
+                           expected_branch=args.expected_branch)
         elif args.lane_command == "cancel":
             result = cancel(root, args.item, environ, expected_revision=args.expected_revision,
                             expected_claim=args.expected_claim)

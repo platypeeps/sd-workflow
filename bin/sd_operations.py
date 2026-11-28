@@ -171,8 +171,8 @@ def queue_builds(args: argparse.Namespace) -> int:
         import sd_db.build as build
     except ImportError:
         raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for builds") from None
-    if args.drop and (len(args.items) != 1 or args.finding):
-        raise WorkRefusal("--drop takes one item and no --finding")
+    if args.drop and (len(args.items) != 1 or args.finding or args.expected_branch is not None):
+        raise WorkRefusal("--drop takes one item and no --finding or --expected-branch")
     sys.path.insert(0, str(BIN))
     try:  # by name from bin/, as `holders` loads the dashboard: a caller may not have bin/ on its path
         sd_bundle_drop = importlib.import_module("sd_bundle_drop")
@@ -183,7 +183,8 @@ def queue_builds(args: argparse.Namespace) -> int:
         if args.drop:
             queued = sd_bundle_drop.drop_item(connection, build, args.items[0], who=getpass.getuser())
         else:
-            queued = build.queue_again(connection, args.items, who=getpass.getuser(), finding=args.finding)
+            queued = build.queue_again(connection, args.items, who=getpass.getuser(), finding=args.finding,
+                                       expected_branch=args.expected_branch)
     except (sd_db.SdDbError, ValueError) as error:
         raise WorkRefusal(str(error)) from error
     except sd_bundle_drop.DropRefused as error:
@@ -810,6 +811,9 @@ def register(groups: Any) -> None:
             parser.add_argument("items", nargs="+", type=item_id, help=ITEM_HELP)
             parser.add_argument("--finding", default="", metavar="TEXT",
                                 help="Send to builder: the note the build's builder reads")
+            parser.add_argument("--expected-branch", metavar="BRANCH",
+                                help="refuse, writing nothing, unless each item retries or fixes a bundle on this "
+                                     "branch, the one you read (sd:10897)")
             parser.add_argument("--drop", action="store_true",
                                 help="take the one item out of its ended bundle: the kept items' commits go on a "
                                      "fresh branch under a kept lead, and the item builds alone (pack sd:9709)")
