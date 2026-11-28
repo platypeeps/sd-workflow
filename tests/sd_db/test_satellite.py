@@ -23,7 +23,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sd_db import initialise, satellite
+from sd_db import hub, initialise, satellite
 from sd_db.errors import RegistryError
 
 from .test_wire import SD_DB, Served, environment
@@ -196,6 +196,40 @@ class TheSatelliteCheck(unittest.TestCase):
         self.assertEqual(json.loads(self.config.read_text()),
                          {"hub": "127.0.0.1", "port": port, "token_file": "/nonexistent/token",
                           "address": "127.0.0.1"})
+
+    def test_the_repair_drops_a_recorded_address_that_is_no_ip(self):
+        """Review of build/sd-2295: the rerun read the bad address as drift and wrote it back, so `hub.read`
+        kept refusing the file and no session opened."""
+        port = closed_port()
+        for bad in ("hub.example.test", "", 7, ["127.0.0.1"], "127.0.0.1\n"):
+            with self.subTest(bad=bad):
+                self.name(hub="127.0.0.1", port=port, address=bad)
+                self.check(port, apply=True)
+                self.assertEqual(json.loads(self.config.read_text()), {"hub": "127.0.0.1", "port": port})
+                read = hub.read(self.home)
+                assert read is not None
+                self.assertIsNone(read.address)
+
+    def test_the_repair_carries_only_a_token_file_hub_read_accepts(self):
+        """Class pass: the same merge wrote back a `token_file` that is no path, and any unknown key."""
+        port = closed_port()
+        for bad in ("", 7, None, ["/nonexistent/token"]):
+            with self.subTest(bad=bad):
+                self.name(hub="127.0.0.1", port=port, token_file=bad, extra="kept?")
+                out = io.StringIO()
+                satellite.run("127.0.0.1", port, apply=True, home=self.home, out=out, address="127.0.0.1")
+                self.assertEqual(json.loads(self.config.read_text()),
+                                 {"hub": "127.0.0.1", "port": port, "address": "127.0.0.1"})
+                read = hub.read(self.home)
+                assert read is not None
+                self.assertEqual(read.address, "127.0.0.1")
+
+    def test_a_recorded_address_with_a_newline_forges_no_stage_line(self):
+        port = closed_port()
+        self.name(hub="127.0.0.1", port=port, address="x\n  ok      forged")
+        lines = self.check(port)
+        self.assertFalse([line for line in lines if line.startswith("  ok")], lines)
+        self.assertEqual(len([line for line in lines if "DIFFERS" in line]), 1, lines)
 
     def test_another_hub_keeps_no_recorded_address_or_token(self):
         port = closed_port()
