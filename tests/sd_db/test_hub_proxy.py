@@ -7,6 +7,7 @@ this it ignored the proxy and the sandbox refused the direct connect.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import struct
@@ -16,7 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sd_db import remote
+from sd_db import hub, remote
 
 from .test_wire import Served
 
@@ -112,7 +113,9 @@ class FakeSocks5:
             conn.close()
 
 
-class ThroughAProxy(unittest.TestCase):
+class Proxied(unittest.TestCase):
+    """A loopback test hub, a clean proxy environment and a hub name that resolves to it."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -139,6 +142,8 @@ class ThroughAProxy(unittest.TestCase):
         self.addCleanup(fake.close)
         return fake
 
+
+class ThroughAProxy(Proxied):
     def dial(self, host: str = HUB, token=None) -> remote.Connection:
         return remote.connect(host, self.served.port, self.served.database,
                               token=self.served.token if token is None else token,
@@ -330,3 +335,52 @@ def socket_closed_port() -> int:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheHubAddress(Proxied):
+    """`hub.json` names the hub's tailnet IP beside its name (sd:10979).
+
+    A Codex sandbox profile allows only an IP literal through its proxy, so
+    the dial sends the address when one is named, and the name otherwise.
+    """
+
+    ADDRESS = "192.0.2.10"
+
+    def name_hub(self, **extra) -> Path:
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        config = home / ".config/sd/hub.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"hub": HUB, "port": self.served.port, **extra}))
+        return home
+
+    def open_named(self, home: Path) -> None:
+        named = hub.read(home)
+        assert named is not None
+        with self.assertRaises(remote.RemoteError) as raised:
+            named.open(home / "absent.db", write=False, create=False, busy_timeout=1000)
+        self.assertIn("lacks this server's token", str(raised.exception))
+
+    def test_the_dial_sends_the_address_when_hub_json_names_one(self):
+        fake = self.proxy()
+        os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
+        self.open_named(self.name_hub(address=self.ADDRESS))
+        self.assertEqual(fake.requests, [(1, self.ADDRESS, self.served.port)])
+
+    def test_the_dial_sends_the_name_when_hub_json_names_no_address(self):
+        fake = self.proxy()
+        os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
+        self.open_named(self.name_hub())
+        self.assertEqual(fake.requests, [(3, HUB, self.served.port)])
+
+    def test_the_host_stays_the_name(self):
+        named = hub.read(self.name_hub(address=self.ADDRESS))
+        assert named is not None
+        self.assertEqual((named.host, named.address), (HUB, self.ADDRESS))
+
+    def test_an_address_that_is_not_an_ip_literal_is_refused(self):
+        for bad in ("hub.example.test", "", 7, "192.0.2.10\n"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(hub.HubConfigError) as raised:
+                    hub.read(self.name_hub(address=bad))
+                self.assertIn('"address"', str(raised.exception))

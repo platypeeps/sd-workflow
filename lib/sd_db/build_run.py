@@ -1051,12 +1051,14 @@ def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> l
 
 
 def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, branch: str | None = None,
-               env: dict | None = None) -> dict | None:
+               env: dict | None = None, branchless: bool = True) -> dict | None:
     """The newest lane entry of any of `items` by enqueue order, from `sd-ship lane list`; None when there is none.
 
     Any member: the entry's item is the first member the branch delivers. With `branch`, only that branch's
     entries: a rebuild of a lane-failed bundle shares its items, and can share its head, with the failed
-    branch's entry (review of build/sd-1808). A row that names no branch, an earlier version's import, counts.
+    branch's entry (review of build/sd-1808). A row that names no branch, an earlier version's import, counts
+    unless `branchless` is False: a rebuild's own entry always names its branch, so a branchless one at its head
+    is the failed bundle's, never its own (sd:10960).
     """
     try:
         answer = json.loads(_read([*ship, "-C", str(cwd), "lane", "list"], env=env))
@@ -1066,7 +1068,7 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, bran
     if not isinstance(entries, list):
         raise Unread("sd-ship lane list gave no entries")
     mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items
-            and (branch is None or not row.get("branch") or row.get("branch") == branch)]
+            and (branch is None or (branchless and not row.get("branch")) or row.get("branch") == branch)]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
 
 
@@ -3165,7 +3167,8 @@ class Supervisor:
             return self.finish("blocked", "the branch delivers no item: no commit has a `Closes: sd:N` trailer "
                                           "for one of the run's items")
         if not unmanaged:
-            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env,
+                               branchless=build.lane_failed_start(self.db, self.row["assignment"]) is None)
             # Only this run's branch's entry is its own (`lane_entry`): a rebuild that starts at a failed
             # bundle's head (`start_point`) shares that head with the old failed entry (review of build/sd-1808).
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
@@ -3206,7 +3209,8 @@ class Supervisor:
             # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
             # that file queued or ended at this head; the shared queue says whether that entry is this head, read
             # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
-            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env,
+                               branchless=build.lane_failed_start(self.db, self.row["assignment"]) is None)
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"
