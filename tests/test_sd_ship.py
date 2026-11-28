@@ -4823,10 +4823,60 @@ roles:
         self.prepare("--deliver", "--acceptance-file", renewal)
         self.assertEqual(self.operation().state["acceptance"]["claim"], before["claim"])
 
-    def test_a_lane_retry_after_only_the_waiver_note_changed_says_so(self):
+    def lane_evidence(self, name, text):
+        """An acceptance file for the fixture item whose one row's evidence is `text`."""
+        path = self.directory / name
+        path.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": text}]}))
+        return str(path)
+
+    def test_a_fresh_enqueue_after_a_renewal_carries_its_new_evidence(self):
+        """pack sd:9580: a renewal by hand marked the claim `renewed` for good, so every later lane prepare whose
+        evidence differed refused as a retry from before the renewal, a fresh enqueue with new evidence too.
+        Only the evidence the renewal replaced refuses; evidence given after it proceeds and stands."""
+        from sd_db import set_item_fields
+        old, renewal = self.lane_evidence("old.json", "fixture-check-pass"), self.lane_evidence("r.json", "renewed")
+        self.prepare("--deliver", "--acceptance-file", old)
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", renewal)
+        newer = self.lane_evidence("newer.json", "checked again after the renewal")
+        with self.as_lane(), contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", newer)
+        stored = self.operation().state["acceptance"]
+        self.assertEqual(stored["claim"]["criteria"][0]["evidence"], "checked again after the renewal")
+        with self.as_lane(), self.assertRaisesRegex(ship.Refusal, "renewed by hand.*enqueue again"):
+            self.prepare("--deliver", "--acceptance-file", old)  # the evidence the renewal replaced
+        self.assertEqual(self.operation().state["acceptance"], stored)
+
+    def test_a_lane_entry_queued_before_a_renewal_refuses_after_it(self):
+        """pack sd:9580: the renewal reads the item's lane entries, so one queued before it, whose evidence no
+        claim held yet, refuses after it too; a queue that does not read renews nothing."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+        self.prepare("--deliver", "--acceptance-file", self.lane_evidence("old.json", "fixture-check-pass"))
+        queued = self.lane_evidence("queued.json", "queued before the retitle")
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), {
+            "id": "e0", "position": 1, "item": self.item, "status": "pending", "claim": "deliver", "closes": [],
+            "acceptance": pathlib.Path(queued).read_text()})
+        self.connection.commit()
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        renewal = self.lane_evidence("r.json", "renewed")
+        with patch.object(sd_lane, "stored", side_effect=sqlite3.OperationalError("database is locked")), \
+                self.assertRaisesRegex(ship.Refusal, "lane queue could not be read"):
+            self.prepare("--deliver", "--acceptance-file", renewal)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", renewal)
+        before = self.operation().state["acceptance"]
+        with self.as_lane(), self.assertRaisesRegex(ship.Refusal, "renewed by hand.*enqueue again"):
+            self.prepare("--deliver", "--acceptance-file", queued)
+        self.assertEqual(self.operation().state["acceptance"], before)
+
+    def test_a_lane_retry_after_only_the_waiver_note_changed_proceeds(self):
         """Lead review of sd:9335: after a renewal by hand, an edit of the decision note that waived a row, its
-        `Waive:` line kept, made the lane's claim differ from the stored one, and the refusal said to enqueue
-        again with the renewal's file: this entry's file. It names the note and says to refresh by hand."""
+        `Waive:` line kept, made the lane's claim differ from the stored one, and the retry refused. The retry
+        carries the renewal's own evidence, which no renewal replaced (pack sd:9580), so it proceeds; the claim
+        then holds the edited note, and the renewal's list of replaced evidence stays."""
         from sd_db import set_item_fields
         from sd_db.writes import set_note_body
         note = self.decision("Ruling: no rig here.\nWaive: runs offline")
@@ -4837,20 +4887,13 @@ roles:
                                           self.waived_row("runs offline", note)))
         with contextlib.redirect_stderr(io.StringIO()):
             self.prepare("--deliver", "--acceptance-file", acceptance)
-        before = self.operation().state["acceptance"]
+        superseded = self.operation().state["acceptance"]["superseded"]
         set_note_body(self.connection, note, "Ruling: no rig here, still.\nWaive: runs offline")
         with self.as_lane():
-            with self.assertRaisesRegex(ship.Refusal, rf"only decision note #{note} changed.*by hand") as caught:
-                self.prepare("--deliver", "--acceptance-file", acceptance)
-        self.assertNotIn("enqueue again", str(caught.exception))
-        self.assertEqual(self.operation().state["acceptance"], before)
-        # Re-review of sd:9335: the printed retry named no item, which `lane retry` requires.
-        retry = re.search(r"`(sd-ship lane retry[^`]*)`", str(caught.exception))[1]
-        self.assertEqual(ship.parser().parse_args(shlex.split(retry)[1:]).item, self.item)
-        self.prepare("--deliver", "--acceptance-file", acceptance)  # the refresh by hand
-        with self.as_lane():
             self.prepare("--deliver", "--acceptance-file", acceptance)  # the retried entry, same file
-        self.assertIn("still.", self.operation().state["acceptance"]["claim"]["criteria"][2]["waived"]["note"]["body"])
+        stored = self.operation().state["acceptance"]
+        self.assertIn("still.", stored["claim"]["criteria"][2]["waived"]["note"]["body"])
+        self.assertEqual(stored["superseded"], superseded)
 
     def test_a_scope_change_before_the_merge_says_nothing_merged(self):
         """Lead review of sd:9335: `merge` refused a scope change with the prepare step's words, "a lane prepare
