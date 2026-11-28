@@ -255,7 +255,8 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     """sd:5988. The passing `sd-review --scope branch` pass recorded for `branch` that covers `head`, and why.
 
     A pass is clean or advisory only (sd:9767): a build's review that cleared
-    stands for the lane's at the same head; a blocking one is never recorded.
+    stands for the lane's at the same head; a blocking one is recorded for
+    `sd-ship adjudicate` alone (sd:10926) and covers nothing.
 
     It covers `head` when it reviewed `head`, or when `carry_forward` carries
     it across clean merges of `origin/<base>` alone, and only when it diffed
@@ -290,6 +291,8 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
         return None, f"it reviewed from {str(record.get('base'))[:12]}, not the fork from origin/{base}"
     if reviewed == head:
         return record, f"the {record['status']} pass of {head[:12]} covers it"
+    if record.get("head_only"):  # a build's settled pass: its rulings judged that tree alone (sd:10919)
+        return None, f"the pass of {reviewed[:12]} settled on rulings, which cover that head alone"
     try:
         carried = carry_forward(root, reviewed, head, f"refs/remotes/origin/{base}")
     except Refusal:
@@ -846,8 +849,9 @@ class SharedReview:
         `save=False` only answers: the held-review path records its result first, and a rebind saved
         before it would strand that result if the process stopped between the two writes."""
         changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
-        if (not sd_lib.TOOL_CHANGES_KEEP_REVIEWS or manifest is None or not changed
-                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
+        if (manifest is None or not changed
+                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)
+                or not sd_lib.tool_changes_keep_reviews()):
             return False
         # A normalizer move reports alone and hides the policy entries, so policy is compared here too.
         current = manifest(self.root)

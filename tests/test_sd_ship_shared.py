@@ -177,7 +177,7 @@ class SharedBindingTests(unittest.TestCase):
         home.start()
         self.addCleanup(home.stop)
         # These pin the strict reading; `ToolChangesKeepReviewTests` pins the default (operator 2026-11-27).
-        strict = patch.object(sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)
+        strict = patch.object(sd_lib, "tool_changes_keep_reviews", lambda *_: False)
         strict.start()
         self.addCleanup(strict.stop)
         self.head = "a" * 40
@@ -757,7 +757,7 @@ class ToolChangesKeepReviewTests(unittest.TestCase):
 
     def setUp(self):
         SharedBindingTests.setUp(self)
-        lenient = patch.object(sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", True)
+        lenient = patch.object(sd_lib, "tool_changes_keep_reviews", lambda *_: True)
         lenient.start()
         self.addCleanup(lenient.stop)
         self.operation.save = lambda **updates: self.operation.state.update(updates)
@@ -792,6 +792,6 @@ class ToolChangesKeepReviewTests(unittest.TestCase):
         stored = {"tools": "old", "local": "L", "review_declaration": {"x": 1}}
         self.assertTrue(sd_lib.same_review_binding(stored, dict(stored, tools="new")))
         self.assertFalse(sd_lib.same_review_binding(stored, dict(stored, local="L2")))
-        with patch.object(sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False):
+        with patch.object(sd_lib, "tool_changes_keep_reviews", lambda *_: False):
             self.assertFalse(sd_lib.same_review_binding(stored, dict(stored, tools="new")))
 

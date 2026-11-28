@@ -150,6 +150,14 @@ class OperationsCLI(unittest.TestCase):
         with self.assertRaisesRegex(cli.WorkRefusal, "--timeout goes with --wait"):
             self.call("assignments", "get", "8", "--timeout", "1")
 
+    def test_assignments_get_until_merged_exits_1_while_the_delivery_is_pending(self):
+        """Review of pack sd:9923: a lane entry merged with its delivery pending read as the build's success."""
+        self.service.assignment_state.side_effect = (
+            lambda connection, ident: {"id": ident, "item": ident + 100, "status": "done", "revision": "r"})
+        self.service.lane_state = Mock(return_value={"id": "e1", "status": "merged", "delivery_pending": True})
+        code, output = self.call("assignments", "get", "8", "--wait", "--until", "merged", "--json")
+        self.assertEqual((code, json.loads(output)["lane"]["delivery_pending"]), (1, True))
+
     def test_assignments_get_wait_until_merged_waits_through_the_lane(self):
         """pack sd:8798: `--until merged` waits on past a done build until its item's lane entry ends; 0 only when
         each one merged, 1 when one failed, a build ended other than done, or at the timeout."""

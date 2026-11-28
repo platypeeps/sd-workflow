@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ from sd_db import (
     operations,
     paths,
     remote,
+    repos,
     runner,
     sessions,
     writes,
@@ -69,7 +71,9 @@ FAKE = textwrap.dedent('''
     role, plans = Path(sys.argv[0]).stem, Path(os.environ["FAKE_PLANS"])
     with open(plans / "calls.jsonl", "a") as log:
         log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd(),
-                             "run": os.environ.get("SD_BUILD_RUN")}) + "\\n")
+                             "run": os.environ.get("SD_BUILD_RUN"),
+                             "jobs": os.environ.get("CARGO_BUILD_JOBS"),
+                             "xdist": os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS")}) + "\\n")
     plan = plans / f"{role}.json"
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
@@ -300,7 +304,9 @@ FAKE = textwrap.dedent('''
         # blocking2_uncovered: blocking2 read from patches only, so the next round reviews the branch whole
         short = mode == "repeat2_short"
         uncovered = mode in ("repeat2_uncovered", "blocking2_uncovered")
-        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered else mode
+        # repeat2_forked: repeat2 from the branch's real fork, with the binding `sd-review` reports (sd:10919)
+        forked = mode == "repeat2_forked"
+        mode = "blocking2" if mode == "blocking2_uncovered" else "repeat2" if short or uncovered or forked else mode
         if mode in ("blocking2", "repeat2", "moved2", "twin2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
                       "evidence": "the original evidence"}
@@ -321,7 +327,10 @@ FAKE = textwrap.dedent('''
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
                           "requested_reviews": 2, "completed_reviews": 1 if short else 2,
                           "verification_report_digest": verified,
-                          "covers_from": None if mode == "clean_uncovered" or uncovered else "c" * 40,
+                          "covers_from": None if mode == "clean_uncovered" or uncovered else
+                          git("-C", work, "merge-base", "HEAD", "refs/remotes/origin/main") if forked else "c" * 40,
+                          **({"binding": {"fixture": "binding"}, "reviewed_by": ["fixture-reader"],
+                              "remote_reviews": {"copilot": {"automatic": False}}} if forked else {}),
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -358,6 +367,17 @@ FAKE = textwrap.dedent('''
         if any(row["item"] == items[0] and row.get("id", "").startswith("import-") and row["status"] != "cancelled"
                and row["expected_head"] == argv[argv.index("--expected-head") + 1] for row in entries):
             print(json.dumps({"ok": False, "error": f"sd:{items[0]} at this head already ran in this lane"}))
+            sys.exit(3)
+        import sqlite3  # the lane's own guard, over each entry as the shared queue stores it now (a hand-back)
+        stored = sqlite3.connect(os.environ["FAKE_DB"])
+        def now(row):
+            newest = stored.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                    "LIMIT 1", (f"lane:v1:example/repo:{row.get('id')}",)).fetchone()
+            return {**row, "status": json.loads(newest[0]).get("status")} if newest else row
+        try:
+            sd_lane.refuse_ran([now(row) for row in entries], items[0], argv[argv.index("--expected-head") + 1])
+        except sd_lane.LaneError as error:
+            print(json.dumps({"ok": False, "error": str(error)}))
             sys.exit(3)
         entry = {"id": f"e{len(entries) + 1}", "item": items[0], "status": "pending", "enqueue_seq": len(entries) + 1,
                  "expected_head": argv[argv.index("--expected-head") + 1]}
@@ -430,6 +450,70 @@ def end(process):
     process.wait()
 
 
+@contextlib.contextmanager
+def lost_lock(connection):
+    """A write transaction whose commit the hub refuses: its session was closed while the body ran."""
+    yield connection
+    raise remote.TransactionLost("01LOST")
+
+
+def arriving_file(path: Path):
+    """`kept_files`, with an ignored file written at `path` just after its first answer."""
+    read = build_run.kept_files
+    calls: list[tuple] = []
+
+    def kept(*args, **kwargs):
+        answer = read(*args, **kwargs)
+        if not calls:
+            path.write_text("mine\n")
+        calls.append(args)
+        return answer
+    return kept
+
+
+def late_beat(db, work: Path):
+    """`_read`, with a session's beat for `work`, found before the move aside, committed just after it:
+    a hook that read the tree's path, then waited for the move's lock (review of build/sd-2103)."""
+    read, found = build_run._read, sessions.worktrees([str(work)])
+
+    def answer(argv, *args, **kwargs):
+        said = read(argv, *args, **kwargs)
+        if "move" in argv and argv[-2] == str(work):
+            sessions.beat(db, "session-late", machine=this_host(), cwd=None, found=found)
+        return said
+    return answer
+
+
+def killed_move(work: Path):
+    """`_read`, whose `git worktree move` of `work` dies after its rename, before git records the move."""
+    read = build_run._read
+
+    def answer(argv, *args, **kwargs):
+        if "move" in argv and argv[-2] == str(work):
+            os.rename(argv[-2], argv[-1])
+            raise build_run.Unread("git worktree move gave no answer: killed")
+        return read(argv, *args, **kwargs)
+    return answer
+
+
+def registered(repo: Path, work: Path) -> bool:
+    """Whether git lists `work` as a worktree of `repo`, at that path."""
+    return f"worktree {work}" in support.git(repo, "worktree", "list", "--porcelain").splitlines()
+
+
+def refused_once(word: str, when=lambda: True):
+    """`_read`, whose first git call naming `word` once `when()` holds dies: a recovery interrupted there."""
+    read = build_run._read
+    seen: list[list[str]] = []
+
+    def answer(argv, *args, **kwargs):
+        if word in argv and not seen and when():
+            seen.append(argv)
+            raise build_run.Unread(f"git worktree {word} gave no answer: killed")
+        return read(argv, *args, **kwargs)
+    return answer
+
+
 class Refuses:
     """A connection whose `at`th statement raises `fault`; `seen` lists every statement, so a new read is covered."""
 
@@ -479,6 +563,20 @@ def fake_grep(files: dict[str, str], head: str, argv: list[str]) -> str:
         tests = [re.compile(rf"\b{re.escape(pattern)}\b") for pattern in patterns]
     return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
                    for number, text in enumerate(body.splitlines(), 1) if any(test.search(text) for test in tests))
+
+
+#: A `CACHEDIR.TAG` as cargo writes it into `target/`.
+CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n"
+
+
+def cargo(work: Path, *folders: str) -> None:
+    """Commit a `Cargo.toml` in each of `folders` of `work` ("" for its top), as a real crate has beside
+    its `target/`."""
+    for folder in folders or ("",):
+        (work / folder).mkdir(parents=True, exist_ok=True)
+        (work / folder / "Cargo.toml").write_text("[package]\nname = \"example\"\n")
+        support.git(work, "add", "-f", str(Path(folder, "Cargo.toml")))
+    support.git(work, "commit", "-q", "-m", "add a manifest")
 
 
 def exclude(work: Path, patterns: str) -> None:
@@ -811,6 +909,21 @@ class Supervise(Case):
         self.assertEqual(found and found["id"], "e1")
         self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [5], env=self.env))
 
+    def test_the_lane_entry_is_read_on_the_runs_branch_alone(self):
+        """Review of build/sd-1808: a rebuild shares items, and can share a head, with the failed branch's entry;
+        the newest entry of the items was taken whatever its branch. A row with no branch, an earlier version's
+        import, still counts."""
+        (self.plans / "lane.json").write_text(json.dumps([
+            {"id": "e1", "item": 7, "status": "failed", "enqueue_seq": 1, "branch": "build/sd-2"},
+            {"id": "e2", "item": 7, "status": "failed", "enqueue_seq": 2, "branch": "build/sd-1"}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-2", env=self.env)
+        self.assertEqual(found and found["id"], "e1")
+        self.assertIsNone(build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env))
+        (self.plans / "lane.json").write_text(json.dumps([{"id": "e3", "item": 7, "status": "merged",
+                                                           "enqueue_seq": 1}]))
+        found = build_run.lane_entry(self.tools.ship, self.repo, [7], branch="build/sd-3", env=self.env)
+        self.assertEqual(found and found["id"], "e3")
+
     def test_an_unread_delivery_writes_nothing(self):
         """`cited` None (the commits were not read) is unknown: no enqueue, no outcome; the reap retries."""
         self.press()
@@ -1006,6 +1119,49 @@ class Supervise(Case):
         self.assertIn("Write no file outside the worktree", prompt)
         self.assertIn("never amend", prompt)
         self.assertIn("Bash(git commit -F:*)", argv[argv.index("--allowedTools"):argv.index("--permission-mode")])
+
+    def test_a_builders_child_runs_its_tests_on_capped_threads(self):
+        """sd:10393: a builder's cargo, pytest and Unity runs took every core; its child now starts with the cap,
+        and a lower count the dispatcher's own environment set wins, as it does for a gate holder."""
+        gate = build_run._gate_slots()
+        for name in (*gate.CPU_VARIABLES, *build_run.THREAD_VARIABLES, "CI", "GITHUB_ACTIONS"):
+            self.env.pop(name, None)  # a gate holder runs this test with its own caps set: none may reach it
+        self.env.update(SD_GATE_SLOTS="1", TEST_WORKERS="1", XDG_CONFIG_HOME=str(self.root / "no-config"))
+        self.press()
+        self.plan(claude=["pass"])
+        supervisor = self.supervisor()
+        with mock.patch("os.getloadavg", return_value=(0.0, 0.0, 0.0)), mock.patch("os.cpu_count", return_value=16):
+            supervisor.run()
+        call = self.calls("claude")[0]
+        self.assertEqual((call["jobs"], call["xdist"]), ("16", "16"), "one slot: a gate's share is every core")
+        self.assertEqual(supervisor.env["TEST_WORKERS"], "1", "the lower count set wins")
+        prompt = call["argv"][call["argv"].index("-p") + 1]
+        self.assertIn("$CARGO_BUILD_JOBS", prompt)
+        with mock.patch("os.getloadavg", return_value=(30.0, 13.0, 9.0)), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["CARGO_BUILD_JOBS"], "3", "the load leaves 3 cores idle")
+        with mock.patch("os.getloadavg", side_effect=OSError), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["NEXTEST_TEST_THREADS"], "16", "an unread load caps at the share")
+
+    def test_the_thread_cap_takes_the_lower_of_the_gate_share_and_the_idle_cores(self):
+        """sd:10393: at most a gate holder's share of the cores, at most the cores the load leaves idle, at least 1."""
+        for slots, load, cap in (("4", 2.0, 4), ("4", 14.0, 2), ("4", 104.0, 1), ("4", None, 4),
+                                 ("4", math.nan, 4), ("4", math.inf, 4), ("0", 2.0, 14), ("bad", 0.0, 16),
+                                 ("20", 0.0, 1)):
+            with self.subTest(slots=slots, load=load):
+                env = {"SD_GATE_SLOTS": slots, "XDG_CONFIG_HOME": str(self.root / "no-config")}
+                self.assertEqual(build_run.thread_cap(env, load=load, cores=16), cap)
+
+    def test_the_thread_cap_reads_the_machine_setting_from_the_environment_it_is_given(self):
+        """Review of build/sd-1808: the cap's inputs come from the environment handed in, never the host's: the
+        variable first, then CI, then `sd.gate_slots` in that environment's config."""
+        home = self.root / "config"
+        (home / "sd-ai-command-pack").mkdir(parents=True)
+        (home / "sd-ai-command-pack" / "config.json").write_text(
+            json.dumps({"config": {"sd": {"gate_slots": "8"}}}), encoding="utf-8")
+        env = {"XDG_CONFIG_HOME": str(home)}
+        self.assertEqual(build_run.thread_cap(env, load=0.0, cores=16), 2)
+        self.assertEqual(build_run.thread_cap({**env, "SD_GATE_SLOTS": "4"}, load=0.0, cores=16), 4)
+        self.assertEqual(build_run.thread_cap({**env, "CI": "1"}, load=0.0, cores=16), 16, "CI caps no gate")
 
     def test_a_success_line_passes_whatever_the_exit_code(self):
         self.press()
@@ -1212,7 +1368,8 @@ class Supervise(Case):
         block the items; each fix resumes."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
         self.assertIn(f"{R + 2} review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
@@ -1228,6 +1385,11 @@ class Supervise(Case):
         self.assertIn("rule each numbered blocker", prompts[-1], "sd:10286: the last round rules")
         self.assertIn("1. work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
+
+    def fixed_ruling(self):
+        """The ruling round's child that rules its one blocker FIX, as each ruling round writes a file (sd:10913)."""
+        (self.plans / "rulings.txt").write_text(json.dumps([{"blocker": 1, "ruling": "fix", "reason": "a failing input"}]))
+        return "rule_apart"
 
     def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2", rule="rule_apart",
                      **options):
@@ -1325,6 +1487,48 @@ class Supervise(Case):
                 (found,) = review.dispose([review._finding(repeat)], "high", seen)
                 self.assertEqual(found["disposition"], lane)
 
+    def test_a_settled_final_review_is_the_lanes_lead_pass(self):
+        """sd:10919: a final review whose blockers every ruling cleared, at head H, is recorded as the lead
+        pass the lane reuses: prepare at H skips its review; a head moved by a commit of its own reviews."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2_forked",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        work = Path(self.bundle["work_path"])
+        head = support.git(work, "rev-parse", "HEAD").strip()
+        sys.path.insert(0, str(BIN))
+        try:
+            lane = importlib.import_module("sd_ship_review")
+            key = importlib.import_module("sd_lib").lead_review_key("fixture/repo", self.bundle["branch"])
+        finally:
+            sys.path.remove(str(BIN))
+        found = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ?", (key,)).fetchone()
+        self.assertIsNotNone(found, "the settled pass is not recorded for the lane")
+        self.assertEqual(json.loads(found[0])["status"], "advisory")
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], head, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNotNone(record, why)
+        # A clean merge of main far from the branch carries a plain pass; a ruling judged the tree at H, and
+        # main may add the caller it said was missing, so this pass covers H alone (review of sd:10919).
+        support.git(work, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        (work / "far").mkdir()
+        (work / "far" / "caller.txt").write_text("a new caller\n", encoding="utf-8")
+        support.git(work, "add", "far")
+        support.git(work, "commit", "-q", "-m", "feat: a new caller")
+        support.git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
+        support.git(work, "checkout", "-q", self.bundle["branch"])
+        support.git(work, "merge", "-q", "--no-edit", "refs/remotes/origin/main")
+        merged = support.git(work, "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(lane.carry_forward(work, head, merged, "refs/remotes/origin/main"))
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], merged, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
+        support.git(work, "commit", "-q", "--allow-empty", "-m", "fix: later")
+        moved = support.git(work, "rev-parse", "HEAD").strip()
+        record, why = lane.lead_review(self.db, work, "fixture/repo", self.bundle["branch"], moved, "main",
+                                       {"fixture": "binding"})
+        self.assertIsNone(record, why)
+
     def test_two_rulings_one_words_and_place_clear_no_repeat(self):
         """Night triage of sd:10286 (bin/sd-review:917, build_run.py:2199): two ruled blockers with one summary
         and place but other evidence. The lane reads only the newest record there, so it blocked the repeat of
@@ -1371,6 +1575,47 @@ class Supervise(Case):
         self.assertEqual(len(self.calls("gate")), 1, "the settled pass ran no gate")
         self.assertEqual(ended.get("outcome"), "blocked", ended)
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def known_failure(self, code):
+        """A managed run whose first review cleared and whose gate failed; its own check exits `code` after."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", f"exit({code})"])
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["gate_failed", "clean"])
+        return self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+
+    def test_a_known_failure_still_failing_spends_no_review(self):
+        """sd:10914: after a fix round for a failed gate, the check runs again before the review. One that
+        still fails starts no reviewer and goes back to the builder."""
+        ended = self.known_failure(3)
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(len(self.calls("sd-review")), 1, "a review ran on a head whose known failure stands")
+        self.assertGreater(len(self.calls("gate")), 1, "the check was not run again after each fix")
+        self.assertIn("exit 3", self.latest()["detail"])
+
+    def test_a_known_failure_that_passes_reviews_once_and_checks_once(self):
+        """sd:10914: a rerun that passes permits the usual review, and its pass is the round's check."""
+        ended = self.known_failure(0)
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual((len(self.calls("sd-review")), len(self.calls("gate"))), (2, 1))
+
+    def test_a_healthy_build_runs_no_extra_check(self):
+        """sd:10914: no known failure, no rerun: a clean managed review runs no check of its own."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(0)"])
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
+        ended = self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()
+        self.assertEqual(ended.get("step"), "enqueued")
+        self.assertEqual(self.calls("gate"), [])
 
     def test_a_ruled_repeat_in_an_incomplete_review_is_no_pass(self):
         """Review of sd:10286: clearing a ruled blocker turns no short or uncovered review into a pass. A
@@ -1438,6 +1683,39 @@ class Supervise(Case):
                 self.assertEqual(ended.get("outcome"), "blocked", ended)
                 self.assertEqual(self.rebuttals(), [])
                 self.assertIn(f"not applied: the round changed {name} (no Python source)", self.decisions()[1])
+
+    def test_a_ruling_lapses_when_its_round_changes_declared_runtime_data(self):
+        """sd:10906: code reads a `.py` file as data, by no name, and the round changed it. The name walk read
+        it as source, so the reject applied. A path the policy's `runtime_data` declares lapses it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.rebuttals(), [])
+        self.assertIn("not applied: the round changed apart.py (declared runtime data)", self.decisions()[1])
+
+    def test_a_lapsed_file_ruling_still_files_its_follow_up(self):
+        """sd:10914 review: a FILE ruling the round's runtime-data change lapsed filed no item, and a review
+        that omitted the blocker enqueued the build: the follow-up was lost. A lapse skips the clearing and
+        the rebuttal alone; the item is filed and the lead's note names it."""
+        repos.set_declaration(self.db, self.repo, "policy", {"runtime_data": ["apart.py"]})
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "file", "reason": "older than this change"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        (filed,) = self.db.execute("SELECT id FROM item WHERE title LIKE 'Review follow-up%work.txt:2%'").fetchall()
+        self.assertIn(f"FILE as sd:{filed['id']}, older than this change; not applied: the round changed "
+                      f"apart.py (declared runtime data)", self.decisions()[1])
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE ?",
+                                         (f"{build_run.RULED}%",)).fetchone()[0], 0)
+
+    def test_declared_runtime_data_is_matched_by_glob(self):
+        """sd:10906: `runtime_data` globs as `check_scope` reads them: `*` in one segment, `**` across them."""
+        self.assertEqual(build_run.unwalked(self.root, ["a/b.py", "data/x/t.py", "top.py", "c.py"],
+                                            data=["data/**", "c.py"]),
+                         ["c.py (declared runtime data)", "data/x/t.py (declared runtime data)"])
 
     def test_only_python_source_is_a_file_the_name_walk_reads(self):
         """Class pass 7: a `.py` file, or a regular file whose first line is a Python shebang; a symlink, a
@@ -1792,11 +2070,85 @@ class Supervise(Case):
                 self.setUp()
                 ended = self.ruling_round(text, after=("blocking2",))
                 self.assertEqual(ended["outcome"], "blocked", ended)
-                self.assertIn(f"{build_run.REVIEW_ROUNDS + 2} review rounds left blockers", self.latest()["detail"])
+                # sd:10913: no file at all ends the run before the review; sd:10914: so does one that does not
+                # rule every blocker, as the review after it may omit one.
+                self.assertIn("the ruling round wrote no rulings file" if name == "no file" else
+                              "do not rule every blocker", self.latest()["detail"])
+                self.assertEqual(len(self.calls("sd-review")), build_run.REVIEW_ROUNDS + 1)
+                self.assertFalse(self.supervisor().rulings_applied())
                 self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
-                said = [body for (body,) in self.db.execute(
-                    "SELECT body FROM note WHERE item = ? AND body LIKE '%ruling round%rulings%'", (self.items[0],))]
-                self.assertEqual(len(said), 0 if name == "no file" else 1, said)
+
+    def test_a_ruling_round_that_writes_no_rulings_file_delivers_nothing(self):
+        """sd:10913: the ruling round wrote no rulings file and the review after it omitted the blockers. The
+        run delivered; it now ends blocked before that review, and no review is spent."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round(None, after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the missing rulings")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_rulings_file_that_leaves_a_blocker_unruled_delivers_nothing(self):
+        """sd:10914: a rulings file that ruled blocker 1 alone read as applied; the review after it omitted
+        blocker 2 and the run delivered it unruled, and the lane reuses that pass (sd:10919). Each blocker
+        needs a ruling that reads: else the run ends blocked before that review, none applied, no mark."""
+        R = build_run.REVIEW_ROUNDS
+        ended = self.ruling_round([{"blocker": 1, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("clean",))
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("no single ruling for blocker(s) 2", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "a review ran after the unruled blocker")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+        again = self.supervisor()
+        self.assertFalse(again.rulings_applied(), "a round with an unruled blocker reads as applied")
+        # A later walk reads the same file and stays blocked: the mark is never written around it.
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertIsNotNone(again.ruled(head))
+        self.assertEqual(again.ending[0], "blocked")
+        self.assertFalse(again.rulings_applied())
+
+    def test_rulings_for_round_blockers_that_do_not_read_apply_nothing(self):
+        """sd:10914, class pass: a round file lost or not JSON reads as no blocker, so an empty rulings list
+        ruled them all. The round's blockers must read, else nothing applies and no mark is written."""
+        for name, text in {"no round file": None, "not json": "{", "empty list": "[]"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.ruling_round([], after=("clean",))
+                again = self.supervisor()
+                again.round_file.unlink(missing_ok=True)
+                if text is not None:
+                    again.round_file.write_text(text)
+                again.rulings.write_text("[]")
+                head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+                self.assertIsNotNone(again.ruled(head))
+                self.assertEqual(again.ending[0], "blocked")
+                self.assertIn("the round's blockers did not read", again.ending[1])
+                self.assertFalse(again.rulings_applied())
+
+    def test_applied_rulings_walked_again_review_as_usual(self):
+        """sd:10913: a later walk at the same count, the applied rulings file gone, is no missing file."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        self.assertFalse(again.rulings.exists())
+        self.assertIsNone(again.ruled(head))
+
+    def test_applied_rulings_clear_no_later_round_at_the_same_head(self):
+        """Review of sd:10913: the applied mark named the commit alone, so a later blocking round at that same
+        head, whose ruling round wrote no file, read as applied and reviewed as usual. It names the round."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        self.assertTrue(again.rulings_applied())
+        head = again.round_head()
+        # A later blocking round at the same commit, as `blocked_round` records it.
+        record_state(self.db, "checkpoint", key=f"{build_run.ROUND_HEAD}{again.row['assignment']}", body=head)
+        self.assertEqual(again.round_head(), head)
+        self.assertFalse(again.rulings_applied(), "a later round's missing rulings read as applied")
 
     def test_a_reason_is_one_bounded_line(self):
         """sd:10286, long input: a reason is folded and cut before it is a note or a rebuttal."""
@@ -1806,14 +2158,15 @@ class Supervise(Case):
 
     def test_a_rulings_file_from_before_the_round_is_not_this_rounds(self):
         """sd:10286, a stale value: a rulings file an earlier round left is gone before the ruling child
-        starts, so a builder that writes none rejects nothing."""
+        starts, so a builder that writes none rejects nothing, and delivers nothing (sd:10913)."""
         self.press()
         self.supervisor().logs.mkdir(parents=True, exist_ok=True)
         self.rulings_file().write_text(json.dumps([{"blocker": 1, "ruling": "reject", "reason": "stale"}]))
         R = build_run.REVIEW_ROUNDS
         self.write_pr()
         self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=[*["blocking"] * (R + 1), "clean"])
-        self.assertEqual(self.supervisor().run().get("step"), "enqueued")
+        self.assertEqual(self.supervisor().run().get("outcome"), "blocked")
+        self.assertIn("the ruling round wrote no rulings file", self.latest()["detail"])
         self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
 
     def test_rulings_walked_twice_are_written_once(self):
@@ -1845,7 +2198,8 @@ class Supervise(Case):
         model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
         self.assertEqual(len(self.calls("sd-review")), R + 2, "the park moved")
@@ -2035,7 +2389,8 @@ class Supervise(Case):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
         R = build_run.REVIEW_ROUNDS
         self.press(2)
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), self.fixed_ruling()],
+                  sd_review=["blocking"] * (R + 2))
         add_note(self.db, self.items[1], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
@@ -2277,7 +2632,9 @@ class Supervise(Case):
         self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
         self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()  # bare entrypoints pass
         self.assertGreaterEqual(len(self.calls("gate")), 1, "the deferral's pass ran no gate")
-        self.assertEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        self.assertGreaterEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        # sd:10914: the check still fails after the fix, so it runs again and no third review is spent.
+        self.assertEqual(len(self.calls("sd-review")), 2)
 
     def test_a_gate_that_refused_to_run_is_no_fix_round(self):
         """Class pass on sd:10286: `sd gate check` that refuses (exit 1, no result) ran no check: unknown,
@@ -3624,6 +3981,15 @@ class Supervise(Case):
         prompt = self.calls("claude")[-1]["argv"]
         self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
+    def test_a_question_holds_no_build_of_a_held_split(self):
+        """Lane review of build/sd-1867: Build of a held split's items read their questions too, so a
+        pending one held a fresh Build that worked before; the press takes a held split as it stands."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        self.release_all()
+        add_note(self.db, self.items[0], "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        queued = build.queue_again(self.db, self.items[:2], who="operator")
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(self.items[:2]))
+
     def test_the_build_press_takes_a_held_bundles_items_fresh(self):
         """Row 12: the held bundle's refusal says Build; the dashboard's Build dialog checks each item (`_item`) and
         its press calls `queue`, not `queue_again`, so both take the blocked items and build them on a new branch."""
@@ -3676,6 +4042,11 @@ class Supervise(Case):
             if kind == "ignored":
                 exclude(work, "local.conf\n")
                 (work / "local.conf").write_text("the left item's setting\n")
+            elif kind == "tagged":
+                exclude(work, "config/\n")
+                (work / "config").mkdir()
+                (work / "config" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+                (work / "config" / "local.toml").write_text("the left item's setting\n")
             elif kind == "cache":
                 exclude(work, "__pycache__/\n")
                 (work / "__pycache__").mkdir()
@@ -3704,6 +4075,10 @@ class Supervise(Case):
     def test_a_split_guard_holds_an_ignored_leftover(self):
         """Row 18: an ignored local config outside a `DISPOSABLE` folder, which `kept_files` counts."""
         self.assert_split_first(self.left_out_of_a_retry(self.leftover("ignored")))
+
+    def test_a_split_guard_holds_config_in_a_tagged_folder(self):
+        """Lead ruling on build/sd-1867: a cache tag alone never makes ignored files disposable."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("tagged")))
 
     def pending(self, state):
         """`prepare` that leaves `state`, an unfinished Git operation, over a clean tree at the base: HEAD and
@@ -4138,7 +4513,7 @@ class Supervise(Case):
             again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
                                 root=self.root / "worktrees")
         assert again is not None
-        self.plan(claude=["fixr"], sd_review=["clean"])
+        self.plan(claude=[self.fixed_ruling()], sd_review=["clean"])
         self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
         fix = [call["argv"] for call in self.calls("claude")][-1]
         self.assertIn("rule each numbered blocker", fix[fix.index("-p") + 1])
@@ -4308,6 +4683,105 @@ class Supervise(Case):
         first = build_run.BRIEF.format(**self.supervisor(self.bundle["id"]).brief())
         self.assertNotIn("Send to builder", first)
 
+    def test_a_fresh_build_with_a_finding_briefs_it(self):
+        """sd:10320: `sd assignments build N --finding TEXT` on a ready item with no build refused: "would be a
+        fresh build, with no builder to send it to". It queues the build and its builder reads TEXT."""
+        item = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        queued = build.queue_again(self.db, [item], who="operator", finding="pin the clock\n<b>naïve</b>")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in queued], [(item, "queued")])
+        with self.assertRaises(build.BuildRefused):  # a press repeated: no second build, no second note
+            build.queue_again(self.db, [item], who="operator", finding="pin the clock\n<b>naïve</b>")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE ?",
+                                         (item, build.FINDING + "%")).fetchone()[0], 1)
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{item}: pin the clock\n<b>naïve</b>", prompt)
+
+    def test_a_fresh_finding_reaches_a_bundle_a_later_item_leads(self):
+        """Review of build/sd-1782: the brief read findings from its lead's queue note on; a later-queued item of a
+        higher priority led the bundle, so the earlier member's finding note was dropped."""
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        build.queue_again(self.db, [member], who="operator", finding="pin the clock")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (member,))
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{member}: pin the clock", prompt)
+
+    def test_a_member_queued_earlier_does_not_revive_another_item_s_older_finding(self):
+        """Class pass, review of build/sd-1782: one window for the bundle, opened by its earliest member, took in
+        the finding of another member's cancelled build. Each item's window opens at its own queue note."""
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        build.queue_again(self.db, [member], who="operator", finding="pin the clock")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (member,))
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        gone = build.queue_again(self.db, [lead], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        self.db.execute("UPDATE note SET timestamp = '2026-01-02T00:00:00+00:00' WHERE item = ?", (lead,))
+        build.queue(self.db, [lead], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{member}: pin the clock", prompt)
+        self.assertNotIn("a cancelled build's order", prompt)
+
+    def test_a_lead_queued_earlier_does_not_revive_a_member_s_cancelled_finding(self):
+        """Review of build/sd-1782, round 3: a member's window opened at the earlier of its own queue note and the
+        lead's, so a lead queued first took in the finding of the member's cancelled build."""
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (lead,))
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        gone = build.queue_again(self.db, [member], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        self.db.execute("UPDATE note SET timestamp = '2026-01-02T00:00:00+00:00' WHERE item = ?", (member,))
+        build.queue(self.db, [member], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertNotIn("a cancelled build's order", prompt)
+
+    def test_a_member_requeued_in_the_same_second_does_not_revive_its_cancelled_finding(self):
+        """Review of build/sd-1782, round 4: note timestamps have whole seconds, so a member cancelled and queued
+        again in the second of its cancelled finding read that finding as inside its window."""
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        gone = build.queue_again(self.db, [member], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        build.queue(self.db, [member], who="operator")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (member,))
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertNotIn("a cancelled build's order", prompt)
+
+    def test_a_lead_requeued_in_the_same_second_does_not_revive_its_cancelled_finding(self):
+        """Lane review of build/sd-1782: the lead's window opened at its queue note's whole-second timestamp, so
+        a replacement build queued in the second of a cancelled build's finding read it as the operator's."""
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready")
+        gone = build.queue_again(self.db, [lead], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        build.queue(self.db, [lead], who="operator")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (lead,))
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertNotIn("a cancelled build's order", prompt)
+
     def test_a_plain_retry_briefs_review_blockers_as_the_reviewer_s_not_the_operator_s(self):
         """Lead review of pack sd:9498: a plain Retry noted the parked run's blockers as Send to builder, which the
         brief presents as the operator's findings. They are the reviewer's text; only Send to builder is the
@@ -4406,13 +4880,14 @@ class Supervise(Case):
         support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: done\n\nCloses: sd:{self.items[0]}")
         head = support.git(work, "rev-parse", "HEAD")
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "pending",
-                                                           "enqueue_seq": 1, "expected_head": head}]))
+                                                           "enqueue_seq": 1, "expected_head": head,
+                                                           "branch": self.bundle["branch"]}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual([call["argv"][-2:] for call in self.calls("sd-ship")], [["lane", "list"]])
         self.assertEqual(len(json.loads((self.plans / "lane.json").read_text())), 1)
 
-    def legacy_resume(self, head_of=lambda head: head, status="pending", branch=None):
+    def legacy_resume(self, head_of=lambda head: head, status="pending"):
         """A run resumed at enqueuing whose item an earlier version's queue file holds pending, not imported:
         `lane list` shows only a cancelled entry, and the enqueue imports the file and then refuses the item."""
         self.press()
@@ -4426,8 +4901,7 @@ class Supervise(Case):
         (self.plans / "lane.json").write_text(json.dumps([{"id": "e1", "item": self.items[0], "status": "cancelled",
                                                            "enqueue_seq": 1, "expected_head": head}]))
         (self.plans / "legacy.json").write_text(json.dumps([{"id": "import-1", "item": self.items[0],
-                                                             "status": status, "expected_head": head_of(head),
-                                                             **({"branch": branch} if branch else {})}]))
+                                                             "status": status, "expected_head": head_of(head)}]))
         build.write(self.db, self.bundle["id"], step="enqueuing")
         return self.supervisor().run()
 
@@ -4445,21 +4919,6 @@ class Supervise(Case):
         self.assertEqual(self.legacy_resume(status="failed")["step"], "enqueued")
         self.assertEqual([(row["id"], row["status"]) for row in json.loads((self.plans / "lane.json").read_text())],
                          [("e1", "cancelled"), ("import-1", "failed")])
-
-    def test_an_imported_entry_on_another_branch_is_the_runs_and_the_watch_reads_it(self):
-        """Review of build/sd-2260, round 2: the lane keys an entry by its item, whatever branch it names, and
-        refuses a second one. A delivery read by branch missed the imported entry and blocked the run; a watch
-        read by branch would then never end it. Both read by item, as the lane does."""
-        self.assertEqual(self.legacy_resume(branch="build/sd-0")["step"], "enqueued")
-        entries = json.loads((self.plans / "lane.json").read_text())
-        self.assertEqual([(row["id"], row["branch"]) for row in entries if row["id"] == "import-1"],
-                         [("import-1", "build/sd-0")])
-        (self.plans / "lane.json").write_text(json.dumps([{**row, "status": "merged"} for row in entries]))
-        row = build.run(self.db, self.bundle["id"])
-        delivered = [member["item"] for member in row["members"] if member["status"] == "done"]
-        with mock.patch.dict(os.environ, {"FAKE_PLANS": str(self.plans), "FAKE_BIN": str(BIN)}):
-            found = build_run.lane_entry(self.tools.ship, self.repo, delivered)
-        self.assertEqual(found and (found["id"], found["status"]), ("import-1", "merged"))
 
     def test_enqueue_resume_blocks_on_a_legacy_entry_at_another_head(self):
         """The imported entry holds another head, so the refusal stands and the run is blocked on it."""
@@ -4492,22 +4951,117 @@ class Supervise(Case):
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("kept worktree", note["body"])
 
-    def test_cleaning_keeps_an_ignored_file(self):
-        """pack sd:6979: `git worktree remove` deletes ignored files, which plain `status --porcelain` omits."""
+    def test_cleaning_keeps_a_merged_worktree_that_holds_a_cargo_target(self):
+        """Pack sd:10506, class pass of build/sd-1867: no place in a cargo target proves a file there can be
+        rebuilt, so cleaning keeps the tree, and its note names the first file."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
         self.supervisor().run()
         work = Path(self.bundle["work_path"])
-        exclude(work, "__pycache__/\n.env\n")
-        (work / "__pycache__").mkdir()
-        (work / "__pycache__" / "x.pyc").write_bytes(b"x")
+        cargo(work)
+        exclude(work, "target/\n")
+        (work / "target" / "debug").mkdir(parents=True)
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
+        (work / "target" / "debug" / "app").write_bytes(b"x")
+        (work / "target" / "debug" / ".cargo-lock").write_bytes(b"")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "target" / "debug" / "app").read_bytes(), b"x")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_keeps_an_ignored_local_file(self):
+        """Review of build/sd-1867, pack sd:6979: `git worktree remove` deletes ignored files, and an ignored
+        `.env` is local work, not build output: it keeps the tree, whatever build output sits beside it."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, "target/\n.env\n")
+        (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
         self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("!! .env", note["body"])
+
+    def test_cleaning_keeps_ignored_config_beside_a_real_cache(self):
+        """Lead ruling on build/sd-1867 (notes #82533, #82540, #82541): a cache tag alone never makes ignored
+        files disposable. A hand-edited config in a tagged folder keeps the tree, as a cargo target does."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        cargo(work)
+        exclude(work, "target/\nconfig/\n.ruff_cache/\n")
+        for folder in (work / "target", work / "config"):
+            folder.mkdir()
+            (folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
+        (work / "config" / "local.toml").write_text("token = \"change-me\"\n")
+        (work / "target" / ".env").write_text("TOKEN=change-me\n")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "target" / ".env").read_text(), "TOKEN=change-me\n")
+        self.assertEqual((work / "config" / "local.toml").read_text(), "token = \"change-me\"\n")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_keeps_an_untracked_file(self):
+        """An untracked file is work no merge carried: cleaning still keeps its tree."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, "target/\n")
+        (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / "out.bin").write_bytes(b"x")
+        (work / "notes.txt").write_text("x\n")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / "notes.txt").exists())
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("?? notes.txt", note["body"])
+
+    def test_cleaning_deletes_declared_generated_paths_then_removes_the_tree(self):
+        """sd:10752: after the merge a declared gate stub is no reason to keep the worktree."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, ".ci/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        repos.set_declaration(self.db, self.repo, "generated", {"paths": [".ci/bin/launchctl"]})
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(work.exists())
+
+    def test_cleaning_a_tree_git_refuses_to_remove_keeps_its_declared_files(self):
+        """sd:10752 class pass: a locked worktree stays after the merge, with its declared gate stub."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, ".ci/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        repos.set_declaration(self.db, self.repo, "generated", {"paths": [".ci/bin/launchctl"]})
+        support.git(self.repo, "worktree", "lock", str(work))
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / ".ci" / "bin" / "launchctl").read_text(), "stub\n")
 
     def test_cleaning_removes_a_clean_worktree(self):
         self.press()
@@ -4575,6 +5129,132 @@ class Supervise(Case):
     def hold(self, session: str) -> None:
         work = Path(self.bundle["work_path"])
         sessions.beat(self.db, session, machine=this_host(), cwd=None, found=sessions.worktrees([str(work)]))
+
+    def test_a_session_that_holds_the_tree_during_the_clean_check_keeps_it(self):
+        """Review of build/sd-2103: a session that registers the tree after the first hold check, while
+        git status runs, still keeps it; the hold is read again with the remove."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        read = build_run.kept_files
+
+        def arriving(*args, **kwargs):
+            self.hold("session-other")
+            return read(*args, **kwargs)
+
+        self.merge_to_cleaning()
+        with mock.patch.object(build_run, "kept_files", arriving):
+            ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "done")
+        self.assertTrue(Path(self.bundle["work_path"]).is_dir())
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("a live session holds it: session-", note["body"])
+
+    def to_cleaning(self) -> Path:
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        self.merge_to_cleaning()
+        return Path(self.bundle["work_path"])
+
+    def test_cleaning_whose_lock_is_lost_at_the_commit_keeps_the_tree(self):
+        """Class pass, build/sd-2103: a hub closes a satellite's transaction after `serve.IDLE_TIMEOUT`, so
+        the lock may be gone before git answers; a commit that fails proves no hold, and the tree stays."""
+        work = self.to_cleaning()
+        real = build_run.transaction
+        back: list[bool | None] = []
+
+        @contextlib.contextmanager
+        def lost_once(connection):
+            if back:  # the walk runs again after the hub fault, and its lock holds this time
+                back.append((work / ".git").is_file())
+                with real(connection):
+                    yield connection
+                return
+            back.append(None)
+            yield connection
+            raise remote.TransactionLost("01LOST")
+
+        with mock.patch.object(build_run, "transaction", lost_once):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual(back[:2], [None, True], "put back after the lost lock, for the next walk to judge")
+
+    def test_cleaning_keeps_a_tree_an_ignored_file_reaches_after_the_clean_check(self):
+        """Class pass: the clean check is read again once the tree is aside, before git deletes it."""
+        work = self.to_cleaning()
+        exclude(work, "late.cfg\n")
+        with mock.patch.object(build_run, "kept_files", arriving_file(work / "late.cfg")):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "late.cfg").read_text(), "mine\n")
+
+    def test_cleaning_keeps_a_tree_a_hold_reaches_after_the_move(self):
+        """Review of build/sd-2103: a beat found under the tree's first name, committed once it is aside."""
+        work = self.to_cleaning()
+        with mock.patch.object(build_run, "_read", late_beat(self.db, work)):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / ".git").is_file())
+
+    def test_cleaning_keeps_a_tree_held_by_its_aside_name(self):
+        """Class pass: a session that found the tree aside holds it by that name once it is put back."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
+                      found=sessions.worktrees([str(aside)]))
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / ".git").is_file())
+
+    def test_cleaning_puts_back_a_tree_git_never_recorded_aside_and_removes_it(self):
+        """Review of build/sd-2103: a move killed after its rename left git's record at the first name."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        os.rename(work, aside)
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_cleaning_whose_move_dies_after_the_rename_puts_the_tree_back(self):
+        """Class pass: the move that fails is the one cleaning ran, so no later pass is needed."""
+        work = self.to_cleaning()
+        with mock.patch.object(build_run, "_read", killed_move(work)):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / ".git").is_file())
+        self.assertTrue(registered(self.repo, work))
+
+    def test_cleaning_that_cannot_put_a_tree_back_says_it_kept_it(self):
+        """Class pass: a tree left aside that git will not repair is kept and named, not called removed."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        os.rename(work, aside)
+        read = build_run._read
+
+        def refused(argv, *args, **kwargs):
+            if "repair" in argv:
+                raise build_run.Unread("git worktree repair failed: exit 1")
+            return read(argv, *args, **kwargs)
+
+        with mock.patch.object(build_run, "_read", refused):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_repairs_a_tree_put_back_on_disk_but_recorded_aside(self):
+        """Review of build/sd-2103: a put-back killed after its rename left git's record at the aside name."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        os.rename(aside, work)
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_cleaning_puts_back_a_tree_a_crash_left_aside_and_removes_it(self):
+        """Class pass: a run that died between the move aside and the remove left the tree aside."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(aside.exists() or work.exists())
 
     def test_a_held_build_worktree_is_kept(self):
         """pack sd:6024: a session other than the run's builder holds the worktree, so cleaning keeps it."""
@@ -5283,6 +5963,96 @@ def sd_quote(argv):
     return shlex.join(argv)
 
 
+class TargetSize(Case):
+    """sd:10384: a run that ends blocked or done notes the size of the Rust `target/` its kept worktree holds.
+
+    Ruling #91707 on #89515 dropped the automatic `cargo clean`: no file test tells a capture under
+    `target/debug/` from cargo's output, and the lane may still hold the worktree, so the run deletes nothing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.press()
+        self.work = Path(self.bundle["work_path"])
+
+    def rust(self):
+        """The run's worktree, holding a `Cargo.toml`, cargo's output and a capture under `target/debug/`."""
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        exclude(self.work, "target/\n")
+        (self.work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
+        (self.work / "target" / "debug" / "deps").mkdir(parents=True)
+        (self.work / "target" / "debug" / "deps" / "big.rlib").write_bytes(b"x" * 4096)
+        (self.work / "target" / "debug" / "repro.log").write_text("capture")
+        (self.work / "target" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+
+    def notes(self):
+        return [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+
+    def sized(self):
+        return [body for body in self.notes() if "Rust target/" in body]
+
+    def test_the_note_warns_that_a_clean_deletes_what_target_holds(self):
+        """Review of build/sd-1798: the note advised `cargo clean`, which deletes a capture saved under
+        `target/` too; on both paths, measured and unread, it says so and asks to move such files first."""
+        self.rust()
+        self.supervisor().note_target()
+        with mock.patch.object(build_run, "target_kib", side_effect=OSError("du")):
+            supervisor = self.supervisor()
+            supervisor.marks.clear()
+            supervisor.note_target()
+        self.assertEqual(len(self.sized()), 2, self.notes())
+        for body in self.sized():
+            self.assertNotIn("run cargo clean there", body)
+            self.assertIn("deletes every file in it", body)
+            self.assertIn("move out any file you keep first", body)
+
+    def capture_survives(self, outcome):
+        """Ruling #83955: target/debug/repro.log stays; the lead gets a note naming the size and the cleanup."""
+        self.rust()
+        self.assertEqual(self.supervisor().finish(outcome, "fixture end")["outcome"], outcome)
+        self.assertEqual((self.work / "target" / "debug" / "repro.log").read_text(), "capture")
+        self.assertTrue((self.work / "target" / "debug" / "deps" / "big.rlib").is_file())
+        sized = self.sized()
+        self.assertTrue(sized and all("GiB" in body and str(self.work) in body for body in sized), self.notes())
+
+    def test_a_capture_survives_a_blocked_run_and_the_size_is_noted(self):
+        self.capture_survives("blocked")
+
+    def test_a_capture_survives_a_done_run_and_the_size_is_noted(self):
+        self.capture_survives("done")
+
+    def test_a_replayed_end_notes_once(self):
+        self.rust()
+        supervisor = self.supervisor()
+        supervisor.note_target()
+        supervisor.note_target()
+        self.assertEqual(len(self.sized()), 1, self.notes())
+
+    def test_cancelled_and_timed_out_note_nothing(self):
+        self.rust()
+        for outcome in ("cancelled", "timed_out"):
+            self.supervisor().finish(outcome, "fixture end")
+        self.assertEqual(self.sized(), [])
+
+    def test_no_rust_no_target_a_linked_target_or_no_worktree_notes_nothing(self):
+        self.supervisor().note_target()  # no worktree
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        self.supervisor().note_target()  # no Cargo.toml
+        (self.work / "Cargo.toml").write_text("")
+        self.supervisor().note_target()  # no target/
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.work / "target").symlink_to(elsewhere)
+        self.supervisor().note_target()  # a linked target/ is someone else's
+        self.assertEqual(self.sized(), [])
+
+    def test_an_unread_size_still_notes_and_the_run_ends(self):
+        self.rust()
+        with mock.patch.object(build_run, "target_kib", side_effect=subprocess.TimeoutExpired(["du"], 300)):
+            self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
+        self.assertTrue(any("size unread" in body for body in self.sized()), self.notes())
+
+
 class Tick(Case):
     def setUp(self):
         super().setUp()
@@ -5337,6 +6107,10 @@ class Tick(Case):
         beat = self.db.execute("SELECT * FROM state WHERE kind = 'heartbeat' AND key = ?",
                                (build_run.HEARTBEAT,)).fetchone()
         self.assertIsNotNone(beat)
+        # sd:10934: the beat names the sd_db build the tick loaded, so the hub can tell a mismatch from a loss.
+        from sd_db import remote
+
+        self.assertEqual(json.loads(beat["body"])["build"], remote.build_digest())
         build.register(self.db, result["claimed"][0], pid=os.getpid(), pgid=os.getpgrp(),
                        start=build.Probe.started(os.getpid()))
         again = self.tick()
@@ -5447,6 +6221,341 @@ class Tick(Case):
         self.assertFalse(self.stored("e1").get("handed_back"))
         build.queue_again(self.db, self.items, who="operator", finding="x", expected_branch=run["branch"])
         self.assertTrue(self.stored("e1").get("handed_back"))
+
+    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
+                                   outsider=None, left_out=False, reverted=None, rebundled=False,
+                                   other_failed=False, claimed=False, newer=False, imported=False,
+                                   retried=False, jammed=False, made=False):
+        """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
+        builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
+        run = self.enqueued(2)
+        support.git(self.repo, "checkout", "-q", "-b", run["branch"])
+        (self.repo / "work.txt").write_text("the bundle's work\n", encoding="utf-8")
+        support.git(self.repo, "add", "work.txt")
+        trailers = "".join(f"\nCloses: sd:{item}" for item in self.items) if closes else ""
+        if outsider is not None:  # a trailer for an item outside the bundle, kept open by the failed entry
+            trailers += f"\nCloses: sd:{outsider}"
+        support.git(self.repo, "commit", "-qm", f"feat: the bundle's work\n{trailers}")
+        if reverted is not None:  # a commit that closes an item outside the bundle, reverted on the failed branch
+            (self.repo / "other.txt").write_text("another item's work\n", encoding="utf-8")
+            support.git(self.repo, "add", "other.txt")
+            support.git(self.repo, "commit", "-qm", f"feat: another item's work\n\nCloses: sd:{reverted}")
+            support.git(self.repo, "revert", "--no-edit", "HEAD")
+        head = support.git(self.repo, "rev-parse", "HEAD")
+        support.git(self.repo, "checkout", "-q", "main")
+        self.failed_branch = run["branch"]
+        if lost:  # the failed branch is gone and its entry names a commit this checkout lacks
+            support.git(self.repo, "branch", "-D", run["branch"])
+            head = "0" * 40
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red", "expected_head": head,
+                                       **({"imported_from": "queue.json"} if imported else {})}
+        self.tick()
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        if trimmed:  # the operator drops the failed branch's commit after the failure; the entry still names it
+            support.git(self.repo, "branch", "-f", run["branch"], f"{head}~1")
+            head = support.git(self.repo, "rev-parse", run["branch"])
+        rebuild = self.items[:count]
+        self.db.execute(f"UPDATE item SET status = 'ready' WHERE id IN ({', '.join('?' for _ in rebuild)})",
+                        rebuild)
+        queued = build.queue_again(self.db, rebuild, who="operator")
+        self.assertNotIn(run["assignment"], [entry["id"] for entry in queued], "a fresh press, not Fix")
+        if rebundled:  # that press is cancelled before a claim and pressed again: a bundle that never ran
+            self.db.execute(f"UPDATE assignment SET status = 'cancelled' WHERE id IN "
+                            f"({', '.join('?' for _ in queued)})", [entry["id"] for entry in queued])
+            build.queue(self.db, rebuild, who="operator")
+        if claimed:  # that press is claimed and cancelled before its builder ran: a run that built nothing
+            first = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+            assert first is not None
+            self.assertEqual(build.run(self.db, first["id"])["step"], "claimed")
+            self.assertIsNotNone(build.end(self.db, first["id"], "cancelled", "fixture: cancelled at its claim"))
+            with self.db:  # as the reap releases it once its groups read gone
+                stamp = build.clock()
+                self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (stamp, first["id"]))
+                self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, first["id"]))
+                for item in rebuild:
+                    build.unpark(self.db, item)
+            build.queue(self.db, rebuild, who="operator")
+        if newer:  # the lead was built since in a bundle of its own, which ran its builder and ended blocked
+            with self.db:
+                ran = self.db.execute("INSERT INTO assignment (item, role, status, lane, scope, run_count) "
+                                      "VALUES (?, 'author', 'blocked', 'parallel', ?, 1)",
+                                      (self.items[0], build.SCOPE)).lastrowid
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "step, outcome, released_at, created_at, updated_at) VALUES ('newer', ?, 1, ?, "
+                    "'build/sd-newer', 'fixture', '', '', 'building', 'blocked', '2999-01-01T00:00:00Z', "
+                    "'2999-01-01T00:00:00Z', '2999-01-01T00:00:00Z')", (ran, str(self.repo)))
+        if extra:  # an unrelated item, never built, queued beside them: the claim bundles it in
+            fresh = create_item(self.db, kind="task", title="Unrelated", repo=str(self.repo), status="ready")
+            if other_failed:  # its own bundle, with an item left out here, failed in the lane before
+                gone = create_item(self.db, kind="task", title="Left behind", repo=str(self.repo), status="ready")
+                build.queue(self.db, [fresh, gone], who="operator")
+                lead = self.db.execute("SELECT id FROM assignment WHERE item = ?", (fresh,)).fetchone()[0]
+                self.db.execute("UPDATE assignment SET status = 'done', parent = ? WHERE item = ?", (lead, gone))
+                self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (lead,))
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "outcome, released_at, created_at, updated_at) VALUES ('other', ?, 1, ?, 'build/sd-other', "
+                    "'fixture', '', '', 'lane_failed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', "
+                    "'2026-01-01T00:00:00Z')", (lead, str(self.repo)))
+                self.assertEqual(len(build.run(self.db, "other")["members"]), 2)
+            build.queue(self.db, [fresh], who="operator")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.assertNotEqual(self.bundle["branch"], run["branch"])
+        if left_out:  # a member cancelled out of the new bundle before its worktree: not selected
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+        if retried:  # a lane Retry of the failed entry since, on the same branch, which failed too
+            self.store({"id": "e2", "item": self.items[0], "status": "failed", "reason": "gate red again",
+                        "expected_head": head}, self.failed_branch)
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        if jammed:  # a file where the worktree goes: `git worktree add` fails
+            Path(self.bundle["work_path"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.bundle["work_path"]).write_text("in the way\n", encoding="utf-8")
+            self.assertEqual(supervisor.worktree().get("outcome"), "blocked")
+            return head, supervisor
+        if made:  # an earlier try of this start made the worktree, then stopped before anything else
+            support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], self.bundle["work_path"],
+                        support.git(self.repo, "rev-parse", self.failed_branch))
+        self.assertEqual(supervisor.worktree(), "building")
+        return head, supervisor
+
+    def test_a_fresh_build_after_a_lane_failure_starts_from_the_failed_head(self):
+        """sd:10379: it started from origin/main and dropped the bundle's commits; it starts from the branch tip."""
+        head, supervisor = self.rebuilt_after_lane_failure(2)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+        self.assertIn("gate red", supervisor.brief()["findings"])
+
+    def test_a_fresh_build_starts_from_the_failed_branch_as_the_operator_left_it(self):
+        """Review of build/sd-1808: it preferred the entry's head, so a commit the operator removed from the failed
+        branch came back. It starts from the branch's tip now."""
+        head, _ = self.rebuilt_after_lane_failure(2, trimmed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_fresh_build_at_the_failed_head_enters_the_lane_again(self):
+        """Review of build/sd-1808: the rebuilt branch starts at the failed head, so the old failed entry matched
+        its head, and the run took it as its own enqueue: it ended lane_failed again, never in the lane. Only an
+        entry of this run's branch is its own."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual([(row["status"], row["expected_head"]) for row in entries],
+                         [("failed", head), ("pending", head)])
+
+    def test_an_unchanged_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Lead review of build/sd-1808: an earlier version's entry failed head H on a flaky gate; the rebuild
+        started at H and changed nothing. The lane's guard (`sd_lane.refuse_ran`) refused H as already run, and
+        the recovery reads only this run's branch, so the run blocked. The rebuild that starts at the failed head
+        hands that entry back, as Fix does, and the same head enters the lane again."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
+        # A second try of the same start (a crash before its worktree) finds it handed back and writes nothing.
+        before = self.stored("e1")
+        failed = build.lane_failed_start(self.db, self.bundle["assignment"])
+        assert failed is not None
+        self.assertIn("cancelled", build.take_over(self.db, failed, self.bundle["id"]))
+        self.assertEqual(self.stored("e1"), before)
+
+    def test_a_rebuild_hands_back_only_the_entry_its_failed_run_recorded(self):
+        """Lead review of build/sd-1808: a lane Retry of the failed entry e1 queued e2 on the same branch, which
+        failed too, and the rebuild handed back e2, an attempt its failed run never read. Only the recorded
+        entry is handed back; another newest entry is left as it is."""
+        self.rebuilt_after_lane_failure(2, retried=True)
+        self.assertEqual(self.stored("e2")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e2"))
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_failed_worktree_add_hands_nothing_back(self):
+        """Lead review of build/sd-1808: the hand-back ran before `git worktree add`; the add failed, and the
+        failed entry was cancelled with no checkout to replace it, so Retry of it was refused. It runs after."""
+        self.rebuilt_after_lane_failure(2, jammed=True)
+        self.assertEqual(self.stored("e1")["status"], "failed")
+        self.assertNotIn("handed_back", self.stored("e1"))
+
+    def test_a_resumed_start_with_its_worktree_made_hands_the_entry_back(self):
+        """Lead review of build/sd-1808: a try that made the worktree and stopped before the hand-back left the
+        entry failed; the next try finds the worktree and hands it back then."""
+        self.rebuilt_after_lane_failure(2, made=True)
+        self.assertEqual(self.stored("e1")["status"], "cancelled")
+        self.assertTrue(self.stored("e1")["handed_back"])
+
+    def test_a_changed_rebuild_of_an_imported_failed_entry_enters_the_lane(self):
+        """Class pass of the lead review of build/sd-1808: a rebuild that moved the head past the imported
+        entry's enters the lane as a new head, the old entry handed back."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, imported=True)
+        work = Path(self.bundle["work_path"])
+        (work / "fix.txt").write_text("the gate's fix\n", encoding="utf-8")
+        support.git(work, "add", "fix.txt")
+        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", "fix: the gate's fix")
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "failed", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head, "imported_from": "queue.json"}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        entries = json.loads((self.plans / "lane.json").read_text())
+        self.assertEqual(entries[-1]["expected_head"], support.git(work, "rev-parse", "HEAD"))
+        self.assertNotEqual(entries[-1]["expected_head"], head)
+
+    def test_a_refused_rebuild_enqueue_never_adopts_the_failed_branchs_entry(self):
+        """Review of build/sd-1808: the enqueue refused, and its recovery took the newest entry at this head as the
+        run's own, the failed branch's included. Only an entry of this run's branch is its own: the run blocks."""
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True)
+        self.write_pr()
+        old = {"id": "e1", "item": self.items[0], "status": "pending", "enqueue_seq": 1,
+               "branch": self.failed_branch, "expected_head": head}
+        (self.plans / "lane.json").write_text(json.dumps([old]))
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("already queued in this lane", ended["blocked"])
+
+    def test_a_rebuilt_failed_bundle_with_an_unrelated_item_beside_it_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: an item never built, bundled in with the whole failed bundle, sent the
+        branch to main and dropped the bundle's commits. Its commits cite only items this bundle holds."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, extra=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3, "the unrelated item rides along")
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+
+    def test_a_rebuild_bundled_afresh_twice_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: a press cancelled before its claim left each item a newer assignment that
+        never ran, so the read found no lane-failed build and the branch started from main. The newest build
+        that ran is the one that counts."""
+        head, _ = self.rebuilt_after_lane_failure(2, rebundled=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_rebuild_claimed_and_cancelled_before_its_builder_keeps_the_failed_head(self):
+        """Lane review of build/sd-1808: a fresh bundle of a whole failed bundle, claimed and cancelled before its
+        builder ran, left each item a newer run that built nothing, and the next fresh bundle started from main
+        without the failed bundle's commits. A run that never reached its builder hides no failed bundle."""
+        head, _ = self.rebuilt_after_lane_failure(2, claimed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(build.outside_rebuild(self.db, self.bundle["assignment"], [99999]), [99999],
+                         "the delivery keeps a citation outside the bundle open as well")
+
+    def test_a_failed_bundle_whose_item_was_built_since_starts_from_main(self):
+        """Lane review of build/sd-1808: the lead was built again after its bundle failed in the lane; the other
+        member's last build named the failed bundle, so the fresh bundle started there, from the lead's older
+        commits. A failed bundle sets the start only when it is the last build of every item it built."""
+        head, _ = self.rebuilt_after_lane_failure(2, newer=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        self.assertNotEqual(head, support.git(self.repo, "rev-parse", "main"))
+
+    def test_a_rebuild_beside_an_item_of_another_failed_bundle_starts_from_the_whole_one(self):
+        """Lane review of build/sd-1808: an item whose own earlier bundle failed in the lane, bundled in with a
+        whole failed bundle, named two runs, and the branch started from main. The whole one wins."""
+        head, _ = self.rebuilt_after_lane_failure(2, extra=True, other_failed=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_failed_branch_that_closes_an_item_outside_the_bundle_starts_from_main(self):
+        """Review of build/sd-1808: the failed branch's commit closes an open item this bundle does not hold, one the
+        failed entry kept open; its merge would close it unselected. It starts from main and says why."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True, outsider=kept)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in body for body in notes), notes)
+
+    def test_a_member_that_leaves_mid_run_turns_no_delivery_check_off(self):
+        """Class pass of build/sd-1808: the delivery's read of the rebuild is history alone, so a member cancelled
+        out since the start (`lane_failed_start` then answers None) still leaves the outside citation open."""
+        self.test_a_citation_revived_after_the_start_stays_open_at_delivery(leaves=True)
+
+    def test_a_citation_revived_after_the_start_stays_open_at_delivery(self, leaves=False):
+        """Class pass of build/sd-1808: the start read the failed branch's citations once. One a revert hid there
+        came back when the rebuild reverted the revert, and the merge would close an item no one selected. The
+        delivery reads them again and keeps each outside the bundle open with a `Refs:` line."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head, "the hidden citation passes the start")
+        support.git(work, "revert", "--no-edit", "HEAD")
+        if leaves:
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+            self.assertIsNone(build.lane_failed_start(self.db, self.bundle["assignment"]))
+        self.write_pr()
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertIn(f"Refs: sd:{kept}", body.splitlines())
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in note and "outside" in note for note in notes), notes)
+
+    def test_a_fenced_refs_line_keeps_no_outside_citation_open(self):
+        """Ruling on sd:10379: a `Refs:` line inside a code fence names nothing (`sd_ship_body.referenced_ids`),
+        so the delivery still adds a live one for a citation outside the bundle."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        support.git(Path(self.bundle["work_path"]), "revert", "--no-edit", "HEAD")
+        self.write_pr(body=f"## Summary\n\nx\n\n## Test plan\n\n```\nRefs: sd:{kept}\n```\n")
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertTrue(body.endswith(f"```\n\nRefs: sd:{kept}\n"), body)
+
+    def test_the_refs_lines_a_delivery_adds_pass_the_lane_line_check(self):
+        """Review of build/sd-1808: one `Refs:` line for many items ran past the lane's 72 characters, and
+        enqueue refused the body. Each added line keeps to the limit, and together they name every item."""
+        ship = build_run._ship_body()
+        items = list(range(10001, 10013))
+        body = build_run.with_refs("## Summary\n\nx\n", items)
+        assert body is not None
+        self.assertEqual(ship.long_lines(body), [])
+        self.assertEqual(ship.referenced_ids(body), set(items))
+        self.assertEqual(build_run.with_refs(body, items), body, "a second pass adds nothing")
+
+    def test_a_body_left_in_an_open_fence_gets_no_dead_refs_line(self):
+        """Review of build/sd-1808: a line added after an unclosed fence names nothing, so the merge would close
+        the item. The helper answers None; the delivery blocks rather than enqueue."""
+        self.assertIsNone(build_run.with_refs("## Summary\n\n```\nx\n", [10001]))
+
+    def test_a_member_cancelled_out_of_the_new_bundle_sends_it_to_main(self):
+        """Review of build/sd-1808: the bundle read counted a member cancelled out of it (`ALONE`) as selected."""
+        head, _ = self.rebuilt_after_lane_failure(2, left_out=True)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+
+    def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
+        """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""
+        head, supervisor = self.rebuilt_after_lane_failure(1)
+        work = Path(self.bundle["work_path"])
+        self.assertNotEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+
+    def test_a_failed_branch_that_does_not_read_starts_from_main_and_says_so(self):
+        """sd:10379: a fallback to main is no silent loss of the bundle's commits: a note on the lead says why."""
+        self.rebuilt_after_lane_failure(2, lost=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any("did not read here" in body for body in notes), notes)
 
     def reopened_dependency(self):
         """The bundle's lead waits on an item reopened since its build: the dependency is open again."""
@@ -5970,6 +7079,154 @@ class Sweep(Case):
         self.assertTrue(work.is_dir())
         self.assertNotEqual(self.branches(), "")
 
+    def test_a_session_that_holds_the_tree_during_the_sweep_keeps_it(self):
+        """Review of build/sd-2103: a hold registered after the sweep's first check still keeps the tree."""
+        work = self.blocked()
+        self.done()
+        read = build_run.kept_files
+
+        def arriving(*args, **kwargs):
+            sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
+                          found=sessions.worktrees([str(work)]))
+            return read(*args, **kwargs)
+
+        with mock.patch.object(build_run, "kept_files", arriving):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue(work.is_dir())
+
+    def test_a_sweep_whose_lock_is_lost_at_the_commit_keeps_the_tree(self):
+        """Class pass, build/sd-2103: a lost satellite transaction proves no hold; the tree stays."""
+        work = self.blocked()
+        self.done()
+        with mock.patch.object(build_run, "transaction", lost_lock), self.assertRaises(remote.TransactionLost):
+            build_run.sweep(self.db)
+        self.assertTrue((work / ".git").is_file())
+
+    def test_a_sweep_keeps_a_tree_an_ignored_file_reaches_after_the_clean_check(self):
+        """Class pass: the clean check is read again once the tree is aside, before git deletes it."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "late.cfg\n")
+        with mock.patch.object(build_run, "kept_files", arriving_file(work / "late.cfg")):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "late.cfg").read_text(), "mine\n")
+
+    def test_a_hold_committed_after_the_sweep_moves_the_tree_keeps_it(self):
+        """Review of build/sd-2103: a beat found under the tree's first name, committed once it is aside."""
+        work = self.blocked()
+        self.done()
+        with mock.patch.object(build_run, "_read", late_beat(self.db, work)):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+
+    def test_a_hold_on_the_aside_name_a_crash_left_keeps_the_tree(self):
+        """Class pass: a session that found the tree aside holds it by that name once it is put back."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
+                      found=sessions.worktrees([str(aside)]))
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+
+    def test_a_sweep_puts_back_a_tree_git_never_recorded_aside_and_removes_it(self):
+        """Review of build/sd-2103: a move killed after its rename left git's record at the first name."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        os.rename(work, aside)
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_a_sweep_whose_move_dies_after_the_rename_puts_the_tree_back(self):
+        """Class pass: the move that fails is the one the sweep ran, so no later pass is needed."""
+        work = self.blocked()
+        self.done()
+        with mock.patch.object(build_run, "_read", killed_move(work)):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+        self.assertTrue(registered(self.repo, work))
+
+    def test_a_sweep_moves_no_tree_into_a_folder_in_the_way(self):
+        """Class pass: git moves a tree into an existing folder, under its own name, where none looks."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        aside.mkdir()
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+        self.assertFalse((aside / work.name).exists())
+
+    def test_a_sweep_repairs_a_tree_put_back_on_disk_but_recorded_aside(self):
+        """Review of build/sd-2103: a put-back killed after its rename left git's record at the aside name."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        os.rename(aside, work)
+        self.assertFalse(registered(self.repo, work))
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_a_sweep_after_a_put_back_killed_at_its_repair_removes_the_tree(self):
+        """Class pass: every state a killed put-back leaves is one the next pass recovers from."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        with mock.patch.object(build_run, "_read", refused_once("repair")):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_a_tree_kept_after_a_put_back_killed_at_its_repair_is_repaired(self):
+        """Class pass: the put-back on the way out of a removal that kept the tree is recovered the same."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "late.cfg\n")
+        with mock.patch.object(build_run, "kept_files", arriving_file(work / "late.cfg")), \
+                mock.patch.object(build_run, "_read", refused_once("repair", (work / "late.cfg").exists)):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertFalse(registered(self.repo, work), "the state the killed repair left")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue(registered(self.repo, work))
+        self.assertEqual((work / "late.cfg").read_text(), "mine\n")
+
+    def test_a_tree_half_removed_aside_is_put_back_and_kept(self):
+        """Class pass: a `git worktree remove` killed mid-delete left part of the tree; it is no clean tree."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        tracked = support.git(aside, "ls-files", "--deduplicate").splitlines()[0]
+        (aside / tracked).unlink()
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue(registered(self.repo, work))
+        self.assertFalse(aside.exists())
+
+    def test_what_a_killed_removal_left_aside_is_not_deleted(self):
+        """Class pass: a folder at the aside name that is no worktree is no tree to put back or remove."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "remove", str(work))
+        aside.mkdir()
+        (aside / "left.txt").write_text("mine\n")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((aside / "left.txt").read_text(), "mine\n")
+        self.assertFalse(work.exists())
+
+    def test_a_sweep_puts_back_a_tree_a_crash_left_aside_and_removes_it(self):
+        """Class pass: a sweep that died between the move aside and the remove left the tree aside."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
     def test_a_dirty_or_held_or_open_worktree_is_kept(self):
         work = self.blocked()
         self.done()
@@ -5989,14 +7246,82 @@ class Sweep(Case):
         """Lane review: `git worktree remove` deletes ignored files, and plain `status --porcelain` omits them."""
         work = self.blocked()
         self.done()
-        common = Path(support.git(work, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        (common / "info").mkdir(exist_ok=True)
-        (common / "info" / "exclude").write_text(".env\n")
+        exclude(work, ".env\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.assertEqual(support.git(work, "status", "--porcelain"), "", "the plain read sees a clean tree")
         self.assertEqual(build_run.sweep(self.db), [])
         self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
         self.assertNotEqual(self.branches(), "")
+
+    def test_no_place_in_a_cargo_target_makes_a_file_disposable(self):
+        """Review of build/sd-1867, the class pass. The class: where an ignored file sits (a folder's name,
+        a cache tag, a manifest beside it, cargo's lock) stood in for proof that the file itself can be
+        rebuilt. Cargo records no list of its files, so each place cargo writes can hold the only copy of
+        a local one. Every ignored file of a complete cargo target keeps the tree, row by row."""
+        work = self.blocked()
+        self.done()
+        cargo(work, "", "crates/one")
+        exclude(work, "target/\n")
+        rows = {
+            "CACHEDIR.TAG": CACHE_TAG,                              # the tag and the manifest
+            ".rustc_info.json": "{}\n",                             # a cargo file name at the top
+            ".env": "TOKEN=change-me\n",                            # a local file at the top
+            "debug/.cargo-lock": "",                                # the lock itself
+            "debug/captured-input.bin": "x",                        # a captured input in a locked profile
+            "debug/deps/captured-input.bin": "x",                   # below a locked profile
+            "debug/build/example-0a1b/out/captured-input.bin": "x",  # a build script's output folder
+            "debug/incremental/captured-input.bin": "x",
+            "example-triple/release/.cargo-lock": "",               # a target triple's profile
+            "example-triple/release/captured-input.bin": "x",
+        }
+        for target in ("target", "crates/one/target"):
+            for path, text in rows.items():
+                (work / target / path).parent.mkdir(parents=True, exist_ok=True)
+                (work / target / path).write_text(text)
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(),
+                         sorted(f"!! {target}/{path}" for target in ("crates/one/target", "target")
+                                for path in rows))
+        # sd:10830, operator ruling 2026-11-27: the sweep alone, once every item is done and the head is
+        # kept at refs/sd-swept, reads a target/ beside its Cargo.toml as rebuildable and removes the tree.
+        self.assertEqual(build_run.kept_files(("git",), str(work), build_output=True), "")
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+
+    def test_a_folder_only_named_like_build_output_keeps_the_tree(self):
+        """Review of build/sd-1867, the class: a folder's name alone made its ignored files disposable, so local
+        files under any `target/`, `node_modules/` or `.venv/` went with the tree. No name decides."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "target/\nnode_modules/\n.venv/\n*.local\n")
+        (work / "docs" / "target").mkdir(parents=True)
+        (work / "docs" / "target" / "notes.local").write_text("mine\n")
+        (work / "node_modules").mkdir()
+        (work / "node_modules" / "patch.js").write_text("mine\n")
+        (work / ".venv").mkdir()
+        (work / ".venv" / "secrets.cfg").write_text("mine\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)),
+                         "!! .venv/secrets.cfg\n!! docs/target/notes.local\n!! node_modules/patch.js")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "docs" / "target" / "notes.local").read_text(), "mine\n")
+
+    def test_the_sweep_keeps_ignored_config_beside_a_real_cache(self):
+        """Lead ruling on build/sd-1867: a cache tag makes no folder build output, so a hand-edited config in
+        one keeps the tree; a real cache (`__pycache__`) beside it changes nothing."""
+        work = self.blocked()
+        self.done()
+        cargo(work)
+        exclude(work, "target/\nconfig/\nout/\n__pycache__/\n")
+        for folder in ("target", "config", "out"):
+            (work / folder).mkdir()
+            (work / folder / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / ".rustc_info.json").write_bytes(b"x")
+        (work / "__pycache__").mkdir()
+        (work / "__pycache__" / "x.pyc").write_bytes(b"x")
+        (work / "config" / "local.toml").write_text("mine\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)).splitlines(), [
+            "!! config/CACHEDIR.TAG", "!! config/local.toml", "!! out/CACHEDIR.TAG",
+            "!! target/.rustc_info.json", "!! target/CACHEDIR.TAG"])
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "config" / "local.toml").read_text(), "mine\n")
 
     def test_a_tree_with_only_caches_is_swept(self):
         """pack sd:6979: a disposable cache is no reason to keep a tree; another ignored file still is."""
@@ -6012,6 +7337,121 @@ class Sweep(Case):
         (work / ".env").unlink()
         self.assertEqual(build_run.sweep(self.db), [str(work)])
         self.assertFalse(work.exists())
+
+    def generated(self, *patterns):
+        repos.set_declaration(self.db, self.repo, "generated", {"paths": list(patterns)})
+
+    def test_a_declared_generated_path_goes_and_the_clean_tree_with_it(self):
+        """sd:10752: the sweep deletes the paths the repo declares its tools write, then removes the tree."""
+        work = self.blocked()
+        self.done()
+        exclude(work, ".ci/\n.venv-check/\n*.csproj\nreports/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        (work / ".venv-check").mkdir()
+        (work / ".venv-check" / ".gitignore").write_text("*\n")
+        (work / "Assembly-CSharp-Editor.csproj").write_text("<x/>\n")
+        (work / "reports").mkdir()
+        (work / "reports" / "junit.xml").write_text("<x/>\n")
+        self.assertEqual(build_run.sweep(self.db), [], "nothing declared: each keeps the tree")
+        self.generated(".ci/bin/launchctl", ".venv-check/", "*.csproj", "reports/junit.xml")
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(work.exists())
+
+    def test_an_undeclared_ignored_file_keeps_the_tree_and_every_declared_path(self):
+        """sd:10752: one ignored file the repo does not declare keeps the tree whole; nothing is deleted."""
+        work = self.blocked()
+        self.done()
+        self.generated("reports/junit.xml", "*.csproj")
+        exclude(work, "reports/\n*.csproj\n.env\n")
+        (work / "reports").mkdir()
+        (work / "reports" / "junit.xml").write_text("<x/>\n")
+        (work / "reports" / "notes.xml").write_text("mine\n")
+        (work / "sub").mkdir()
+        (work / "sub" / "Hand.csproj").write_text("mine\n")
+        self.assertEqual(build_run.sweep(self.db), [], "a glob matches the root alone, a path exactly")
+        self.assertTrue((work / "reports" / "junit.xml").exists(), "nothing goes while the tree stays")
+        (work / "reports" / "notes.xml").unlink()
+        (work / "sub" / "Hand.csproj").unlink()
+        (work / ".env").write_text("TOKEN=change-me\n")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
+        self.assertTrue((work / "reports" / "junit.xml").exists())
+
+    def stub(self, work):
+        """A declared, ignored gate stub in `work`: the one file that would go with the tree."""
+        exclude(work, ".ci/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        self.generated(".ci/bin/launchctl")
+        return work / ".ci" / "bin" / "launchctl"
+
+    def test_a_tree_git_refuses_to_remove_keeps_its_declared_files(self):
+        """sd:10752 class pass: a declared file goes only with its tree; a locked worktree loses nothing."""
+        work = self.blocked()
+        self.done()
+        stub = self.stub(work)
+        support.git(self.repo, "worktree", "lock", str(work))
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual(stub.read_text(), "stub\n")
+        support.git(self.repo, "worktree", "unlock", str(work))
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+
+    def test_a_tree_off_its_branch_keeps_its_declared_files(self):
+        """sd:10752 class pass: a detached HEAD off its branch keeps the tree, so no declared file goes."""
+        work = self.blocked()
+        self.done()
+        stub = self.stub(work)
+        support.git(work, "-c", "user.name=operator", "-c", "user.email=operator@example.test", "commit",
+                    "--allow-empty", "-m", "ahead")
+        support.git(work, "checkout", "--detach", "HEAD~1")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual(stub.read_text(), "stub\n")
+
+    def test_reading_what_keeps_a_tree_deletes_nothing(self):
+        """sd:10752 class pass: `kept_files` only reads; git's own remove is the one delete."""
+        work = self.blocked()
+        stub = self.stub(work)
+        (work / ".ci" / "bin" / "mine").write_text("x\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work), generated=(".ci/bin/launchctl",)),
+                         "!! .ci/bin/mine")
+        (work / ".ci" / "bin" / "mine").unlink()
+        self.assertEqual(build_run.kept_files(("git",), str(work), generated=(".ci/bin/launchctl",)), "")
+        self.assertEqual(stub.read_text(), "stub\n")
+
+    def test_a_name_ending_in_a_unicode_line_end_still_keeps_the_tree(self):
+        """sd:10752 ruling: git ends a status line at "\\n" alone; `splitlines` also cut at U+2028 and
+        the like, so an undeclared name read as a declared one and its tree went."""
+        work = self.blocked()
+        self.stub(work)
+        for end in (" ", " ", "\x85"):
+            with self.subTest(end=repr(end)):
+                odd = work / ".ci" / "bin" / f"launchctl{end}"
+                odd.write_text("x\n")
+                self.assertEqual(build_run.kept_files(("git",), str(work), generated=(".ci/bin/launchctl",)),
+                                 f"!! .ci/bin/launchctl{end}")
+                odd.unlink()
+
+    def test_a_declared_path_behind_a_symlink_is_not_followed(self):
+        """sd:10752: a declared path whose folder links outside the tree deletes nothing there."""
+        work = self.blocked()
+        self.done()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "junit.xml").write_text("keep\n")
+        (work / "reports").symlink_to(outside, target_is_directory=True)
+        exclude(work, "reports\n")
+        self.generated("reports/junit.xml", "reports")
+        build_run.sweep(self.db)
+        self.assertEqual((outside / "junit.xml").read_text(), "keep\n")
+
+    def test_a_generated_declaration_out_of_shape_is_refused(self):
+        value: Any
+        for value in ({"paths": ["/etc/passwd"]}, {"paths": ["../x"]}, {"paths": ["a/../b"]}, {"paths": [".git/x"]},
+                      {"paths": ["a\nb"]}, {"paths": [""]}, {"paths": []}, {"paths": "x"}, {"paths": [1]},
+                      {"paths": ["a\\b"]}, {"other": 1}, {"paths": ["x" * 300]}):
+            with self.subTest(value=value), self.assertRaises(repos.RepoRefusal):
+                repos.set_declaration(self.db, self.repo, "generated", value)
 
     def test_an_ignored_file_named_like_a_cache_still_keeps_the_tree(self):
         """Lane review of pack sd:6979: only a folder of that name is disposable, not a file."""
@@ -6766,6 +8206,184 @@ class Drafts(Case):
         self.park_bundle()
         queued = build.retry(self.db, self.bundle["assignment"], who="operator")["queued"]
         self.assertEqual([row["item"] for row in queued], [code, design])
+
+    def test_a_blocked_design_builds_again_after_its_code_bundle_ships(self):
+        """Pack sd:10294: a design the builder skipped with an open question ended blocked, and its code
+        bundle shipped. Retry refused, as the lead is done, and Build pressed it fresh, which refused a
+        blocked item. Once ruled, Build queues its ride again."""
+        design = self.designed("draft-plain")
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        build.queue(self.db, [code], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
+        asked = add_note(self.db, design, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [code]))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (code,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"question note #{asked}"):
+            build.queue_again(self.db, [design], who="operator")
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, design, "decision", f"Ruling on note #{asked}: A")
+        resolve_note(self.db, asked)
+        [ride] = build.queue_again(self.db, [design], who="operator")
+        self.assertEqual((ride["item"], ride["status"], ride["scope"]), (design, "queued", build.SCOPE))
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "ready")
+
+    def test_a_blocked_task_builds_again_only_once_its_question_is_answered(self):
+        """Review of build/sd-1867: Build lifted a task its run blocked on a builder question to ready once
+        its bundle shipped, and the press checks no question on a task, so it built before the answer."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+
+    def test_the_dashboard_press_builds_an_answered_item_its_bundle_left_blocked(self):
+        """Review of build/sd-1867: only `queue_again` lifted a build's own block. The dashboard's dialog
+        check (`_item`) and its press (`queue`) refused the item as blocked, answered or not."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        for check in (lambda: build._item(self.db, second), lambda: build.queue(self.db, [second], who="dashboard")):
+            with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+                check()
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        build._item(self.db, second)
+        [again] = build.queue(self.db, [second], who="dashboard")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "ready")
+
+    def test_the_dashboard_press_leaves_a_retryable_bundles_block(self):
+        """Class pass of build/sd-1867: a member whose bundle Retry still takes keeps its block on a
+        press: a fresh build would leave the bundle's branch behind."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        self.db.execute("UPDATE assignment SET status = 'blocked', result = ? WHERE id = ? OR parent = ?",
+                        (f"build run {bundle['id']} ended", lead, lead))
+        for item in (first, second):
+            writes.transition(self.db, item, "blocked", who="build", reason=f"build run {bundle['id']} ended")
+        with self.assertRaisesRegex(build.BuildRefused, "is blocked"):
+            build.queue(self.db, [second], who="dashboard")
+
+    def test_build_keeps_an_operator_block_newer_than_its_run(self):
+        """Review of build/sd-1867: Build lifted any blocked item whose newest build ended blocked, so an
+        operator's later block went too. Only the build's own block, still the item's latest, lifts."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        writes.transition(self.db, second, "ready", who="operator")
+        writes.transition(self.db, second, "blocked", who="operator", reason="hold for the vendor")
+        with self.assertRaises(build.BuildRefused):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the operator's block stays")
+
+    def test_a_later_run_of_the_bundle_does_not_hide_the_blocking_question(self):
+        """Review of build/sd-1867: Build read questions from the bundle's newest run. A lane Fix claims
+        the bundle again after the run that blocked a skipped task, so its question went unread and the
+        task built unanswered. Questions are read from the run that blocked the item."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix",
+                              stamp="2999-01-01T00:00:00Z")  # the Fix's claim, since ended
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
+    def test_a_rebuild_claimed_at_the_block_stamp_does_not_hide_the_question(self):
+        """Class pass of build/sd-1867: Build found the run that blocked an item by time, so a lane rebuild
+        claimed in the block's own second read as that run and hid the question. The block's reason names
+        its run, and that run is the one read."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?", (bundle["id"],))
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:01Z' WHERE id = ?", (asked,))
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        ended = self.db.execute("SELECT ended FROM assignment WHERE item = ? AND status = 'blocked'",
+                                (second,)).fetchone()[0]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix", stamp=ended)
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
+    def test_a_block_that_names_no_run_reads_every_question(self):
+        """Class pass of build/sd-1867: a build block whose reason names no run of its bundle has no run to
+        read questions from, so no time stands in for one: every pending question holds the Build."""
+        self.assertEqual(build._blocking_run(self.db, 1, "refused; not built"), None)
+        self.assertEqual(build._blocking_run(self.db, 1, "build run " + "f" * 32 + " ended"), None,
+                         "a run id no run of this bundle holds")
+
+    def test_build_reads_only_the_questions_its_blocking_run_raised(self):
+        """Lane review of build/sd-1867: Build refused a run-blocked item on any pending question, so an
+        unrelated one asked before that build was queued held a Build that worked before."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        older = add_note(self.db, second, "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = ? WHERE id = ?", ("2000-01-01T00:00:00Z", older))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
 
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""

@@ -41,7 +41,7 @@ Fix: put every trailer in the final paragraph, one per line, with no blank line 
     Delivers: sd:N
 
 Check after committing: git log -1 --format='%(trailers:key=Delivers,valueonly)'
-must print the value. The rejected message is kept in .git/COMMIT_EDITMSG.
+must print the value. The rejected message is kept in {kept}.
 """
 
 
@@ -77,7 +77,9 @@ def main(argv: list[str]) -> int:
     if not replaying and not message.startswith(("fixup! ", "squash! ", "amend! ")):
         # Comment lines: any char git's `auto` may pick, or the configured string; a verbose diff
         # sits below a scissors line in that char. ponytail: such a line is skipped even where git
-        # keeps it (-m/-F); the lane refuses it (filed with the --body-only advisory).
+        # keeps it (-m/-F): the hook cannot read git's cleanup mode, and a guess from the command
+        # line refused git's own status comments (pack sd:10220). The build's enqueue check and
+        # the lane measure the saved message, `#` lines too.
         # Read raw: git_output strips stdout, and a comment string may start with spaces.
         configured = (subprocess.run(["git", "config", "--get", key], cwd=root, capture_output=True,
                                      text=True, check=False).stdout.rstrip("\n")
@@ -107,7 +109,7 @@ def main(argv: list[str]) -> int:
                 print(f"commit-msg: refused, a line is {length} characters (limit {sd_ship_body.LINE_LIMIT}): "
                       f"{kept[number - 1][:40]}...", file=sys.stderr)
             print("Rewrap it; a fenced code line or a bare URL line is exempt. "
-                  "The rejected message is kept in .git/COMMIT_EDITMSG.", file=sys.stderr)
+                  f"The rejected message is kept in {message_file.resolve()}.", file=sys.stderr)
             return 1
     if not sd_lib.unread_trailers(message, ""):  # states none of the checked trailers
         return 0
@@ -126,7 +128,7 @@ def main(argv: list[str]) -> int:
           file=sys.stderr)
     for line in stray:
         print(f"    {line}", file=sys.stderr)
-    print(FIX, end="", file=sys.stderr)
+    print(FIX.format(kept=message_file.resolve()), end="", file=sys.stderr)
     return 1
 
 

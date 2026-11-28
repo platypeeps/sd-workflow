@@ -7,6 +7,7 @@ operator's `--replace`, named per stem on an import. Every database and
 folder is a temp dir; nothing reads the operator's vault or store.
 """
 
+import datetime
 import hashlib
 import json
 import os
@@ -468,6 +469,29 @@ class TheVerbs(Briefs):
         self.assertIn(f"{DAILY}: the row holds other text", refused.stderr)
         extended = self.sd("add", str(draft), "--belongs-to", str(self.checkout), "--extend")
         self.assertEqual((extended.returncode, extended.stdout), (0, f"extended {DAILY}\n"), extended.stderr)
+
+    def test_a_list_past_its_limit_says_so_and_show_still_finds_the_rest(self):
+        """sd:10638: `list` printed 200 of 300 briefs and said nothing. It still prints the newest 200,
+        in the same text and JSON, and says on stderr that more exist and how to reach them."""
+        first = datetime.date(2026, 1, 1)
+        stems = [f"{first + datetime.timedelta(days=n)} - Daily Intel Brief" for n in range(201)]
+        for stem in stems:
+            self.add(stem=stem)
+        self.db.commit()
+        for args in (("list",), ("list", "--json")):
+            listed = self.sd(*args)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            shown = json.loads(listed.stdout) if "--json" in args else listed.stdout.splitlines()
+            self.assertEqual(len(shown), 200)
+            self.assertIn("showing the newest 200 briefs; more exist", listed.stderr)
+            self.assertIn("--series or --since", listed.stderr)
+        narrowed = self.sd("list", "--since", stems[-3][:10])
+        self.assertEqual((len(narrowed.stdout.splitlines()), narrowed.stderr), (3, ""))
+        self.assertEqual(self.sd("show", stems[0]).stdout, TEXT)
+        missing = self.sd("show", "2025-12-31 - Daily Intel Brief")
+        self.assertEqual((missing.returncode, missing.stdout), (1, ""))
+        self.assertIn("2025-12-31 - Daily Intel Brief", missing.stderr)
+        self.assertIn("at most 200", self.sd("list", "--help").stdout)
 
     def test_an_unusable_draft_exits_2_and_extend_with_replace_is_refused(self):
         bad = self.root / "notes.md"

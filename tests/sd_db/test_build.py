@@ -1527,18 +1527,26 @@ class Reap(Case):
 
     def test_build_with_a_finding_on_a_blocked_bundle_sends_it_to_the_builder(self):
         """pack sd:8792: `sd assignments build N --finding TEXT` is Send to builder: the finding note the builder
-        reads, then the bundle queued again. A fresh build has no builder to send it to, so it refuses."""
+        reads, then the bundle queued again. A fresh item in the same press builds with the note too (sd:10320)."""
         build.write(self.db, self.bundle["id"], step="building")
         row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
         build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
         fresh = self.item()
-        with self.assertRaisesRegex(build.BuildRefused, f"--finding .*sd:{fresh}"):
-            build.queue_again(self.db, [self.items[0], fresh], who="operator", finding="check the parser")
-        self.assertEqual(self.statuses(self.items), ["blocked", "blocked"], "one refusal writes nothing")
-        queued = build.queue_again(self.db, [self.items[0]], who="operator", finding="check the parser")
+        queued = build.queue_again(self.db, [self.items[0], fresh], who="operator", finding="check the parser")
         self.assertEqual({entry["status"] for entry in queued}, {"queued"})
-        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
-        self.assertIn(build.FINDING + "check the parser", notes)
+        self.assertEqual({entry["item"] for entry in queued}, {*self.items, fresh})
+        for item in (self.items[0], fresh):
+            notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (item,))]
+            self.assertEqual(notes.count(build.FINDING + "check the parser"), 1, notes)
+
+    def test_a_finding_on_a_fresh_design_item_refuses(self):
+        """Lane review of build/sd-1782: a design item with no design builds a design run first, which reads
+        no Send to builder note, and its code build's window opens later: the finding was lost unsaid."""
+        design = self.item(fields={"work_kind": "design"})
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{design}.*design run"):
+            build.queue_again(self.db, [design], who="operator", finding="check the parser")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment WHERE item = ?", (design,)).fetchone()[0],
+                         0, "one refusal writes nothing")
 
     def test_build_with_a_stale_expected_branch_is_refused(self):
         """sd:10897: the open-PR sweep reads a branch, then presses an item; a press bound to a branch the item's
@@ -3727,6 +3735,39 @@ class Hosts(Case):
                    hosts=WORK)
         self.assertIsNotNone(build.run(self.db, run["id"])["released_at"], "work's own probe releases it")
         self.assertFalse(self.lease_held(run))
+
+    def test_the_hub_pauses_the_runs_of_a_satellite_on_another_build(self):
+        """sd:10934: a hub refresh refuses a satellite's every call until it follows the pins, so its dispatcher
+        and runs go quiet while its builders still run. A quiet host whose last beat named another sd_db build
+        is paused for `MISMATCH_SECONDS`, its runs left open; past that it strands as any quiet host's."""
+        from sd_db import remote
+
+        run = self.satellite_run()
+        now = later(run["created_at"], build.STALE_SECONDS + 1)
+        other = "0" * 16 if remote.build_digest() != "0" * 16 else "1" * 16
+        quiet = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=quiet,
+                     body={"pid": 1, "why": "", "build": other})
+        self.assertIsNotNone(build.dispatcher_gone(self.db, "work"))
+        self.assertEqual(self.strand(run), [], "a mismatch pauses the run")
+        self.assertIsNone(build.run(self.db, run["id"])["outcome"])
+        lapsed = (datetime.fromisoformat(now) - timedelta(seconds=build.MISMATCH_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", timestamp=lapsed,
+                     body={"pid": 1, "why": "", "build": other})
+        [settled] = self.strand(run)
+        self.assertEqual((settled["run"], settled["outcome"]), (run["id"], "blocked"))
+        self.assertIn(f"its last beat ran sd_db build {other}", build.run(self.db, run["id"])["detail"])
+        self.assertTrue(self.lease_held(run))
+
+    def test_the_hub_strands_a_quiet_run_whose_beat_names_this_build_or_none(self):
+        """sd:10934: only another build pauses; a beat on the hub's own build, or an unreadable one, does not."""
+        from sd_db import remote
+
+        for body in ({"build": remote.build_digest()}, {"build": ["0" * 16]}, {"build": ""}):
+            with self.subTest(body=body):
+                self.assertFalse(build.mismatched_build(json.dumps(body)))
+        self.assertFalse(build.mismatched_build("not json"))
+        self.assertFalse(build.mismatched_build(None))
 
     def test_the_hub_strands_a_run_whose_beat_leads_past_stale_seconds(self):
         """Pack sd:7970: a run beat is stamped on its satellite's clock, so it takes the dispatcher beat's lead
