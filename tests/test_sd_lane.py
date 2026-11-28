@@ -2201,7 +2201,39 @@ class TrainLanding(Trees):
         self.assertEqual({key: entries[0]["train_landing"][key] for key in ("status", "pull", "items")},
                          {"status": "merged", "pull": 9, "items": [1, 2, 3]})
         self.assertEqual([entries[index]["train"]["status"] for index in (1, 2)], ["landed", "landed"])
-        self.assertEqual([entries[index]["merge_commit"] for index in (1, 2)], ["2" * 40, "3" * 40])
+        # Each member ends at the commit its landing reconcile named, with no second prepare (sd:10105).
+        self.assertEqual([entries[index]["merge_commit"] for index in (1, 2)], ["merged-2", "merged-3"])
+
+    def test_a_member_reconciled_at_the_landing_ends_merged_with_its_branch_gone(self) -> None:
+        """sd:10105: a member's reconcile answered merged at the train's landing, and its next claim still
+        needed a checkout: with its branch gone it ended skipped, though the train had delivered it. A
+        member the landing reconciled ends merged at that commit, with no checkout, prepare or merge."""
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            answer = self.ship(argv, log)
+            if argv[2] == "reconcile" and argv[argv.index("--item") + 1] == "2":  # the landing's reconcile
+                git(self.repo, "worktree", "remove", "--force", str(self.second))
+                git(self.repo, "branch", "-D", "second")
+                git(self.repo, "push", "-q", "origin", "--delete", "second")
+            return answer
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+        self.assertEqual(len(self.landed), 1)
+        member = self.entries()[1]
+        self.assertEqual((member["status"], member.get("merge_commit")), ("merged", "merged-2"), member)
+        self.assertTrue(member["train"]["reconciled"])
+        after = [argv for argv in self.calls[self.calls.index(next(argv for argv in self.calls
+                                                                    if argv[2] == "reconcile")):]
+                 if int(argv[argv.index("--item") + 1]) == 2 and argv[2] in ("prepare", "merge")]
+        self.assertEqual(after, [], "a reconciled member was prepared or merged again")
+
+    def test_a_member_whose_landing_reconcile_held_its_delivery_is_claimed_again(self) -> None:
+        """A reconcile with its delivery pending is no proof of delivery: that member's claim runs as before."""
+        self.answers[(2, "reconcile")] = DELIVERY_HELD
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        member = self.entries()[1]
+        self.assertFalse(member["train"]["reconciled"])
+        self.assertIn(["prepare", 2], [[argv[2], int(argv[argv.index("--item") + 1])] for argv in self.calls])
 
     def reconciles(self) -> list[int]:
         return [int(argv[argv.index("--item") + 1]) for argv in self.calls if argv[2] == "reconcile"]
