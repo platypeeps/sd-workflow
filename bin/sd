@@ -1690,6 +1690,12 @@ SMUGGLED_HEADING = re.compile(r"^ {0,3}## ")
 #: fenced `## Score` as the real heading.
 CODE_FENCE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
 
+#: A list item's marker, as CommonMark opens one (sd:10962): up to three
+#: spaces, a bullet or a number with `.` or `)`, then one to four spaces or
+#: the line's end. The item's content starts after them; a fence in it ends
+#: with the item, at the first line indented less than that content.
+LIST_MARKER = re.compile(r"^(?P<lead> {0,3}(?:[-+*]|[0-9]{1,9}[.)]))(?P<gap> {1,4}(?=\S)|[ ]*(?=\r?\n?$))")
+
 
 def refuse_protected(kind: dict[str, object], field: str, verb: str) -> None:
     """The verb is passed in because both write verbs call this.
@@ -1804,13 +1810,30 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     then *create* a second `## Score` below the one already on screen.
     `parse_sections` refuses the same wider shape in incoming text for exactly
     this reason.
+
+    A fence opened in a list item ends with the item (sd:10962): CommonMark
+    ends the item, and so the fence, at the first non-blank line indented less
+    than the item's content, so a column-zero `## Score` after a list item's
+    unclosed fence is on screen as a heading and is read as one here. The
+    item's indent is taken off a line before it is matched as a closer.
     """
 
     found: list[tuple[int, str]] = []
     fence = ""                      # the exact opening run, "" when outside one
+    items: list[int] = []           # each open list item's content indent, innermost last
     for index in range(start, len(lines)):
         line = lines[index]
-        if match := CODE_FENCE.match(line):
+        indent = len(line) - len(line.lstrip(" "))
+        while items and line.strip() and indent < items[-1]:
+            items.pop()
+            fence = ""              # the item ends here, and a fence in it with it
+        item = items[-1] if items else 0
+        inner = line[item:]
+        if not fence and (marker := LIST_MARKER.match(inner)):
+            # Content after the marker is the item's; a fence may open on it.
+            items.append(item + marker.end())
+            inner = line[items[-1]:]
+        if match := CODE_FENCE.match(inner):
             run, info = match.group("marker"), match.group("info")
             if not fence:
                 # A backtick fence's info string may not itself hold a

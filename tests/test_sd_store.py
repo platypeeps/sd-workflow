@@ -619,6 +619,23 @@ class EditSectionTests(unittest.TestCase):
         after = self.edit(text, "Score", "written")
         self.assertEqual(after, "## Tip\n\n```` `x` ````\n\n## Score\n\nwritten\n")
 
+    def test_a_list_items_fence_ends_with_the_item(self) -> None:
+        # sd:10962: CommonMark ends a list item's fence with the item, so the column-0 heading renders.
+        text = "## Tip\n\n- run:\n  ```sh\n  echo hi\n## Score\n\nreal\n"
+        after = self.edit(text, "Score", "written")
+        self.assertEqual(after, "## Tip\n\n- run:\n  ```sh\n  echo hi\n## Score\n\nwritten\n")
+
+    def test_a_fence_in_a_list_item_still_hides_its_own_heading(self) -> None:
+        text = "## Tip\n\n1. ```\n   ## Score\n   ```\n\n- b\n  ```\n\n  ## Score\n  ```\n## Score\n\nreal\n"
+        after = self.edit(text, "Score", "written")
+        self.assertEqual(after.count("## Score"), 3, f"a fenced line was read as the section:\n{after}")
+        self.assertTrue(after.endswith("```\n## Score\n\nwritten\n"), after)
+
+    def test_a_nested_items_fence_ends_where_its_item_does(self) -> None:
+        text = "## Tip\n\n- a\n  - b\n    ```\n    x\n  ```\n  ## Score\n## Score\n\nreal\n"
+        after = self.edit(text, "Score", "written")
+        self.assertIn("  ```\n  ## Score\n## Score\n\nwritten\n", after)
+
     def test_an_indented_heading_is_the_section_it_looks_like(self) -> None:
         text = "## Tip\n\nt\n\n   ## Score\n\nindented\n"
         after = self.edit(text, "Score", "written")
