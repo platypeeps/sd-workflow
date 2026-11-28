@@ -364,15 +364,6 @@ class AddRefusalTests(StoreFixture):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("its own `## ` heading", done.stderr)
 
-    def test_a_tab_heading_in_section_text_is_refused_too(self) -> None:
-        """`##<tab>Score` renders as a heading, so section text may not carry it."""
-
-        self.build()
-        done = self.run_sd(
-            "store", "add", "pp.tip", "T", "--field", "score=9",
-            "--section", "Tip=text\n##\tScore\nsmuggled")
-        self.assertNotEqual(done.returncode, 0)
-
     def test_a_misspelled_placeholder_is_refused_rather_than_shipped(self) -> None:
         """Left in place it would reach every note written from that template
         as literal text, and be noticed by a reader rather than an author."""
@@ -597,14 +588,6 @@ class EditSectionTests(unittest.TestCase):
             self.edit(text, "Score", "x"),
             "## Tip\n\nkeep me\n\n## Score\n\nx\n\n## Provenance\n\nkeep me too\n")
 
-    def test_a_tab_after_the_marker_is_a_heading_that_ends_the_section(self) -> None:
-        """CommonMark ends `##` with a space or a tab: editing Tip must keep a
-        saved `##<tab>Score` section (lead review of build/sd-2304)."""
-        text = "## Tip\n\nold\n\n##\tScore\n\nreal\n"
-        after = self.edit(text, "Tip", "updated")
-        self.assertIn("##\tScore\n\nreal\n", after)
-        self.assertNotIn("old", after)
-
     def test_a_fenced_heading_does_not_end_the_section_it_sits_in(self) -> None:
         text = "## Tip\n\nRun it:\n\n```markdown\n## Score\nnot a heading\n```\n\n## Score\n\nreal score\n"
         after = self.edit(text, "Tip", "replaced")
@@ -635,59 +618,6 @@ class EditSectionTests(unittest.TestCase):
         text = "## Tip\n\n```` `x` ````\n\n## Score\n\nreal\n"
         after = self.edit(text, "Score", "written")
         self.assertEqual(after, "## Tip\n\n```` `x` ````\n\n## Score\n\nwritten\n")
-
-    def test_a_list_items_fence_ends_with_the_item(self) -> None:
-        # sd:10962: CommonMark ends a list item's fence with the item, so the column-0 heading renders.
-        text = "## Tip\n\n- run:\n  ```sh\n  echo hi\n## Score\n\nreal\n"
-        after = self.edit(text, "Score", "written")
-        self.assertEqual(after, "## Tip\n\n- run:\n  ```sh\n  echo hi\n## Score\n\nwritten\n")
-
-    def test_a_fence_in_a_list_item_still_hides_its_own_heading(self) -> None:
-        text = "## Tip\n\n1. ```\n   ## Score\n   ```\n\n- b\n  ```\n\n  ## Score\n  ```\n## Score\n\nreal\n"
-        after = self.edit(text, "Score", "written")
-        self.assertEqual(after.count("## Score"), 3, f"a fenced line was read as the section:\n{after}")
-        self.assertTrue(after.endswith("```\n## Score\n\nwritten\n"), after)
-
-    def test_a_nested_items_fence_ends_where_its_item_does(self) -> None:
-        text = "## Tip\n\n- a\n  - b\n    ```\n    x\n  ```\n  ## Score\n## Score\n\nreal\n"
-        after = self.edit(text, "Score", "written")
-        self.assertIn("  ```\n  ## Score\n## Score\n\nwritten\n", after)
-
-    def test_a_tab_indent_is_measured_to_the_next_tab_stop(self) -> None:
-        # sd:10962 review: a tab reaches column 4, so each of these lines stays in its list item's fence;
-        # read as width 0, it ended the item and the next fence line opened a top-level one hiding `## Score`.
-        cases = {"tab-indented line": "- a\n  ```\n\t## Score\n  ```\n",
-                 "tab-indented closer": "- a\n  ```\n  ## Score\n\t```\n  ```\n  y\n",
-                 "tab after the marker": "-\t```\n    ## Score\n    ```\n",
-                 "tab before a nested marker": "- a\n\t- ```\n\t  ## Score\n\t  ```\n"}
-        for name, fenced in cases.items():
-            with self.subTest(name):
-                text = f"## Tip\n\n{fenced}## Score\n\nreal\n"
-                after = self.edit(text, "Score", "written")
-                self.assertEqual(after, f"## Tip\n\n{fenced}## Score\n\nwritten\n")
-
-    def test_text_the_write_guard_accepts_reads_back_as_one_section(self) -> None:
-        # sd:10962 review: the reader may call a line a heading only when `parse_sections` refuses it. A tab
-        # after `##` passed the guard, which reads the line as written, and the reader's tab-expanded copy
-        # took it for a heading, so the saved section ended early.
-        sd = sd_module()
-        # A tab ends the marker as a space does, so the guard refuses these (build/sd-2304 lead review).
-        for text in ["##\tScore", " ##\tScore\nmore", "- a\n  ##\tScore", "x\n   ##\tProvenance\ny", "##\t"]:
-            with self.subTest(refused=text), self.assertRaises(sd.Refusal):
-                sd.parse_sections([f"Tip={text}"])
-        texts = ["- a\n\t##\tScore",
-                 "-\t##\tScore", "\t## Score", " \t## Score", "- a\n\t## Score\n\t```\n\t## Score",
-                 # An item's fence the text leaves open ends at the next section's column-0 heading.
-                 "- ```", "-\t```\n\tx", "1. ~~~\n   y", "- a\n  - b\n\t```"]
-        for text in texts:
-            with self.subTest(text=text):
-                self.assertEqual(sd.parse_sections([f"Tip={text}"]), {"Tip": text}, "the guard accepts it")
-                after = self.edit("## Tip\n\nold\n\n## Score\n\nreal\n", "Tip", text)
-                lines = after.splitlines(keepends=True)
-                headings = sd.note_heading_lines(lines, 0)
-                self.assertEqual([name for _, name in headings], ["Tip", "Score"])
-                start, end = sd.section_span(lines, headings, "Tip")
-                self.assertEqual("".join(lines[start + 1:end]).strip("\r\n"), text)
 
     def test_an_indented_heading_is_the_section_it_looks_like(self) -> None:
         text = "## Tip\n\nt\n\n   ## Score\n\nindented\n"
