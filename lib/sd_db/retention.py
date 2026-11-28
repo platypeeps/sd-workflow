@@ -317,12 +317,20 @@ def expire_exec_outputs(connection, *, now: datetime) -> int:
 
 
 def compact_heartbeats(connection, *, now: datetime | None = None) -> int:
-    """One `heartbeat` row per key: the one every reader orders first; with `now`, no stale session row."""
+    """One `heartbeat` row per key, the newest written; with `now`, no stale session row.
+
+    And a second where they differ: the newest real tick (`reporting.REAL_TICK`), the row a job's health reads
+    when the newest written carries a stamp rejected as future (sd:10410). Kept alone, that row became health.
+    """
     with transaction(connection):
         cursor = connection.execute(
             "DELETE FROM state WHERE kind='heartbeat' AND id NOT IN ("
             "  SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY key ORDER BY timestamp DESC, id DESC) AS rank"
-            "                  FROM state WHERE kind='heartbeat') WHERE rank = 1)")
+            "                  FROM state WHERE kind='heartbeat') WHERE rank = 1)"
+            " AND id NOT IN ("
+            "  SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY key ORDER BY"
+            "                         json_extract(body, '$.ended') DESC, id DESC) AS rank"
+            f"                  FROM state WHERE kind='heartbeat' AND {reporting.REAL_TICK}) WHERE rank = 1)")
     stale = sessions.expire(connection, now=now.astimezone(UTC).isoformat(timespec="seconds")) if now else 0
     return cursor.rowcount + stale
 

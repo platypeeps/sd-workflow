@@ -494,21 +494,40 @@ def health(connection, job, *, now=None):
     return body["healthy"] if body else None
 
 
-def _current_tick(connection, key, now=None):
+#: A heartbeat row whose `ended` is a real stamp, in SQL: text, and no later
+#: than the row's own write time, its `timestamp`, plus `FUTURE_ALLOWANCE`.
+#: Judged against the write, not the reader's clock (sd:10410): a stamp
+#: rejected when it was written stays rejected after the clock passes it.
+REAL_TICK = ("json_valid(body) AND json_type(body, '$.ended') = 'text' AND json_extract(body, '$.ended')"
+             f" <= strftime('%Y-%m-%dT%H:%M:%S+00:00', timestamp, '+{int(FUTURE_ALLOWANCE.total_seconds())} seconds')")
+
+
+def _real_tick(connection, key, now=None):
     """The newest real tick under `key`, its body, or `None` when it has none.
 
-    The latest `ended` within `now` plus `FUTURE_ALLOWANCE`, the newest row on
-    a tie: not the newest row by id, which can be one stamped past the
-    allowance (sd:10410), and it held health over the real newest tick. With
-    no such row, the newest row by id: a bad stamp is then all there is.
+    The latest `ended` among the `REAL_TICK` rows, also within `now` plus
+    `FUTURE_ALLOWANCE`, the newest row on a tie: not the newest row by id,
+    which can be one stamped past the allowance (sd:10410), and it held
+    health over the real newest tick. `retention.compact_heartbeats` keeps
+    this row.
     """
     limit = stamp(((now or datetime.now(UTC)) + FUTURE_ALLOWANCE).isoformat())
     row = connection.execute(
-        "SELECT body FROM state WHERE kind='heartbeat' AND key=? AND json_valid(body)"
-        " AND json_type(body, '$.ended') = 'text' AND json_extract(body, '$.ended') <= ?"
+        f"SELECT body FROM state WHERE kind='heartbeat' AND key=? AND {REAL_TICK}"
+        " AND json_extract(body, '$.ended') <= ?"
         " ORDER BY json_extract(body, '$.ended') DESC, id DESC LIMIT 1", (key, limit)).fetchone()
-    row = row or connection.execute(
-        "SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+    return json.loads(row["body"]) if row else None
+
+
+def _current_tick(connection, key, now=None):
+    """`_real_tick`, or with no real tick the newest row by id: a bad stamp is
+    then all there is to read. `None` when the key has no row."""
+    real = _real_tick(connection, key, now)
+    if real is not None:
+        return real
+    row = connection.execute(
+        "SELECT body FROM state WHERE kind='heartbeat' AND key=? AND json_valid(body)"
+        " ORDER BY id DESC LIMIT 1", (key,)).fetchone()
     return json.loads(row["body"]) if row else None
 
 
@@ -577,10 +596,11 @@ def _beat(connection, *, job, run_id, healthy, ended, exit_code, now, host=None)
             (key, run_id, host, run_id, _tagged(run_id, host))).fetchone():
         return "recorded"
     # The newest real tick (sd:10410), as `health` reads it; a row stamped
-    # past the allowance outranks nothing, even when it is the only one.
-    newest_body = _current_tick(connection, key, now) or {}
+    # past the allowance at its write outranks nothing, even when it is the
+    # only one and the clock has passed its stamp since.
+    newest_body = _real_tick(connection, key, now) or {}
     newest = newest_body.get("ended") or ""
-    if ended < newest <= stamp((now + FUTURE_ALLOWANCE).isoformat()):
+    if ended < newest:
         return "older"
     body = {"healthy": healthy, "run_id": run_id, "ended": ended, "exit_code": exit_code}
     if host is not None:
@@ -592,7 +612,8 @@ def _beat(connection, *, job, run_id, healthy, ended, exit_code, now, host=None)
         newest_host = newest_body.get("host") if isinstance(newest_body.get("host"), str) else None
         previous = [_tagged(newest_body["run_id"], newest_host)] if isinstance(newest_body.get("run_id"), str) else []
         body["same_second"] = [*earlier, *previous][-REMEMBERED_RUNS:]
-    record_state(connection, "heartbeat", key=key, body=body)
+    # Written at `now`, the clock `REAL_TICK` judges this row's stamp by.
+    record_state(connection, "heartbeat", key=key, body=body, timestamp=stamp(now.isoformat()))
     return "tied" if tied else "written"
 
 
@@ -1116,12 +1137,9 @@ def clean_reports(connection, *, before, now=None):
             job, ended = row["job"], row["ended"]
             if isinstance(job, str) and isinstance(ended, str):
                 if job not in beats:
-                    # The newest row by id, the one `health` and `_beat` read.
-                    beat = connection.execute(
-                        "SELECT CASE WHEN json_valid(body) THEN json_extract(body, '$.ended') END"
-                        " FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1",
-                        (HEARTBEAT_KEY + job,)).fetchone()
-                    beats[job] = beat[0] if beat else None
+                    # The tick `health` reads (sd:10410), not the newest row by id.
+                    beat = _current_tick(connection, HEARTBEAT_KEY + job, now)
+                    beats[job] = beat.get("ended") if isinstance(beat, dict) else None
                 if isinstance(beats[job], str) and ended > beats[job]:
                     reasons.add("late")
             if row["id"] in candidates and not reasons & {"record", "assignment", "late"}:

@@ -201,9 +201,11 @@ class TheDryRun(Store):
         # A job with no heartbeat at all does not decline its reports.
         self.assertEqual([entry["id"] for entry in preview["selected"]], [unwatched])
 
-    def test_the_job_s_health_is_its_newest_heartbeat_by_id_not_its_latest_ended(self):
+    def test_the_job_s_health_is_its_newest_real_tick_not_a_rejected_stamp(self):
+        """sd:10410: the tick `health` reads, the latest real `ended`. Read as the newest row by id, a
+        stamp rejected as future hid that this report is later than the job's real tick."""
         late = self.report(job="alpha", ended="2026-09-09T00:00:00+00:00")
-        for ended in ("2026-09-09T12:00:00+00:00", "2026-09-08T00:00:00+00:00"):
+        for ended in ("2026-09-08T00:00:00+00:00", "2099-01-01T00:00:00+00:00"):
             record_state(self.db, "heartbeat", key=reporting.HEARTBEAT_KEY + "alpha",
                          body={"healthy": True, "run_id": ended, "ended": ended, "exit_code": 0})
         preview = self.preview()

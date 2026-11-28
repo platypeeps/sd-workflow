@@ -9,7 +9,7 @@ clean tick filed a recovery that never happened.
 import json
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -229,6 +229,40 @@ class AReplayWritesNothing(unittest.TestCase):
     def test_with_only_a_future_stamp_health_is_that_row(self):
         self.tick("typo", 0, ended="2027-09-08T00:01:00Z", exit_code=1, text="boom\n")
         self.assertIs(reporting.health(self.db, "probe", now=NOW), False)
+
+    def test_a_rejected_stamp_stays_rejected_once_the_clock_passes_it(self):
+        """sd:10410 review, the class: a stamp was judged against the reader's clock, so one
+        rejected at its write turned real once the clock passed it, and took health back."""
+        self.tick("typo", 0, ended="2026-09-08T03:00:00Z", exit_code=1, text="boom\n")
+        self.tick("b", 16)
+        self.tick("typo2", 0, ended="2026-09-08T04:00:00Z", exit_code=1, text="boom\n")
+        for clock in (NOW, NOW + timedelta(days=1)):
+            self.assertIs(reporting.health(self.db, "probe", now=clock), True, clock)
+
+    def test_a_lone_rejected_stamp_outranks_no_run_once_the_clock_passes_it(self):
+        """With only a rejected row, a run that ended before its stamp read as older
+        once the clock passed the stamp: it was never written, and the bad row stayed health."""
+        self.tick("typo", 0, ended="2026-09-08T03:00:00Z", exit_code=1, text="boom\n")
+        later = NOW + timedelta(days=1)
+        (self.root / "c.log").write_text("ok\n")
+        reporting.ingest_log(self.db, job="probe", run_id="c", started="2026-09-08T02:00:00Z",
+                             ended="2026-09-08T02:30:00Z", exit_code=0, log_path=self.root / "c.log", now=later)
+        self.assertEqual(self.beats(), ["typo", "c"])
+        self.assertIs(reporting.health(self.db, "probe", now=later), True)
+
+    def test_compaction_keeps_the_newest_real_tick_beside_a_rejected_stamp(self):
+        """Compaction kept the newest row alone: a rejected stamp, so the real tick `health`
+        reads was deleted and the bad row became health. A replay of the real run stays recorded."""
+        self.tick("b", 16, exit_code=1, text="boom\n")
+        self.tick("typo", 0, ended="2026-09-08T03:00:00Z")
+        self.assertEqual(retention.compact_heartbeats(self.db), 0)
+        self.assertEqual(self.beats(), ["b", "typo"])
+        self.assertIs(reporting.health(self.db, "probe", now=NOW), False)
+        self.assertIs(reporting.health(self.db, "probe", now=NOW + timedelta(days=1)), False)
+        self.tick("c", 31)
+        self.assertEqual(retention.compact_heartbeats(self.db), 2, "c is the newest written and the newest real")
+        self.assertEqual(self.beats(), ["c"])
+        self.assertEqual(retention.compact_heartbeats(self.db), 0, "a second pass removes nothing")
 
     def test_a_stamp_within_the_allowance_still_counts_as_newest(self):
         """Five minutes past the clock is a slewing clock, not a typo: it still wins."""
