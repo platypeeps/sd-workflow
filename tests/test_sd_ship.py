@@ -3356,6 +3356,25 @@ roles:
         self.assertEqual(cleanup["kept"], {str(tree): ship.MERGE_CHECKOUT,
                                            "builder": "a kept worktree has it checked out"})
 
+    def test_a_merge_cleanup_removes_a_worktree_holding_nextjs_build_output(self):
+        """sd:10985. A Next.js build leaves `.next/` and `*.tsbuildinfo`; both kept every merged worktree.
+
+        A name that only contains the suffix, `notes.tsbuildinfo.bak`, is still data and keeps it."""
+        head = _git(self.root, "rev-parse", "HEAD")
+        with (self.root / ".git/info/exclude").open("a") as stream:
+            stream.write("target/\n.next/\n*.tsbuildinfo\n*.bak\n")
+        tree = self.merged_worktree("nextjs")
+        (tree / ".next/cache").mkdir(parents=True)
+        (tree / ".next/cache/page.js").write_text("output")
+        (tree / "web").mkdir()
+        (tree / "web/tsconfig.tsbuildinfo").write_text("{}")
+        self.assertEqual(ship.clean_up_merged(self.root, "nextjs", head),
+                         {"removed": [str(tree), "nextjs", "origin/nextjs"], "kept": {}})
+        kept = self.merged_worktree("nextbak")
+        (kept / "notes.tsbuildinfo.bak").write_text("data")
+        self.assertEqual(ship.clean_up_merged(self.root, "nextbak", head)["kept"].get(str(kept)),
+                         "it holds ignored notes.tsbuildinfo.bak")
+
     def test_a_merge_cleanup_keeps_a_worktree_holding_ignored_data_that_is_not_build_output(self):
         """Review of sd:3013: `git status --porcelain` hides ignored files, and
         `git worktree remove` deleted ignored local data with the tree."""

@@ -3052,7 +3052,9 @@ def clean_up_merged(root: pathlib.Path, branch: str, merged: str) -> dict:
         return {"error": str(error)}
 
 
-BUILD_OUTPUT = frozenset({"target", "node_modules", ".venv", "__pycache__"})
+BUILD_OUTPUT = frozenset({"target", "node_modules", ".venv", "__pycache__", ".next"})
+#: Build output a file's name ends in: TypeScript's incremental build state, as a Next.js build leaves it (sd:10985).
+BUILD_OUTPUT_SUFFIXES = (".tsbuildinfo",)
 #: Why the merge keeps the checkout it runs in (sd:3477). The lane merges in the builder's own worktree,
 #: and a builder whose harness resets its cwd between calls has no process inside to keep it: an idle
 #: builder lost its directory mid-task. The lane entry's `remove` command takes it once the builder stops.
@@ -3072,7 +3074,8 @@ def ignored_data(path: pathlib.Path) -> str | None:
     """Why to keep a tree whose ignored files are more than build output, or None."""
     for line in tree_status(path, "--ignored=matching").splitlines():
         name = line[3:]
-        if line.startswith("!! ") and not BUILD_OUTPUT & set(name.rstrip("/").split("/")):
+        parts = name.rstrip("/").split("/")
+        if line.startswith("!! ") and not (BUILD_OUTPUT & set(parts) or parts[-1].endswith(BUILD_OUTPUT_SUFFIXES)):
             return f"it holds ignored {name}"
     return None
 
