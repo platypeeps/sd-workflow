@@ -3119,7 +3119,7 @@ class Ship(SharedReview):
             raise Refusal("a rebase repository's prepare rewrites the branch and needs a clean working tree",
                           code="dirty_worktree", boundary="input", state="operator_decision",
                           next_action="Commit or stash the changes, then run prepare again.")
-        remote = f"refs/remotes/origin/{base}"
+        remote, queued = f"refs/remotes/origin/{base}", head
         onto = git(self.root, "merge-base", head, remote)
         self.rebase_onto(head, onto, "-i", "--autosquash")
         # Linearizing drops merge commits; one that edited a file on its own
@@ -3148,7 +3148,8 @@ class Ship(SharedReview):
         if message.strip() != git(self.root, "show", "-s", "--format=%B", tip).strip():
             run(self.root, ["git", "commit", "--amend", "--no-verify", "--allow-empty", "--file=-"], input=message)
         head = current_head(self.root)
-        self.save(rebase_tip={"commit": head, "message": original}, landed_commits=len(commits))
+        # `from` is the head this prepare rewrote: the lane follows the rewrite by it, not by guessing (sd:10223).
+        self.save(rebase_tip={"commit": head, "message": original, "from": queued}, landed_commits=len(commits))
         return head
 
     def rebase_onto(self, head: str, onto: str, *flags: str) -> None:
@@ -3587,6 +3588,11 @@ def clean_up_merged(root: pathlib.Path, branch: str, merged: str) -> dict:
 
 
 BUILD_OUTPUT = frozenset({"target", "node_modules", ".venv", "__pycache__"})
+#: Build output only as a directory: a Next.js build's folder (sd:10985). A file of that name is data.
+BUILD_OUTPUT_DIRECTORIES = frozenset({".next"})
+#: Build output a file's name ends in: TypeScript's incremental build state, as a Next.js build leaves it
+#: (sd:10985). A directory that ends in it is data.
+BUILD_OUTPUT_SUFFIXES = (".tsbuildinfo",)
 #: Why the merge keeps the checkout it runs in (sd:3477). The lane merges in the builder's own worktree,
 #: and a builder whose harness resets its cwd between calls has no process inside to keep it: an idle
 #: builder lost its directory mid-task. The lane entry's `remove` command takes it once the builder stops.
@@ -3606,9 +3612,21 @@ def ignored_data(path: pathlib.Path) -> str | None:
     """Why to keep a tree whose ignored files are more than build output, or None."""
     for line in tree_status(path, "--ignored=matching").splitlines():
         name = line[3:]
-        if line.startswith("!! ") and not BUILD_OUTPUT & set(name.rstrip("/").split("/")):
+        if line.startswith("!! ") and not build_output(name):
             return f"it holds ignored {name}"
     return None
+
+
+def build_output(name: str) -> bool:
+    """Whether the ignored path `name`, as `git status` prints it (a directory ends in `/`), is build output.
+
+    A `BUILD_OUTPUT` name anywhere in the path; a `BUILD_OUTPUT_DIRECTORIES` name as a directory in it; or a
+    file whose name ends in a `BUILD_OUTPUT_SUFFIXES` suffix. Each is matched whole, never as part of a name.
+    """
+    parts = name.rstrip("/").split("/")
+    directories = parts if name.endswith("/") else parts[:-1]
+    return bool(BUILD_OUTPUT & set(parts) or BUILD_OUTPUT_DIRECTORIES & set(directories)
+                or (not name.endswith("/") and parts[-1].endswith(BUILD_OUTPUT_SUFFIXES)))
 
 
 def kept_because(path: pathlib.Path, merged: str) -> str | None:

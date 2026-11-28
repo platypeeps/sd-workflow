@@ -207,8 +207,8 @@ transaction, and so does
 the before-merge write: after a move the entry in flight goes back to
 pending at its place, with `moved_off`, and the run stops; a merge that
 answers `lane_elsewhere` counts as the same move. Such a put-back moves
-`expected_head` only to a catch-up merge prepare pushed
-(`pushed_catch_up`). The same scheduled job runs on every machine: `lane
+`expected_head` only to a catch-up merge or a rebase prepare pushed
+(`pushed_catch_up`, sd:10223). The same scheduled job runs on every machine: `lane
 run --hosted` runs each lane this machine hosts, side by side, and
 skips one whose runner is busy; a lane that gets work while the run lasts
 starts then (sd:5809). For every other checkout here it imports the file
@@ -4953,7 +4953,7 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
     """
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
     found = prepared_head(tree, branch, entry["expected_head"], train["head"]) if train else \
-        pushed_catch_up(tree, branch, entry["expected_head"])
+        pushed_catch_up(tree, branch, entry["expected_head"], queue, entry["item"])
     expected = found or str(entry["expected_head"])
     elsewhere: list[str] = []
 
@@ -5124,20 +5124,56 @@ def at_head(tree: pathlib.Path, expected: str) -> bool:
     return head == expected or catch_up_of(tree, head, expected)
 
 
-def pushed_catch_up(tree: pathlib.Path, branch: str, expected: str) -> str:
+def pushed_catch_up(tree: pathlib.Path, branch: str, expected: str, queue: Queue | None = None,
+                    item: Any = None) -> str:
     """`origin/<branch>` when it is the catch-up merge of `expected` that prepare pushed, else `expected` (sd:3283).
 
-    A put-back reads `origin` only for this, so `expected_head` always names a
+    Given the `queue` and the entry's `item`, also when it is the rebase of
+    `expected` its prepare pushed (`prepared_rebase`, sd:10223). A put-back
+    reads `origin` only for this, so `expected_head` always names a
     published commit. A catch-up only in the worktree, or a read that fails,
     keeps `expected`; this host's worktree rule (`checkout_for`) accepts that
-    catch-up.
+    catch-up, and the claim reads the receipt again.
     """
     listed = publish_git(tree, "ls-remote", "origin", f"refs/heads/{branch}") if branch else None
     tip = (listed.stdout.split() or [""])[0] if listed is not None and listed.returncode == 0 else ""
     try:
-        return tip if tip and catch_up_of(tree, tip, expected) else expected
+        if tip and catch_up_of(tree, tip, expected):
+            return tip
+        return tip if queue is not None and prepared_rebase(queue, branch, item, expected, tip) else expected
     except LaneError:  # unknown keeps the published head
         return expected
+
+
+def prepared_rebase(queue: Queue, branch: str, item: Any, expected: str, tip: str) -> bool:
+    """Whether `tip` is the rewrite of `expected` that `sd-ship prepare` saved for `item` on `branch` (sd:10223).
+
+    A rebase policy's prepare rewrites the branch and force-pushes it; its
+    ship receipt keeps `rebase_tip`, the commit it wrote and the head it
+    rewrote (`from`). That record is the proof, so no tree is compared and
+    the queued commit need not be on this disk (sd:10312). A receipt with
+    no `from`, an older prepare's, proves nothing. A read that fails raises
+    `LaneError`: unknown, not a skip.
+    """
+    try:
+        number = int(str(item))
+    except ValueError:
+        return False
+    if not (branch and tip and expected and tip != expected):
+        return False
+    require_sd_db()
+    from sd_db import ship  # noqa: PLC0415
+    from sd_db.workflow import WorkflowError  # noqa: PLC0415
+
+    def rebase_receipt(connection: Any) -> Any:
+        try:
+            return ship.read(connection, ship.receipt_key(queue.repository, branch, number))[1]
+        except WorkflowError as error:
+            raise LaneError(f"sd:{number}'s ship receipt for {branch} cannot be read ({error}), so whether "
+                            f"{tip} is its prepare's rebase is unknown", code=PUBLISH_UNKNOWN) from None
+    found = on_hub(queue, rebase_receipt, write=False)
+    saved = found.get("rebase_tip") if isinstance(found, dict) else None
+    return isinstance(saved, dict) and saved.get("commit") == tip and saved.get("from") == expected
 
 
 def back_to_pending(row: dict[str, Any], expected: str, **fields: Any) -> None:
@@ -5431,8 +5467,8 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     never failed: main may hold its train, and its delivery is owed (sd:9923).
     It keeps its place, and `hub_fault` or `retryable_fault` says what failed
     where; a later outcome writes its own fields beside it. Its
-    `expected_head` moves only to a catch-up merge prepare pushed
-    (`pushed_catch_up`, sd:3283).
+    `expected_head` moves only to a catch-up merge or a rebase prepare
+    pushed (`pushed_catch_up`, sd:3283, sd:10223).
     """
     hub, retryable = outcome.pop("hub_fault", False), outcome.pop("retryable", False)
     waited = outcome.pop("slot_wait", False)
@@ -5441,7 +5477,8 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     if not (hub or retryable or waited) or (retryable and retries >= (math.inf if landed else RETRYABLE_RETRIES)):
         return None
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
-    expected = pushed_catch_up(tree, branch, entry["expected_head"])  # a fenced lead's copy is at its fenced head
+    # a fenced lead's copy is at its fenced head
+    expected = pushed_catch_up(tree, branch, entry["expected_head"], queue, entry["item"])
     fault: dict[str, Any] = {key: outcome[key] for key in ("step", "reason", "prepare_log", "merge_log", "log_host")
                              if key in outcome}
     fields = (hub_fields(retries, fault) if hub else
@@ -5799,6 +5836,8 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
     try:
         entry = sent_train_settled(queue, settle_mark(queue, entry, token, root), token, root)
         found = train_reconciled(entry) or checkout_for(root, queue, entry)
+        if found.get("code") == HEAD_MOVED:
+            entry, found = followed_rebase(root, queue, entry, token, found)
     except Stop as stop:
         return None, record_hub_stop(queue, token, stop, entry)
     except LaneError as error:
@@ -5815,6 +5854,31 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
         # interrupt) may have merged with its delivery pending, so the worktree stays: the next claim reuses it.
         if tree is not None and found.get("made") and ran[0] is not None and not delivery_owed(ran[0], entry):
             drop_lane_worktree(sd_lib.main_worktree_root(root), tree, found.get("branch_made"), made=True)
+
+
+def followed_rebase(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: str,
+                    skipped: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The claimed `entry` moved to the rebase its prepare pushed, and where it runs; else `skipped` (sd:10312).
+
+    A put-back with no answer from the hub, or a reclaim, leaves the row at
+    the pre-prepare head while `origin/<branch>` holds prepare's rewrite of
+    it. The ship receipt's `rebase_tip` proves that rewrite
+    (`prepared_rebase`), so the queued commit need not be fetchable. A read
+    that fails raises `PUBLISH_UNKNOWN`: unknown is not a skip.
+    """
+    branch, expected = str(entry.get("branch") or ""), str(entry["expected_head"])
+    tip = fetched_tip(sd_lib.main_worktree_root(root), branch)
+    try:
+        rewritten = prepared_rebase(queue, branch, entry["item"], expected, tip)
+    except Stop:
+        raise
+    except LaneError as error:
+        raise LaneError(str(error), code=PUBLISH_UNKNOWN) from None
+    if not rewritten:
+        return entry, skipped
+    runner_write(queue, lambda entries: held(entries, entry, token).update(expected_head=tip))
+    entry["expected_head"] = tip  # the claim's copy too, so a put-back after a failed read keeps the rewrite
+    return entry, checkout_for(root, queue, entry)
 
 
 def delivery_owed(row: dict[str, Any], entry: dict[str, Any]) -> bool:
@@ -5892,7 +5956,7 @@ def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token:
             outcome = processed()
             if outcome.get("moved"):
                 put_back(queue, entry, token, pushed_catch_up(tree, str(entry.get("branch") or ""),
-                                                              entry["expected_head"]),
+                                                              entry["expected_head"], queue, entry["item"]),
                          moved_off={"host": this_host(), "at": stamp_now(), "step": "merge"})
                 return ({"item": entry["item"], **outcome, "status": "pending"},
                         f"{outcome['moved']} sd:{entry['item']} is pending again at its place, for that host.")
