@@ -218,18 +218,22 @@ class TheWrites(DbStoreFixture):
         whole body. A fence one section leaves open is closed by the next section's opener, so that
         section's fenced `## ` line reads as a heading, and a later edit deleted the real one."""
         opened, fenced = "```sh\necho hello", "Keep this explanation.\n```\n## Example\n```"
-        says = "which lines read as `## ` headings"
         self.refused("store", "add", "pp.tip", "Both at once", "--field", "score=7",
-                     "--section", f"Tip={opened}", "--section", f"Notes={fenced}", says=says)
+                     "--section", f"Tip={opened}", "--section", f"Notes={fenced}", says="leaves a code fence open")
         self.refused("store", "add", "pp.tip", "Open alone", "--field", "score=7",
-                     "--section", f"Tip={opened}", says=says)
+                     "--section", f"Tip={opened}", says="leaves a code fence open")
+        # Ruling round: a fenced `## Notes` stood in for the real one in a compare of sorted titles.
+        twin = "Keep this explanation.\n```\n## Notes\n```"
+        self.refused("store", "add", "pp.tip", "A twin heading", "--field", "score=7",
+                     "--section", "Tip=```", "--section", f"Notes={twin}", says="leaves a code fence open")
         self.add("First tip", "--section", f"Notes={fenced}")
         before = self.ok("store", "get", "pp.tip", "First tip").stdout
         for verb in ("set", "set-section"):
             with self.subTest(verb=verb):
-                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Tip={opened}", says=says)
-                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Notes={fenced}",
-                             "--section", f"Tip={opened}", says=says)
+                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Tip={opened}",
+                             says="leaves a code fence open")
+                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Notes={twin}",
+                             "--section", "Tip=```", says="leaves a code fence open")
         self.assertEqual(self.ok("store", "get", "pp.tip", "First tip").stdout, before)
         self.ok("store", "set-section", "pp.tip", "First tip", "--section", "Tip=```sh\necho hello\n```")
         self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout,

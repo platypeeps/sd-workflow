@@ -606,6 +606,16 @@ class EditSectionTests(unittest.TestCase):
             self.edit(text, "Score", "x"),
             "## Tip\n\nkeep me\n\n## Score\n\nx\n\n## Provenance\n\nkeep me too\n")
 
+    def test_a_section_is_not_created_inside_a_fence_the_body_leaves_open(self) -> None:
+        """Ruling round: a row stored before the fence check may end inside an open fence. A section
+        appended there sits in that fence, its own opener closes it, and its fenced `## ` line reads
+        as the heading."""
+        stored = "# T\n\n## Tip\n\n```\nopen\n"
+        with self.assertRaises(sd_module().Refusal) as caught:
+            sd_module().edit_sections(stored, {"Score": "Keep.\n```\n## Score\n```"}, self.ORDER)
+        self.assertIn("ends inside an open code fence", str(caught.exception))
+        self.assertEqual(sd_module().edit_sections(stored, {"Tip": "closed"}, self.ORDER), "# T\n\n## Tip\n\nclosed\n")
+
     def test_a_fenced_heading_does_not_end_the_section_it_sits_in(self) -> None:
         text = "## Tip\n\nRun it:\n\n```markdown\n## Score\nnot a heading\n```\n\n## Score\n\nreal score\n"
         after = self.edit(text, "Tip", "replaced")

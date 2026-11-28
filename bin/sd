@@ -1826,6 +1826,12 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     return found
 
 
+def ends_outside_a_fence(lines: list[str]) -> bool:
+    """Whether the reader is outside every code fence after `lines`: a heading below them is read."""
+
+    return (len(lines), "end") in note_heading_lines([*lines, "## end"], 0)
+
+
 def fenced_headings_only(lines: list[str]) -> bool:
     """Whether every `## ` line of section text is code wherever the note renders (sd:10784).
 
@@ -1876,6 +1882,12 @@ def edit_sections(body: str, filled: dict[str, str], order: list[str]) -> str:
     """`body` with each section of `filled` edited, its headings where the reader found them."""
 
     held = {title for _, title in note_heading_lines(body.splitlines(), 0)}
+    # An edited section starts at a heading the reader found, so outside a fence. A created one may be
+    # appended, and a row stored before the fence check can end inside a fence (ruling round).
+    if any(section not in held for section in filled) and not ends_outside_a_fence(body.splitlines()):
+        raise Refusal(
+            "the row's body ends inside an open code fence, so no section can be added below it;"
+            " close the fence in the section that opens it first")
     edited = body
     for section, text in filled.items():
         edited = edit_section(edited, section, text, order)
@@ -2161,6 +2173,11 @@ def parse_sections(pairs: list[str]) -> dict[str, str]:
                 raise Refusal(
                     f"section {name!r} carries its own `## ` heading;"
                     " section text is the body under a heading, not more headings")
+        # Every text closes the fences it opens: one left open hides the headings below it, and the
+        # next section's opener closes it, so that section's fenced `## ` line reads as a heading
+        # (ruling round, sd:10784).
+        if not ends_outside_a_fence(lines):
+            raise Refusal(f"section {name!r} leaves a code fence open; close it in the section text")
         filled[name] = text
     return filled
 
