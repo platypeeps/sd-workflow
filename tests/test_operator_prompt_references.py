@@ -217,6 +217,16 @@ class ReviewRoundFixes(unittest.TestCase):
         self.assertIn("Cancel only an assignment whose run has ended or lost its beat", triage)
         self.assertIn("A member of a live bundle waits for its run to end", triage)
 
+    def test_triage_builds_suggested_items(self):
+        """Triage moves the Queue's Suggested planning items into the build queue (sd:10945)."""
+        triage = reference("sd-next", "triage.md")
+        collect = triage.split("\n1. Collect\n", 1)[1].split("\n2. Decide", 1)[0]
+        decide = triage.split("\n2. Decide", 1)[1].split("\n3. Build\n", 1)[0]
+        self.assertIn("every suggested item", collect)
+        self.assertIn("sd today --here --all", collect)
+        self.assertIn("A suggested planning item that waits on nothing", decide)
+        self.assertIn("so step 3 builds it", decide)
+
     def test_item_writes_bind_to_the_revision_read(self):
         """A status move or a cancel decided from a read carries that read's revision."""
         for skill, name in (("sd-next", "triage.md"), ("sd-research-repo", "fleet-review.md"),

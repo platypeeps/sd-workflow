@@ -320,6 +320,20 @@ class QueueOutlivesTheProcess(Lane):
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertEqual(json.loads(done.stdout)["expected_head"], head)
 
+    def test_retry_expected_branch_refuses_another_branch(self) -> None:
+        """sd:10897. The open-PR sweep reads a PR's branch, then retries an item; an entry on another branch,
+        such as one a second writer queued between the read and the write, is refused with `stale_head`."""
+        sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        branch = self.entries()[0]["branch"]
+        done = self.sd_ship(self.repo, "retry", "7", "--expected-branch", "build/sd-0")
+        answer = json.loads(done.stdout)
+        self.assertEqual((done.returncode, answer["ok"], answer["code"]), (3, False, sd_lane.STALE_HEAD), done.stdout)
+        self.assertIn(branch, answer["error"])
+        self.assertEqual([row["status"] for row in self.entries()], ["prepared"])
+        done = self.sd_ship(self.repo, "retry", "7", "--manual", "--expected-branch", branch)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
     def test_retry_takes_a_cancelled_entry_and_its_help_says_so(self) -> None:
         """sd:3389. The system Queue page re-queues a cancelled row; it reads `cancelled` in the help to offer it."""
         sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
@@ -375,6 +389,120 @@ class Enqueue(Lane):
         sd_lane.cancel(self.repo, 3, self.environ)
         self.assertEqual(sd_lane.run_lane(self.repo, self.environ, self.ship), {"ran": []})
         self.assertEqual(self.calls, [])
+
+
+class RoundCap(Lane):
+    """sd:10287. Past 3 counted review rounds of an item, a re-prepare of the head a lane review blocked is
+    refused until the lead rules each blocker with `sd-ship adjudicate`; the next prepare then runs the gate
+    alone against those rulings. A fix, a new head, is no re-prepare and queues."""
+
+    def blocked(self, passes: int, catch_up: bool = False) -> tuple[str, str]:
+        """Item 7's lane entry, failed `review_blocking`, and a ship receipt of `passes` lane passes, the last
+        at the entry's head, or with `catch_up` at prepare's merge of main onto it in the worktree: the
+        receipt's key and the reviewed head."""
+        self.answers[(7, "prepare")] = {"ok": False, "phase": "reviewed", "error": "blocking findings",
+                                        "workflow": {"blocker": {"code": "review_blocking"}}}
+        sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        [entry] = self.entries()
+        self.assertEqual((entry["status"], entry.get("code")), ("failed", "review_blocking"))
+        reviewed = None
+        if catch_up:
+            git(self.feature, "commit", "-q", "--allow-empty", "-m", "Merge origin/main")
+            reviewed = git(self.feature, "rev-parse", "HEAD")
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            key = "ship:example/pack:feature:7"
+            ship.save(connection, key, 0, {"item": 7, "repository": "example/pack", "branch": "feature",
+                                           "passes": [{"head": "a" * 40}] * (passes - 1)
+                                           + [{"head": reviewed or entry["expected_head"]}]})
+        finally:
+            connection.close()
+        return key, reviewed or entry["expected_head"]
+
+    def receipt(self, key: str) -> dict:
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            return ship.read(connection, key)[1]
+        finally:
+            connection.close()
+
+    def add_pass(self, key: str, head: str) -> None:
+        """A new lane review at `head`: another report, which an earlier ruling did not see."""
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            revision, value = ship.read(connection, key)
+            ship.save(connection, key, revision, {**value, "passes": [*value["passes"], {"head": head}]})
+        finally:
+            connection.close()
+
+    def rule(self, key: str, head: str) -> None:
+        """An accepted adjudication bound, as `sd-ship adjudicate` binds one, to `head` and the receipt's passes."""
+        import sd_db
+        import sd_ship_dispositions
+        from sd_db import ship
+        passes = self.receipt(key)["passes"]
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            where = "ship-adjudication:" + key.removeprefix("ship:")
+            ship.save(connection, where, ship.read(connection, where)[0],
+                      {"decision": "accepted", "proposal": {"bindings": {
+                          "head": head, "passes_digest": sd_ship_dispositions.digest(passes)}}})
+        finally:
+            connection.close()
+
+    def test_retry_past_round_three_refuses_until_each_blocker_is_ruled(self) -> None:
+        key, head = self.blocked(4)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.retry(self.repo, 7, self.environ)
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        self.assertIn(f"sd-ship adjudicate --item 7 --expected-head {head}", str(caught.exception))
+        self.assertEqual([row["status"] for row in self.entries()], ["failed"])
+        self.rule(key, "b" * 40)  # a ruling of another head is not this review's
+        with self.assertRaises(sd_lane.LaneError):
+            sd_lane.retry(self.repo, 7, self.environ)
+        self.rule(key, head)
+        self.assertEqual(sd_lane.retry(self.repo, 7, self.environ)["status"], "pending")
+
+    def test_enqueue_of_the_blocked_head_refuses_and_a_fix_queues(self) -> None:
+        self.blocked(4)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        git(self.feature, "commit", "-q", "--allow-empty", "-m", "fix: the blocker")
+        self.assertEqual(sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ,
+                                               claim="deliver")["status"], "pending")
+
+    def test_enqueue_of_the_blocked_catch_up_head_refuses(self) -> None:
+        """Review of build/sd-2260: prepare reviewed its catch-up of the entry's head; enqueueing that catch-up
+        is the same blocked review again, not a fix."""
+        _, caught_up = self.blocked(4, catch_up=True)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.enqueue_entry(self.feature, 7, "fix: Topic", self.body, self.environ, claim="deliver")
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        self.assertIn(caught_up, str(caught.exception))
+
+    def test_a_ruling_of_an_older_report_at_the_same_head_is_no_ruling(self) -> None:
+        """Review of build/sd-2260: a later review blocked the same head again; the ruling bound the passes it
+        saw, so it rules nothing of the new report."""
+        key, head = self.blocked(4)
+        self.rule(key, head)
+        self.add_pass(key, head)
+        with self.assertRaises(sd_lane.LaneError) as caught:
+            sd_lane.retry(self.repo, 7, self.environ)
+        self.assertEqual(caught.exception.code, sd_lane.UNRULED)
+        self.rule(key, head)
+        self.assertEqual(sd_lane.retry(self.repo, 7, self.environ)["status"], "pending")
+
+    def test_three_rounds_retry_as_before(self) -> None:
+        self.blocked(3)
+        self.assertEqual(sd_lane.retry(self.repo, 7, self.environ)["status"], "pending")
 
 
 class Runner(Lane):
