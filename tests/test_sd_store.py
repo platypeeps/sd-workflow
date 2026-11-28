@@ -669,6 +669,41 @@ class EditSectionTests(unittest.TestCase):
             if risky:
                 self.assertEqual(found, shaped, "".join(lines))
 
+    # sd:10962 review: the other direction. A `## ` line inside a block a
+    # renderer reads as raw text was read as a heading, so an edit of that
+    # "section" replaced the block's closer and hid the rest of the note.
+    RAW_BLOCKS = {
+        "an HTML comment": "## Tip\n\n<!--\n## Score\n-->\n\n## Provenance\n\np\n",
+        "an HTML comment across a blank line": "## Tip\n\n<!-- a\n\n## Score\n-->\n",
+        "an HTML block before a blank line": "## Tip\n\n<div>\n## Score\n</div>\n\n## Provenance\n\np\n",
+        "a pre block across a blank line": "## Tip\n\n<pre>\n\n## Score\n</pre>\n",
+        "a processing instruction": "## Tip\n\n<?x\n## Score\n?>\n",
+        "a CDATA block": "## Tip\n\n<![CDATA[\n## Score\n]]>\n",
+        "an Obsidian comment": "## Tip\n\n%%\n## Score\n%%\n\n## Provenance\n\np\n",
+        "an Obsidian comment opened mid-line": "## Tip\n\nsee %% hidden\n## Score\n%%\n",
+        "a math block": "## Tip\n\n$$\n## Score\n$$\n",
+    }
+
+    def test_a_heading_inside_a_raw_block_refuses(self) -> None:
+        sd = sd_module()
+        for why, text in self.RAW_BLOCKS.items():
+            with self.subTest(why):
+                for section in ("Tip", "Score"):
+                    with self.assertRaises(sd.Refusal) as refused:
+                        self.edit(text, section, "replaced")
+                    self.assertIn("raw", str(refused.exception))
+                # The reader (`section_of`) reads through the same scan.
+                with self.assertRaises(sd.Refusal):
+                    sd.note_heading_lines(text.splitlines(keepends=True), 0)
+
+    def test_a_closed_raw_block_leaves_the_headings_after_it(self) -> None:
+        for text in ("## Tip\n\n<!-- note -->\n## Score\n\nold\n",
+                     "## Tip\n\n<div>x</div>\n\n## Score\n\nold\n",
+                     "## Tip\n\n%%c%% and $$x$$\n## Score\n\nold\n",
+                     "## Tip\n\n```\n<!--\n%%\n```\n\n## Score\n\nold\n"):
+            with self.subTest(text=text):
+                self.assertTrue(self.edit(text, "Score", "new").endswith("## Score\n\nnew\n"))
+
     def test_a_closed_list_item_fence_edits_as_before(self) -> None:
         text = "## Tip\n\n1. step\n   ```sh\n   run\n   ```\n\n## Score\n\nreal\n"
         self.assertEqual(self.edit(text, "Tip", "replaced"), "## Tip\n\nreplaced\n\n## Score\n\nreal\n")

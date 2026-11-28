@@ -1693,6 +1693,51 @@ NESTED_FENCE = re.compile(r"^[ \t>*+\-0-9.)]*?[ \t>*+\-0-9.)](?:`{3,}|~{3,})")
 #: (`%%`, which may open anywhere on a line).
 FENCE_HIDING_BLOCK = re.compile(r"^ {0,3}<|\$\$|%%")
 
+#: An HTML block's start, and what ends it, as CommonMark reads them: a comment,
+#: a `script`/`pre`/`style`/`textarea` block, a processing instruction, CDATA and
+#: a declaration end at their marker, any other tag at a blank line ("").
+RAW_HTML_STARTS = (
+    (re.compile(r"^ {0,3}<!--"), "-->"),
+    (re.compile(r"^ {0,3}<(script|pre|style|textarea)(?=[\s>]|$)", re.IGNORECASE), "</{0}>"),
+    (re.compile(r"^ {0,3}<\?"), "?>"),
+    (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
+    (re.compile(r"^ {0,3}<![A-Za-z]"), ">"),
+    (re.compile(r"^ {0,3}<"), ""),
+)
+
+
+def raw_block_start(line: str) -> tuple[str, int] | None:
+    """The raw block `line` opens and leaves open: `(what ends it, where to look)`.
+
+    The end is a marker searched from that column on, `""` for a blank line,
+    or `%%`/`$$` for an Obsidian comment or a math block, which an odd count
+    on one line leaves open. `None` when the line opens none, or closes the
+    one it opens (`<!-- x -->`, `%%c%%`).
+    """
+
+    for start, end in RAW_HTML_STARTS:
+        if match := start.match(line):
+            end = end.format(*match.groups()).lower()
+            if end and end in line[match.end():].lower():
+                return None
+            return end, match.end()
+    toggles = sorted((line.find(token), token) for token in ("%%", "$$") if line.count(token) % 2)
+    return (toggles[0][1], 0) if toggles else None
+
+
+def raw_block_ends(line: str, end: str, at: int) -> bool:
+    """Whether `line`, from column `at`, ends the raw block `raw_block_start` named.
+
+    `raw_block_start` reads the opening line itself, so a later line is read whole.
+    """
+
+    if not end:
+        return not line.strip()
+    if end in ("%%", "$$"):
+        return line[at:].count(end) % 2 == 1
+    return end in line[at:].lower()
+
+
 #: A fenced code block's delimiter: three or more backticks or tildes, indented
 #: by up to three spaces, with an optional info string. The **run length** is
 #: the part that matters and the part a `startswith` check throws away: a
@@ -1790,6 +1835,47 @@ def body_headings(body: str) -> list[str]:
     return [line[3:].strip() for line in body.splitlines() if line.startswith("## ")]
 
 
+def fence_step(line: str, fence: str) -> str | None:
+    """The fence state after `line`, from `fence` before it; `None` when it is no fence line.
+
+    A closing fence must match the marker that opened it, and be at least as
+    long, with no info string.
+    """
+
+    if not (match := CODE_FENCE.match(line)):
+        return None
+    run, info = match.group("marker"), match.group("info")
+    if not fence:
+        # A backtick fence's info string may not itself hold a backtick;
+        # that line is not an opener at all.
+        return fence if run[0] == "`" and "`" in info else run
+    if run[0] == fence[0] and len(run) >= len(fence) and not info.strip():
+        return ""
+    return fence
+
+
+def raw_block_headings(lines: list[str], start: int, outside: set[int]) -> list[tuple[int, int]]:
+    """Each `## ` line inside a raw block, with the line that opened the block.
+
+    A block opens only on a line read `outside` a fence, and not on the line
+    that ends the block before it.
+    """
+
+    found: list[tuple[int, int]] = []
+    raw: tuple[str, int, int] | None = None     # (end, column, line) of an open raw block
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if raw is not None:
+            if SMUGGLED_HEADING.match(line):
+                found.append((index, raw[2]))
+            if raw_block_ends(line, raw[0], 0):
+                raw = None
+            continue
+        if index in outside and (opened := raw_block_start(line)):
+            raw = (*opened, index)
+    return found
+
+
 def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     """Every `## ` heading in a note, by line index, with fenced ones skipped.
 
@@ -1826,25 +1912,28 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     a line scan, not a renderer, so when the note holds a fenced heading
     line and any such block (`NESTED_FENCE`, `FENCE_HIDING_BLOCK`), it
     refuses and names the line rather than guess.
+
+    The other direction too (review of sd:10962): a `## ` line inside a raw
+    block -- an HTML comment or block, a `%%` comment, a `$$` math block --
+    renders as text, and an edit of it as a section would replace the
+    block's closer and hide the rest of the note. The block is followed by
+    `raw_block_start` and `raw_block_ends`, which end it no sooner than a
+    renderer would, and a heading line inside one refuses.
     """
 
     found: list[tuple[int, str]] = []
     hidden: list[int] = []          # heading lines read as code
     risky: list[int] = []           # lines a renderer may read another way
+    outside: set[int] = set()       # lines read outside a fence
     fence = ""                      # the exact opening run, "" when outside one
     for index in range(start, len(lines)):
         line = lines[index]
-        if match := CODE_FENCE.match(line):
-            run, info = match.group("marker"), match.group("info")
-            if line[:1] != run[0]:
+        if not fence:
+            outside.add(index)
+        if (after := fence_step(line, fence)) is not None:
+            if line[:1] not in "`~":
                 risky.append(index)
-            if not fence:
-                # A backtick fence's info string may not itself hold a
-                # backtick; that line is not an opener at all.
-                if not (run[0] == "`" and "`" in info):
-                    fence = run
-            elif run[0] == fence[0] and len(run) >= len(fence) and not info.strip():
-                fence = ""
+            fence = after
             # A fence line is never a heading, opener, closer or neither.
             continue
         if NESTED_FENCE.match(line) or (not fence and FENCE_HIDING_BLOCK.search(line)):
@@ -1854,6 +1943,14 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
                 hidden.append(index)
             else:
                 found.append((index, line.lstrip()[2:].strip()))
+    raw_headings = raw_block_headings(lines, start, outside)
+    if raw_headings:
+        heading, block = raw_headings[0]
+        raise Refusal(
+            f"line {heading + 1} reads as a `## ` heading inside the raw block"
+            f" line {block + 1} opens (an HTML comment or block, `%%` or `$$`),"
+            " which renders it as text; refusing to guess where the section"
+            " ends: edit the note by hand")
     if hidden and risky:
         raise Refusal(
             f"line {hidden[0] + 1} reads as a `## ` heading inside a code fence,"
