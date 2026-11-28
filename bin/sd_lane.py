@@ -5790,8 +5790,8 @@ def followed_rebase(root: pathlib.Path, queue: Queue, entry: dict[str, Any], tok
     if not rewritten:
         return entry, skipped
     runner_write(queue, lambda entries: held(entries, entry, token).update(expected_head=tip))
-    moved = {**entry, "expected_head": tip}
-    return moved, checkout_for(root, queue, moved)
+    entry["expected_head"] = tip  # the claim's copy too, so a put-back after a failed read keeps the rewrite
+    return entry, checkout_for(root, queue, entry)
 
 
 def delivery_owed(row: dict[str, Any], entry: dict[str, Any]) -> bool:

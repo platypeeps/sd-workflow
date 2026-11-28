@@ -7163,6 +7163,25 @@ class AnyHost(SharedQueue):
                 else:
                     self.assertEqual((entry["status"], entry["expected_head"], seen[:1]), ("merged", rewrite, [rewrite]))
 
+    def test_a_followed_rebase_whose_next_read_fails_stays_at_the_rewrite(self) -> None:
+        """sd:10312, class pass: the row moved to the rewrite, then the checkout read failed; the put-back
+        wrote the pre-prepare head back from the claim's stale copy."""
+        tree, [queued] = self.committed("refollow", "work")
+        sd_lane.enqueue_entry(tree, 1, "fix: t", self.body, self.environ, manual=True, claim="deliver")
+        rewrite = self.rewritten(tree, "refollow", 1)
+        self.saved_rebase("refollow", 1, rewrite, queued)
+        real, calls = sd_lane.checkout_for, []
+
+        def checkout_for(*args: Any) -> dict:
+            calls.append(args)
+            if len(calls) == 2:
+                raise sd_lane.LaneError("git rev-parse failed", code=sd_lane.PUBLISH_UNKNOWN)
+            return real(*args)
+        with mock.patch.object(sd_lane, "checkout_for", checkout_for):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        entry = self.entries()[0]
+        self.assertEqual((entry["status"], entry["expected_head"], self.calls), ("pending", rewrite, []))
+
     def test_a_claim_whose_rebase_receipt_cannot_be_read_stays_pending(self) -> None:
         """sd:10312, unknown reads: the receipt read failed; the moved entry is not skipped."""
         tree, _ = self.committed("unread", "work")
