@@ -61,13 +61,18 @@ def _write(path: Path, data: bytes) -> None:
         raise
 
 
-def _named(config: Path) -> tuple | None:
-    """The hub, port and address `hub.json` names, or `None` when it names none readably."""
+def _recorded(config: Path) -> dict | None:
+    """`hub.json` as a JSON object, or `None` when it reads as none."""
     try:
         data = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def _named(data: dict | None) -> tuple | None:
+    """The hub, port and address `data` names, or `None` for no readable file."""
+    if data is None:
         return None
     return data.get("hub"), data.get("port", hub.DEFAULT_PORT), data.get("address")
 
@@ -88,8 +93,14 @@ def run(host: str, port: int, *, apply: bool = False, home: Path | str | None = 
         _line(out, "EXTRA", f"database {local} — a satellite holds no database; move it away, "
                             f"then rerun. {config} was not written")
         return 0
+    recorded = _recorded(config) if config.exists() else None
+    named = _named(recorded)
+    # The same hub keeps what this run was not told: its recorded address, when no `--address` names
+    # one, and its loopback `token_file` (review of build/sd-2295). Another hub keeps neither.
+    same: dict = recorded if recorded is not None and named is not None and named[:2] == (host, port) else {}
+    if address is None and hub.ip_literal(same.get("address")):
+        address = same["address"]
     wanted = (host, port, address)
-    named = _named(config) if config.exists() else None
     if not config.exists():
         _line(out, "MISSING", f"{config} — this machine names no sd hub")
     elif named != wanted:
@@ -103,7 +114,7 @@ def run(host: str, port: int, *, apply: bool = False, home: Path | str | None = 
             # One gap, one line: the hub is asked once this machine names it.
             _line(out, "SKIP", "the build and providers.yaml are checked once hub.json names the hub")
             return 0
-        written = {"hub": host, "port": port} | ({"address": address} if address is not None else {})
+        written = {**same, "hub": host, "port": port} | ({"address": address} if address is not None else {})
         _write(config, (json.dumps(written) + "\n").encode("utf-8"))
     # The loopback token, only from a file that names this same hub. On the
     # tailnet the peer is the credential and no token is sent (step 7).
