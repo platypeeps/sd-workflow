@@ -1104,6 +1104,26 @@ class SharedReview:
             return False
         return not self.binding_moved()
 
+    def dispatch_scope(self, passes: list[dict], prior: dict, head: str, whole: bool, retry: bool,
+                       additional: bool) -> tuple[bool, dict | None, bool]:
+        """(binding moved, catch-up merge or None, moved binding verifies only the fix) for `review`."""
+        moved = self.binding_moved()
+        caught_up = self.caught_up_pass(passes, head, whole, additional)
+        fix_only = (moved and not (whole or retry or additional) and caught_up is None
+                    and self.fix_verifies_moved_binding(passes, prior, head))
+        return moved, caught_up, fix_only
+
+    def fix_verifies_moved_binding(self, passes: list[dict], prior: dict, head: str) -> bool:
+        """sd:10222, lever (a). Whether a moved binding at a moved head can verify only the fix delta.
+
+        The range is the last pass's head to this head, and the prior report
+        carries every earlier blocker into the verification. Where either
+        cannot be established -- no completed pass, the same head, an
+        imported history that needs a continuation -- the pass stays full.
+        """
+        return (bool(passes) and not self.history.requires_continuation(self.state)
+                and completed_depth(prior) and passes[-1].get("head") != head)
+
     @staticmethod
     def verified_pass(passes: list[dict], additional: bool) -> dict:
         """The pass a fix verification continues: for a request, the one `request_verifies_fix` read."""
@@ -1195,16 +1215,17 @@ class SharedReview:
             return
         self.validate_dispatch(head, prior, retry, additional)
         # Only past the cap check, so a spent item refuses before the manifest
-        # is read. A re-review forced by a moved binding is a full-branch pass,
-        # not a fix verification: `--base <previous head>` would be this same
-        # head and would review an empty range, which is a rubber stamp rather
-        # than a review. It resumes the complete prior history so no earlier
-        # blocker is dropped, exactly as a whole-branch post-cap request does.
-        # sd:2192. A request under a moved binding is marked too, so a later
-        # request cannot verify past it if it fails (`verified_index`).
-        moved = self.binding_moved()
-        caught_up = self.caught_up_pass(passes, head, whole, additional)
-        full = whole or moved or caught_up is not None
+        # is read. A re-review forced by a moved binding at the same head is a
+        # full-branch pass, not a fix verification: `--base <previous head>`
+        # would be this same head and would review an empty range, which is a
+        # rubber stamp rather than a review. It resumes the complete prior
+        # history so no earlier blocker is dropped, exactly as a whole-branch
+        # post-cap request does. sd:2192. A request under a moved binding is
+        # marked too, so a later request cannot verify past it if it fails
+        # (`verified_index`). sd:10222: at a moved head after a completed
+        # pass, the fix delta is verified under the new tools instead.
+        moved, caught_up, fix_only = self.dispatch_scope(passes, prior, head, whole, retry, additional)
+        full = whole or (moved and not fix_only) or caught_up is not None
         prior = self.dispatch_prior(passes, prior, full, additional)
         base = self.verified_pass(passes, additional)["head"] if passes and not (retry or full) else None
         argv = sd_review_request.review_argv(self.runtime.bin_dir, self.database, self.args, base, gate_check=self.gate_check_base())
@@ -1216,9 +1237,10 @@ class SharedReview:
         if caught_up is not None:
             passes[-1]["catch_up"] = caught_up
         if moved:
-            passes[-1]["review_binding_change"] = {"head": head, "recorded_at": self.runtime.clock(),
-                                                   "superseded_binding": self.state.get("binding"),
-                                                   "changed": [list(row) for row in self.binding_changes()]}
+            # `review_binding_change` marks a full-branch pass (`full_branch_coverage`); a fix verification is not one.
+            passes[-1]["review_binding_fix" if fix_only else "review_binding_change"] = {
+                "head": head, "recorded_at": self.runtime.clock(), "superseded_binding": self.state.get("binding"),
+                "changed": [list(row) for row in self.binding_changes()]}
         # The pid lets the next gate start remove the folder a killed run left (sd:3059, `sd_gate_cache.OWNED`).
         with tempfile.TemporaryDirectory(prefix=f"sd-ship-verify-{os.getpid()}-") as directory:
             if prior:

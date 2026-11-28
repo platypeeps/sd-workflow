@@ -951,6 +951,47 @@ roles:
         self.assertEqual(fresh["base"], before)
         self.assertNotIn("catch_up", fresh)
 
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
+    def test_a_fix_under_a_moved_binding_verifies_only_the_fix(self):
+        # sd:10222, lever (a): a blocked pass, a fix, then a landing that
+        # moved a review tool. The pass verifies the fix delta under the new
+        # tools, carrying the blocker, instead of the whole branch.
+        program, payload = self.blocking_review()
+        with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
+            self.prepare()
+        blocked = _git(self.root, "rev-parse", "HEAD")
+        self.fix_and_clear(program, payload)
+        operation = self.operation()
+        operation.state["binding"] = "a review tool file landed on the default branch"
+        operation.state["binding_manifest"]["verdict"]["sd-review"] = "ast:before"
+        operation.save()
+        self.assertEqual(self.prepare()["phase"], "ready_to_send")
+        state = self.operation().state
+        fresh = state["passes"][-1]
+        self.assertEqual(len(state["passes"]), 2)
+        self.assertEqual(fresh["base"], blocked, "a fix verification, not the whole branch")
+        self.assertNotIn("review_binding_change", fresh)
+        self.assertEqual(fresh["review_binding_fix"]["changed"], [["sd-review", "verdict"]])
+        self.assertEqual(state["binding"], ship.binding(self.root))
+        self.assertEqual(self.merge()["phase"], "merged")
+
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
+    def test_a_moved_binding_after_an_incomplete_pass_still_re_reviews_in_full(self):
+        # sd:10222. No completed pass to verify from, so the range cannot be
+        # established and the moved binding keeps the full-branch pass.
+        self.assertEqual(self.prepare()["phase"], "ready_to_send")
+        operation = self.operation()
+        operation.state["passes"][-1]["report"]["completed_reviews"] = 0
+        operation.state["binding"] = "a review tool file landed on the default branch"
+        operation.state["binding_manifest"]["verdict"]["sd-review"] = "ast:before"
+        operation.save()
+        (self.root / "src.py").write_text("value = 3\n")
+        _git(self.root, "commit", "-q", "-am", "fix\n\nAuthored-with: human")
+        self.assertEqual(self.prepare()["phase"], "ready_to_send")
+        fresh = self.operation().state["passes"][-1]
+        self.assertIsNone(fresh["base"])
+        self.assertIn("review_binding_change", fresh)
+
     def test_a_catch_up_before_any_review_is_an_ordinary_first_pass(self):
         # Nothing was reviewed, so there is no history for the pass to cover.
         self.remote.commit_on("main", "unrelated main work\n\nAuthored-with: human", files={"other.txt": "main\n"})
