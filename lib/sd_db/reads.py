@@ -20,7 +20,6 @@ assertion was written against.
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 import subprocess
 from dataclasses import asdict, dataclass
@@ -304,20 +303,29 @@ def open_followups(connection: sqlite3.Connection, *, limit: int = 200) -> list[
     return open_notes(connection, "followup", limit=limit)
 
 
-#: An item that is a review batch, filed under `review.REF_SOURCE` and the ref `review:<queue>:<batch>`. Copied,
-#: as `review` imports `workflow`, which imports this; a test holds the two equal. `IS` and `coalesce` keep a NULL
-#: a no (sd:5130). A review-finding item's `review:<slug>` ref, one name with no second colon, is no batch
-#: (sd:10755); `is_review_batch` is the same test in Python, and a test holds the two equal.
-REVIEW_BATCH_SOURCE = "task-ref"
+#: An item that is a review batch, filed under `review.REF_SOURCE` and the ref `review:<queue>:<batch>`, whose first
+#: comment is `review.HEADER`'s header. Copied, as `review` imports `workflow`, which imports this; a test holds them
+#: equal. `IS` and `coalesce` keep a NULL a no (sd:5130). A review-finding item's `review:<slug>` ref, one name with no
+#: second colon, is no batch (sd:10755); nor is a lane review's findings item, filed under a `review:` ref with no
+#: header (sd:10097): the header tells a batch, not the ref (sd:10981). A header that does not read keeps its
+#: "not a review batch" tile on the Review page (sd:5298). `review_batches` asks the same in Python.
+REVIEW_BATCH_SOURCE, REVIEW_BATCH_HEADER = "task-ref", "Review batch"
 REVIEW_BATCH = (f"(item.source IS '{REVIEW_BATCH_SOURCE}' AND coalesce(item.external_id, '') GLOB 'review:?*:?*'"
-                " AND coalesce(item.external_id, '') NOT GLOB 'review:*:*:*')")
-_REVIEW_BATCH_REF = re.compile(r"review:[^:]+:[^:]+")
+                " AND coalesce(item.external_id, '') NOT GLOB 'review:*:*:*'"
+                # The first comment's first line, as `review._parse_header` reads it; a newline is appended so a
+                # header with no other line still ends in one.
+                " AND coalesce((SELECT head.body FROM note AS head WHERE head.item = item.id"
+                " AND head.kind = 'comment' ORDER BY head.id LIMIT 1) || char(10), '')"
+                f" GLOB '{REVIEW_BATCH_HEADER}[' || char(10, 13) || ']*')")
 
 
-def is_review_batch(source: Any, external_id: Any) -> bool:
-    """Whether an item's ref names a review batch, `review:<queue>:<batch>`, as `REVIEW_BATCH` does in SQL."""
-    return (source == REVIEW_BATCH_SOURCE and isinstance(external_id, str)
-            and _REVIEW_BATCH_REF.fullmatch(external_id) is not None)
+def review_batches(connection: sqlite3.Connection, items: Iterable[int]) -> set[int]:
+    """Which of `items` are review batches, by `REVIEW_BATCH`: the one test, so a page and a count cannot differ."""
+    ids = sorted(set(items))
+    if not ids:
+        return set()
+    return {row[0] for row in connection.execute(
+        f"SELECT item.id FROM item WHERE item.id IN ({','.join('?' * len(ids))}) AND {REVIEW_BATCH}", ids)}
 
 
 def repo_in(column: str, keep: set[str | None] | None) -> tuple[str, list[Any]]:

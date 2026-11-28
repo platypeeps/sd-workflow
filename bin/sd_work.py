@@ -1252,11 +1252,10 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
             raise WorkRefusal(f"note {args.answers} is a {asked['kind']}, not a question")
         if asked["resolved_at"] is not None:
             raise WorkRefusal(f"note {args.answers} is already resolved, at {asked['resolved_at']}")
-        item = workflow.item_state(connection, args.item)["item"]
         # A question with no `Option:` line has no label to rule, so it is answered plainly (sd:8975).
         offers = any((tag := review.TAGGED.match(line)) and tag[1] == "Option"
                      for line in (asked["body"] or "").splitlines())
-        if reads.is_review_batch(item["source"], item["external_id"]) and (
+        if args.item in reads.review_batches(connection, [args.item]) and (
                 offers or getattr(args, "option", None) is not None):
             if _asks_in_batch(review, connection, args.item, args.answers):
                 return _rule_batch(review, workflow, connection, args, body, who, revision)

@@ -60,7 +60,8 @@ def seed(case):
     broken = case.item("Not a batch")
     case.connection.execute("UPDATE item SET source = 'task-ref', external_id = 'review:labels:X9' WHERE id = ?", (broken,))
     case.connection.commit()
-    case.note(broken, "Just a comment", kind="comment")
+    # A header that does not read keeps its "not a review batch" tile (sd:5298); a bare ref is no batch (sd:10981).
+    case.note(broken, "Review batch\nJust a comment", kind="comment")
     ids["broken"] = broken
     return ids
 
@@ -369,6 +370,22 @@ class TodaysDecisions(ScreenCase):
         asked = self.note(slug, "Rename it?\nOption: Yes\nOption: No", kind="question")
         tiles = [b["item"] for b in review_screen.document(self.connection)["batches"]]
         self.assertNotIn(slug, tiles)
+        self.assertIn(ids["broken"], tiles)
+        doc = decisions.document(self.connection)
+        self.assertIn(asked, [d["note"] for d in doc["decisions"]])
+        self.assertEqual(doc["review"], 7)
+
+    def test_a_review_batch_ref_with_no_header_is_a_decision_not_a_scoring_tile(self):
+        # sd:10981: a lane review's findings item carries a `review:<queue>:<batch>`-shaped ref and no header.
+        ids = seed(self)
+        bare = self.item("Lane findings")
+        self.connection.execute("UPDATE item SET source = 'task-ref', external_id = 'review:lane:L1' WHERE id = ?",
+                                (bare,))
+        self.connection.commit()
+        self.note(bare, "Lane review of example.test", kind="comment")
+        asked = self.note(bare, "Fix it?\nOption: Yes\nOption: No", kind="question")
+        tiles = [b["item"] for b in review_screen.document(self.connection)["batches"]]
+        self.assertNotIn(bare, tiles)
         self.assertIn(ids["broken"], tiles)
         doc = decisions.document(self.connection)
         self.assertIn(asked, [d["note"] for d in doc["decisions"]])

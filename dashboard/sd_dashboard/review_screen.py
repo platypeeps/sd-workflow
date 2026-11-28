@@ -59,8 +59,9 @@ def _rows(connection):
     from .tasks_screen import is_scheduled
 
     rows = [row for row in reads.backlog_items(connection, include_done_days=0)
-            if row["status"] != "done" and not is_scheduled(row)
-            and reads.is_review_batch(row["source"], row["external_id"])]
+            if row["status"] != "done" and not is_scheduled(row)]
+    batches = reads.review_batches(connection, [row["id"] for row in rows])  # by its header (sd:10981)
+    rows = [row for row in rows if row["id"] in batches]
     return sorted(rows, key=lambda row: (row["created_at"], row["id"]))
 
 

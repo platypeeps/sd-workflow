@@ -376,6 +376,7 @@ class TheSections(TodayCase):
     def test_the_batch_marker_is_the_one_the_review_store_files(self):
         self.assertIn(f"item.source IS '{review.REF_SOURCE}'", reads.REVIEW_BATCH)
         self.assertEqual(reads.REVIEW_BATCH_SOURCE, review.REF_SOURCE)
+        self.assertEqual(reads.REVIEW_BATCH_HEADER, review.HEADER)
 
     def test_a_review_slug_work_item_is_no_batch_and_its_question_is_a_decision(self):
         """sd:10755: a review-finding item carries `review:<slug>`; only `review:<queue>:<batch>` is a batch."""
@@ -385,16 +386,35 @@ class TheSections(TodayCase):
         self.assertEqual([row["note"] for row in today.decisions(self.connection)], [asked])
         self.assertEqual(today.review_questions(self.connection), 1)
         self.assertNotIn(batch, [row["id"] for row in today.decisions(self.connection)])
-        cases = {"review:labels:B1": True, "review:mws-ux-terms": False, "review:a:": False, "review::b": False,
+        cases = {"review:labels:B7": True, "review:mws-ux-terms": False, "review:a:": False, "review::b": False,
                  "review:a:b:c": False, "Review:a:b": False, "review:": False, "": False, None: False}
         for ref, want in cases.items():
             with self.subTest(ref=ref):
-                self.assertIs(reads.is_review_batch(review.REF_SOURCE, ref), want)
-                sql = self.connection.execute(
-                    f"SELECT {reads.REVIEW_BATCH} FROM (SELECT ? AS source, ? AS external_id) AS item",
-                    (review.REF_SOURCE, ref)).fetchone()[0]
-                self.assertEqual(sql, int(want), "the SQL and Python predicates agree")
-        self.assertFalse(reads.is_review_batch("jira", "review:labels:B1"))
+                held = self.item(f"Ref {ref!r}", source="task-ref", external_id=ref)
+                add_note(self.connection, held, "comment", f"{review.HEADER}\nQueue: labels")
+                self.assertEqual(bool(reads.review_batches(self.connection, [held])), want)
+        jira = self.item("Jira", source="jira", external_id="review:labels:B2")
+        add_note(self.connection, jira, "comment", review.HEADER)
+        self.assertEqual(reads.review_batches(self.connection, [jira]), set())
+
+    def test_a_review_ref_with_no_header_is_no_batch(self):
+        """sd:10981: a lane review files findings under a `review:` ref with no header (sd:10097); the header tells a
+        batch, so its question is a decision and Today counts it outside the batches."""
+        batch = self.batch("B1", questions=1)
+        bare = self.item("Lane findings", source="task-ref", external_id="review:lane:B9")
+        add_note(self.connection, bare, "comment", "Lane review of example.test")
+        asked = add_note(self.connection, bare, "question", "Fix it?\nOption: Yes (Recommended)\nOption: No")
+        self.assertEqual([row["note"] for row in today.decisions(self.connection)], [asked])
+        self.assertEqual(today.review_questions(self.connection), 1)
+        self.assertEqual(reads.review_batches(self.connection, [batch, bare]), {batch})
+        # The first comment's first line alone: CRLF, a one-line header and a near miss.
+        for body, want in {f"{review.HEADER}\r\nQueue: q": True, review.HEADER: True,
+                           f"{review.HEADER}s\nQueue: q": False, f" {review.HEADER}": False}.items():
+            with self.subTest(body=body):
+                held = self.item("Header", source="task-ref", external_id=f"review:labels:H{len(body)}{want}")
+                add_note(self.connection, held, "comment", body)
+                add_note(self.connection, held, "comment", review.HEADER)
+                self.assertEqual(bool(reads.review_batches(self.connection, [held])), want)
 
     def grill(self, ref="grill:2026-09-07", repo=APP, questions=2):
         """A weekly grill as the KISS audit files it: `sd task add --ref grill:<date>`, then question notes."""

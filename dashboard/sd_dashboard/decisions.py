@@ -71,12 +71,13 @@ def document(connection, *, now: str | None = None) -> dict:
         if note["item_status"] == "done" and note["item"] not in open_items:
             open_items[note["item"]] = reads.item_by_id(connection, note["item"])
     found, batched = [], 0
+    batches = reads.review_batches(connection, open_items)  # by its header, not its ref (sd:10981)
     for row in reads.brief_notes(connection, list(open_items)):
         question, options = parse(row["body"])
         if row["kind"] != "question":
             continue
         item = open_items[row["item"]]
-        if reads.is_review_batch(item["source"], item["external_id"]):  # sd:10755: `review:<queue>:<batch>` alone
+        if row["item"] in batches:
             batched += 1
             continue
         found.append({"note": row["id"], "item": row["item"], "title": item["title"], "repo": item["repo"],
