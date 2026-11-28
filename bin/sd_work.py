@@ -237,8 +237,9 @@ def _edit_changes(args: argparse.Namespace) -> dict[str, Any]:
     checkout is a path that has to be resolved -- and `run`'s job is to pick
     the operation, not to do this.
     """
+    # sd:10758: `work_kind` is `fields.work_kind`, which `edit_item` folds and `build._slots` reads.
     changes: dict[str, Any] = {
-        field: getattr(args, field) for field in ("title", "body", "priority", "due")
+        field: getattr(args, field) for field in ("title", "body", "priority", "due", "work_kind")
         if getattr(args, field) is not None
     }
     if args.clear_priority:
@@ -1238,8 +1239,8 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
     if args.kind != "decision":
         raise WorkRefusal("--answers records a decision: add --kind decision")
     sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
+    import sd_db.reads as reads  # noqa: PLC0415 - after the helper
     import sd_db.review as review  # noqa: PLC0415 - after the helper
-    from sd_db.review import REF_SOURCE  # noqa: PLC0415 - after the helper
 
     with workflow.transaction(connection):
         asked = connection.execute("SELECT item, kind, resolved_at, body FROM note WHERE id = ?",
@@ -1252,11 +1253,10 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
             raise WorkRefusal(f"note {args.answers} is a {asked['kind']}, not a question")
         if asked["resolved_at"] is not None:
             raise WorkRefusal(f"note {args.answers} is already resolved, at {asked['resolved_at']}")
-        item = workflow.item_state(connection, args.item)["item"]
         # A question with no `Option:` line has no label to rule, so it is answered plainly (sd:8975).
         offers = any((tag := review.TAGGED.match(line)) and tag[1] == "Option"
                      for line in (asked["body"] or "").splitlines())
-        if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:") and (
+        if args.item in reads.review_batches(connection, [args.item]) and (
                 offers or getattr(args, "option", None) is not None):
             if _asks_in_batch(review, connection, args.item, args.answers):
                 return _rule_batch(review, workflow, connection, args, body, who, revision)
@@ -1825,6 +1825,9 @@ def register(groups: Any, store: Any) -> None:
                             "No build takes the item until each is done")
     waits.add_argument("--clear-blocked-by", action="store_true",
                        help="drop every item this one waits on")
+    # sd:10758: `fields.work_kind`, which `build._slots` reads.
+    edit.add_argument("--work-kind", choices=("mechanical", "normal"),
+                      help="mechanical: a small, low-risk item that takes half a bundle slot; normal: a whole one")
     # `--belongs-to` and not `--repo`: see `_belongs_to`. `--no-repo` is the
     # word `add` already uses for the same idea, so the pair reads the same on
     # both verbs.

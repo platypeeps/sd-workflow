@@ -646,7 +646,7 @@ reviewer chain before vendor, transport, availability and spending gates run.
 
 Core settings use `sd config get|set|unset|list` and the existing atomic machine configuration writer.
 The file is `~/.config/sd-ai-command-pack/config.json`, honoring `XDG_CONFIG_HOME`.
-These keys serve every machine and live in the workflow database as `setting` rows: `sd.fleet_owners`, `sd.copilot_review` (sd:3989), `sd.hub_name` (sd:4044), `sd.status_companions` (sd:5098) and the `sd.notion_*` publish ids (sd:5141).
+These keys serve every machine and live in the workflow database as `setting` rows: `sd.fleet_owners`, `sd.copilot_review` (sd:3989), `sd.review_tool_changes` (sd:10929), `sd.hub_name` (sd:4044), `sd.status_companions` (sd:5098) and the `sd.notion_*` publish ids (sd:5141).
 Every plugin key (`hoa.*`, `sdw.*`, `songs.*`) is a `setting` row too (sd:5109).
 `sd config set` and `unset` write the row; with a database the row alone answers, the file's line for that key is not read, and `get` names it on stderr.
 A machine with no database and no `hub.json` keeps them in the file. A database that cannot be read is an error, never the file's value.
@@ -663,6 +663,10 @@ The reserved `sd` namespace declares these settings:
 - `sd.external_reviews`: `configured` permits private code and scoped review context to eligible configured providers.
   It includes future registry entries; registry configuration chooses capability, while this explicit operator grant authorizes transmission.
   `deny` vetoes all local allowances. Absence supplies no standing grant.
+- `sd.review_tool_changes`: `keep`, the default, keeps a review and its rebuttals across a change to the
+  review tools alone; a policy change still re-reviews. `strict`, or a value that does not read,
+  voids rebuttals on a tool change and re-reviews, unless the sd:1397 replay finds the reviewers
+  would be asked the same. Settings → Fleet sets it.
 - `sd.copilot_review`: when `sd-ship` requests a Copilot review by itself. `deep` requests one on deep-tier changes only,
   `always` on every reviewing tier, `never` on none. Absence reads `deep`, so a repository with no
   review declaration gets Copilot on deep changes and on nothing else.
@@ -688,8 +692,8 @@ The reserved `sd` namespace declares these settings:
   all-mechanical bundle (sd:9942). It grants nothing.
 - `sd.lane_parallel`: how many lanes one hosted lane run runs at once on this machine, 1 to 8. Absence reads 5
   (sd:9323); the gate's slots and load limit still hold lanes back below it. It grants nothing.
-- `sd.lane_train`: how many queued entries of one repository one lane run gates at once as a stack, 1 to 9;
-  1 gates each entry alone. Absence reads 3 (sd:9899). It grants nothing.
+- `sd.lane_train`: how many queued entries of one repository one lane run gates at once as a stack, and
+  lands as one train pull request (sd:9923), 1 to 9; 1 gates and lands each entry alone. Absence reads 3 (sd:9899). It grants nothing.
 - `sd.machine_cap`: how many code-writing builders, drafts and interactive builders may run at once on this
   machine, 1 to 16. Absence reads 6 (sd:8158, sd:9891); the load guard still holds builds back. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,

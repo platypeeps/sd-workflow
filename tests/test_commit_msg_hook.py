@@ -354,6 +354,62 @@ class TheHook(HookFixture):
         result = self.commit(f"fix: a subject\n\n{url}\n\n```\n{'y' * 90}\n```\n")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_the_refusal_names_the_message_file_git_passed(self):
+        """pack sd:10220: in a linked worktree the message is not in .git/COMMIT_EDITMSG."""
+        result = self.commit("fix: a subject\n\n" + "x" * 73 + "\n")
+        kept = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-path", "COMMIT_EDITMSG"],
+                              cwd=self.root, env=clean_environment(), capture_output=True, text=True,
+                              check=True).stdout.strip()
+        self.assertIn(f"kept in {pathlib.Path(kept).resolve()}.", result.stderr)
+
+    def test_a_comment_line_git_drops_is_not_measured(self):
+        """Each way git drops a `#` line under -m/-F: a cleanup flag, its config, an editor run."""
+        long = "# " + "d" * 75
+        runs = {
+            "--cleanup=strip": ([], ["--cleanup=strip"], {}),
+            "--clean strip": ([], ["--clean", "strip"], {}),
+            "commit.cleanup": (["-c", "commit.cleanup=strip"], [], {}),
+            "inherited editor": ([], ["-e"], {"GIT_EDITOR": ":"}),
+        }
+        for name, (config, flags, extra) in runs.items():
+            with self.subTest(name):
+                result = subprocess.run(["git", *config, "commit", "-q", "--allow-empty", *flags, "-m",
+                                         "fix: a subject", "-m", long], cwd=self.root,
+                                        env=clean_environment(**extra), capture_output=True, text=True,
+                                        check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_editor_session_under_an_inherited_colon_editor_drops_git_status_comments(self):
+        """Review of pack sd:10220: `GIT_EDITOR=:` inherited, no -m/-F: git ran the editor, and strips
+        its status comments, one long with a staged path."""
+        template = self.root.parent / f"{self.root.name}-template"
+        template.write_text("fix: a subject\n", encoding="utf-8")
+        self.addCleanup(template.unlink)
+        wide = "w" * 70 + ".txt"
+        (self.root / wide).write_text("w\n", encoding="utf-8")
+        git("add", wide, cwd=self.root)
+        result = subprocess.run(["git", "-c", f"commit.template={template}", "commit", "-q"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=":"), capture_output=True, text=True,
+                                check=False)
+        # Past the hook git refuses the unedited template itself: the hook refused nothing.
+        self.assertNotIn("commit-msg: refused", result.stderr)
+        self.assertIn("you did not edit the message", result.stderr)
+
+    def test_a_staged_path_that_reads_as_a_message_option_is_no_message_option(self):
+        """Class pass: the hook read `ps`, where an amended path `a -m w.txt` shows a `-m` word.
+
+        Git ran the editor and strips its status comments, one long with that path. The hook cannot
+        know git's cleanup mode, so it skips every comment line; the enqueue check measures what landed.
+        """
+        self.assertEqual(self.commit("fix: a subject\n").returncode, 0)
+        wide = "a -m " + "w" * 70 + ".txt"
+        (self.root / wide).write_text("w\n", encoding="utf-8")
+        git("add", wide, cwd=self.root)
+        result = subprocess.run(["git", "commit", "-q", "--amend", wide], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=":"), capture_output=True, text=True,
+                                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_make_hooks_replaces_a_dangling_link(self):
         """pack sd:10212: 19 clones linked a retired pack path, and git skipped the hook silently."""
         link = self.root / ".git" / "hooks" / "commit-msg"

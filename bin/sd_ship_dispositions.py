@@ -79,14 +79,63 @@ def gate_waivable(check: Any) -> bool:
     return (type(code) is int and code == 0) or (check.get("status") == GATE_NOT_RUN and code is None)
 
 
-#: The `context` entries a tool change moves; under `sd_lib.TOOL_CHANGES_KEEP_REVIEWS` a recorded
+def lead_context(operation: Any, head: str) -> tuple[dict, list[dict]] | None:
+    """sd:10926. The lead's blocking `sd-review --scope branch` of `head` as `context` gives a ship review, when
+    the ship receipt holds no pass of `head`: a lead's rejection is a rebuttal in the store `sd-review` reads.
+    None, and the ship review decides, for a record of another subject, head or status, or one that does not read."""
+    import sd_lib  # noqa: PLC0415
+    import sd_ship_review  # noqa: PLC0415 -- it imports this module
+
+    passes = operation.history.native(operation.state)
+    # The ship pass decides only when the review loader takes it (`review_inputs`): a reserved pass a failed
+    # prepare left, or one a timed-out reviewer left short of depth, is no review of `head` (lead ruling, sd:10926).
+    if passes:
+        last = passes[-1]
+        report = last.get("report") if isinstance(last.get("report"), dict) else {}
+        subject = operation.carried_from(head, last)
+        reviewed = subject if subject != head else operation.state.get("reviewed_head")
+        if sd_ship_review.missing_part(last, report, subject, reviewed) is None:
+            return None
+    found = operation.connection.execute(
+        "SELECT body FROM state WHERE id = (SELECT MAX(id) FROM state WHERE kind = 'checkpoint' AND key = ?)",
+        (sd_lib.lead_review_key(operation.repository, operation.branch),)).fetchone()
+    try:
+        record = json.loads(found[0]) if found else None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(record, dict) or [record.get(name) for name in ("repository", "branch", "head", "status")] != [
+            operation.repository, operation.branch, head, "blocking"] or not isinstance(record.get("findings"), list):
+        return None
+    rows = [{"index": index, "finding_digest": digest(row), "raw_finding": row} for index, row in enumerate(
+        (row for row in record["findings"] if isinstance(row, dict) and row.get("disposition") == "blocking"), 1)]
+    return ({"repository": operation.repository, "branch": operation.branch, "head": head,
+             "source": sd_lib.LEAD_REVIEW_SOURCE, "lead_review_digest": digest(record)}, rows) if rows else None
+
+
+def choices(bindings: dict) -> tuple[str, ...]:
+    """The dispositions a proposal may give: a lead review's takes a rebuttal alone, as nothing reads a parked
+    row in its store and the finding would block again (ruling round, sd:10926)."""
+    import sd_lib  # noqa: PLC0415
+
+    return DISPOSITIONS[:1] if bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE else DISPOSITIONS
+
+
+def recorded_key(operation: Any, bindings: dict) -> str:
+    """Where a proposal records: a lead review's apart from the ship review's, which prepare reads (sd:10926)."""
+    import sd_lib  # noqa: PLC0415
+
+    where = key(operation)
+    return "ship-adjudication:lead:" + where.split(":", 1)[1] if bindings.get("source") == sd_lib.LEAD_REVIEW_SOURCE else where
+
+
+#: The `context` entries a tool change moves; under `sd.review_tool_changes` keep a recorded
 #: rebuttal survives them (operator 2026-11-27). A policy change still re-reviews, so a new report
 #: (its digest and `passes_digest`) voids the rebuttal there.
 TOOL_BINDINGS = ("review_binding", "adjudicator_binding")
 
 
 def same_bindings(stored: object, current: dict) -> bool:
-    if sd_lib.TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict):
+    if isinstance(stored, dict) and sd_lib.tool_changes_keep_reviews():
         return digest({k: v for k, v in stored.items() if k not in TOOL_BINDINGS}) == digest(
             {k: v for k, v in current.items() if k not in TOOL_BINDINGS})
     return digest(stored) == digest(current)
@@ -95,6 +144,8 @@ def same_bindings(stored: object, current: dict) -> bool:
 def context(operation: Any, head: str) -> tuple[dict, list[dict]]:
     if git(operation.root, "status", "--porcelain", "--untracked-files=all") or git(operation.root, "rev-parse", "HEAD") != head:
         raise Refusal("adjudication requires the clean exact reviewed head")
+    if lead := lead_context(operation, head):
+        return lead
     report = operation.review_inputs(head)
     if report["status"] != "blocking":
         raise Refusal("adjudication requires a complete blocking report")
@@ -186,9 +237,9 @@ def validate(operation: Any, head: str, proposal: Any, *, run_tests: bool = Fals
         if (not isinstance(row, dict) or set(row) - {"test"} != set(identity) | {"response_disposition", "reason"}
                 or type(row.get("index")) is not int or digest({name: row.get(name) for name in identity}) != digest(identity)):
             raise Refusal("disposition finding indices, raw findings or digests changed")
-        if row["response_disposition"] not in DISPOSITIONS:
-            raise Refusal("only a rebuttal or a parked risk can clear a blocker: response_disposition "
-                          f"is 'rebutted' or 'parked', not {row['response_disposition']!r}")
+        if row["response_disposition"] not in choices(bindings):
+            raise Refusal("only a rebuttal or a parked risk can clear a blocker: response_disposition is "
+                          f"{' or '.join(map(repr, choices(bindings)))}, not {row['response_disposition']!r}")
         text(row["reason"], "reason")
     tests = [test_argv(row.get("test")) for row in rows]
     if run_tests:
@@ -326,9 +377,9 @@ def adjudicate(operation: Any) -> dict:
     bindings, rows = context(operation, args.expected_head)
     if args.dispositions_file is None:
         proposal = {"schema_version": 1, "bindings": bindings,
-                    "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="", test=[]) for row in rows]}
+                    "findings": [dict(row, response_disposition="|".join(choices(bindings)), reason="", test=[]) for row in rows]}
         # sd:9966: the dispositions this review already holds, which a filled template replaces whole.
-        revision, value = operation.store.read(operation.connection, key(operation))
+        revision, value = operation.store.read(operation.connection, recorded_key(operation, bindings))
         held = (revision and value.get("decision") == "accepted"
                 and same_bindings((value.get("proposal") or {}).get("bindings"), bindings))
         return operation.result("disposition_template", proposal=proposal, recorded_revision=revision if held else None)
@@ -342,8 +393,9 @@ def adjudicate(operation: Any) -> dict:
         source_revision, source_state = operation.store.read(operation.connection, operation.key)
         if source_revision != operation.revision or source_state != operation.state:
             raise Refusal("ship receipt changed before the dispositions were recorded")
-        previous, prior = operation.store.read(operation.connection, key(operation))
-        revision = operation.store.save(operation.connection, key(operation), previous, {
+        where = recorded_key(operation, proposal["bindings"])
+        previous, prior = operation.store.read(operation.connection, where)
+        revision = operation.store.save(operation.connection, where, previous, {
             "decision": "accepted", "proposal": proposal, "proposal_digest": proposal_digest,
             "source_checkpoint": source_revision, "previous_adjudication_digest": digest(prior),
             "accepted_at": datetime.now(timezone.utc).isoformat()})

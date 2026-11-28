@@ -185,7 +185,7 @@ def split_branch(plan: dict, done: dict) -> dict:
     # Marked made first: a failed add may leave a half-made worktree or branch; undo removes both either way.
     _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
     done["onto"] = _replay(new_work, start, fork, kept)
-    check_branch(new_work, done["onto"], kept, aside, fork)
+    check_branch(new_work, done["onto"], kept, aside)
     done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     return done
 
@@ -224,9 +224,10 @@ def _renames(work: str | Path, old: str, new: str) -> dict[str, str]:
     return renamed
 
 
-def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int], fork: str) -> None:
+def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int]) -> None:
     """The new branch holds the kept commits alone: one commit each, no path past theirs, no `aside` citation.
-    A kept path main renamed since `fork` counts under its new name too (note #71874)."""
+    A kept path counts under the name `start` gives it too: read from each kept commit's parent, not the fork,
+    since a file the dropped commit added and main landed under a new name is not on the fork (sd:10020)."""
     shas = _out("rev-list", "--reverse", f"{start}..HEAD", cwd=work).split()
     if len(shas) != len(kept):
         raise DropRefused(f"the new branch holds {len(shas)} commits, not the {len(kept)} kept")
@@ -234,10 +235,11 @@ def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int],
     cited = aside & set(sd_ship_body.cited_ids("", commits))
     if cited:
         raise DropRefused(f"the new branch still cites {', '.join(f'sd:{n}' for n in sorted(cited))}")
-    allowed = set().union(*(_paths(work, sha) for sha in kept)) if kept else set()
-    if kept:
-        renamed = _renames(work, fork, start)
-        allowed |= {renamed[path] for path in allowed if path in renamed}
+    allowed: set[str] = set()
+    for sha in kept:
+        paths = _paths(work, sha)
+        renamed = _renames(work, f"{sha}^", start)
+        allowed |= paths | {renamed[path] for path in paths if path in renamed}
     changed = _names("diff", "--name-only", "-z", start, "HEAD", cwd=work)
     if changed - allowed:
         raise DropRefused(f"the new branch changes {', '.join(sorted(changed - allowed))}, which no kept commit does")

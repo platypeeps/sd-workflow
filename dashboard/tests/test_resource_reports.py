@@ -293,6 +293,73 @@ class CronJobFiles(unittest.TestCase):
                 found = collectors.cron_job_files()
             self.assertEqual(found, [jobs / "mini/mine.job", jobs / "mini/one.job"])
 
+    def test_an_inline_comment_on_the_host_line_names_the_schedulers_folder(self):
+        """sd:10424: `cron-jobs.sh` sources `.env`, so `# note` ends the value; the dashboard read the
+        host as `mini # this machine`, a folder that does not exist, and missed this host's jobs."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "config/cron-jobs/jobs"
+            (jobs / "mini").mkdir(parents=True)
+            (jobs / "mini/mine.job").write_text("A\n")
+            (root / "config/cron-jobs/.env").write_text("CRON_JOBS_HOST=mini # this machine\n")
+            with patch.dict(os.environ, {"SYSTEM_TOOLS_CONFIG": str(root / "config")}):
+                os.environ.pop("CRON_JOBS_EXTRA_DIRS", None)
+                os.environ.pop("CRON_JOBS_HOST", None)
+                found = collectors.cron_job_files()
+            self.assertEqual(found, [jobs / "mini/mine.job"])
+
+    #: system sd:10423's fixture: each `.env` line and the CRON_JOBS_HOST `.` leaves (checked there against sh).
+    HOST_LINES = [
+        ("CRON_JOBS_HOST=mini # this machine", "mini"),
+        ("CRON_JOBS_HOST=mini\t# tab", "mini"),
+        ('CRON_JOBS_HOST="mini" # quoted', "mini"),
+        ("CRON_JOBS_HOST='mini' # single", "mini"),
+        ('CRON_JOBS_HOST="mini # kept"', "mini # kept"),
+        ("CRON_JOBS_HOST=mini#kept", "mini#kept"),
+        ("CRON_JOBS_HOST=mi'ni'\"x\"", "minix"),
+        ("CRON_JOBS_HOST=mini\\ two", "mini two"),
+        ('CRON_JOBS_HOST="m\\"i"', 'm"i'),
+        ("export CRON_JOBS_HOST=mini  # export", "mini"),
+        ("CRON_JOBS_HOST=m\u00efni # non-ASCII", "m\u00efni"),
+        ("CRON_JOBS_HOST=mini;", "mini"),
+        ("CRON_JOBS_HOST=mini ; X=1", "mini"),
+        ("X=1; CRON_JOBS_HOST=mini", "mini"),
+        ("X=1 && CRON_JOBS_HOST=mini", "mini"),
+        ("CRON_JOBS_HOST=mini; CRON_JOBS_HOST=later", "later"),
+    ]
+
+    def test_each_scheduler_fixture_line_names_the_same_host_folder(self):
+        """sd:10424 takes system sd:10423's cases: the dashboard reads the folder `cron-jobs.sh` reads."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env_file = root / "config/cron-jobs/.env"
+            env_file.parent.mkdir(parents=True)
+            for line, host in self.HOST_LINES:
+                with self.subTest(line=line):
+                    env_file.write_text(line + "\n", encoding="utf-8")
+                    folder = root / "config/cron-jobs/jobs" / host.lower()
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / "mine.job").write_text("A\n")
+                    with patch.dict(os.environ, {"SYSTEM_TOOLS_CONFIG": str(root / "config")}):
+                        os.environ.pop("CRON_JOBS_EXTRA_DIRS", None)
+                        os.environ.pop("CRON_JOBS_HOST", None)
+                        found = collectors.cron_job_files()
+                    (folder / "mine.job").unlink()
+                    self.assertEqual(found, [folder / "mine.job"])
+
+    def test_a_line_the_scheduler_reads_past_the_parser_refuses_by_name(self):
+        """sd:10423's ruling: a redirection is refused by file, line and name, never guessed at."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env_file = root / "config/cron-jobs/.env"
+            env_file.parent.mkdir(parents=True)
+            env_file.write_text("CRON_JOBS_HOST=mini 2>/dev/null\n", encoding="utf-8")
+            with patch.dict(os.environ, {"SYSTEM_TOOLS_CONFIG": str(root / "config")}):
+                os.environ.pop("CRON_JOBS_HOST", None)
+                with self.assertRaises(ValueError) as refused:
+                    collectors.cron_job_files()
+            self.assertTrue(str(refused.exception).startswith(f"{env_file}:1: CRON_JOBS_HOST: an unquoted"))
+
     def test_no_host_folder_reads_the_shared_jobs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

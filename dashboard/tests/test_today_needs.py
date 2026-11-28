@@ -69,6 +69,20 @@ class TheBadge(ReportsCase):
         self.assertEqual([(row["band"], row["item"], row["what"], row["detail"]) for row in rows],
                          [("queued", grilled, "Grill ready: 3 questions", "say 'grill' in a fresh session")])
 
+    def test_a_stranded_item_is_a_look_row_naming_its_last_assignment(self):
+        """pack sd:10167: items sat in_progress for days after a bundle drop, with no build and no lane entry, and
+        Today listed them only as quiet "in progress, no session". Each is a look row naming what it last had."""
+        from sd_db import create_assignment, create_item
+
+        stuck = create_item(self.connection, kind="task", title="Dropped from a bundle")
+        self.connection.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (stuck,))
+        self.connection.execute("DELETE FROM note WHERE item = ?", (stuck,))
+        self.connection.execute("UPDATE item SET created_at = ? WHERE id = ?", ("2026-09-01T00:00:00+00:00", stuck))
+        create_assignment(self.connection, role="author", status="blocked", item=stuck)
+        rows = [row for row in self.today()["needs"] if row.get("item") == stuck]
+        self.assertEqual([(row["id"], row["band"]) for row in rows], [(f"stranded:{stuck}", "look")])
+        self.assertIn("blocked, no lane entry", rows[0]["detail"])
+
     def base_row(self, kind, stage, title):
         from sd_db import create_item
 

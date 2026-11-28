@@ -842,7 +842,7 @@ class NoItemContracts(unittest.TestCase):
         )
 
     # The strict reading (sd:10929): by default a tool change keeps the clearance (sd:10928).
-    @patch.object(fixture.ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)
+    @patch.object(fixture.ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)
     def test_each_verdict_member_mutation_refuses_no_item_clearance(self):
         """The manifest guards both modes, so both modes are measured.
 
