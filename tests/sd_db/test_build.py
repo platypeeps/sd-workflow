@@ -1513,18 +1513,26 @@ class Reap(Case):
 
     def test_build_with_a_finding_on_a_blocked_bundle_sends_it_to_the_builder(self):
         """pack sd:8792: `sd assignments build N --finding TEXT` is Send to builder: the finding note the builder
-        reads, then the bundle queued again. A fresh build has no builder to send it to, so it refuses."""
+        reads, then the bundle queued again. A fresh item in the same press builds with the note too (sd:10320)."""
         build.write(self.db, self.bundle["id"], step="building")
         row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
         build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
         fresh = self.item()
-        with self.assertRaisesRegex(build.BuildRefused, f"--finding .*sd:{fresh}"):
-            build.queue_again(self.db, [self.items[0], fresh], who="operator", finding="check the parser")
-        self.assertEqual(self.statuses(self.items), ["blocked", "blocked"], "one refusal writes nothing")
-        queued = build.queue_again(self.db, [self.items[0]], who="operator", finding="check the parser")
+        queued = build.queue_again(self.db, [self.items[0], fresh], who="operator", finding="check the parser")
         self.assertEqual({entry["status"] for entry in queued}, {"queued"})
-        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
-        self.assertIn(build.FINDING + "check the parser", notes)
+        self.assertEqual({entry["item"] for entry in queued}, {*self.items, fresh})
+        for item in (self.items[0], fresh):
+            notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (item,))]
+            self.assertEqual(notes.count(build.FINDING + "check the parser"), 1, notes)
+
+    def test_a_finding_on_a_fresh_design_item_refuses(self):
+        """Lane review of build/sd-1782: a design item with no design builds a design run first, which reads
+        no Send to builder note, and its code build's window opens later: the finding was lost unsaid."""
+        design = self.item(fields={"work_kind": "design"})
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{design}.*design run"):
+            build.queue_again(self.db, [design], who="operator", finding="check the parser")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment WHERE item = ?", (design,)).fetchone()[0],
+                         0, "one refusal writes nothing")
 
     def test_a_plain_retry_of_a_review_parked_run_sends_its_blockers(self):
         """pack sd:9498: Retry of a run parked after REVIEW_ROUNDS dropped the last round's blockers, which only

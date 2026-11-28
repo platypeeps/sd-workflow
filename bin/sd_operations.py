@@ -103,7 +103,13 @@ def get_assignments(args: argparse.Namespace) -> int:
         time.sleep(min(POLL_SECONDS, left))
     for state in states:
         print(json.dumps(state, ensure_ascii=False) if args.json else json.dumps(state, ensure_ascii=False, indent=2))
-    return 0 if not args.wait or (ended and (not merged or set(lanes) == {"merged"})) else 1
+    return 0 if not args.wait or (ended and (not merged or lanes_delivered(states))) else 1
+
+
+def lanes_delivered(states: list[dict]) -> bool:
+    """Whether each build's lane entry merged with no delivery pending: `--until merged`'s success (pack sd:9923)."""
+    lanes = [state.get("lane") or {} for state in states]
+    return all(lane.get("status") == "merged" and not lane.get("delivery_pending") for lane in lanes)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -803,7 +809,7 @@ def register(groups: Any) -> None:
             parser.set_defaults(handler=queue_builds)
             parser.add_argument("items", nargs="+", type=item_id, help=ITEM_HELP)
             parser.add_argument("--finding", default="", metavar="TEXT",
-                                help="Send to builder: the note the retried or fixed bundle's builder reads")
+                                help="Send to builder: the note the build's builder reads")
             parser.add_argument("--drop", action="store_true",
                                 help="take the one item out of its ended bundle: the kept items' commits go on a "
                                      "fresh branch under a kept lead, and the item builds alone (pack sd:9709)")

@@ -178,8 +178,11 @@ class GitHub:
         except ValueError:
             raise Refusal("GitHub returned unreadable JSON") from None
 
-    def api_status(self, path: str) -> tuple[int, Any]:
-        """`(HTTP status, body)` for a GET whose non-2xx answer is still an answer.
+    def api_status(self, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, Any]:
+        """`(HTTP status, body)` for a call whose non-2xx answer is still an answer.
+
+        A train's merge PUT reads it too: a 4xx there is GitHub's word that
+        it merged nothing, where a 5xx or no answer may hide a merge (sd:9923).
 
         `api` folds every failure into one refusal, which is right everywhere
         but the protection endpoints: there a 404 means "no classic protection
@@ -192,20 +195,21 @@ class GitHub:
         the response line `gh api --include` prints, not from the wording of
         gh's stderr, so a reworded message cannot turn a refusal into a fact.
         """
-        argv = ["gh", "api", "--include", path, "--method", "GET"]
+        argv = ["gh", "api", "--include", path, "--method", method, *(["--input", "-"] if body is not None else [])]
         try:
-            result = subprocess.run(argv, cwd=self.root, text=True, capture_output=True, timeout=60, check=False)
+            result = subprocess.run(argv, cwd=self.root, text=True, capture_output=True, timeout=60, check=False,
+                                    input=json.dumps(body) if body is not None else None)
         except (OSError, subprocess.SubprocessError) as error:
             raise Refusal(f"gh could not finish: {error}", code="command_unavailable", boundary="runtime",
                           state="retryable_failure", next_action="Restore command access, then retry this command.") from None
-        head, _, body = result.stdout.partition("\n\n")
+        head, _, answer = result.stdout.partition("\n\n")
         match = re.match(r"HTTP/[\d.]+ (\d{3})", head)
         if not match:
             raise Refusal((result.stderr or "gh api returned no HTTP status line").strip()[:2000],
                           code="command_failed", boundary="runtime", state="retryable_failure",
                           next_action="Inspect the command error, resolve its cause, then retry.")
         try:
-            return int(match[1]), json.loads(body)
+            return int(match[1]), json.loads(answer)
         except ValueError:
             raise Refusal("GitHub returned unreadable JSON") from None
 
@@ -585,13 +589,36 @@ class GitHub:
         the `sd/local-gate` status at this exact SHA is, and a missing one
         refuses as a missing run does. A failed one already refused above.
         """
-        runs = self.pages(f"{self.prefix}/commits/{head}/check-runs?filter=latest", "check_runs")
-        statuses = self.pages(f"{self.prefix}/commits/{head}/statuses")
+        runs, statuses = self.check_records(head)
         if self.ci == "local":
             self.local_gate_passed(head, statuses)
         if not runs and not statuses and self.jenkins_green != head:
             raise Refusal(f"nothing validated {head}: no check run and no status exists for it", code="ci_missing",
                           next_action="Run the repository's checks for this exact head, then retry merge.", boundary="ci", state="retryable_failure")
+        self.records_passing(head, runs, statuses)
+        if self.ci != "local":
+            self.pull_request_runs_passed(head)
+
+    def member_checks(self, head: str) -> None:
+        """A train member's own checks at `head`: every one recorded passes (sd:9923).
+
+        `sd/local-gate` may be missing, as the train's gate on its tip
+        stands in for it; one posted at `head` must still be `success`.
+        GitHub enforces required checks only on the train PR's head, so
+        this runs whatever the protection says.
+        """
+        runs, statuses = self.check_records(head)
+        self.records_passing(head, runs, statuses)
+        if self.ci != "local":
+            self.pull_request_runs_passed(head)
+
+    def check_records(self, head: str) -> tuple[list, list]:
+        """The latest check runs and the statuses GitHub holds at `head`."""
+        return (self.pages(f"{self.prefix}/commits/{head}/check-runs?filter=latest", "check_runs"),
+                self.pages(f"{self.prefix}/commits/{head}/statuses"))
+
+    def records_passing(self, head: str, runs: list, statuses: list) -> None:
+        """Refuse a check run or a newest status per context at `head` that did not pass."""
         for entry in runs:
             if (entry.get("head_sha") != head or entry.get("status") != "completed"
                     or entry.get("conclusion") not in PASSING):
@@ -605,8 +632,6 @@ class GitHub:
             if entry.get("sha", head) != head or entry.get("state") != "success":
                 raise Refusal(f"status is not passing on {head}: {context}", code="ci_not_passing",
                               next_action="Wait for or fix exact-head CI, then retry merge.", boundary="ci", state="retryable_failure")
-        if self.ci != "local":
-            self.pull_request_runs_passed(head)
 
     def pull_request_runs_passed(self, head: str) -> None:
         """Every workflow at `head` that runs on `pull_request` has a successful run there."""

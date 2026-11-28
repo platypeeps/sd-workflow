@@ -47,7 +47,7 @@ progress belongs to the database.
 | Find items by age in status | Operations → Progress; a bar opens matching Backlog items |
 | See weekly numbers, cost and providers | Operations → Usage |
 | Request a supported retry or stop | Operations, `sd jobs retry NAME`, `sd jobs cancel NAME` |
-| Start a build: the one verb (sd:9063) | `sd assignments build ID [ID ...]`; a planning item is set ready first; an item whose bundle ended blocked or cancelled is retried, worktree kept; one whose lane entry failed is Fix, the lane's reason its finding; `--finding TEXT` is Send to builder on a retry or Fix, refused on a fresh build; one refusal refuses the selection |
+| Start a build: the one verb (sd:9063) | `sd assignments build ID [ID ...]`; a planning item is set ready first; an item whose bundle ended blocked or cancelled is retried, worktree kept; one whose lane entry failed is Fix, the lane's reason its finding; `--finding TEXT` is Send to builder, on a fresh build too, refused where it would start a design run; one refusal refuses the selection |
 | Take one item out of an ended bundle, lead included (pack sd:9709) | `sd assignments build ID --drop`, on the host that built it: the kept items' commits are cherry-picked onto a fresh branch and worktree from the base under a kept lead, the item builds alone, and its old commits and files stay in the old branch and worktree; a commit that cites both sides, or one that cites no item, refuses the drop |
 | Run one build-dispatch tick: reap, lane watch, claim, spawn | `sd assignments dispatch`; the hub's job runs it |
 | Supervise one build run, or list the live sessions | `sd assignments dispatch --supervise RUN`, `sd assignments dispatch --sessions` |
