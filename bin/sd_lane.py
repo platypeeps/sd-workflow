@@ -373,6 +373,9 @@ STALE_HEAD = "stale_head"
 #: A last entry the dashboard's Fix (`sd_db.build.lane_fix`, pack sd:8584) cancelled and handed to a builder: its
 #: worktree is the builder's, so `retry` refuses it.
 HANDED_BACK = "handed_back"
+#: sd:10287. Past `ROUND_CAP` counted review rounds of an item (`reads.review_costs`: build and lane rounds
+#: together), a re-prepare of the head a lane review blocked waits on the lead's rulings: refused `UNRULED`.
+ROUND_CAP, UNRULED = 3, "unruled_blockers"
 #: An entry on a build bundle's branch would deliver a member the operator cancelled on its own (sd:9222).
 MEMBER_LEFT = "member_cancelled_alone"
 #: A `Closes:` trailer cites a blocked item that no `--item` names and no `Refs:` keeps (sd:9918).
@@ -833,6 +836,7 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
     closes = tuple(dict.fromkeys(number for number in closes if number != item))
     def checked(connection: Any) -> str | None:
         check_item(connection, worktree, item, body, claim, closes, title, branch)
+        refuse_unruled(connection, queue.repository, item, newest_entry(connection, queue.repository, item), head)
         return forwarded_to(connection, queue)
     forwarded = on_hub(queue, checked)
     entry = {"id": entry_id(), "repository": queue.repository, "item": item, "branch": branch, "expected_head": head,
@@ -870,6 +874,55 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
     return add_entry(queue, entry, (lambda entries: refuse_ran(entries, item, head)) if expected_head else None)
+
+
+def refuse_unruled(connection: Any, repository: str, item: int, last: dict[str, Any] | None,
+                   head: str | None = None) -> None:
+    """Refuse `UNRULED` a re-prepare of a head the lane's review blocked, past `ROUND_CAP` rounds (sd:10287).
+
+    `last` is the item's newest entry; it counts only when a review blocked it (`review_blocking`) and
+    `head`, the head queued now (None: a retry, at `last`'s head), is its head. A new head is a fix, which
+    queues. The blocked review is the last pass of the item's ship receipt on `last`'s branch; an accepted
+    adjudication of that pass's head lets it through (`ruled`), and prepare then runs the gate alone.
+    """
+    if last is None or last.get("code") != "review_blocking" or last.get("status") not in BLOCKED:
+        return
+    if head is not None and head != last.get("expected_head"):
+        return
+    require_sd_db()
+    from sd_db import reads  # noqa: PLC0415
+    rounds = reads.review_costs(connection, [item]).get(item, {}).get("rounds", 0)
+    if rounds <= ROUND_CAP:
+        return
+    reviewed, done = ruled(connection, repository, item, str(last.get("branch")), str(last.get("expected_head")))
+    if not done:
+        raise LaneError(f"sd:{item} has had {rounds} review rounds, past {ROUND_CAP}, and its lane review blocked "
+                        f"at {reviewed}; nothing was queued. Rule each blocker with `sd-ship adjudicate --item "
+                        f"{item} --expected-head {reviewed} --json`, or fix it on a new head", code=UNRULED)
+
+
+def ruled(connection: Any, repository: str, item: int, branch: str, head: str) -> tuple[str, bool]:
+    """The head `item`'s newest ship receipt on `branch` last reviewed (`head` when none says), and whether an
+    accepted adjudication binds that head. An unreadable receipt or ruling is no ruling."""
+    from sd_db import ship  # noqa: PLC0415
+    from sd_db.workflow import WorkflowError  # noqa: PLC0415
+    for (key,) in connection.execute("SELECT key FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship:%' "
+                                     "GROUP BY key ORDER BY MAX(id) DESC").fetchall():
+        try:
+            receipt = ship.read(connection, key)[1]
+            if (receipt.get("item") != item or receipt.get("branch") != branch
+                    or str(receipt.get("repository") or "").lower() != repository.lower()):
+                continue
+            ruling = ship.read(connection, "ship-adjudication:" + key.removeprefix("ship:"))[1]
+        except WorkflowError:
+            continue
+        passes = receipt.get("passes") if isinstance(receipt.get("passes"), list) else []
+        last = passes[-1] if passes and isinstance(passes[-1], dict) else {}
+        reviewed = last["head"] if isinstance(last.get("head"), str) else head
+        proposal = ruling.get("proposal") if isinstance(ruling.get("proposal"), dict) else {}
+        bindings = proposal.get("bindings") if isinstance(proposal.get("bindings"), dict) else {}
+        return reviewed, ruling.get("decision") == "accepted" and bindings.get("head") == reviewed
+    return head, False
 
 
 def refuse_ran(entries: list[dict[str, Any]], item: int, head: str) -> None:
@@ -1815,6 +1868,7 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
             handed = latest["handed_back"] if isinstance(latest["handed_back"], dict) else {}
             raise LaneError(f"sd:{item}'s last entry was handed back to its builder (build run "
                             f"{handed.get('run')}); the builder enqueues its new head", code=HANDED_BACK)
+        refuse_unruled(connection, queue.repository, item, latest)
         return latest
 
     def still_newest(connection: Any) -> None:
