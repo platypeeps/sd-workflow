@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .database import transaction
+from .database import Patient, transaction
 from .errors import RegistryError
 from .yaml_lite import YamlLiteError, load
 
@@ -386,21 +386,36 @@ def read(
     With no connection this is the file alone, which is what a caller with no
     database -- the installer, a doctor command -- gets, at `registry_path`.
     With a connection and neither `path` nor `home`, the file is the one
-    beside that connection's database (`beside`), not the one under `$HOME`.
+    beside that connection's database (`beside`), not the one under `$HOME`;
+    on a hub's session, the hub's file, read over that session.
     """
-    if path is not None:
-        target = Path(path)
-    elif connection is not None and home is None:
-        target = beside(connection)
+    session = _session(connection) if path is None and home is None else None
+    if session is not None:
+        # A hub's session answers the hub's path, which names no file on a satellite: read the hub's
+        # file over that session instead (seam 7; sd:10400, a satellite build lost its cost attribution).
+        registry = parse(session.registry_bytes().decode("utf-8"), f"{session.host}:{REGISTRY_NAME}")
     else:
-        target = registry_path(home)
-    if not target.exists():
-        raise RegistryError(f"no provider registry at {target}")
-    registry = parse(target.read_text(encoding="utf-8"), target)
+        if path is not None:
+            target = Path(path)
+        elif connection is not None and home is None:
+            target = beside(connection)
+        else:
+            target = registry_path(home)
+        if not target.exists():
+            raise RegistryError(f"no provider registry at {target}")
+        registry = parse(target.read_text(encoding="utf-8"), target)
     if connection is None:
         return registry
     ensure_seeded(connection, registry)
     return merge(registry, connection)
+
+
+def _session(connection: Any):
+    """The hub session `connection` reads through, unwrapped from `Patient`, or None for a local file."""
+    from . import remote
+
+    inner = connection.connection if isinstance(connection, Patient) else connection
+    return inner if isinstance(inner, remote.Connection) else None
 
 
 def writable(connection: sqlite3.Connection) -> bool:
