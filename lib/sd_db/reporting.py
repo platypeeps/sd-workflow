@@ -483,17 +483,33 @@ def _set_chain(connection, key, row, body):
                            (json.dumps(body, sort_keys=True), now(), row["id"]))
 
 
-def health(connection, job):
+def health(connection, job, *, now=None):
     """What this job's last recorded tick said, or `None` if it has never run.
 
     Read from the heartbeat rather than from the report items, because the
     reports are the exceptions now and a job with no report is the normal case
-    rather than a job that has never run.
+    rather than a job that has never run. The last tick is `_current_tick`'s.
     """
+    body = _current_tick(connection, HEARTBEAT_KEY + job, now)
+    return body["healthy"] if body else None
+
+
+def _current_tick(connection, key, now=None):
+    """The newest real tick under `key`, its body, or `None` when it has none.
+
+    The latest `ended` within `now` plus `FUTURE_ALLOWANCE`, the newest row on
+    a tie: not the newest row by id, which can be one stamped past the
+    allowance (sd:10410), and it held health over the real newest tick. With
+    no such row, the newest row by id: a bad stamp is then all there is.
+    """
+    limit = stamp(((now or datetime.now(UTC)) + FUTURE_ALLOWANCE).isoformat())
     row = connection.execute(
-        "SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1",
-        (HEARTBEAT_KEY + job,)).fetchone()
-    return json.loads(row["body"])["healthy"] if row else None
+        "SELECT body FROM state WHERE kind='heartbeat' AND key=? AND json_valid(body)"
+        " AND json_type(body, '$.ended') = 'text' AND json_extract(body, '$.ended') <= ?"
+        " ORDER BY json_extract(body, '$.ended') DESC, id DESC LIMIT 1", (key, limit)).fetchone()
+    row = row or connection.execute(
+        "SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+    return json.loads(row["body"]) if row else None
 
 
 def _beat(connection, *, job, run_id, healthy, ended, exit_code, now, host=None):
@@ -560,17 +576,11 @@ def _beat(connection, *, job, run_id, healthy, ended, exit_code, now, host=None)
             "                 WHERE value IN (?, ?)))",
             (key, run_id, host, run_id, _tagged(run_id, host))).fetchone():
         return "recorded"
-    # The newest real tick: the latest `ended` within the allowance, the
-    # newest row on a tie. Not the newest row by id: a row stamped past the
-    # allowance can be that, and it hid the real newest tick (sd:10410).
-    latest = connection.execute(
-        "SELECT body FROM state WHERE kind='heartbeat' AND key=? AND json_valid(body)"
-        " AND json_type(body, '$.ended') = 'text' AND json_extract(body, '$.ended') <= ?"
-        " ORDER BY json_extract(body, '$.ended') DESC, id DESC LIMIT 1",
-        (key, stamp((now + FUTURE_ALLOWANCE).isoformat()))).fetchone()
-    newest_body = json.loads(latest["body"]) if latest else {}
+    # The newest real tick (sd:10410), as `health` reads it; a row stamped
+    # past the allowance outranks nothing, even when it is the only one.
+    newest_body = _current_tick(connection, key, now) or {}
     newest = newest_body.get("ended") or ""
-    if ended < newest:
+    if ended < newest <= stamp((now + FUTURE_ALLOWANCE).isoformat()):
         return "older"
     body = {"healthy": healthy, "run_id": run_id, "ended": ended, "exit_code": exit_code}
     if host is not None:
@@ -755,9 +765,7 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
         # another host's clean tick is no recovery from this host's failure.
         previous = last.get("healthy")
         if type(previous) is not bool:
-            latest = connection.execute("SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1",
-                                        (HEARTBEAT_KEY + job,)).fetchone()
-            latest = json.loads(latest["body"]) if latest else {}
+            latest = _current_tick(connection, HEARTBEAT_KEY + job, now) or {}
             previous = latest.get("healthy") if latest.get("host") in (None, host) else None
         clock = now or datetime.now(UTC)
         beat = _beat(connection, job=job, run_id=run_id, healthy=not attention,

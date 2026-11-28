@@ -60,7 +60,7 @@ case "$*" in
   *" adjudicate "*) case "$*" in
        *--dispositions-file*) if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_REFUSE"; exit 3; fi
          eval "f=\\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
-       *) if [ -n "$QUEUE_TEMPLATE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_TEMPLATE_REFUSE"; exit 3; fi
+       *) if [ -n "$QUEUE_TEMPLATE_REFUSE" ]; then printf '{"ok": false, "error": "%s", "workflow": {"blocker": {"code": "%s", "retryable": %s}}}\\n' "$QUEUE_TEMPLATE_REFUSE" "${QUEUE_TEMPLATE_CODE:-prerequisite_failed}" "${QUEUE_TEMPLATE_RETRYABLE:-false}"; exit 3; fi
          if [ -n "$QUEUE_TEMPLATE_CRASH" ]; then echo "Traceback: $QUEUE_TEMPLATE_CRASH" >&2; exit 1; fi
          raw="$QUEUE_RAW"; [ -n "$raw" ] || raw='{"severity": "high", "path": "a.py", "line": 1, "summary": "wrong"}'
          fs=""; for d in ${QUEUE_DIGEST:-f1}; do fs="$fs${fs:+, }{\\"index\\": 1, \\"finding_digest\\": \\"$d\\", \\"raw_finding\\": $(printf '%s' "$raw" | sed "s/@D/$d/g"), \\"response_disposition\\": \\"rebutted|parked\\", \\"reason\\": \\"\\"}"; done
@@ -1030,6 +1030,18 @@ class TheMove(Lane, BrowserSession):
             self.log.write_text("")
             self.rebuild()
             self.assertEqual(len(self.adjudicated()), 1, "a template that gave no answer is asked again")
+
+    def test_a_retryable_adjudicate_refusal_is_asked_again(self):
+        """sd:10997 review: a hub outage is a refusal the lane marks retryable; kept, it left Reject off
+        after the hub came back. Only a refusal that says it is not retryable is kept."""
+        for env in ({"QUEUE_TEMPLATE_CODE": "hub_unavailable", "QUEUE_TEMPLATE_RETRYABLE": "true"},
+                    {"QUEUE_TEMPLATE_RETRYABLE": "null"}):
+            with self.subTest(env=env):
+                with mock.patch.dict(os.environ, {"QUEUE_TEMPLATE_REFUSE": "the sd hub is unreachable", **env}):
+                    self.assertIsNone(self.failed()["review"])
+                self.log.write_text("")
+                self.assertIsNotNone(self.rebuild()["review"], "the hub answered again: Reject is back")
+                self.assertEqual(len(self.adjudicated()), 1)
 
     def test_only_the_newest_entry_of_an_item_runs_adjudicate(self):
         """sd:10997: an older failed entry superseded by a newer one offers no Reject; it asks nothing."""

@@ -209,6 +209,27 @@ class AReplayWritesNothing(unittest.TestCase):
                               (reporting.HEARTBEAT_KEY + "probe",)).fetchone()
         self.assertEqual([run.split("@")[0] for run in json.loads(row["body"])["same_second"]], ["b"])
 
+    def test_a_future_stamp_does_not_hold_health_over_the_newest_real_tick(self):
+        """sd:10410 review: `health` and `ingest_log`'s previous health read the newest row by id,
+        so a future-stamped failure held health over the real newest tick."""
+        self.tick("b", 16)
+        self.tick("typo", 0, ended="2027-09-08T00:01:00Z", exit_code=1, text="boom\n")
+        self.assertIs(reporting.health(self.db, "probe", now=NOW), True)
+        self.tick("a", 1, exit_code=1, text="late\n")
+        self.assertIs(reporting.health(self.db, "probe", now=NOW), True)
+
+    def test_previous_health_with_no_chain_row_is_the_newest_real_tick(self):
+        self.tick("b", 16, exit_code=1, text="boom\n")
+        self.tick("typo", 0, ended="2027-09-08T00:01:00Z")
+        self.db.execute("DELETE FROM state WHERE key LIKE ?", (reporting.CHAIN_KEY + "%",))
+        self.db.commit()
+        recovered = self.tick("c", 31)
+        self.assertEqual(recovered["why"], "the job recovered")
+
+    def test_with_only_a_future_stamp_health_is_that_row(self):
+        self.tick("typo", 0, ended="2027-09-08T00:01:00Z", exit_code=1, text="boom\n")
+        self.assertIs(reporting.health(self.db, "probe", now=NOW), False)
+
     def test_a_stamp_within_the_allowance_still_counts_as_newest(self):
         """Five minutes past the clock is a slewing clock, not a typo: it still wins."""
         self.tick("ahead", 0, ended="2026-09-08T01:04:59Z")
