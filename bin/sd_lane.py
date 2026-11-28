@@ -5711,7 +5711,7 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
     """
     try:
         entry = sent_train_settled(queue, settle_mark(queue, entry, token, root), token, root)
-        found = checkout_for(root, queue, entry)
+        found = train_reconciled(entry) or checkout_for(root, queue, entry)
     except Stop as stop:
         return None, record_hub_stop(queue, token, stop, entry)
     except LaneError as error:
@@ -5751,6 +5751,24 @@ def unknown_checkout(queue: Queue, entry: dict[str, Any], token: str,
     except Stop as stop:
         return None, record_hub_stop(queue, token, stop, entry)
     return {"item": entry["item"], "status": "pending"}, f"sd:{entry['item']}: {error} It is pending again."
+
+
+def train_reconciled(entry: dict[str, Any]) -> dict[str, Any] | None:
+    """The merged fields of a member its train's landing reconciled, or None (sd:10105).
+
+    `land_joined` ran `sd-ship reconcile` for it once GitHub confirmed the
+    train, and that answered merged with nothing pending: the train
+    delivered it. Its claim then needs no checkout, prepare or merge, and
+    GitHub may have deleted its branch at that merge, so `checkout_for`
+    would skip it. Any other record, delivery held included, runs as before.
+    """
+    train = entry.get("train")
+    commit = train.get("merge_commit") if isinstance(train, dict) else None
+    if not (isinstance(train, dict) and train.get("status") == "landed" and train.get("reconciled") is True
+            and isinstance(commit, str) and commit):
+        return None
+    return {"status": "merged", "step": "merge", "merge_commit": commit,
+            "reason": f"merged in train pull request #{train.get('pull')}; reconciled at its landing"[:REASON_CHARS]}
 
 
 def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: str, environ: dict[str, str],
