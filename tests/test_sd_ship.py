@@ -148,7 +148,7 @@ class ShipDouble(GitHubDouble):
 
     def _pull(self, pull):
         head = getattr(pull, "merged_head", None) or pull.head_sha(self.remote)
-        return {"number": pull.number, "title": pull.title, "body": pull.body,
+        return {"number": pull.number, "title": pull.title, "body": pull.body, "user": {"login": pull.author},
                 "state": "closed" if pull.state == "MERGED" else pull.state.lower(),
                 "merged": pull.state == "MERGED", "draft": pull.draft,
                 "html_url": f"https://github.com/{self.remote.slug}/pull/{pull.number}",
@@ -1233,7 +1233,7 @@ roles:
         # The receipt reads back through the same coverage walk that merge uses.
         self.assertEqual(self.merge()["phase"], "merged")
 
-    @unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)  # the strict reading
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
     def test_a_re_review_records_what_moved_and_stores_a_fresh_manifest(self):
         """sd:1834, sd:1246. The pass a moved binding spends says which file spent it."""
         self.assertEqual(self.prepare()["phase"], "ready_to_send")
@@ -1255,7 +1255,7 @@ roles:
                 self.assertEqual(state["passes"][-1]["review_binding_change"]["changed"], changed)
                 self.assertEqual(state["binding_manifest"], ship.binding_manifest(self.root))
 
-    @unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)  # the strict reading
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
     def test_a_landing_that_leaves_the_request_unchanged_keeps_the_receipt(self):
         """sd:1397, option E. A verdict file moved, but `sd-review --explain` replayed for the
         stored pass asks the reviewers the same thing, so the receipt stands and no pass is spent."""
@@ -1275,10 +1275,11 @@ roles:
         self.assertEqual(state["binding_manifest"], ship.binding_manifest(self.root))
         self.assertEqual(state["review_binding_kept"][0]["changed"], [["sd_route.py", "verdict"]])
         self.assertEqual(state["review_binding_kept"][0]["request_sha256"], state["passes"][0]["review_request"]["sha256"])
+        self.assertIn("rebutted_through", state["passes"][0]["review_request"], "the cap a replay reads (sd:9973)")
         land()
         self.assertEqual(self.merge()["phase"], "merged")
 
-    @unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False)  # the strict reading
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
     def test_a_landing_that_moves_finding_parsing_re_reviews_though_the_request_is_unchanged(self):
         """sd:1397, operator ruling (option A). `sd-review` parses and disposes findings, so a
         landing that moves it re-reviews even when `--explain` would ask the reviewers the same."""
@@ -4123,6 +4124,23 @@ roles:
         self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0], "done")
         self.assertEqual(len([call for call in self.remote.calls if call.method == "PUT"]), 1)
 
+    def test_a_reconcile_that_delivers_clears_the_lanes_pending_delivery(self):
+        """Review of sd:9923: a reconcile that delivered left the lane row reading delivery pending;
+        a lane write that fails is reported, not swallowed."""
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [{"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        with patch("sd_db.progress.deliver_work", side_effect=sqlite3.OperationalError("DB write unavailable")):
+            self.assertTrue(self.merge()["delivery_pending"])
+        refused = ship.sd_lane.LaneError("hub down", code=ship.sd_lane.HUB_UNAVAILABLE)
+        with patch.object(ship.sd_lane, "delivery_settled", side_effect=refused) as settled:
+            fixed = self.operation("reconcile").reconcile()
+        self.assertEqual((fixed["delivery_pending"], fixed.get("lane_unsettled")), (False, "hub down"))
+        self.assertEqual(settled.call_args.args[1:3], (self.item, fixed["merge_commit"]))
+        with patch.object(ship.sd_lane, "delivery_settled", return_value=1) as settled:
+            again = self.operation("reconcile").reconcile()
+        self.assertEqual((again["delivery_pending"], "lane_unsettled" in again, settled.call_count), (False, False, 1))
+
     def waiver_file(self, *rows: dict) -> pathlib.Path:
         """An acceptance file for the claimed item: a passing row, then `rows`."""
         acceptance = self.directory / "acceptance.json"
@@ -5223,7 +5241,7 @@ roles:
     def test_a_lead_review_under_other_review_tools_gets_a_full_review_when_strict(self):
         calls = self.lead_reviewed_branch()
         self.rewrite_lead_record(binding={**self.lead_record()["binding"], "tools": "0" * 40})
-        with unittest.mock.patch.object(ship.sd_lib, "TOOL_CHANGES_KEEP_REVIEWS", False):
+        with unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False):
             self.assert_full_review(calls, "the review tools or policy changed since")
 
     def test_a_lead_review_that_wanted_copilot_gets_the_lane_review(self):
@@ -5313,8 +5331,12 @@ roles:
             review.record_lead_review(self.root, args, {**result, "binding": {"review_declaration": "older"}},
                                       dict(os.environ))
         self.assertIsNone(self.lead_record(), "a pass under another binding was stamped with the current one")
-        review.record_lead_review(self.root, args, {**result, "status": "blocking"}, dict(os.environ))
-        self.assertIsNone(self.lead_record(), "a blocking pass was recorded")
+        blocker = {"path": "src.py", "line": 1, "summary": "defect", "disposition": "blocking"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, {**result, "status": "blocking", "findings": [
+                blocker, dict(blocker, disposition="advisory")]}, dict(os.environ))
+        self.assertEqual((self.lead_record()["status"], self.lead_record()["findings"]), ("blocking", [blocker]),
+                         "a blocking pass keeps its blockers for adjudicate (sd:10926)")
         with contextlib.redirect_stderr(io.StringIO()):
             review.record_lead_review(self.root, args, result, dict(os.environ))
         self.assertEqual(self.lead_record()["status"], "advisory", "an advisory pass was not recorded (sd:9767)")
@@ -6579,6 +6601,654 @@ roles:
         state = self.operation().state
         self.assertFalse(state.get("passes"))
         self.assertIsNone(state.get("reviewed_head"))
+
+
+    # -- a train lands as one train pull request (sd:9923) --------------------
+
+    def landing_before(self, name="earlier.py"):
+        """A commit on `origin/main` that is not on it: the landing an earlier train member left."""
+        _git(self.root, "fetch", "-q", "origin", "main")
+        main = _git(self.root, "rev-parse", "FETCH_HEAD")
+        earlier = self.remote.commit_on(f"earlier-{name}", "earlier member\n\nAuthored-with: human",
+                                        files={name: "earlier = 1\n"})
+        _git(self.root, "fetch", "-q", "origin", f"earlier-{name}")
+        return main, earlier
+
+    def join(self, onto, *extra):
+        head = _git(self.root, "rev-parse", "HEAD")
+        return self.operation("merge", "--manual", "--expected-head", head, "--train-onto", onto, *extra).merge()
+
+    def land_train(self, tip):
+        """The train pull request merged with a merge commit, as `land_train` lands it."""
+        _git(self.root, "push", "-q", "origin", f"{tip}:refs/heads/sd-train/fixture")
+        train = self.remote.open_pull_request("sd-train/fixture", title="train")
+        return self.remote.merge(train.number, sha=tip, method="merge")
+
+    def test_a_train_join_writes_the_merge_onto_the_landing_and_dispatches_nothing(self):
+        self.delivering()
+        head = _git(self.root, "rev-parse", "HEAD")
+        _main, earlier = self.landing_before()
+        joined = self.join(earlier)
+        self.assertEqual(joined["phase"], "train_joined")
+        commit = joined["train_commit"]
+        self.assertEqual(_git(self.root, "rev-parse", f"{commit}^1", f"{commit}^2").split(), [earlier, head])
+        message = _git(self.root, "show", "-s", "--format=%B", commit)
+        self.assertIn("(#1)", message.splitlines()[0])
+        self.assertIn(f"Item: sd:{self.item}", message)
+        self.assertIn(f"Reviewed-base: {earlier}", message)
+        self.assertIs(ship.sd_lib.held_at_merge(message, earlier), False)  # the joined-tree gate releases it
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
+        state = self.operation("merge", "--manual", "--expected-head", head).state
+        self.assertEqual((state["phase"], state["train_commit"], state["train_onto"]),
+                         ("train_joined", commit, earlier))
+        again = self.join(earlier)["train_commit"]
+        after = self.operation("merge", "--manual", "--expected-head", head).state
+        self.assertEqual((after["train_commit"], _git(self.root, "rev-parse", f"{again}^1", f"{again}^2").split()),
+                         (again, [earlier, head]))  # a second join records the commit it answers
+
+    def test_a_second_train_join_writes_the_same_commit(self):
+        """Review of sd:9923: the lane joins each member again after the gate, and the tip it gated must not move."""
+        self.delivering()
+        _main, earlier = self.landing_before()
+        first = self.join(earlier)["train_commit"]
+        time.sleep(1.1)  # a commit dated now would differ
+        self.assertEqual(self.join(earlier)["train_commit"], first)
+
+    def test_a_train_join_refuses_a_member_retargeted_off_the_base(self):
+        """Review of sd:9923: the join read the member PR's head and state, not its base, so a PR moved to a
+        release branch landed on main through the train."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.remote.pull(1).base = "release"
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(earlier)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_not_open")
+
+    def test_a_train_join_that_conflicts_refuses_and_records_no_join(self):
+        self.prepare()
+        conflicting = self.remote.commit_on("clash", "clash\n\nAuthored-with: human", files={"src.py": "value = 9\n"})
+        _git(self.root, "fetch", "-q", "origin", "clash")
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(conflicting)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_conflict")
+        self.assertNotEqual(self.operation("merge", "--manual", "--expected-head", "HEAD").state.get("phase"),
+                            "train_joined")
+
+    def test_a_train_join_refuses_a_landing_that_lacks_the_default_branch(self):
+        self.prepare()
+        _git(self.root, "fetch", "-q", "origin", "main")
+        old = _git(self.root, "rev-parse", "FETCH_HEAD")
+        self.remote.commit_on("main", "moved\n\nAuthored-with: human", files={"moved.py": "m = 1\n"})
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(old)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_stale_landing")
+
+    def test_a_train_join_refuses_a_member_whose_own_check_failed(self):
+        """Review of sd:9923: the train gated only its tip, so a member whose remote check failed joined."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.remote.pull(1).checks[0]["conclusion"] = "failure"
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(earlier)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "ci_not_passing")
+
+    def test_a_train_join_refuses_a_member_whose_status_failed(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        head = _git(self.root, "rev-parse", "HEAD")
+        self.double.statuses.insert(0, {"context": "lint", "state": "failure", "sha": head,
+                                        "creator": {"login": "fixture"}})
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(earlier)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "ci_not_passing")
+
+    def test_a_train_join_refuses_a_repository_without_merge_commits(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        saved = self.double._route
+
+        def route(method, path, body):
+            code, value = saved(method, path, body)
+            if method == "GET" and path == f"/repos/{self.remote.slug}":
+                value = {**value, "allow_merge_commit": False}
+            return code, value
+        self.double._route = route
+        with self.assertRaisesRegex(ship.Refusal, "merge merging is disabled"):
+            self.join(earlier)
+
+    def test_a_landed_train_reconciles_each_member_at_its_train_merge(self):
+        self.delivering()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        self.assertEqual((self.remote.pull(1).state, self.remote.pull(1).merge_commit_sha), ("MERGED", commit))
+        merged = self.merge()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", commit))
+        self.assertFalse(merged["delivery_pending"])
+        self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
+                         "done")
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def test_a_member_below_the_train_top_reconciles_delivered(self):
+        """Review of sd:9923: `--first-parent` never walked into the train, so every member but the top was held."""
+        self.delivering()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        _old, later = self.landing_before("later.py")
+        top = _git(self.root, "commit-tree", f"{commit}^{{tree}}", "-p", commit, "-p", later, "-m", "later member")
+        self.land_train(top)
+        merged = self.merge()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", commit))
+        self.assertFalse(merged["delivery_pending"])
+        self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
+                         "done")
+
+    def test_a_prepare_after_a_landed_train_refuses_to_reconcile_unlocked(self):
+        """A train that landed after `dispatch` read it: the unlocked prepare refuses, and the next one locks."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_landed")
+        self.assertEqual(self.operation().state["phase"], "train_joined")
+
+    def test_a_prepare_after_a_landed_train_reconciles_under_the_ship_lock(self):
+        """Review of sd:9923: a train_joined prepare reconciled unlocked, off the lane host's check."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        real, locked = receipts.repository_lock, []
+
+        @contextlib.contextmanager
+        def recording(*args, **options):
+            with real(*args, **options):
+                locked.append(True)
+                yield
+        reconcile = ship.Ship.reconcile
+
+        def checked(delivery):
+            self.assertTrue(locked, "reconciled without the ship lock")
+            return reconcile(delivery)
+        with patch.object(receipts, "repository_lock", recording), patch.object(ship.Ship, "reconcile", checked):
+            prepared = ship.dispatch(self.root, self.connection, self.database, self.args("prepare"), receipts,
+                                     False)
+        self.assertEqual((prepared["phase"], prepared["merge_commit"]), ("merged", commit))
+
+    def landed_and_read_open(self):
+        """A member whose train landed, and a patch under which GitHub still reads its pull request open."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def lagging(api, number):
+            return {**real(api, number), "merged": False, "state": "open", "merge_commit_sha": None}
+        return commit, patch.object(remote.GitHub, "pull", lagging)
+
+    def assert_train_landed_refusal(self, caught, commit):
+        blocker = caught.exception.workflow["blocker"]
+        self.assertEqual((blocker["code"], blocker["retryable"]), ("train_landed", True))
+        state = self.operation().state
+        self.assertEqual((state["phase"], state["train_commit"]), ("train_joined", commit))
+
+    def test_a_prepare_of_a_landed_member_github_reads_open_pushes_nothing(self):
+        """Class pass of sd:9923: `train_landed` read GitHub's `merged` flag alone, so a flag that lagged the
+        landing sent the next prepare on to catch up and push a member the train had delivered."""
+        commit, lagging = self.landed_and_read_open()
+        branch = _git(self.root, "rev-parse", "--abbrev-ref", "HEAD")
+        pushed = _git(self.remote.path, "rev-parse", branch)
+        with lagging, self.assertRaises(ship.Refusal) as caught:
+            ship.dispatch(self.root, self.connection, self.database, self.args("prepare", "--catch-up"), receipts,
+                          False)  # as the lane prepares
+        self.assertEqual(_git(self.remote.path, "rev-parse", branch), pushed)
+        self.assert_train_landed_refusal(caught, commit)
+
+    def test_a_prepare_whose_train_read_fails_refuses_retryably_having_spent_nothing(self):
+        """Review of sd:9923: a transient GitHub failure in `train_landed` before prepare's lock refused
+        with no `passes_spent`, so the lane failed a member whose train had landed."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.land_train(self.join(earlier)["train_commit"])
+        remote = sys.modules["sd_ship_remote"]
+
+        def down(api, number):
+            raise remote.Refusal("gh api returned no HTTP status line", code="command_failed",
+                                 state="retryable_failure")
+        with patch.object(remote.GitHub, "pull", down), self.assertRaises(ship.Refusal) as caught:
+            ship.dispatch(self.root, self.connection, self.database, self.args("prepare", "--catch-up"), receipts,
+                          False)
+        answer = ship.failure("prepare", caught.exception)
+        self.assertEqual((answer["workflow"]["blocker"]["code"], answer["workflow"]["blocker"]["retryable"],
+                          answer.get("passes_spent")), ("train_unread", True, 0))
+        self.assertEqual(self.operation().state["phase"], "train_joined")
+
+    def test_a_merge_of_a_landed_member_github_reads_open_sends_no_merge(self):
+        """Class pass of sd:9923: the same lagging flag sent `sd-ship merge` down the lone merge, which
+        cleared the train record and sent its own PUT."""
+        commit, lagging = self.landed_and_read_open()
+        with lagging, self.assertRaises(ship.Refusal) as caught:
+            self.merge()
+        self.assert_train_landed_refusal(caught, commit)
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def test_a_rejoin_of_a_landed_member_github_reads_open_writes_no_join(self):
+        commit, lagging = self.landed_and_read_open()
+        with lagging, self.assertRaises(ship.Refusal) as caught:
+            self.join(_git(self.remote.path, "rev-parse", "main"))
+        self.assert_train_landed_refusal(caught, commit)
+
+    def test_a_git_that_cannot_answer_is_no_proof_the_train_did_not_land(self):
+        """Class pass of sd:9923: a failed `cat-file` read as "not on the base", which dropped the train
+        record in reconcile and would let the landed-train guard pass."""
+        head = _git(self.root, "rev-parse", "HEAD")
+        self.assertTrue(ship.train_on_base(self.root, head, head))
+        self.assertFalse(ship.train_on_base(self.root, "0" * 39 + "1", head))  # an absent object did not land
+        with self.assertRaises(ship.Refusal) as caught:
+            ship.train_on_base(self.root / "no-checkout-here", head, head)
+        self.assertTrue(caught.exception.workflow["blocker"]["retryable"])
+
+    def test_a_train_member_merged_at_another_commit_refuses(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        self.remote.pull(1).merge_commit_sha = _git(self.remote.path, "rev-parse", "main")
+        with self.assertRaises(ship.Refusal) as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_merge_mismatch")
+        self.assertIn(commit, str(caught.exception))
+
+    def test_a_member_merged_by_hand_after_a_train_that_never_landed_reconciles(self):
+        """Review of sd:9923: a join's `train_commit` outlived a train that never landed, so a hand merge
+        of the member read as `train_merge_mismatch` in merge, reconcile and prepare alike."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.join(earlier)
+        squash = self.remote.merge(1, sha=_git(self.root, "rev-parse", "HEAD"))
+        merged = self.operation("reconcile").reconcile()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", squash))
+
+    def test_a_member_whose_train_did_not_land_merges_alone(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.join(earlier)
+        merged = self.merge()
+        self.assertEqual(merged["phase"], "merged")
+        state = self.operation("merge", "--manual", "--expected-head", "HEAD").state
+        self.assertIsNone(state.get("train_commit"))
+        self.assertEqual(len([call for call in self.remote.calls if call.method == "PUT"]), 1)
+
+
+    def joined_tip(self):
+        """A delivering member joined onto an earlier landing: the train tip `land_train` lands."""
+        self.delivering()
+        _main, earlier = self.landing_before()
+        return self.join(earlier)["train_commit"]
+
+    def landed_by_lane(self, tip, gate="success", during=lambda: None, ready=lambda: None):
+        gates = []
+
+        def local_gate(api, root, head, *, base=None, database=None):
+            gates.append((head, base))
+            during()
+            return {"status": gate, "summary": f"sd-check {gate}"}
+        with patch.object(ship.sd_local_gate, "local_gate", local_gate):
+            landed = ship.sd_lane.land_train(self.root, tip, "main", [self.item], ready,
+                                             database=self.database)
+        return landed, gates
+
+    def train_branches(self):
+        return [name for name in self.remote.branches() if name.startswith("sd-train/")]
+
+    def test_land_train_gates_the_tip_once_and_merges_one_train_pull_request(self):
+        tip = self.joined_tip()
+        landed, gates = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        self.assertEqual(gates, [(tip, "main")])
+        [put] = [call for call in self.remote.calls if call.method == "PUT"]
+        self.assertEqual((put.body["sha"], put.body["merge_method"]), (tip, "merge"))
+        train = self.remote.pull(landed["pull"])
+        self.assertEqual((train.state, train.head), ("MERGED", f"sd-train/{tip[:12]}"))
+        self.assertEqual(_git(self.remote.path, "rev-parse", "main^2"), tip)
+        self.assertEqual((self.remote.pull(1).state, self.remote.pull(1).merge_commit_sha), ("MERGED", tip))
+        self.assertEqual(self.train_branches(), [])
+        self.assertEqual(self.merge()["merge_commit"], tip)
+
+    def test_a_landed_train_shows_each_member_delivered_on_the_first_parent_history(self):
+        """Review of sd:9923: the outer train merge carried no trailer, and the ledger reads first parents only."""
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        _git(self.root, "fetch", "-q", "origin", "main")
+        self.assertTrue(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
+
+    def test_a_train_merged_onto_a_base_that_moved_at_the_put_delivers_nothing_in_git(self):
+        tip = self.joined_tip()
+        saved = self.double._route
+
+        def route(method, path, body):  # GitHub's own moment: after every read the lane takes
+            if method == "PUT" and path.endswith("/merge"):
+                self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
+            return saved(method, path, body)
+        self.double._route = route
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        _git(self.root, "fetch", "-q", "origin", "main")
+        self.assertFalse(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
+
+    def landed_after_the_put(self, read, *, lose_put=False):
+        """`land_train`'s answer when `read` stands in for the pull request read after the PUT.
+
+        `lose_put` loses the PUT's answer after GitHub merged, as a dropped connection does.
+        """
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real, saved = remote.GitHub.pull, self.double._route
+
+        def route(method, path, body):
+            answer = saved(method, path, body)
+            if lose_put and method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(502, "the merge answer was lost")
+            return answer
+
+        def pull(api, number):
+            answer = real(api, number)
+            if any(call.method == "PUT" for call in self.remote.calls):
+                return read(answer)
+            return answer
+        self.double._route = route
+        with patch.object(remote.GitHub, "pull", pull):
+            return self.landed_by_lane(tip)[0]
+
+    def refused_read(self, answer):
+        raise sys.modules["sd_ship_remote"].Refusal("read-back lost")
+
+    def broken_read(self, answer):
+        raise ValueError("the read broke outside any refusal")
+
+    def test_land_train_whose_put_merged_and_read_back_fails_counts_as_landed(self):
+        """Class pass of sd:9923: a refused GET dropped the PUT's own proof, so the landed train read unknown."""
+        landed = self.landed_after_the_put(self.refused_read)
+        self.assertEqual((landed["status"], landed.get("merge_commit")),
+                         ("merged", _git(self.remote.path, "rev-parse", "main")))
+
+    def test_land_train_whose_put_merged_and_read_back_breaks_counts_as_landed(self):
+        """Class pass of sd:9923: an exception that is no refusal left `land_train`, and the lead merged alone."""
+        landed = self.landed_after_the_put(self.broken_read)
+        self.assertEqual((landed["status"], landed.get("merge_commit")),
+                         ("merged", _git(self.remote.path, "rev-parse", "main")))
+
+    def test_land_train_whose_put_answer_and_read_back_are_lost_answers_unknown(self):
+        """Review of sd:9923: a lost read-back after the PUT read as failed, so the lead merged alone."""
+        self.assertEqual(self.landed_after_the_put(self.refused_read, lose_put=True)["status"], "unknown")
+        self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
+
+    def test_land_train_whose_put_answer_is_lost_and_read_back_is_stale_answers_unknown(self):
+        """Class pass of sd:9923: a lost PUT answer and a lagging `merged: false` read as failed, so the lead
+        merged alone over a train GitHub had landed."""
+        landed = self.landed_after_the_put(lambda answer: {**answer, "merged": False, "merge_commit_sha": None},
+                                           lose_put=True)
+        self.assertEqual(landed["status"], "unknown")
+        self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
+
+    def test_land_train_whose_put_answer_is_lost_and_read_back_breaks_answers_unknown(self):
+        self.assertEqual(self.landed_after_the_put(self.broken_read, lose_put=True)["status"], "unknown")
+
+    def test_land_train_whose_read_back_is_malformed_after_the_put_answers_unknown(self):
+        """Review of sd:9923: `base: "main"` raised AttributeError past the unknown outcome.
+
+        The PUT's answer is lost, as a confirmed PUT alone counts as landed."""
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+        saved = self.double._route
+
+        def route(method, path, body):
+            answer = saved(method, path, body)
+            if method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(502, "the merge answer was lost")
+            return answer
+        self.double._route = route
+
+        def pull(api, number):
+            if any(call.method == "PUT" for call in self.remote.calls):
+                return {"merged": True, "base": "main", "merge_commit_sha": "c" * 40}
+            return real(api, number)
+        with patch.object(remote.GitHub, "pull", pull):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "unknown")
+        self.assertEqual(self.train_branches(), [])
+
+    def test_land_train_read_back_merged_with_an_empty_base_counts_as_landed(self):
+        """Lead ruling, round 8 of sd:9923: `base: {}` read as failed, so the lead merged alone."""
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def pull(api, number):
+            if any(call.method == "PUT" for call in self.remote.calls):
+                return {"merged": True, "base": {}, "merge_commit_sha": "c" * 40}
+            return real(api, number)
+        with patch.object(remote.GitHub, "pull", pull):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual((landed["status"], landed["merge_commit"]), ("merged", "c" * 40))
+
+    def test_land_train_whose_put_merged_and_read_back_is_stale_counts_as_landed(self):
+        """Review of sd:9923: the PUT answer was dropped, so a stale `merged: false` read failed the train."""
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def pull(api, number):
+            answer = real(api, number)
+            if any(call.method == "PUT" for call in self.remote.calls):
+                return {**answer, "merged": False, "merge_commit_sha": None}
+            return answer
+        with patch.object(remote.GitHub, "pull", pull):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        self.assertEqual(landed["merge_commit"], _git(self.remote.path, "rev-parse", "main"))
+
+    def test_land_train_whose_member_is_cancelled_during_the_final_fetch_sends_no_merge(self):
+        """Review of sd:9923: the last queue read ran before the final base fetch under the lock."""
+        tip = self.joined_tip()
+        real, fetched = ship.sd_lane.base_moved, []
+
+        def base_moved(*args):
+            fetched.append(True)
+            return real(*args)
+
+        def ready():  # the operator cancels sd:2 while the second fetch runs
+            return "sd:2 was cancelled" if len(fetched) >= 2 else None
+        with patch.object(ship.sd_lane, "base_moved", base_moved):
+            landed, _ = self.landed_by_lane(tip, ready=ready)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("sd:2 was cancelled", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def assert_unread_member_trailers_send_no_merge(self, failing):
+        """Review of sd:9923: a git read that failed dropped trailers from a train that still merged."""
+        tip = self.joined_tip()
+        real = ship.sd_lane.lane_git
+
+        def lane_git(tree, *args):
+            return None if args[:1] == (failing,) else real(tree, *args)
+        with patch.object(ship.sd_lane, "lane_git", lane_git):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("trailers", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def test_land_train_whose_member_merges_cannot_be_listed_sends_no_merge(self):
+        self.assert_unread_member_trailers_send_no_merge("rev-list")
+
+    def test_land_train_whose_member_message_cannot_be_read_sends_no_merge(self):
+        self.assert_unread_member_trailers_send_no_merge("show")
+
+    def test_land_train_whose_gate_fails_opens_no_pull_request(self):
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip, gate="failure")
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("did not pass", landed["reason"])
+        self.assertEqual(sorted(self.remote.pull_requests), [1])
+        self.assertEqual(self.train_branches(), [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
+
+    def test_land_train_reads_back_a_lost_merge_answer(self):
+        tip = self.joined_tip()
+        saved = self.double._route
+
+        def route(method, path, body):
+            answer = saved(method, path, body)
+            if method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(502, "merge answer lost")
+            return answer
+        self.double._route = route
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        self.assertEqual(len([call for call in self.remote.calls if call.method == "PUT"]), 1)
+
+    def test_land_train_finds_a_train_pull_request_whose_create_answer_was_lost(self):
+        tip = self.joined_tip()
+        self.double.lose_create = True
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual((landed["status"], landed["pull"]), ("merged", 2))
+        self.assertEqual(sorted(self.remote.pull_requests), [1, 2])
+
+    def test_land_train_merges_no_recovered_pull_request_retargeted_off_the_base(self):
+        """Review of sd:9923: the recovery read matched the head ref only, so a train PR moved to `release` merged."""
+        tip = self.joined_tip()
+        self.remote.commit_on("release", "release\n\nAuthored-with: human", files={"release.txt": "r\n"})
+        real = self.remote.open_pull_request
+
+        def retargeted(head, *, base=None, title="", body=""):
+            return real(head, base="release" if head.startswith("sd-train/") else base, title=title, body=body)
+        self.double.lose_create = True
+        with patch.object(self.remote, "open_pull_request", retargeted):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("onto main", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def test_land_train_whose_members_changed_during_the_gate_dispatches_nothing(self):
+        """Review of sd:9923: eligibility read before the gate was used after it."""
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip, ready=lambda: "sd:2 was held during the train gate")
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("sd:2 was held", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(self.train_branches(), [])
+
+    def test_land_train_whose_base_moved_during_the_gate_dispatches_nothing(self):
+        """Review of sd:9923: main advanced during the gate, and GitHub merged an untested combination."""
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip, during=lambda: self.remote.commit_on(
+            "main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"}))
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("moved during the train gate", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
+
+    def test_a_train_merged_onto_a_base_its_gate_never_saw_holds_delivery(self):
+        """Review of sd:9923: main advanced between the last read and the PUT; reconcile delivered anyway."""
+        tip = self.joined_tip()
+        self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
+        self.land_train(tip)
+        merged = self.merge()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", tip))
+        self.assertTrue(merged["delivery_pending"])
+        self.assertEqual(merged["workflow"]["blocker"]["code"], "base_advanced_at_merge")
+        self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
+                         "in_progress")
+
+    def assert_taken_before_the_put_sends_no_merge(self, take, reason):
+        """Review of sd:9923: the train PUT neither read the repository hold nor took the ship lock that
+        serializes holds with merges, so a hold taken after the last join did not stop it."""
+        tip = self.joined_tip()
+        main = []
+
+        def taken():  # on the read before the lock; the read under it, after the last fetch, takes nothing
+            if not main:
+                take()
+                main.append(_git(self.remote.path, "rev-parse", "main"))  # as it stands once taken: the PUT moves it
+        landed, _ = self.landed_by_lane(tip, ready=taken)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn(reason, landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual([_git(self.remote.path, "rev-parse", "main")], main)
+
+    def test_land_train_whose_base_moved_after_the_fence_sends_no_merge(self):
+        """Review of sd:9923: a lone merge under a declared gap reads the base again right before its PUT;
+        the train read it only after the gate, so a base that moved after that landed untested."""
+        self.assert_taken_before_the_put_sends_no_merge(
+            lambda: self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"}),
+            "moved")
+
+    def test_land_train_under_a_repository_hold_sends_no_merge(self):
+        other = create_item(self.connection, kind="work", title="held work", status="in_progress",
+                            repo=str(self.operator), branch="other")
+        self.assert_taken_before_the_put_sends_no_merge(
+            lambda: ship.sd_ship_hold.take(self.database, self.operation().repository, other, window=600,
+                                           holder="operator", command=f"sd-ship hold --item {other}"),
+            f"held for sd:{other}")
+
+    def test_land_train_while_another_merge_holds_the_ship_lock_sends_no_merge(self):
+        self.assert_taken_before_the_put_sends_no_merge(
+            lambda: self.hold_ship_lock(self.operation().repository), "another ship operation")
+
+    def test_a_held_train_member_names_the_train_landing_to_verify(self):
+        """Review of sd:9923: the recovery said to verify the member's merge, which lacks the newer base;
+        the combined tree is the outer train landing, and the member's merge is what delivers."""
+        tip = self.joined_tip()
+        raced = self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
+        self.land_train(tip)
+        landing = _git(self.remote.path, "rev-parse", "main")
+        merged = self.merge()
+        self.assertEqual(merged["workflow"]["blocker"]["code"], "base_advanced_at_merge")
+        self.assertIn(f"Verify the combined tree at {landing}", merged["workflow"]["next_action"])
+        self.assertEqual((merged["train_landing"], merged["merged_parent"]), (landing, raced))
+
+    def test_land_train_under_a_declared_gap_needs_every_check_at_the_tip(self):
+        """Review of sd:9923: a lone merge under a declared gap needs every
+        check, the pull_request workflows too, at the exact head it lands;
+        the train merged its tip with its members' runs alone."""
+        tip = self.joined_tip()
+        member = _git(self.root, "rev-parse", "topic")
+        self.remote.protection = None
+        set_declaration(self.connection, str(self.operator), "status", DeclaredGapCase.DECLARATION)
+        self.double.workflow_runs = [{"path": ".github/workflows/tests.yml", "name": "tests.yml",
+                                      "event": "pull_request", "status": "completed",
+                                      "conclusion": "success", "head_sha": member}]
+        main = _git(self.remote.path, "rev-parse", "main")
+        with patch.object(ship.GitHub, "expected_workflows",
+                          lambda api, head: [(".github/workflows/tests.yml", "Tests")]):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn(tip, landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(_git(self.remote.path, "rev-parse", "main"), main)
+
+    def test_land_train_that_github_refuses_lands_nothing(self):
+        tip = self.joined_tip()
+        saved = self.double._route
+
+        def route(method, path, body):
+            if method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(405, "Required status check is expected")
+            return saved(method, path, body)
+        self.double._route = route
+        main = _git(self.remote.path, "rev-parse", "main")
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertEqual(_git(self.remote.path, "rev-parse", "main"), main)
+        self.assertEqual(self.train_branches(), [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
 
 
 class SettledFollowupTests(unittest.TestCase):

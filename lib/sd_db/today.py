@@ -19,6 +19,7 @@ from typing import Any, Iterable
 from . import hub
 from .build import HEALTH, waiting_on
 from .reads import (
+    _STATUS_SINCE,
     IDEA_KINDS,
     REVIEW_BATCH,
     WORK_KIND,
@@ -108,18 +109,80 @@ def _hub_rows(connection: sqlite3.Connection, keep: set[str | None] | None) -> l
     return [(row, why) for row in rows]
 
 
-def attention(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None = None) -> list[dict]:
+def attention(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None = None,
+              now: str | None = None) -> list[dict]:
     """Open reports whose fields say they need attention, and on the hub open hub requests (`_hub_rows`),
-    newest first: `status`, `why`, `at`.
+    newest first, then the stranded items (`stranded`): `status`, `why`, `at`.
 
     Unreadable fields count, as an unknown is no pass.
     """
     keep = _keep(repos)
     rows = sorted([*_attention_rows(connection, keep), *_hub_rows(connection, keep)],
                   key=lambda pair: (pair[0]["created_at"], pair[0]["id"]), reverse=True)
-    return [{"id": row["id"], "repo": row["repo"], "status": row["status"], "title": row["title"],
-             "why": why if isinstance(why, str) else "", "at": row["created_at"]}
-            for row, why in rows]
+    return [*({"id": row["id"], "repo": row["repo"], "status": row["status"], "title": row["title"],
+               "why": why if isinstance(why, str) else "", "at": row["created_at"]}
+              for row, why in rows), *stranded(connection, repos=keep, now=now)]
+
+
+#: How long an item may sit in_progress with no build and no lane entry before Attention lists it (pack sd:10167).
+STRANDED_HOURS = 2
+#: The lane entry states that still move an item: one in them holds it, not stranded.
+LIVE_LANE = ("queued", "running", "pending")
+
+
+def _lane_states(connection: sqlite3.Connection) -> tuple[set[int], dict[int, str]]:
+    """The items a live lane entry holds, as its item or a `closes` member, and each item's newest entry status."""
+    rows = connection.execute(
+        "SELECT state.body FROM state JOIN (SELECT MAX(id) AS last, MIN(id) AS first FROM state WHERE kind = "
+        "'checkpoint' AND substr(key, 1, ?) = ? GROUP BY key) ON state.id = last ORDER BY first",
+        (len(LANE_KEY_PREFIX), LANE_KEY_PREFIX)).fetchall()
+    live: set[int] = set()
+    last: dict[int, str] = {}
+    for row in rows:
+        try:
+            entry = json.loads(row["body"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        closes = entry.get("closes")
+        named = [number for number in [entry.get("item"), *(closes if isinstance(closes, list) else ())]
+                 if is_item_id(number)]
+        for number in named:
+            last[number] = str(entry.get("status") or "unknown")
+            if entry.get("status") in LIVE_LANE:
+                live.add(number)
+    return live, last
+
+
+def stranded(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None = None,
+             now: str | None = None) -> list[dict]:
+    """Items in_progress for more than `STRANDED_HOURS` that a build took once, with no queued or running build and
+    no live lane entry (`LIVE_LANE`): nothing moves them, so the operator must (pack sd:10167). Each names its
+    last assignment and its last lane status, oldest first. A hand-worked item, which no build ever took, is no
+    row: a session may hold it for days."""
+    current = _parse(_now(now)) or datetime.now(timezone.utc)
+    where, values = repo_in("item.repo", _keep(repos))
+    rows = connection.execute(
+        f"SELECT item.id, item.repo, item.status, item.title, {_STATUS_SINCE} AS since, "
+        "assignment.id AS assignment, assignment.status AS assigned FROM item JOIN assignment ON assignment.id = "
+        "(SELECT MAX(id) FROM assignment WHERE assignment.item = item.id) WHERE item.status = 'in_progress' "
+        f"AND NOT EXISTS (SELECT 1 FROM assignment other WHERE other.item = item.id AND other.status IN ('queued', "
+        f"'running')) AND {where} ORDER BY since, item.id", values).fetchall()
+    if not rows:
+        return []
+    live, last = _lane_states(connection)
+    found = []
+    for row in rows:
+        since = _parse(row["since"])
+        if since is None or row["id"] in live or current - since <= timedelta(hours=STRANDED_HOURS):
+            continue
+        hours = int((current - since).total_seconds() // 3600)
+        lane = f"last lane status {last[row['id']]}" if row["id"] in last else "no lane entry"
+        found.append({"id": row["id"], "repo": row["repo"], "status": row["status"], "title": row["title"],
+                      "why": f"in_progress {hours} h, no build or lane entry moves it: last assignment "
+                             f"{row['assignment']} {row['assigned']}, {lane}", "at": row["since"]})
+    return found
 
 
 #: The finding of a report whose fields do not parse: it may name this machine, so it is a row, not a pass.
@@ -645,7 +708,7 @@ def sections(connection: sqlite3.Connection, *, repos: Iterable[str | None] | No
     """
     keep = None if repos is None else list(dict.fromkeys(repos))
     found: dict[str, Any] = {
-        "attention": attention(connection, repos=keep),
+        "attention": attention(connection, repos=keep, now=now),
         "operations": operations(connection, gate=gate, repos=keep),
         "decisions": decisions(connection, repos=keep),
         "landing": landing(connection, repos=keep, gate=gate),

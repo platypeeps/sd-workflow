@@ -666,6 +666,25 @@ def grill_rows(connection: sqlite3.Connection) -> list[dict]:
              "source": "tasks", "at": row["at"]} for row in found]
 
 
+def stranded_rows(connection: sqlite3.Connection, now: str) -> list[dict]:
+    """Each item `sd_db.today.stranded` reads as stranded, in progress with nothing to move it, as a look Needs you
+    row naming its last assignment and lane status; two or more fold into one group (pack sd:10167). A read that
+    failed is a dark row, never none stranded."""
+    from sd_db import today
+
+    try:
+        found = today.stranded(connection, now=now)
+    except (SdDbError, sqlite3.Error) as failure:
+        return [dark_row("stranded", str(failure) or "the stranded items could not be read")]
+    rows = [{"id": f"stranded:{row['id']}", "kind": "item", "rank": ATTENTION, "item": row["id"], "repo": row["repo"],
+             "state": "stranded", "what": f"#{row['id']} {row['title']}", "detail": row["why"], "source": "tasks",
+             "at": row["at"]} for row in found]
+    if len(rows) < 2:
+        return rows
+    return [_group("group:stranded", f"{len(rows)} stranded in progress", ", ".join(f"#{row['item']}" for row in rows[:4]),
+                   ATTENTION, rows, source="tasks")]
+
+
 def triage_rows(connection: sqlite3.Connection) -> list[dict]:
     """The decision queues (`triage.QUEUES`) as one queued Needs you row (sd:8013): how many rows wait in each, each linking its home.
 
@@ -1104,8 +1123,11 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
     held = [{**row, "lamp": LAMP.get(row["source"], "")} if row["kind"] == "dark" else row
             for row in snoozed + dark_snoozed + work_snoozed + reports_snoozed + mail_snoozed + grill_snoozed
             + flaky_snoozed]
-    listed = needs([*shown, *dark, *reports, *threads, *grills, *flaky_needs(flakes), *triage_rows(connection)],
-                   work=work, live=live, today=now[:10], lanes=queue.get("lanes") or [], briefs=reported["briefs"])
+    stuck = stranded_rows(connection, now)
+    # A stranded item is its own look row, not one of the quiet "in progress, no session" (pack sd:10167).
+    held_items = {member["item"] for row in stuck for member in row.get("members") or [row] if member.get("item")}
+    listed = needs([*shown, *dark, *reports, *threads, *grills, *flaky_needs(flakes), *triage_rows(connection), *stuck],
+                   work=[row for row in work if row.get("item") not in held_items], live=live, today=now[:10], lanes=queue.get("lanes") or [], briefs=reported["briefs"])
     summary = lane_summary(queue)
     motion(connection, active, queue.get("lanes") or [])
     return {"now": now, "sources": sources, "observed": observed, "rows": shown, "active": active,

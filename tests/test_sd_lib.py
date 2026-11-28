@@ -653,6 +653,26 @@ class CorePolicyReadTests(Fixture):
         self.assertEqual(sd_lib.core_setting("external_reviews", {"HOME": str(one), "XDG_CONFIG_HOME": str(two)}), "configured")
         self.assertIsNone(sd_lib.core_setting("external_reviews", {"HOME": str(self.tmp / "fresh")}))
 
+    def test_review_tool_changes_keep_unless_set_strict(self):
+        """sd:10929: `sd.review_tool_changes` replaces the constant; keep is the default, and strict, or a
+        value that does not read, re-reviews on any tool change."""
+        env = {"HOME": str(self.tmp)}
+        path = self.tmp / ".config" / sd_lib.CONFIG_RELATIVE_PATH
+        path.parent.mkdir(parents=True)
+        self.assertTrue(sd_lib.tool_changes_keep_reviews(env))
+        for value, keeps in (("keep", True), ("strict", False), ("Strict\n", False)):
+            with self.subTest(value):
+                path.write_text(json.dumps({"config": {"sd": {"review_tool_changes": value}}}))
+                self.assertIs(sd_lib.tool_changes_keep_reviews(env), keeps)
+        self.assertIn("review_tool_changes", sd_lib.FLEET_KEYS)
+
+    def test_review_tool_changes_strict_says_the_request_replay_still_keeps_a_review(self):
+        """Review of build/sd-2285: strict is the reading before sd:10928, where the sd:1397 replay keeps a
+        review whose reviewers would be asked the same; the description must not promise more."""
+        said = sd_lib.CORE_CONFIG["review_tool_changes"]["description"]
+        self.assertNotIn("any tool change re-reviews", said)
+        self.assertIn("sd:1397", said)
+
     def test_malformed_policy_never_becomes_a_grant(self):
         env = {"HOME": str(self.tmp)}
         path = self.tmp / ".config" / sd_lib.CONFIG_RELATIVE_PATH

@@ -4,14 +4,15 @@ Step 9 of `docs/work/2026-09-22-run-the-framework-from-a-second-machine/`.
 `local-machine-setup/machine-setup.sh` runs it with the pack's interpreter,
 `-I`, so the installed copy answers and not a checkout:
 
-    python -I -m sd_db.satellite --hub HOST [--port N] [--apply]
+    python -I -m sd_db.satellite --hub HOST [--port N] [--address IP] [--apply]
 
 It prints the stage's lines and exits 0 when it could report. The lines
 carry the drift words the stage's counter greps for:
 
 * `EXTRA` for a local database. A machine is a hub or a satellite, not
   both, so nothing else is written while one is there.
-* `MISSING` or `DIFFERS` for `~/.config/sd/hub.json`; `--apply` writes it.
+* `MISSING` or `DIFFERS` for `~/.config/sd/hub.json`; `--apply` writes it,
+  with `--address`, the hub's tailnet IP, beside the name (sd:10979).
   Without `--apply` the hub is asked nothing until the file names it, so
   a missing file is one line of drift, not three.
 * `DIFFERS` for a build the hub refuses, with both sides' values and the
@@ -60,49 +61,78 @@ def _write(path: Path, data: bytes) -> None:
         raise
 
 
-def _named(config: Path) -> tuple[str, int] | None:
-    """The hub and port `hub.json` names, or `None` when it names none readably."""
+def _recorded(config: Path) -> dict | None:
+    """`hub.json` as a JSON object, or `None` when it reads as none."""
     try:
         data = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def _named(data: dict | None) -> tuple | None:
+    """The hub, port and address `data` names, or `None` for no readable file."""
+    if data is None:
         return None
-    return data.get("hub"), data.get("port", hub.DEFAULT_PORT)
+    return data.get("hub"), data.get("port", hub.DEFAULT_PORT), data.get("address")
+
+
+def _plain(value) -> str:
+    """`value` as one printable word of a stage line; anything else, as a file may hold, by its `repr`."""
+    return str(value) if isinstance(value, (str, int)) and str(value).isprintable() else repr(value)
+
+
+def _shown(host, port, address) -> str:
+    return f"{_plain(host)}:{_plain(port)}" + (f" at {_plain(address)}" if address is not None else "")
 
 
 def run(host: str, port: int, *, apply: bool = False, home: Path | str | None = None,
-        out=sys.stdout) -> int:
-    """The stage."""
+        out=sys.stdout, address: str | None = None) -> int:
+    """The stage; 2 for an `address` that is not an IP, with nothing written."""
+    if address is not None and not hub.ip_literal(address):
+        out.write(f"  ERROR   --address {address!r} is not an IP address; nothing written\n")
+        return 2
     config = hub.config_path(home)
     local = database.local_path(home)
     if local.exists():
         _line(out, "EXTRA", f"database {local} — a satellite holds no database; move it away, "
                             f"then rerun. {config} was not written")
         return 0
-    wanted = (host, port)
-    named = _named(config) if config.exists() else None
+    recorded = _recorded(config) if config.exists() else None
+    named = _named(recorded)
+    # The same hub keeps what this run was not told: its recorded address, when no `--address` names
+    # one, and its loopback `token_file` (review of build/sd-2295). Another hub keeps neither, and
+    # each is kept only as `hub.read` accepts it: a value it refuses, written back, would leave the
+    # repair's own file unreadable. No other recorded key is carried.
+    same: dict = recorded if recorded is not None and named is not None and named[:2] == (host, port) else {}
+    if address is None and hub.ip_literal(same.get("address")):
+        address = same["address"]
+    token_file = same.get("token_file")
+    kept = {"token_file": token_file} if isinstance(token_file, str) and token_file else {}
+    wanted = (host, port, address)
     if not config.exists():
         _line(out, "MISSING", f"{config} — this machine names no sd hub")
     elif named != wanted:
-        shown = "nothing readable" if named is None else f"{named[0]}:{named[1]}"
-        _line(out, "DIFFERS", f"{config} names {shown}, not {host}:{port}")
+        shown = "nothing readable" if named is None else _shown(*named)
+        _line(out, "DIFFERS", f"{config} names {shown}, not {_shown(*wanted)}")
     else:
-        _line(out, "ok", f"{config} names {host}:{port}")
+        _line(out, "ok", f"{config} names {_shown(*wanted)}")
     if named != wanted:
         _plan(out, apply, f"write {config}")
         if not apply:
             # One gap, one line: the hub is asked once this machine names it.
             _line(out, "SKIP", "the build and providers.yaml are checked once hub.json names the hub")
             return 0
-        _write(config, (json.dumps({"hub": host, "port": port}) + "\n").encode("utf-8"))
+        written = {"hub": host, "port": port, **kept} | ({"address": address} if address is not None else {})
+        _write(config, (json.dumps(written) + "\n").encode("utf-8"))
     # The loopback token, only from a file that names this same hub. On the
     # tailnet the peer is the credential and no token is sent (step 7).
     try:
         current = hub.read(home) if named == wanted else None
         token = current.token if current is not None and current.token_file is not None else ""
         session = remote.connect(host, port, None, token=token, write=False,
-                                 timeout=hub.CONNECT_TIMEOUT, answer_timeout=hub.ANSWER_TIMEOUT)
+                                 timeout=hub.CONNECT_TIMEOUT, answer_timeout=hub.ANSWER_TIMEOUT,
+                                 address=address)
     except remote.BuildMismatch as mismatch:
         _line(out, "DIFFERS", f"{remote.DESCRIBED[mismatch.field]}: satellite {mismatch.satellite}, "
                               f"hub {mismatch.hub} — {_remedy(mismatch)}")
@@ -156,9 +186,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m sd_db.satellite")
     parser.add_argument("--hub", required=True, help="the hub's host name on the tailnet")
     parser.add_argument("--port", type=int, default=hub.DEFAULT_PORT)
+    parser.add_argument("--address", help="the hub's tailnet IP, which the dial uses in place of the name")
     parser.add_argument("--apply", action="store_true", help="write hub.json and providers.yaml")
     arguments = parser.parse_args(argv)
-    return run(arguments.hub, arguments.port, apply=arguments.apply)
+    return run(arguments.hub, arguments.port, apply=arguments.apply, address=arguments.address)
 
 
 if __name__ == "__main__":

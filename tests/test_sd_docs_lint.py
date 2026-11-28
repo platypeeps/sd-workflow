@@ -636,8 +636,14 @@ class PullRequestPrivacyTests(LintFixture):
 
     def test_red_a_body_line_over_72_characters_is_named(self) -> None:
         """pack sd:10212: the builder's own lint run catches what the lane refused at enqueue."""
-        report = self.run_lint("## Summary\n\n" + "z" * 73 + "\n", body_only=True)
+        report = self.run_lint("## Summary\n\n" + "z" * 73 + "\n")
         self.assertEqual(report.failures, ["pull request body: line 3 is 73 characters (limit 72)"])
+
+    def test_green_a_body_only_run_measures_no_line(self) -> None:
+        """pack sd:10220: `--body-only` lints a foreign repository's body, which no lane line check
+        refuses, and `sd-ship` measures its own body first (`sd_ship_body.docs_lint`)."""
+        report = self.run_lint("## Summary\n\n" + "z" * 73 + "\n", body_only=True)
+        self.assertEqual(report.failures, [])
 
     def test_green_owned_and_scope_lines_are_neither_required_nor_refused(self) -> None:
         body = "Work: sd:1\nWork: sd:2\nWork:\n\n## Summary\n\n- touches .github/workflows\n"

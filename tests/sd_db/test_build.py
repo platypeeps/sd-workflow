@@ -370,6 +370,24 @@ class Claim(Case):
         self.assertEqual(len(self.claim()["members"]), 5, "one whole slot and four half ones")
         self.assertEqual([build.bundled(self.db, items) for items in ([], [self.item()] * 4)], [0, 3])
 
+    def test_an_item_edited_mechanical_bundles_at_half_a_slot(self):
+        """sd:10758: `edit_item` writes `fields.work_kind`; mechanical is half a slot, normal clears it."""
+        items = [self.item(fields={"area": "home"}) for _ in range(6)]
+        self.assertEqual(build.bundled(self.db, items), 3)
+        for item in items:
+            workflow.edit_item(self.db, item, {"work_kind": "mechanical"}, who="operator")
+        self.assertEqual(build.bundled(self.db, items), 6, "six half slots fill three")
+        self.assertEqual(json.loads(item_state(self.db, items[0])["item"]["fields"]),
+                         {"area": "home", "work_kind": "mechanical"}, "other keys stay")
+        workflow.edit_item(self.db, items[0], {"work_kind": "normal"}, who="operator")
+        self.assertEqual(json.loads(item_state(self.db, items[0])["item"]["fields"]), {"area": "home"})
+        for bad in ("design", "Mechanical", "", None, 1):
+            with self.subTest(bad=bad), self.assertRaises(WorkflowError):
+                workflow.edit_item(self.db, items[1], {"work_kind": bad}, who="operator")
+        designed = self.item(fields={"work_kind": "design"})
+        with self.assertRaisesRegex(WorkflowError, "design"):
+            workflow.edit_item(self.db, designed, {"work_kind": "mechanical"}, who="operator")
+
     def test_one_running_bundle_fills_its_repository_not_another(self):
         """sd:8158: one bundle per repository at a time, so later items wait for it and the next bundle takes them."""
         build.queue(self.db, [self.item()], who="operator")
@@ -1516,18 +1534,26 @@ class Reap(Case):
 
     def test_build_with_a_finding_on_a_blocked_bundle_sends_it_to_the_builder(self):
         """pack sd:8792: `sd assignments build N --finding TEXT` is Send to builder: the finding note the builder
-        reads, then the bundle queued again. A fresh build has no builder to send it to, so it refuses."""
+        reads, then the bundle queued again. A fresh item in the same press builds with the note too (sd:10320)."""
         build.write(self.db, self.bundle["id"], step="building")
         row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
         build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
         fresh = self.item()
-        with self.assertRaisesRegex(build.BuildRefused, f"--finding .*sd:{fresh}"):
-            build.queue_again(self.db, [self.items[0], fresh], who="operator", finding="check the parser")
-        self.assertEqual(self.statuses(self.items), ["blocked", "blocked"], "one refusal writes nothing")
-        queued = build.queue_again(self.db, [self.items[0]], who="operator", finding="check the parser")
+        queued = build.queue_again(self.db, [self.items[0], fresh], who="operator", finding="check the parser")
         self.assertEqual({entry["status"] for entry in queued}, {"queued"})
-        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
-        self.assertIn(build.FINDING + "check the parser", notes)
+        self.assertEqual({entry["item"] for entry in queued}, {*self.items, fresh})
+        for item in (self.items[0], fresh):
+            notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (item,))]
+            self.assertEqual(notes.count(build.FINDING + "check the parser"), 1, notes)
+
+    def test_a_finding_on_a_fresh_design_item_refuses(self):
+        """Lane review of build/sd-1782: a design item with no design builds a design run first, which reads
+        no Send to builder note, and its code build's window opens later: the finding was lost unsaid."""
+        design = self.item(fields={"work_kind": "design"})
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{design}.*design run"):
+            build.queue_again(self.db, [design], who="operator", finding="check the parser")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment WHERE item = ?", (design,)).fetchone()[0],
+                         0, "one refusal writes nothing")
 
     def test_a_plain_retry_of_a_review_parked_run_sends_its_blockers(self):
         """pack sd:9498: Retry of a run parked after REVIEW_ROUNDS dropped the last round's blockers, which only
@@ -2010,36 +2036,36 @@ class ReapThree(Case):
         build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
         return row
 
-    def test_build_of_a_member_the_retry_skips_is_refused_while_the_lead_waits_on_another(self):
-        """Review of build/sd-1742 (build.py:2089): the lead waits on one member, and Build presses another that
-        did not move. Retry frees only the member the lead waits on and leaves the pressed one ended, so Build
-        reported success with the selected item unbuilt. It refuses, naming what to build first, and writes
-        nothing."""
+    def test_build_of_a_member_the_retry_skips_builds_what_the_lead_waits_on(self):
+        """Lane review of build/sd-1654 (build.py:1327): the lead waits on one member, and Build presses another
+        that did not move. The press refused, though Retry building what the lead waits on is the only step
+        toward the pressed item. It builds that member, keeps the lead and the pressed item ended together, and
+        says so on the pressed item (review of build/sd-1742: not silently)."""
         from sd_db.workflow import edit_item
         row = self._ended()
         lead, ahead, member = self.items
         edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
-        members = [one["id"] for one in build.run(self.db, row["id"])["members"]]
-        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt.*only sd:{ahead}"):
-            build.queue_again(self.db, [member], who="operator")
-        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", one) for one in members],
-                         ["blocked"] * 3, "the refused press wrote")
+        queued = build.queue_again(self.db, [member], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [ahead])
+        self.assertEqual(self._blocked(row)[::2], ["blocked"] * 2, "the lead and the pressed item left their bundle")
+        notes = [one[0] for one in self.db.execute("SELECT body FROM note WHERE item = ?", (member,))]
+        self.assertTrue(any(f"its lead sd:{lead} waits on that work" in note for note in notes), notes)
 
     def _blocked(self, row):
         return [self.count("SELECT status FROM assignment WHERE id = ?", one["id"])
                 for one in build.run(self.db, row["id"])["members"]]
 
-    def test_build_of_the_lead_and_a_member_its_retry_skips_is_refused(self):
-        """Class pass, review of build/sd-1742 (build.py:1228): every selected item is built or the press
-        refuses. The lead waits on one member; the selection names the whole bundle. Retry builds only the
-        member the lead waits on, and naming the lead excused the third, which stayed ended."""
+    def test_build_of_the_whole_bundle_builds_what_the_lead_waits_on(self):
+        """Lane review of build/sd-1654 (build.py:1327): the selection names the whole bundle and the lead
+        waits on one member. Retry builds that member; the press refused for the third, which waits with the
+        lead for the next Retry."""
         from sd_db.workflow import edit_item
         row = self._ended()
         lead, ahead, member = self.items
         edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
-        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt"):
-            build.queue_again(self.db, [lead, ahead, member], who="operator")
-        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
+        queued = build.queue_again(self.db, [lead, ahead, member], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [ahead])
+        self.assertEqual(self._blocked(row)[::2], ["blocked"] * 2)
 
     def test_build_of_the_lead_and_a_member_that_waits_on_it_is_refused(self):
         """Class pass (build.py:1231): the selection names the lead and a member that waits on it. Retry parks
@@ -2527,6 +2553,155 @@ class CancelParks(Case):
         self.assertEqual([member["id"] for member in build.run(self.db, again["id"])["members"]], [lead, kept])
         fresh = build.queue_again(self.db, [items[2]], who="operator")
         self.assertNotIn(fresh[0]["id"], (lead, kept, left))
+
+    def test_a_subset_naming_a_done_member_retries_only_the_named_part(self):
+        """Review of build/sd-1654 (build.py:1209): Build A C of blocked bundle A, B, C whose item C is done
+        since, its row still blocked. `_part` counted only open members, so it named one item, A, and the press
+        retried the whole bundle, B too. Two bundle items named is a part: A queues and B leaves the bundle."""
+        items, (lead, other, finished) = self.blocked_bundle()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[2],))
+        self.db.commit()
+        queued = build.queue_again(self.db, [items[0], items[2]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [lead])
+        self.assertEqual(runner.queue_state(self.db, other)["status"], "cancelled")
+
+    def test_a_subset_build_resumes_its_bundle_past_an_unselected_member_a_newer_build_owns(self):
+        """Pack sd:9936: bundle A, B, C ended blocked; newer presses of A and B were cancelled before a claim, and C
+        has a newer build that ran. Build A B read every member's ownership, C's too, and built A and B fresh from
+        main; the press queues only A and B, so they resume the bundle's branch under its lead."""
+        items, (lead, kept, left) = self.blocked_bundle()
+        transition(self.db, items[2], "ready", who="operator")
+        build.queue(self.db, [items[2]], who="operator")
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        for item in items[:2]:
+            transition(self.db, item, "ready", who="operator")
+            press = build.queue(self.db, [item], who="operator")[0]["id"]
+            self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (press,))  # before a claim
+        queued = build.queue_again(self.db, items[:2], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), [lead, kept])
+        self.assertEqual(runner.queue_state(self.db, left)["status"], "cancelled")
+
+    def press_unran(self, item, status="cancelled"):
+        """A newer press of `item` that ended `status` before any claim: cancelled, or refused (blocked)."""
+        transition(self.db, item, "ready", who="operator")
+        press = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = ? WHERE id = ?", (status, press))
+        return press
+
+    def newer_build(self, item):
+        """A newer build of `item` that ran and was cancelled: it owns the item (`_current`)."""
+        transition(self.db, item, "ready", who="operator")
+        build.queue(self.db, [item], who="operator")
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+
+    def assert_fresh(self, queued, items, old):
+        """`queued` is one fresh build per item of `items`, and the `old` bundle's rows are as they ended."""
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(items))
+        self.assertFalse({entry["id"] for entry in queued} & set(old), "fresh builds, not the old bundle's rows")
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
+
+    def test_a_subset_build_counts_only_the_members_whose_row_reads_the_bundle(self):
+        """Class pass, review of build/sd-1654 (the read and the Retry it runs name one set): as above, but B's newer
+        press was refused before a claim (blocked, never ran). B's row is that press, not the bundle, so the press
+        names one bundle member, A: its Retry is the whole bundle's, which C's newer build refuses. The read
+        narrowed A's row to A and B and that Retry ran and refused. Both build fresh, as before pack sd:9936."""
+        items, old = self.blocked_bundle()
+        self.newer_build(items[2])
+        self.press_unran(items[0])
+        self.press_unran(items[1], "blocked")
+        self.assert_fresh(build.queue_again(self.db, items[:2], who="operator"), items[:2], old)
+
+    def test_a_subset_build_without_the_lead_builds_fresh(self):
+        """Class pass, review of build/sd-1654: Build B C of bundle A, B, C whose lead A a newer build owns. A part
+        without the lead is no Retry (`retry` refuses it), so B and C build fresh, as before pack sd:9936. The
+        read narrowed to B and C and refused."""
+        items, old = self.blocked_bundle()
+        self.newer_build(items[0])
+        for item in items[1:]:
+            self.press_unran(item)
+        self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
+
+    def test_two_items_whose_newest_press_was_refused_build_fresh(self):
+        """Class pass, review of build/sd-1654: B and C of a blocked bundle, each with a newer press refused before a
+        claim. `_retry_row` read past a refused press to the bundle, and the part without its lead refused; it
+        reads past a cancelled press only, so both build fresh, as before this change."""
+        items, old = self.blocked_bundle()
+        for item in items[1:]:
+            self.press_unran(item, "blocked")
+        self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
+
+    def assert_whole_retry(self, queued, old):
+        """`queued` is the `old` bundle's Retry, each member queued once, and nothing else."""
+        self.assertEqual(sorted(entry["id"] for entry in queued), sorted(old))
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"queued"})
+
+    def test_a_mixed_selection_queues_a_member_its_bundle_retry_takes_once(self):
+        """Lane case 1, review of build/sd-1654: Build A B of blocked bundle A, B, C whose B has a newer press
+        refused before a claim. A reads its bundle, B its refused press: one bundle item named, so its Retry is
+        the whole bundle's, which takes B too; then the press queued B fresh and refused. B goes with the Retry."""
+        items, old = self.blocked_bundle()
+        self.press_unran(items[1], "blocked")
+        self.assert_whole_retry(build.queue_again(self.db, items[:2], who="operator"), old)
+
+    def test_a_subset_without_the_lead_whose_presses_were_cancelled_builds_fresh(self):
+        """Lane case 2, review of build/sd-1654: Build B C of blocked bundle A, B, C, each with a newer press
+        cancelled before a claim. The read took the whole bundle, but the press handed `retry` B and C alone,
+        which refuses a part without its lead (pack sd:9581). The read is that part's, no Retry: both build
+        fresh."""
+        items, old = self.blocked_bundle()
+        for item in items[1:]:
+            self.press_unran(item)
+        self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
+
+    def test_a_refused_press_as_a_named_items_newest_row_leaves_one_plan(self):
+        """Lane case 3, review of build/sd-1654: as case 1, but A's newer press was cancelled before a claim, so
+        A reads its bundle past it. `_reads` drops B from the narrowing, so the press retried the whole bundle,
+        then queued B fresh and refused with a cause it made itself. B goes with the Retry."""
+        items, old = self.blocked_bundle()
+        self.press_unran(items[0])
+        self.press_unran(items[1], "blocked")
+        self.assert_whole_retry(build.queue_again(self.db, items[:2], who="operator"), old)
+
+    def test_build_refuses_a_member_the_retry_it_reads_leaves_unbuilt(self):
+        """Lane review of build/sd-1654 (build.py:1182): blocked bundle A, B, C whose lead A waits on B. Build C
+        read the bundle, whose Retry frees B alone, and dropped C from the press: B queued, C stayed blocked, and
+        nothing said so. A member the Retry parks as waiting on another bundle item refuses the press before it
+        writes; one that waits with the lead for its next Retry goes ahead with a note (ReapThree, build.py:1327)."""
+        from sd_db.workflow import edit_item
+        items, old = self.blocked_bundle()
+        edit_item(self.db, items[0], {"blocked_by": [items[1]]}, who="operator")
+        # Named with its lead, C is a part whose Retry refuses the waiting lead: that refusal writes nothing too.
+        with self.assertRaisesRegex(build.BuildRefused, "waits on"):
+            build.queue_again(self.db, items[::2], who="operator")
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
+        edit_item(self.db, items[0], {"blocked_by": []}, who="operator")
+        edit_item(self.db, items[2], {"blocked_by": [items[0]]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{items[2]} would stay unbuilt"):
+            build.queue_again(self.db, [items[2]], who="operator")
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
+        queued = build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), old[:2], "the lead's Retry parks C, as before")
+
+    def test_a_subset_build_reads_the_held_split_of_the_bundle_it_narrowed_to(self):
+        """Class pass, review of build/sd-1654: bundle A, B, C is held after a subset Retry left D out, and a newer
+        build owns C. Build A B read the bundle narrowed to A and B, but the held split on each item's newest row,
+        a cancelled press, so the bundle's Retry ran and refused. The split guard reads the same narrowed row:
+        A and B build fresh on a new branch."""
+        with mock.patch.object(build, "BUNDLE_MAX", 4):
+            items, old = self.blocked_bundle(4)
+        build.retry(self.db, old[0], who="operator", only=items[:3])
+        held = self.claim()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, released_at = ? WHERE id = ?",
+                        (build.SPLIT + "its branch holds earlier work", build.clock(), held["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), held["id"]))
+        marks = ", ".join("?" for _ in old[:3])
+        self.db.execute(f"UPDATE assignment SET status = 'blocked' WHERE id IN ({marks})", old[:3])
+        self.db.execute(f"UPDATE item SET status = 'blocked' WHERE id IN ({marks})", items[:3])
+        self.assertEqual(build.split(self.db, old[0]), "held")
+        self.newer_build(items[2])
+        for item in items[:2]:
+            self.press_unran(item)
+        self.assert_fresh(build.queue_again(self.db, items[:2], who="operator"), items[:2], old[:3])
 
     def test_a_subset_retry_must_name_the_lead(self):
         """Pack sd:9581: the lead's worktree holds the bundle's work, so a subset without it refuses, writing nothing."""
@@ -3621,6 +3796,19 @@ class Hosts(Case):
         self.claim(hosts=WORK)
         self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (lead, member)],
                          ["blocked", "blocked"])
+        self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
+
+    def test_beat_recovery_requeues_no_lead_of_a_bundle_whose_member_moved_to_planning(self):
+        """Pack sd:9865 (review of build/sd-1378 at 9b5457ce4): a member moved to planning after the hub blocked
+        the bundle, which cancels its assignment. The whole-bundle check read blocked members only, so recovery
+        queued the lead, and the claim refused it (its branch holds the member's work), replacing the beat result.
+        The lead stays blocked on the beat, for a Retry of the bundle once the member is ready."""
+        items, lead, member = self._blocked_retry()
+        transition(self.db, items[1], "planning", who="operator")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", member), "cancelled")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        self.assertIsNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
         self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
 
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):

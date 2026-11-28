@@ -1362,6 +1362,8 @@ ITEM_FINISHED = ("done", "cancelled")
 
 def _lane_history(entry: dict[str, Any], item_status: str | None) -> bool:
     """An entry `sd-ship lane list` keeps as history: settled, or failed for an item that is finished."""
+    if entry.get("delivery_pending") and item_status not in ITEM_FINISHED:  # merged, its delivery owed (sd:9923)
+        return False
     return entry.get("status") in LANE_SETTLED or (entry.get("status") in LANE_FAILED and item_status in ITEM_FINISHED)
 
 
