@@ -3375,6 +3375,25 @@ roles:
         self.assertEqual(ship.clean_up_merged(self.root, "nextbak", head)["kept"].get(str(kept)),
                          "it holds ignored notes.tsbuildinfo.bak")
 
+    def test_a_merge_cleanup_keeps_an_ignored_directory_named_like_typescript_build_state(self):
+        """sd:10985 review. The suffix names a file TypeScript writes; a directory that only ends in it
+        holds whatever the builder put there, at the top or below a folder, and keeps the worktree."""
+        head = _git(self.root, "rev-parse", "HEAD")
+        with (self.root / ".git/info/exclude").open("a") as stream:
+            stream.write("target/\n*.tsbuildinfo\n.next\n")
+        named = self.merged_worktree("nextfile")
+        (named / ".next").write_text("a file, not a build folder")
+        self.assertEqual(ship.clean_up_merged(self.root, "nextfile", head)["kept"].get(str(named)),
+                         "it holds ignored .next")
+        for number, folder in enumerate(("saved.tsbuildinfo", "web/saved.tsbuildinfo")):
+            with self.subTest(folder=folder):
+                tree = self.merged_worktree(f"tsdir{number}")
+                (tree / folder).mkdir(parents=True)
+                (tree / folder / "notes.txt").write_text("data")
+                cleanup = ship.clean_up_merged(self.root, f"tsdir{number}", head)
+                self.assertEqual(cleanup["kept"].get(str(tree)), f"it holds ignored {folder}/", cleanup)
+                self.assertTrue((tree / folder / "notes.txt").exists())
+
     def test_a_merge_cleanup_keeps_a_worktree_holding_ignored_data_that_is_not_build_output(self):
         """Review of sd:3013: `git status --porcelain` hides ignored files, and
         `git worktree remove` deleted ignored local data with the tree."""
