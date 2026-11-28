@@ -394,8 +394,8 @@ def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[st
 #: sd:10814: each failed row's review fields, keyed by its lane, item, head, prepare log (path, mtime) and the store's
 #: review generation (`_review_generation`): a retry writes a new log, and a review run again or an adjudication
 #: from the CLI writes a `ship` checkpoint; `forget` drops them after a page write. A template that answered is kept,
-#: a refusal too (sd:10997: a superseded entry's refusal ran on every load); one that gave no answer, timed out or
-#: crashed, is asked again on the next build.
+#: a refusal too when it is not retryable (`_final`, sd:10997: a superseded entry's refusal ran on every load); one
+#: that gave no answer, timed out, crashed or met a hub outage is asked again on the next build.
 _REVIEWS: dict[tuple, dict] = {}
 #: The most `_REVIEWS` keeps before it starts again: a lane holds a few failed rows.
 REVIEWS_KEPT = 512
@@ -432,6 +432,14 @@ def _review_fields(entry: dict, lane: Path, generation: int | None = None) -> di
     return fields
 
 
+def _final(answer: dict) -> bool:
+    """Whether a pack command's refusal holds until its entry or the store moves (sd:10997): it answered, and its
+    blocker says it is not retryable. A hub outage is `retryable`; a refusal that does not say is asked again too."""
+    workflow = answer.get("workflow")
+    blocker = workflow.get("blocker") if isinstance(workflow, dict) else None
+    return "exit" in answer and isinstance(blocker, dict) and blocker.get("retryable") is False
+
+
 def _read_review_fields(entry: dict, lane: Path) -> tuple[dict, bool]:
     """A failed row's review key, and each finding it covers whole, for Reject's dialog; none for a review this
     host cannot rebut: none named, a worktree on another host, or a template `shown_review` cannot print
@@ -447,7 +455,7 @@ def _read_review_fields(entry: dict, lane: Path) -> tuple[dict, bool]:
                     LIST_SECONDS)
     recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
     held = None if recorded is False else recorded is not None
-    answered = "exit" in template  # a refusal is an answer; `_run` gives no `exit` for none (sd:10997)
+    answered = template.get("exit") == 0 or _final(template)
     shown = shown_review(review, template) if review else None
     if shown:  # `reviewed_head`: the head Reject's CLI line adjudicates at (sd:10246)
         return {"review": shown[1], "review_findings": shown[0], "held": held, "reviewed_head": review[0]}, answered
