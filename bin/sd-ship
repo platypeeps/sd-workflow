@@ -1248,14 +1248,8 @@ class Ship(SharedReview):
 
         entries = self.copilot_entries()
         pull_entries = [entry for entry in entries if entry["pull"] == number]
-        # A receipt nothing confirmed is owed and unasked as far as anyone can tell: send it again, in place.
-        unconfirmed = next((index for index in reversed(range(len(entries)))
-                            if entries[index]["pull"] == number and entries[index]["status"] == "requesting"), None)
-        if unconfirmed is not None:
-            self.require_copilot_capacity(pull_entries)
-            return self.dispatch_copilot_request(entries, number, head, selection, automatic, unconfirmed)
-        if automatic and pull_entries:
-            return {**pull_entries[-1], "decision": "not_repeated"}
+        if (owed := self.owed_copilot_request(entries, number, head, selection, automatic)) is not None:
+            return owed
         existing = next((entry for entry in reversed(pull_entries) if entry["head"] == head), None)
         if existing is None:
             self.require_copilot_capacity(pull_entries)
@@ -1278,6 +1272,27 @@ class Ship(SharedReview):
             self.clear_copilot_suppression()
             return result
         return self.dispatch_copilot_request(entries, number, head, selection, automatic)
+
+    def owed_copilot_request(self, entries: list[dict], number: int, head: str, selection: str,
+                             automatic: bool) -> dict | None:
+        """What a prepare does with the pull's earlier receipts, or None to go on (sd:10207).
+
+        An automatic prepare buys one review per pull: after any receipt it
+        sends nothing, save the resend of an unconfirmed one when no receipt
+        is confirmed. An owed explicit receipt after a confirmed one waits for
+        an explicit rerun or an abandonment. A receipt nothing confirmed is
+        owed and unasked as far as anyone can tell: send it again, in place.
+        """
+        pull_entries = [entry for entry in entries if entry["pull"] == number]
+        unconfirmed = next((index for index in reversed(range(len(entries)))
+                            if entries[index]["pull"] == number and entries[index]["status"] == "requesting"), None)
+        confirmed = [entry for entry in pull_entries if entry["status"] != "requesting"]
+        if automatic and confirmed:
+            return {**confirmed[-1], "decision": "not_repeated"}
+        if unconfirmed is not None:
+            self.require_copilot_capacity(pull_entries)
+            return self.dispatch_copilot_request(entries, number, head, selection, automatic, unconfirmed)
+        return None
 
     def dispatch_copilot_request(self, entries: list[dict], number: int, head: str, selection: str,
                                  automatic: bool, resend: int | None = None) -> dict:

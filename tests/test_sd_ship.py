@@ -2615,6 +2615,24 @@ roles:
         [entry] = self.operation().state["copilot_reviews"]
         self.assertNotIn("claimed", entry)
 
+    def test_an_automatic_rerun_resends_no_explicit_receipt_after_a_confirmed_one(self):
+        """sd:10207 lane review (class: an automatic prepare spends a paid
+        request its once-per-pull policy no longer allows). A confirmed
+        receipt exists; a later explicit request was killed before its
+        POST. The automatic rerun sends nothing: the receipt stays owed
+        for an explicit rerun or an abandonment."""
+        self.enable_automatic_copilot()
+        self.prepare("--copilot-review", "request")
+        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
+        self.double.copilot_pending.clear()
+        self.advance()
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        rerun = self.prepare()
+        self.assertEqual(rerun["copilot_review"]["decision"], "not_repeated")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]],
+                         ["requested", "requesting"])
+
     def test_a_skipped_rerun_keeps_a_receipt_an_older_review_cannot_answer(self):
         """sd:10207 lane review. The same older review settles nothing on a
         rerun that skips Copilot: the receipt stays owed."""
