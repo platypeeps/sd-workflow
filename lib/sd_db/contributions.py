@@ -1324,11 +1324,16 @@ def unlinked_pr_waits(connection, *, now=None) -> list[dict]:
     """
     end = now or datetime.now(timezone.utc).isoformat(timespec="seconds")
     linked = {metadata.get("pull_url") for _row, metadata in _registered(connection, [])}
-    checkpoints = _latest(connection, "checkpoint", "contribution:")
+    # Only each pull's newest reading that is open, or that does not parse, so `snapshot` still refuses it: the
+    # Queue page decoded ~10,100 closed ones a load (sd:10997). The range is the exact prefix, as `_latest` reads.
+    prefix = "contribution:github:"
+    checkpoints = {row["key"]: row for row in connection.execute(
+        "SELECT key,id,body FROM state WHERE id IN (SELECT max(id) FROM state WHERE kind='checkpoint'"
+        " AND key>=? AND key<? GROUP BY key) AND (NOT json_valid(body) OR json_type(body) != 'object'"
+        " OR json_extract(body, '$.observation.state') = 'open')", (prefix, prefix[:-1] + ";"))}
     found = []
-    for entry in connection.execute("SELECT DISTINCT key FROM state WHERE kind = 'checkpoint' AND key LIKE ?",
-                                    ("contribution:github:%",)):
-        key = entry["key"][len("contribution:"):]
+    for name in checkpoints:
+        key = name[len("contribution:"):]
         url = _observed_url(key)
         source = snapshot(connection, key, checkpoints)
         observation = source.get("observation") or {}

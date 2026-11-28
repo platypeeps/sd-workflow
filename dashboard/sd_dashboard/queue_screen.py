@@ -233,21 +233,21 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
             **({"legacy": said} if said else {})}
 
 
-#: How long one `sd-ship` answer to `lane retry --help` serves (pack sd:10077): each probe is a subprocess, ~0.1 s.
-HELP_SECONDS = 300.0
-#: `sd-ship`'s path -> (monotonic time, the answer); only an answer the probe read is kept.
+#: `sd-ship`'s path -> the answer `lane retry --help` gave, for the process life (pack sd:10077, sd:10997): each probe
+#: is a subprocess, ~0.1 s, and the installed pack moves only with a refresh, which restarts the dashboard. Only an
+#: answer the probe read is kept.
 _help: dict = {}
 
 
 def retry_help() -> dict:
     """What the installed pack's `lane retry` takes, from its `--help`: `retry` when it names `--expected-head` (sd:3254,
     sd:3268), `requeue` when it also names a cancelled entry (pack sd:3389). A failed probe offers neither; `requeue_off`
-    says why Re-queue is off, and names a failed probe as one, not as a pack without it. A read answer serves
-    `HELP_SECONDS` per `sd-ship` path; a failed probe is asked again at the next read."""
+    says why Re-queue is off, and names a failed probe as one, not as a pack without it. A read answer serves the
+    process life per `sd-ship` path; a failed probe is asked again at the next read."""
     found = command("sd-ship")
     kept = _help.get(found)
-    if kept is not None and 0 <= time.monotonic() - kept[0] < HELP_SECONDS:
-        return dict(kept[1])
+    if kept is not None:
+        return dict(kept)
     try:
         done = subprocess.run([found, "lane", "retry", "--help"], capture_output=True, text=True,
                               timeout=LIST_SECONDS, check=False)
@@ -261,7 +261,7 @@ def retry_help() -> dict:
     requeue = retry and "cancelled" in done.stdout
     answer = {"retry": retry, "requeue": requeue, "requeue_off": None if requeue else
               "the installed pack's lane retry takes no cancelled entry; it needs pack sd:3389. Enqueue it again from its worktree."}
-    _help[found] = (time.monotonic(), dict(answer))
+    _help[found] = dict(answer)
     return answer
 
 
@@ -393,8 +393,9 @@ def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[st
 
 #: sd:10814: each failed row's review fields, keyed by its lane, item, head, prepare log (path, mtime) and the store's
 #: review generation (`_review_generation`): a retry writes a new log, and a review run again or an adjudication
-#: from the CLI writes a `ship` checkpoint; `forget` drops them after a page write. Only a template that answered
-#: is kept, so a timed-out adjudicate is asked again on the next build.
+#: from the CLI writes a `ship` checkpoint; `forget` drops them after a page write. A template that answered is kept,
+#: a refusal too (sd:10997: a superseded entry's refusal ran on every load); one that gave no answer, timed out or
+#: crashed, is asked again on the next build.
 _REVIEWS: dict[tuple, dict] = {}
 #: The most `_REVIEWS` keeps before it starts again: a lane holds a few failed rows.
 REVIEWS_KEPT = 512
@@ -446,7 +447,7 @@ def _read_review_fields(entry: dict, lane: Path) -> tuple[dict, bool]:
                     LIST_SECONDS)
     recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
     held = None if recorded is False else recorded is not None
-    answered = template.get("exit") == 0
+    answered = "exit" in template  # a refusal is an answer; `_run` gives no `exit` for none (sd:10997)
     shown = shown_review(review, template) if review else None
     if shown:  # `reviewed_head`: the head Reject's CLI line adjudicates at (sd:10246)
         return {"review": shown[1], "review_findings": shown[0], "held": held, "reviewed_head": review[0]}, answered

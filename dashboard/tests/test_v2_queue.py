@@ -60,7 +60,9 @@ case "$*" in
   *" adjudicate "*) case "$*" in
        *--dispositions-file*) if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_REFUSE"; exit 3; fi
          eval "f=\\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
-       *) raw="$QUEUE_RAW"; [ -n "$raw" ] || raw='{"severity": "high", "path": "a.py", "line": 1, "summary": "wrong"}'
+       *) if [ -n "$QUEUE_TEMPLATE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_TEMPLATE_REFUSE"; exit 3; fi
+         if [ -n "$QUEUE_TEMPLATE_CRASH" ]; then echo "Traceback: $QUEUE_TEMPLATE_CRASH" >&2; exit 1; fi
+         raw="$QUEUE_RAW"; [ -n "$raw" ] || raw='{"severity": "high", "path": "a.py", "line": 1, "summary": "wrong"}'
          fs=""; for d in ${QUEUE_DIGEST:-f1}; do fs="$fs${fs:+, }{\\"index\\": 1, \\"finding_digest\\": \\"$d\\", \\"raw_finding\\": $(printf '%s' "$raw" | sed "s/@D/$d/g"), \\"response_disposition\\": \\"rebutted|parked\\", \\"reason\\": \\"\\"}"; done
          printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [%s]}%s}\\n' "$fs" "${QUEUE_OLD_TEMPLATE-, \\"recorded_revision\\": ${QUEUE_RECORDED:-null}}" ;;
      esac ;;
@@ -253,6 +255,9 @@ class TheRows(Lane, ScreenCase):
             self.assertIs(queue_screen.retry_help()["retry"], False)
         self.assertIs(queue_screen.retry_help()["retry"], True)
         self.assertIs(queue_screen.retry_help()["retry"], True)
+        # sd:10997: a read answer serves the process life; the installed pack moves only with a restart.
+        with mock.patch.object(queue_screen.time, "monotonic", return_value=time.monotonic() + 86400):
+            self.assertIs(queue_screen.retry_help()["retry"], True)
         self.assertEqual(self.calls().count(["lane", "retry", "--help"]), 2)
 
     def test_each_lane_carries_its_checkouts_realm(self):
@@ -1003,6 +1008,41 @@ class TheMove(Lane, BrowserSession):
         os.utime(log, ns=(log.stat().st_atime_ns, log.stat().st_mtime_ns + 1))  # a retry's new prepare log
         queue_screen.document(self.connection, now=NOW)
         self.assertEqual(len([c for c in self.calls() if "adjudicate" in c]), 1)
+
+    def adjudicated(self):
+        return [c for c in self.calls() if "adjudicate" in c]
+
+    def rebuild(self):
+        return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                    if row.get("item") == 14)
+
+    def test_a_refused_adjudicate_is_kept_as_an_answered_one(self):
+        """sd:10997: only an answer that exited 0 was kept, so an entry whose adjudicate refused ("item belongs
+        to a different branch") ran it again on every load. A refusal is an answer; no answer is asked again."""
+        with mock.patch.dict(os.environ, {"QUEUE_TEMPLATE_REFUSE": "item belongs to a different branch"}):
+            self.assertIsNone(self.failed()["review"])
+            self.assertEqual(len(self.adjudicated()), 1)
+            self.log.write_text("")
+            self.assertIsNone(self.rebuild()["review"])
+            self.assertEqual(self.adjudicated(), [])
+        with mock.patch.dict(os.environ, {"QUEUE_TEMPLATE_CRASH": "hub gone"}):
+            self.failed()
+            self.log.write_text("")
+            self.rebuild()
+            self.assertEqual(len(self.adjudicated()), 1, "a template that gave no answer is asked again")
+
+    def test_only_the_newest_entry_of_an_item_runs_adjudicate(self):
+        """sd:10997: an older failed entry superseded by a newer one offers no Reject; it asks nothing."""
+        self.failed()
+        newer = {**json.loads(self.fixture.read_text())["entries"][-1]}
+        older = {**newer, "finished_at": "2026-09-06T09:00:00Z", "prepare_log": str(self.lane / "logs" / "old.log")}
+        (self.lane / "logs" / "old.log").write_text(Path(newer["prepare_log"]).read_text())
+        entries = json.loads(self.fixture.read_text())["entries"][:-1]
+        self.list(numbered(entries + [older, newer]))
+        queue_screen.forget()
+        self.log.write_text("")
+        self.rebuild()
+        self.assertEqual(len(self.adjudicated()), 1)
 
     def test_an_adjudication_or_review_rerun_from_the_cli_reads_the_review_again(self):
         """sd:10814 lead review: the kept fields outlived a CLI adjudication and a review run again at the same

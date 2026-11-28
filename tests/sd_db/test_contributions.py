@@ -1362,6 +1362,25 @@ class UnlinkedWaits(ContributionCase):
                           "approximate": True, "stale": False, "draft": False, "mine": True})
         self.assertEqual((wait["on_reviewers"], wait["on_you"], wait["waited"]), (21480, 0, 21480))
 
+    def test_only_an_open_pull_is_decoded(self):
+        """sd:10997: the Queue page decoded ~10,100 snapshots a load, nearly all closed; it reads the open ones."""
+        mine = self.pull(40, observed_at=T3)
+        self.pull(43, observed_at=T3, state="merged")
+        self.pull(45, observed_at=T3, state="closed")
+        with mock.patch.object(c, "snapshot", wraps=c.snapshot) as read:
+            waits = c.unlinked_pr_waits(self.db, now=self.NOW)
+        self.assertEqual([w["url"] for w in waits], [mine])
+        self.assertEqual([call.args[1] for call in read.call_args_list], ["github:" + mine])
+
+    def test_a_malformed_reading_still_fails_the_read(self):
+        url = self.pull(49, observed_at=T3)
+        for body in ("not json", "[]"):
+            with self.subTest(body=body):
+                self.db.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                                ("contribution:github:" + url, self.NOW, body))
+                with self.assertRaises(WorkflowError):
+                    c.unlinked_pr_waits(self.db, now=self.NOW)
+
     def test_with_no_event_the_wait_starts_at_created_at(self):
         url = self.pull(44, observed_at=T3)
         upsert_shadow(self.db, tracker="github", url=url, repo="upstream/project", number=44, kind="pull",
