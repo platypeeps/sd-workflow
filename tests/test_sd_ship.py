@@ -1666,9 +1666,14 @@ roles:
         `Reviewed-base: <base> ~2` on the tip, and force-pushes it with a lease; the merge lands both
         commits by rebase and reconcile delivers the item at the landed tip."""
         base = self.rebase_branch()
+        queued = _git(self.root, "rev-parse", "HEAD")
         self.delivering()
         head = _git(self.root, "rev-parse", "HEAD")
         self.assertEqual(_git(self.remote.path, "rev-parse", "topic"), head)
+        # sd:10223: the receipt names the head prepare rewrote, so the lane can follow the rewrite exactly.
+        stored = receipts.read(self.connection, receipts.receipt_key(self.remote.slug, "topic", self.item))[1]
+        self.assertEqual({key: stored["rebase_tip"].get(key) for key in ("commit", "from")},
+                         {"commit": head, "from": queued})
         self.assertEqual(_git(self.root, "rev-list", "--count", f"{base}..{head}"), "2")
         with patch.object(ship.time, "sleep"):
             result = self.merge()

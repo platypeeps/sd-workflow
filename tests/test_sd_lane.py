@@ -7063,6 +7063,61 @@ class AnyHost(SharedQueue):
                 sd_lane.cancel(self.repo, item, self.environ)  # before the check, so a failure leaves no entry behind
                 self.assertEqual((entry["item"], entry["status"], entry["expected_head"]), (item, "pending", queued))
 
+    def saved_rebase(self, branch: str, item: int, commit: str, rewrote: str | None) -> None:
+        """The ship receipt a rebase policy's prepare leaves: the tip it wrote and, `rewrote`, the head it rewrote."""
+        import sd_db
+        from sd_db import ship
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            key = ship.receipt_key("example/pack", branch, item)
+            saved = {"commit": commit, "message": "the tip\n", **({"from": rewrote} if rewrote else {})}
+            ship.save(connection, key, ship.read(connection, key)[0],
+                      {"repository": "example/pack", "branch": branch, "item": item, "phase": "push_dispatch",
+                       "head": commit, "rebase_tip": saved})
+        finally:
+            connection.close()
+
+    def test_a_put_back_after_a_pushed_rebase_is_queued_at_the_rewrite(self) -> None:
+        """sd:10223: a rebase policy's prepare force-pushed its rewrite, and a put-back kept the old head.
+
+        A retryable refusal and a move each put the entry back; `expected_head` follows the rewrite the
+        receipt names for that queued head. A receipt of another head, or one with no `from`, moves nothing.
+        """
+        retryable = {"ok": False, "phase": "prepare", "passes_spent": 0, "error": "no timing plan",
+                     "workflow": {"blocker": {"code": "timing_plan_invalid", "retryable": True}}}
+        for case in ("retryable", "moved", "other_head", "no_from"):
+            with self.subTest(case=case):
+                item = {"retryable": 1, "moved": 2, "other_head": 3, "no_from": 4}[case]
+                tree = self.worktree(f"rebased{item}")
+                self.commit_file(tree, f"work{item}.txt")
+                queued = sd_lane.enqueue_entry(tree, item, "fix: one", self.body, self.environ, manual=True,
+                                               claim="deliver")["expected_head"]
+                if case == "moved":
+                    self.answers[(item, "merge")] = {"ok": False, "phase": "merge", "error": "runs on build-2",
+                                                     "workflow": {"blocker": {"code": "lane_elsewhere"}}}
+                rewrites: list[str] = []
+
+                def prepare(argv: list[str], log: pathlib.Path, tree: pathlib.Path = tree, case: str = case,
+                            item: int = item, queued: str = queued, rewrites: list[str] = rewrites) -> dict:
+                    if argv[2] == "prepare":
+                        self.commit_file(self.repo, f"base{item}.txt")
+                        git(self.repo, "push", "-q", "origin", "main")
+                        git(tree, "rebase", "-q", "main")
+                        git(tree, "commit", "-q", "--amend", "-m", f"the tip\n\nDelivers: sd:{item}")
+                        rewrites.append(git(tree, "rev-parse", "HEAD"))
+                        git(tree, "push", "-q", "--force", "origin", f"HEAD:refs/heads/rebased{item}")
+                        rewrote = {"other_head": "f" * 40, "no_from": None}.get(case, queued)
+                        self.saved_rebase(f"rebased{item}", item, rewrites[0], rewrote)
+                        if case != "moved":
+                            self.calls.append(argv)
+                            return retryable
+                    return self.ship(argv, log)
+                sd_lane.run_lane(self.repo, self.environ, prepare)
+                entry = self.entries()[-1]
+                sd_lane.cancel(self.repo, item, self.environ)
+                want = rewrites[0] if case in ("retryable", "moved") else queued
+                self.assertEqual((entry["item"], entry["status"], entry["expected_head"]), (item, "pending", want))
+
     def test_an_own_worktree_that_moved_on_its_branch_skips_head_moved(self) -> None:
         """sd:3413. The builder committed or amended after enqueue; the run never advises removing its branch."""
         for amended in (False, True):

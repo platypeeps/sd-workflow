@@ -2604,7 +2604,7 @@ class Ship(SharedReview):
             raise Refusal("a rebase repository's prepare rewrites the branch and needs a clean working tree",
                           code="dirty_worktree", boundary="input", state="operator_decision",
                           next_action="Commit or stash the changes, then run prepare again.")
-        remote = f"refs/remotes/origin/{base}"
+        remote, queued = f"refs/remotes/origin/{base}", head
         onto = git(self.root, "merge-base", head, remote)
         self.rebase_onto(head, onto, "-i", "--autosquash")
         # Linearizing drops merge commits; one that edited a file on its own
@@ -2633,7 +2633,8 @@ class Ship(SharedReview):
         if message.strip() != git(self.root, "show", "-s", "--format=%B", tip).strip():
             run(self.root, ["git", "commit", "--amend", "--no-verify", "--allow-empty", "--file=-"], input=message)
         head = current_head(self.root)
-        self.save(rebase_tip={"commit": head, "message": original}, landed_commits=len(commits))
+        # `from` is the head this prepare rewrote: the lane follows the rewrite by it, not by guessing (sd:10223).
+        self.save(rebase_tip={"commit": head, "message": original, "from": queued}, landed_commits=len(commits))
         return head
 
     def rebase_onto(self, head: str, onto: str, *flags: str) -> None:
