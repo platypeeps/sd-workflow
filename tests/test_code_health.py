@@ -1479,7 +1479,7 @@ MYPY_RATCHET_PATHS = ("lib", "tests/sd_db")
 
 #: mypy's error count over those paths (sd:3485). A rise fails; a fall passes
 #: and prints a notice, so a builder who fixes errors is not failed for it.
-MYPY_CEILING = 484  # measured; lower it with the count
+MYPY_CEILING = 483  # measured; lower it with the count
 
 MYPY_SUMMARY = re.compile(r"^(?:Found (\d+) errors? in \d+ files? \(checked (\d+) source files?\)"
                           r"|Success: no issues found in (\d+) source files?)$", re.M)
