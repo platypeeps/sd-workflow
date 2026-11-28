@@ -194,6 +194,21 @@ class AReplayWritesNothing(unittest.TestCase):
         self.assertIs(reporting.health(self.db, "probe"), True)
         self.assertEqual(self.beats(), ["typo", "b", "c"])
 
+    def test_a_future_stamp_does_not_hide_the_newest_real_tick(self):
+        """sd:10410: `_beat` read only the newest row by id. After a future-stamped
+        row, a late older failure outranked the real newest tick and became health."""
+        self.tick("b", 16)
+        self.tick("typo", 0, ended="2027-09-08T00:01:00Z")
+        late = self.tick("a", 1, exit_code=1, text="boom\n")
+        self.assertEqual(late["recorded"], "report")
+        self.assertEqual(self.beats(), ["b", "typo"])
+        self.assertIs(reporting.health(self.db, "probe"), True)
+        # A tick that ties the newest real one is a tie with it, not with the typo.
+        self.tick("b2", 16)
+        row = self.db.execute("SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1",
+                              (reporting.HEARTBEAT_KEY + "probe",)).fetchone()
+        self.assertEqual([run.split("@")[0] for run in json.loads(row["body"])["same_second"]], ["b"])
+
     def test_a_stamp_within_the_allowance_still_counts_as_newest(self):
         """Five minutes past the clock is a slewing clock, not a typo: it still wins."""
         self.tick("ahead", 0, ended="2026-09-08T01:04:59Z")
@@ -203,9 +218,10 @@ class AReplayWritesNothing(unittest.TestCase):
         self.tick("beyond", 0, ended="2026-09-08T01:30:00Z")
         self.assertEqual(self.beats(), ["ahead", "beyond"])
         # beyond's clean run closed b's report (pack sd:7729), so the second
-        # `exit 1` opens a fresh one; its heartbeat still makes the job unhealthy.
+        # `exit 1` opens a fresh one; it ended before ahead, the newest real
+        # tick, so it does not become health (sd:10410).
         self.assertEqual(self.tick("c", 31, exit_code=1, text="boom\n")["recorded"], "report")
-        self.assertIs(reporting.health(self.db, "probe"), False)
+        self.assertIs(reporting.health(self.db, "probe"), True)
 
     def test_a_late_failure_is_still_filed_but_does_not_become_current_health(self):
         """A run whose ingest never landed, recovered by hand after newer ticks:

@@ -560,11 +560,17 @@ def _beat(connection, *, job, run_id, healthy, ended, exit_code, now, host=None)
             "                 WHERE value IN (?, ?)))",
             (key, run_id, host, run_id, _tagged(run_id, host))).fetchone():
         return "recorded"
+    # The newest real tick: the latest `ended` within the allowance, the
+    # newest row on a tie. Not the newest row by id: a row stamped past the
+    # allowance can be that, and it hid the real newest tick (sd:10410).
     latest = connection.execute(
-        "SELECT body FROM state WHERE kind='heartbeat' AND key=? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+        "SELECT body FROM state WHERE kind='heartbeat' AND key=? AND json_valid(body)"
+        " AND json_type(body, '$.ended') = 'text' AND json_extract(body, '$.ended') <= ?"
+        " ORDER BY json_extract(body, '$.ended') DESC, id DESC LIMIT 1",
+        (key, stamp((now + FUTURE_ALLOWANCE).isoformat()))).fetchone()
     newest_body = json.loads(latest["body"]) if latest else {}
     newest = newest_body.get("ended") or ""
-    if ended < newest <= stamp((now + FUTURE_ALLOWANCE).isoformat()):
+    if ended < newest:
         return "older"
     body = {"healthy": healthy, "run_id": run_id, "ended": ended, "exit_code": exit_code}
     if host is not None:
