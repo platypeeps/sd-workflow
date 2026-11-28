@@ -1853,6 +1853,36 @@ def fenced_headings_only(lines: list[str]) -> bool:
     return note_heading_lines([*marked, "## end"], 0) == [(len(lines), "end")]
 
 
+def refuse_moved_headings(before: str, after: str, created: list[str]) -> None:
+    """Refuse a write that changes which lines of a body read as `## ` headings.
+
+    `parse_sections` vets each section's text alone, but a fence is read with
+    the whole body: a fence one section leaves open hides the headings below
+    it, and the next section's opener closes it, so that section's fenced
+    `## ` line reads as a heading and a later edit deletes the real one
+    (final-round class pass, sd:10784). `created` names the headings the
+    write adds itself.
+    """
+
+    was, now = (sorted(title for _, title in note_heading_lines(body.splitlines(), 0)) for body in (before, after))
+    if now != sorted([*was, *created]):
+        raise Refusal(
+            "the section text would change which lines read as `## ` headings:"
+            " a code fence is left open, or closes another section's;"
+            " close each fence in the section that opens it")
+
+
+def edit_sections(body: str, filled: dict[str, str], order: list[str]) -> str:
+    """`body` with each section of `filled` edited, its headings where the reader found them."""
+
+    held = {title for _, title in note_heading_lines(body.splitlines(), 0)}
+    edited = body
+    for section, text in filled.items():
+        edited = edit_section(edited, section, text, order)
+    refuse_moved_headings(body, edited, [section for section in filled if section not in held])
+    return edited
+
+
 def section_span(lines: list[str], headings: list[tuple[int, str]],
                  name: str) -> tuple[int, int] | None:
     """`(heading, end)` for one section, ends excluded, or `None` when absent.
@@ -2256,6 +2286,8 @@ def rendered_body(kind: dict[str, object], root: pathlib.Path, args: argparse.Na
             resolve_pair_files(args.section or [], "--section-file", sequences=False)))
 
     order = declared_sections(kind)
+    # The fill moves no heading: a fence one section leaves open would hide or expose another's.
+    refuse_moved_headings(titled, body, [])
     # The template's own headings, read before the fill and with no fence model: section text may hold
     # a fenced `## ` line, which `parse_sections` has vetted, and a `## ` line of the template counts
     # fenced or not, as it did before sd:10784.
@@ -2376,9 +2408,7 @@ def store_set(args: argparse.Namespace) -> int:
         refuse_human_only(kind, stage, DB_HUMAN)
     with db_store(name) as (records, rules, connection):
         row = records.get_row(connection, kind=name, title=args.title)
-        body = row["body"]
-        for section, text in filled.items():
-            body = edit_section(body, section, text, order)
+        body = edit_sections(row["body"], filled, order)
         done = records.edit_row(connection, row["id"], rules, revision=read_revision(args, row), who=STORE_WHO,
                                 stage=stage, fields=scalars, body=body if filled else None)
     if done["revision"] == row["revision"]:
@@ -2441,9 +2471,7 @@ def store_set_section(args: argparse.Namespace) -> int:
     filled, order = section_request(args, kind)
     with db_store(name) as (records, rules, connection):
         row = records.get_row(connection, kind=name, title=args.title)
-        body = row["body"]
-        for section, text in filled.items():
-            body = edit_section(body, section, text, order)
+        body = edit_sections(row["body"], filled, order)
         done = records.edit_row(connection, row["id"], rules, revision=read_revision(args, row), who=STORE_WHO,
                                 stage=None, fields={}, body=body)
     if done["revision"] == row["revision"]:

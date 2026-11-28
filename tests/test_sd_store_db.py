@@ -213,6 +213,28 @@ class TheWrites(DbStoreFixture):
                 self.refused("store", "set-section", "pp.tip", "First tip", "--section", f"Tip={text}",
                              says="its own `## ` heading")
 
+    def test_a_fence_one_section_opens_never_moves_the_headings(self) -> None:
+        """Final-round class pass: section text is vetted alone, but its fences are read with the
+        whole body. A fence one section leaves open is closed by the next section's opener, so that
+        section's fenced `## ` line reads as a heading, and a later edit deleted the real one."""
+        opened, fenced = "```sh\necho hello", "Keep this explanation.\n```\n## Example\n```"
+        says = "which lines read as `## ` headings"
+        self.refused("store", "add", "pp.tip", "Both at once", "--field", "score=7",
+                     "--section", f"Tip={opened}", "--section", f"Notes={fenced}", says=says)
+        self.refused("store", "add", "pp.tip", "Open alone", "--field", "score=7",
+                     "--section", f"Tip={opened}", says=says)
+        self.add("First tip", "--section", f"Notes={fenced}")
+        before = self.ok("store", "get", "pp.tip", "First tip").stdout
+        for verb in ("set", "set-section"):
+            with self.subTest(verb=verb):
+                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Tip={opened}", says=says)
+                self.refused("store", verb, "pp.tip", "First tip", "--section", f"Notes={fenced}",
+                             "--section", f"Tip={opened}", says=says)
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip").stdout, before)
+        self.ok("store", "set-section", "pp.tip", "First tip", "--section", "Tip=```sh\necho hello\n```")
+        self.assertEqual(self.ok("store", "get", "pp.tip", "First tip", "--section", "Notes").stdout,
+                         fenced + "\n")
+
     def test_a_missing_row_refuses(self) -> None:
         self.refused("store", "set", "pp.tip", "No such tip", "score", "8", says="no tip row has the title")
 
