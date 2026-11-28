@@ -4849,6 +4849,32 @@ roles:
             self.prepare("--deliver", "--acceptance-file", old)  # the evidence the renewal replaced
         self.assertEqual(self.operation().state["acceptance"], stored)
 
+    def test_fresh_evidence_cannot_restore_the_body_a_renewal_replaced(self):
+        """Review of build/sd-2328: a lane prepare with fresh evidence returned before the body check, so an entry
+        enqueued with the body a renewal by hand replaced published it again. Fresh evidence still meets the
+        body check when its entry's body is one the renewal replaced; a body given after the renewal stands."""
+        from sd_db import set_item_fields
+        body = self.directory / "hand-body.md"
+        body.write_text("Body A.\n")
+        self.prepare("--deliver", "--acceptance-file", self.lane_evidence("old.json", "fixture-check-pass"),
+                     "--body-file", str(body))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        body.write_text("Body B.\n")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", self.lane_evidence("r.json", "renewed"),
+                         "--body-file", str(body))
+        before = self.operation().state["acceptance"]
+        newer = self.lane_evidence("newer.json", "checked again after the renewal")
+        body.write_text("Body A.\n")
+        with self.as_lane("Body A.\n"), self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.prepare("--deliver", "--acceptance-file", newer, "--body-file", str(body))
+        self.assertEqual(self.operation().state["acceptance"], before)
+        body.write_text("Body C.\n")
+        with self.as_lane("Body C.\n"), contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", newer, "--body-file", str(body))
+        self.assertEqual(self.operation().state["acceptance"]["claim"]["criteria"][0]["evidence"],
+                         "checked again after the renewal")
+
     def test_a_lane_entry_queued_before_a_renewal_refuses_after_it(self):
         """pack sd:9580: the renewal reads the item's lane entries, so one queued before it, whose evidence no
         claim held yet, refuses after it too; a queue that does not read renews nothing."""

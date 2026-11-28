@@ -1023,7 +1023,8 @@ class Ship(SharedReview):
             return claim, None, None
         if self.lane_started():
             return self.lane_renewal(claim, stored, changed, basis), None, None
-        claim = {**claim, "renewed": True, "superseded": self.superseded(stored)}
+        claim = {**claim, "renewed": True, "superseded": self.superseded(stored),
+                 "superseded_bodies": self.superseded_bodies(stored)}
         if not changed:
             return claim, None, None
         self.refuse_stale_evidence(claim, stored)
@@ -1041,11 +1042,10 @@ class Ship(SharedReview):
         """
         self.refuse_held_by_lane_row(changed)
         items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
-        superseded = stored.get("superseded")
-        if stored.get("renewed") and isinstance(superseded, list):
-            claim = {**claim, "superseded": superseded}
-            if not changed and evidence_key(claim.get("claim"), items) not in superseded:
-                return {**claim, "renewed": True}  # evidence given after the renewal (pack sd:9580)
+        if stored.get("renewed") and isinstance(stored.get("superseded"), list):
+            claim = {**claim, "superseded": stored["superseded"], "superseded_bodies": stored.get("superseded_bodies")}
+            if not changed and self.fresh_evidence(claim, stored, items, basis):
+                return {**claim, "renewed": True}
         other_items = set(items) != set((self.state.get("closing") or {}).get("items") or [])
         if stored.get("renewed") and not changed and other_items:
             raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
@@ -1091,6 +1091,28 @@ class Ship(SharedReview):
                 continue
             named = tuple(dict.fromkeys(number for number in row.get("closes") or () if isinstance(number, int)))
             keys.add(evidence_key(value, list(self.closing(named, True))))
+        return sorted(keys)
+
+    def fresh_evidence(self, claim: dict, stored: dict, items: list, basis: tuple[str | None, str | None]) -> bool:
+        """Whether a lane prepare carries evidence given after a renewal by hand (pack sd:9580); such an entry
+        still meets the body check when its body is one the renewal replaced, or one no row vouches for
+        (review of build/sd-2328)."""
+        if evidence_key(claim.get("claim"), items) in stored["superseded"]:
+            return False
+        bodies = stored.get("superseded_bodies")
+        if basis[0] is None or not isinstance(bodies, list) or basis[0] in bodies:
+            self.refuse_other_body(*basis)
+        return True
+
+    def superseded_bodies(self, stored: dict) -> list[str]:
+        """The digests of the bodies a renewal by hand replaces, as `body_basis` gives an entry's: the published
+        body, the words it was made from, those an earlier renewal listed, and each of the item's lane entries'
+        (review of build/sd-2328). `superseded` has read the queue, so a queue that does not read refused."""
+        published = digest(self.normal(self.state.get("body")))
+        keys = {published, *(stored.get("superseded_bodies") or []),
+                *(digest(self.normal(row.get("body"))) for row in self.lane_entries()[0])}
+        if basis := (self.state.get("body_bases") or {}).get(published):
+            keys.add(basis)
         return sorted(keys)
 
     def refuse_other_body(self, basis: str | None, entry: str | None) -> None:
