@@ -31,7 +31,7 @@ class DispositionTests(unittest.TestCase):
     merge = fixture.ShipCase.merge
     cli = fixture.ShipCase.cli
 
-    def blocked(self):
+    def blocked(self, path="src.py"):
         provider = self.programs / "review-fixture"
         payload = {
             "type": "result",
@@ -39,9 +39,9 @@ class DispositionTests(unittest.TestCase):
             "structured_output": {
                 "findings": [
                     {
-                        "path": "src.py",
+                        "path": path,
                         "line": 1,
-                        "severity": "high", "instances": ["src.py:1"],
+                        "severity": "high", "instances": [f"{path}:1"],
                         "family": "correctness",
                         "summary": "fixture disputed finding",
                         "evidence": "python3 src.py: Traceback",
@@ -952,6 +952,59 @@ class DispositionTests(unittest.TestCase):
             self.operation().state["review_clearance"]["kind"], "adjudicated"
         )
         self.assertEqual(self.merge()["phase"], "merged")
+
+
+    def rebutted_outside_the_branch(self):
+        """A blocker citing `lib/cited.txt`, a file main brought, rebutted and cleared at its head."""
+        self.remote.commit_on("main", "cited\n\nAuthored-with: human", files={"lib/cited.txt": "a\nb\n"})
+        fixture._git(self.root, "fetch", "-q", "origin", "main:refs/remotes/origin/main")
+        fixture._git(self.root, "merge", "-q", "--no-ff", "-m", "Merge origin/main into topic\n\nAuthored-with: human",
+                     "origin/main")
+        self.blocked("lib/cited.txt")
+        self.accepted()
+        self.assertEqual(self.prepare()["phase"], "ready_to_send")
+
+    def test_a_rebutted_blocker_carries_across_a_clean_catch_up(self):
+        """pack sd:10999: a blocking pass cleared by a rebuttal stayed bound to its head, so the lane's catch-up
+        merge of main re-raised it (MWS sd:10359), one extra lane round per main move. A clean merge-in that
+        leaves the cited file alone carries the pass and its rebuttal; no provider is called."""
+        self.rebutted_outside_the_branch()
+        self.remote.commit_on("main", "unrelated\n\nAuthored-with: human", files={"lib/other.txt": "main\n"})
+        with patch.object(ship, "review_process", side_effect=AssertionError("re-reviewed after the rebuttal")):
+            result = self.prepare("--catch-up")
+        self.assertEqual(result["phase"], "ready_to_send")
+        head, state = fixture._git(self.root, "rev-parse", "HEAD"), self.operation().state
+        self.assertNotEqual(head, self.head)
+        self.assertEqual([entry["head"] for entry in state["passes"]], [self.head], "no pass is spent")
+        self.assertEqual((state["reviewed_head"], state["review_carry_forward"]["from"]), (head, self.head))
+        self.assertEqual(state["review_clearance"]["kind"], "adjudicated")
+        pull = self.remote.pull(result["pull_request"]["number"])
+        pull.checks = [{**row, "head_sha": head} for row in pull.checks]
+        self.assertEqual(self.merge()["phase"], "merged")
+
+    def test_a_catch_up_that_edits_a_rebutted_blockers_file_reviews_again(self):
+        """pack sd:10999: main's merge edits the cited file, so the rebuttal answers lines that changed: no carry."""
+        self.rebutted_outside_the_branch()
+        self.remote.commit_on("main", "edit cited\n\nAuthored-with: human", files={"lib/cited.txt": "A\nb\n"})
+        with self.assertRaises(ship.Refusal):
+            self.prepare("--catch-up")
+        state = self.operation().state
+        self.assertNotIn("review_carry_forward", state)
+        self.assertEqual(len(state["passes"]), 2, "the catch-up head is reviewed again")
+
+    def test_a_rebuttal_carry_cut_short_recovers_on_the_next_prepare(self):
+        """A prepare stopped after the carry's first write leaves no clearance; the next prepare refreshes it."""
+        self.rebutted_outside_the_branch()
+        self.remote.commit_on("main", "unrelated\n\nAuthored-with: human", files={"lib/other.txt": "main\n"})
+        with patch.object(sd_ship_review.SharedReview, "check_review", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.prepare("--catch-up")
+        self.assertIsNone(self.operation().state["review_clearance"])
+        with self.assertRaises(ship.Refusal):  # no clearance, and no gate at the new head
+            self.merge()
+        with patch.object(ship, "review_process", side_effect=AssertionError("re-reviewed after the rebuttal")):
+            self.assertEqual(self.prepare()["phase"], "ready_to_send")
+        self.assertEqual(self.operation().state["review_clearance"]["kind"], "adjudicated")
 
 
 sd_ship_review = importlib.import_module("sd_ship_review")

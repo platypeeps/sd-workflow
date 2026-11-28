@@ -141,6 +141,13 @@ def same_bindings(stored: object, current: dict) -> bool:
     return digest(stored) == digest(current)
 
 
+def subject_head(operation: Any, head: str) -> str:
+    """The head a proposal binds: a carried head's is the head its pass reviewed, as the rebuttal answers that
+    review (pack sd:10999); any other head is itself."""
+    passes = operation.history.native(operation.state)
+    return operation.carried_from(head, passes[-1]) if passes else head
+
+
 def context(operation: Any, head: str) -> tuple[dict, list[dict]]:
     if git(operation.root, "status", "--porcelain", "--untracked-files=all") or git(operation.root, "rev-parse", "HEAD") != head:
         raise Refusal("adjudication requires the clean exact reviewed head")
@@ -161,7 +168,8 @@ def context(operation: Any, head: str) -> tuple[dict, list[dict]]:
             for index, row in enumerate(report["findings"], 1) if row["disposition"] == "blocking"]
     if not rows:
         raise Refusal("blocking report has no blocking findings to adjudicate")
-    identity = operation.identity.bindings(operation.repository, operation.branch, head, operation.state)
+    identity = operation.identity.bindings(operation.repository, operation.branch, subject_head(operation, head),
+                                           operation.state)
     return {**identity, "report_digest": digest(report), "review_binding": operation.state["binding"],
             "adjudicator_binding": adjudicator_binding(operation.store.__file__)}, rows
 

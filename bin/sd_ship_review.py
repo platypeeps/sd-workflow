@@ -204,6 +204,36 @@ def paths_between(root: pathlib.Path, old: str, new: str) -> set[str] | None:
     return None if listed is None else {path for path in listed.split("\0") if path}
 
 
+def cited_files(report: dict) -> list[str] | None:
+    """Every file a blocking finding of `report` cites, its `path` and `instances`, or None when one is not a
+    plain relative path (pack sd:10999): a name that `git diff` would spell otherwise cannot be matched exactly.
+
+    ponytail: a whole file, not the cited lines; main's edit elsewhere in a cited file reviews again.
+    """
+    cited: set[str] = set()
+    for row in report.get("findings") or []:
+        if not isinstance(row, dict) or row.get("disposition") != "blocking":
+            continue
+        for path in [row.get("path"), *sd_lib.instance_files(row.get("instances"))]:
+            if path is None:
+                continue
+            if (not isinstance(path, str) or not path or path.startswith("/") or "\\" in path
+                    or any(part in ("", ".", "..") for part in path.split("/"))):
+                return None
+            cited.add(path)
+    return sorted(cited)
+
+
+def untouched_citations(root: pathlib.Path, report: dict, reviewed: str, head: str) -> list[str] | None:
+    """The files `report`'s blockers cite when `reviewed..head` changes none of them, else None (pack sd:10999).
+
+    A diff that does not read, or a citation `cited_files` cannot match exactly, is None: review again.
+    """
+    cited = cited_files(report)
+    changed = paths_between(root, reviewed, head) if cited else set()
+    return None if cited is None or changed is None or changed & set(cited) else cited
+
+
 def base_near_branch(root: pathlib.Path, reviewed: str, head: str, base_ref: str) -> bool:
     """Whether the base's new commits touch a file, or a directory, the branch touches (sd:1485).
 
@@ -570,18 +600,22 @@ class SharedReview:
     def carried_from(self, head: str, last: dict) -> str:
         """The head the last pass reviewed, when a recorded carry covers `head` (sd:1485), else `head`."""
         carried = self.state.get("review_carry_forward") or {}
+        status = (last.get("report") or {}).get("status")
         if (carried.get("to") == head and carried.get("from") == last.get("head")
                 and self.state.get("reviewed_head") == head
-                and (last.get("report") or {}).get("status") in ("clean", "advisory")):
+                and (status in ("clean", "advisory") or (status == "blocking" and "cited" in carried))):
             return carried["from"]
         return head
 
     def carried_review(self, head: str) -> bool:
         """sd:1485. Carry the last cleared review to a clean merge-in of the base.
 
-        Only a clean or advisory receipt: a blocking one is cleared by
-        dispositions bound to its own head. `carry_forward` decides; the
-        receipt records what it found, and the output names it.
+        A clean or advisory receipt, or a blocking one its recorded
+        dispositions cleared (pack sd:10999) when the merge-in leaves every
+        file its blockers cite alone (`cited_files`): the rebuttal then
+        answers the same finding at the same lines. Its clearance is read
+        again at the new head, each row's test run there. `carry_forward`
+        decides; the receipt records what it found, and the output names it.
 
         A review that cleared before its gate failed (`kept_gate_failure`)
         carries too, and the gate runs alone at the new head (`rerun_gate`,
@@ -592,28 +626,41 @@ class SharedReview:
         passes, base = self.history.native(self.state), self.state.get("base")
         report = (passes[-1].get("report") or {}) if passes else {}
         kept = kept_gate_failure(report)
-        if not passes or not base or not (self.state.get("reviewed_head") or kept):
-            return False
-        if (report.get("status") not in ("clean", "advisory") and not kept) or not completed_depth(report) \
-                or self.binding_moved():
-            return False
-        # A named reviewer is a selection a receipt from another cannot replace.
-        requested = getattr(self.args, "provider", None)
-        if requested is not None and report.get("reviewed_by") != [requested]:
+        if not passes or not base or not (self.state.get("reviewed_head") or kept) or not self.carriable(report, kept):
             return False
         carried = carry_forward(self.root, passes[-1]["head"], head, f"refs/remotes/origin/{base}")
-        if carried is None:
+        blocked = report.get("status") == "blocking" and not kept
+        cited = untouched_citations(self.root, report, carried["from"], head) if carried and blocked else []
+        if carried is None or cited is None:
             return False
-        carried = {**carried, "recorded_at": self.runtime.clock()}
+        carried = {**carried, "recorded_at": self.runtime.clock(), **({"cited": cited} if blocked else {})}
         print(f"sd-ship: {head[:12]} adds only clean merges of origin/{base} to reviewed {carried['from'][:12]}, "
               "and the branch's own patch-id is unchanged; its review carries forward, no provider called"
               + ("; the gate that failed after it runs again here" if kept else ""), file=sys.stderr)
         if kept:
             self.rerun_gate(head, carried)
-            return True
-        self.save(reviewed_head=head, review_carry_forward=carried)
-        self.check_review(head)
+        elif blocked:  # no clearance until it is read at `head`; a stop between leaves one `reusable_review` refreshes
+            self.save(reviewed_head=head, review_carry_forward=carried, review_clearance=None)
+            self.save(review_clearance=self.check_review(head, refresh_adjudication=True, run_gate=True))
+        else:
+            self.save(reviewed_head=head, review_carry_forward=carried)
+            self.check_review(head)
         return True
+
+    def carriable(self, report: dict, kept: bool) -> bool:
+        """Whether the last pass's report may carry at all: cleared, whole, under today's tools and reviewer.
+
+        A blocking report carries only with the dispositions that cleared it (pack sd:10999).
+        """
+        status = report.get("status")
+        if status == "blocking" and not kept and (self.state.get("review_clearance") or {}).get("kind") != "adjudicated":
+            return False
+        if (status not in ("clean", "advisory", "blocking") and not kept) or not completed_depth(report) \
+                or self.binding_moved():
+            return False
+        # A named reviewer is a selection a receipt from another cannot replace.
+        requested = getattr(self.args, "provider", None)
+        return requested is None or report.get("reviewed_by") == [requested]
 
     def check_review(self, head: str, *, refresh_adjudication: bool = False, run_gate: bool = False) -> dict | None:
         report = self.review_inputs(head)
@@ -958,7 +1005,7 @@ class SharedReview:
         # otherwise reuse, rather than once above: each of these ends in
         # `check_review`, which refuses on exactly this manifest, so reuse was
         # being selected on head equality and then rejected on the binding.
-        if not retry and prior.get("status") == "blocking" and prior.get("subject", {}).get("head") == head:
+        if not retry and prior.get("status") == "blocking" and prior.get("subject", {}).get("head") == covered:
             if self.binding_moved():
                 return False
             clearance = self.check_review(head, refresh_adjudication=True, run_gate=True)
