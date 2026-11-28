@@ -1822,7 +1822,10 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
     fence = ""                      # the exact opening run, "" when outside one
     items: list[int] = []           # each open list item's content indent, innermost last
     for index in range(start, len(lines)):
-        line = lines[index]
+        # Columns, not characters: CommonMark takes a tab to the next multiple
+        # of four, so a tab-indented line stays in its item (sd:10962). The
+        # expanded copy is only matched; the note's own line is kept.
+        line = lines[index].expandtabs(4)
         indent = len(line) - len(line.lstrip(" "))
         while items and line.strip() and indent < items[-1]:
             items.pop()
@@ -1845,7 +1848,7 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
             # A fence line is never a heading, opener, closer or neither.
             continue
         if not fence and SMUGGLED_HEADING.match(line):
-            found.append((index, line.lstrip()[3:].strip()))
+            found.append((index, lines[index].lstrip()[3:].strip()))
     return found
 
 

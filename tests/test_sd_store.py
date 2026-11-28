@@ -636,6 +636,19 @@ class EditSectionTests(unittest.TestCase):
         after = self.edit(text, "Score", "written")
         self.assertIn("  ```\n  ## Score\n## Score\n\nwritten\n", after)
 
+    def test_a_tab_indent_is_measured_to_the_next_tab_stop(self) -> None:
+        # sd:10962 review: a tab reaches column 4, so each of these lines stays in its list item's fence;
+        # read as width 0, it ended the item and the next fence line opened a top-level one hiding `## Score`.
+        cases = {"tab-indented line": "- a\n  ```\n\t## Score\n  ```\n",
+                 "tab-indented closer": "- a\n  ```\n  ## Score\n\t```\n  ```\n  y\n",
+                 "tab after the marker": "-\t```\n    ## Score\n    ```\n",
+                 "tab before a nested marker": "- a\n\t- ```\n\t  ## Score\n\t  ```\n"}
+        for name, fenced in cases.items():
+            with self.subTest(name):
+                text = f"## Tip\n\n{fenced}## Score\n\nreal\n"
+                after = self.edit(text, "Score", "written")
+                self.assertEqual(after, f"## Tip\n\n{fenced}## Score\n\nwritten\n")
+
     def test_an_indented_heading_is_the_section_it_looks_like(self) -> None:
         text = "## Tip\n\nt\n\n   ## Score\n\nindented\n"
         after = self.edit(text, "Score", "written")
