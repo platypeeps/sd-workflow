@@ -377,6 +377,9 @@ HANDED_BACK = "handed_back"
 MEMBER_LEFT = "member_cancelled_alone"
 #: A `Closes:` trailer cites a blocked item that no `--item` names and no `Refs:` keeps (sd:9918).
 CITED_BLOCKED = "cited_blocked"
+#: Set on every `sd-ship` the runner starts: a lane prepare never renews a delivery claim, even once a forced
+#: runner stop leaves it running under another parent (sd:9335).
+LANE_CHILD = "SD_LANE_CHILD"
 #: The refusal code of a cancel whose `--expected-claim` no longer holds the item's running entry (sd:3330).
 STALE_CLAIM = "stale_claim"
 #: The refusals of a cancelled entry's retry (sd:3389): its item has a newer entry, or merged at its head.
@@ -2271,7 +2274,7 @@ def ship_process(argv: list[str], log: pathlib.Path, timeout: int) -> dict[str, 
     log.parent.mkdir(parents=True, exist_ok=True)
     try:
         done = sd_lib.run_group([sys.executable, str(BIN / "sd-ship"), *argv], cwd=pathlib.Path("."),
-                                env=dict(os.environ), timeout=timeout)
+                                env={**os.environ, LANE_CHILD: "1"}, timeout=timeout)
         out, err = done.stdout, done.stderr
     except sd_lib.GroupTimeout as error:
         out, err = error.stdout, f"timed out after {timeout} s\n{error.stderr}"
@@ -2538,6 +2541,10 @@ def draw_shots(worktree: pathlib.Path, out: pathlib.Path) -> dict[str, Any]:
     return {"shots": files} if files else {}
 
 
+#: The head of the Screenshots section `with_shots` writes and `only_shots` reads.
+SHOTS_HEAD = "## Screenshots\n\nThe lane drew each changed dashboard page.\nThe Queue row links the PNGs.\n\n"
+
+
 def with_shots(body: str, files: list[str]) -> str:
     """`body` and a Screenshots section naming each page and its variants; the PNGs stay local (sd:6728)."""
     pages: dict[str, list[str]] = {}
@@ -2545,8 +2552,18 @@ def with_shots(body: str, files: list[str]) -> str:
         page, theme, width = pathlib.Path(file).stem.rsplit("-", 2)
         pages.setdefault(page, []).append(f"{theme} {width}")
     lines = [f"- {page}: {', '.join(variants)}" for page, variants in pages.items()]
-    return (f"{body.rstrip()}\n\n## Screenshots\n\nThe lane drew each changed dashboard page.\n"
-            "The Queue row links the PNGs.\n\n" + "\n".join(lines) + "\n")
+    return f"{body.rstrip()}\n\n{SHOTS_HEAD}" + "\n".join(lines) + "\n"
+
+
+def only_shots(text: str) -> bool:
+    """Whether `text` is nothing, or the one Screenshots section `with_shots` adds and nothing else.
+
+    `sd-ship` asks it of what follows an entry's own body in the body the
+    entry's runner gave it, never of a body whose author is unknown: text
+    alone cannot tell the lane's section from an entry's copy of one, or
+    from one edited since (sd:9335).
+    """
+    return not text or re.fullmatch(r"\s*" + re.escape(SHOTS_HEAD) + r"(?:- [^\n]*\n)*- [^\n]*\n?", text) is not None
 
 
 def prepare_step(entry: dict[str, Any], worktree: pathlib.Path, log: pathlib.Path, ship: Ship,
