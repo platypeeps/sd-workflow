@@ -1709,6 +1709,11 @@ HTML_LONE_TAG = re.compile(
     r"\s*/?>|</[A-Za-z][A-Za-z0-9-]*\s*>)\s*$")
 
 
+#: A math block's opener: `$$` at the start of a line, as CommonMark indents a
+#: block. A `$$` later in prose (`pay $$ for it`) is text, never an opener.
+MATH_OPENER = re.compile(r"^ {0,3}\$\$")
+
+
 def outside_code_spans(line: str) -> str:
     return CODE_SPAN.sub("", line)
 
@@ -1716,13 +1721,13 @@ def outside_code_spans(line: str) -> str:
 def hides_fence(line: str) -> bool:
     """Outside a fence, whether `line` starts a block that takes fence lines as
     its own text: an HTML block, a math block (`$$`) or an Obsidian comment
-    (`%%`, which may open anywhere on a line but inside a code span).
+    (`%%`, which may open anywhere on a line but inside a code span). A
+    math block opens only at the line's start (`MATH_OPENER`).
     """
 
-    if raw_html_start(line):
+    if raw_html_start(line) or MATH_OPENER.match(line):
         return True
-    rest = outside_code_spans(line)
-    return "$$" in rest or "%%" in rest
+    return "%%" in outside_code_spans(line)
 
 #: An HTML block's start, and what ends it, as CommonMark reads them: a comment,
 #: a `script`/`pre`/`style`/`textarea` block, a processing instruction, CDATA and
@@ -1752,7 +1757,7 @@ def raw_block_start(line: str) -> tuple[str, int] | None:
 
     The end is a marker searched from that column on, `""` for a blank line,
     or `%%`/`$$` for an Obsidian comment or a math block, which an odd count
-    on one line leaves open. `None` when the line opens none, or closes the
+    on one line leaves open; a math block only on a `MATH_OPENER` line. `None` when the line opens none, or closes the
     one it opens (`<!-- x -->`, `%%c%%`).
     """
 
@@ -1763,7 +1768,8 @@ def raw_block_start(line: str) -> tuple[str, int] | None:
             return None
         return end, match.end()
     rest = outside_code_spans(line)
-    toggles = sorted((rest.find(token), token) for token in ("%%", "$$") if rest.count(token) % 2)
+    tokens = ("%%", "$$") if MATH_OPENER.match(line) else ("%%",)
+    toggles = sorted((rest.find(token), token) for token in tokens if rest.count(token) % 2)
     return (toggles[0][1], 0) if toggles else None
 
 

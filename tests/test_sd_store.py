@@ -743,6 +743,9 @@ class EditSectionTests(unittest.TestCase):
         "%% inside a code span": "use `%%` here",
         "$$ inside a code span": "costs ``$$`` here",
         "a list item's inline code": "- ```x``` inline",
+        "an odd $$ in prose": "pay $$ for it",
+        "an even $$ in prose": "costs $$ and $$ more",
+        "an escaped $$ at the line start": "\\$$ is literal",
     }
 
     def test_inline_markdown_opens_no_raw_block(self) -> None:
@@ -761,6 +764,9 @@ class EditSectionTests(unittest.TestCase):
         "a block closing tag": "</section>",
         "any tag alone on its line": "<my-box data-x='1'/>",
         "%% after a code span": "`a` %% open",
+        "a $$ line alone": "$$",
+        "a $$ indented three spaces": "   $$ x = 1",
+        "a $$ opener holding backticks": "$$\\text{`a`}",
     }
 
     def test_a_real_opener_still_hides_the_heading_after_it(self) -> None:
