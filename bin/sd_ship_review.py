@@ -13,6 +13,7 @@ import pathlib
 import posixpath
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -255,7 +256,8 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     """sd:5988. The passing `sd-review --scope branch` pass recorded for `branch` that covers `head`, and why.
 
     A pass is clean or advisory only (sd:9767): a build's review that cleared
-    stands for the lane's at the same head; a blocking one is never recorded.
+    stands for the lane's at the same head; a blocking one is recorded for
+    `sd-ship adjudicate` alone (sd:10926) and covers nothing.
 
     It covers `head` when it reviewed `head`, or when `carry_forward` carries
     it across clean merges of `origin/<base>` alone, and only when it diffed
@@ -848,8 +850,9 @@ class SharedReview:
         `save=False` only answers: the held-review path records its result first, and a rebind saved
         before it would strand that result if the process stopped between the two writes."""
         changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
-        if (not sd_lib.TOOL_CHANGES_KEEP_REVIEWS or manifest is None or not changed
-                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
+        if (manifest is None or not changed
+                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)
+                or not sd_lib.tool_changes_keep_reviews()):
             return False
         # A normalizer move reports alone and hides the policy entries, so policy is compared here too.
         current = manifest(self.root)
@@ -900,12 +903,22 @@ class SharedReview:
             self.save(**rebound)
         return True
 
+    def receipts_through(self) -> int | None:
+        """The newest state row id, the rebuttal receipts a pass reads (pack sd:9973); None when unread."""
+        try:
+            return self.connection.execute("SELECT COALESCE(MAX(id), 0) FROM state").fetchone()[0]
+        except (AttributeError, sqlite3.Error):
+            return None
+
     def replayed_request(self, passes: list[dict], request: dict) -> str | None:
         """The request digest `--explain` gives now for the last pass; None when it cannot be rebuilt."""
         last = passes[-1]
         argv = sd_review_request.review_argv(self.runtime.bin_dir, self.database,
                                              SimpleNamespace(provider=last.get("requested_provider")), last.get("base"))
         wanted = request.get("verify") or request.get("resume")
+        through = request.get("rebutted_through")
+        if type(through) is int:  # the receipts the pass read, not those recorded since (pack sd:9973)
+            argv += ["--rebutted-through", str(through)]
         with tempfile.TemporaryDirectory(prefix="sd-ship-replay-") as directory:
             if wanted:
                 # The prior is rebuilt the two ways `review` builds it, and used only if it is the one handed over.
@@ -1336,6 +1349,9 @@ class SharedReview:
 
     def execute_review(self, argv: list[str], head: str, passes: list[dict]) -> subprocess.CompletedProcess:
         stage = "planning"
+        # pack sd:9973. The pass reads the rebuttal receipts recorded up to now, and a replay reads the same.
+        through = self.receipts_through()
+        argv = argv if through is None else [*argv, "--rebutted-through", str(through)]
         try:
             planned = self.runtime.process(self.root, argv + ["--explain"], timeout=self.runtime.setup_seconds)
             try:
@@ -1349,7 +1365,8 @@ class SharedReview:
             explained = json.loads(planned.stdout)
             passes[-1]["review_request"] = {"sha256": explained.get("request_sha256"),
                                             "verify": explained.get("verification_report_digest"),
-                                            "resume": explained.get("resume_report_digest")}
+                                            "resume": explained.get("resume_report_digest"),
+                                            "rebutted_through": through}
             # What dispatch overwrites, so a released gate failure can put it back.
             self.superseded = {key: self.state.get(key, ABSENT) for key in DISPATCH_FIELDS}
             bound: dict[str, Any] = {"binding": self.runtime.binding(self.root)}

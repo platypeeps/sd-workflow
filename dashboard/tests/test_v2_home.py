@@ -300,6 +300,16 @@ class TheLiveRead(ScreenCase):
         self.assertEqual(self.tile(doc, "lock.front_door")["error"], "HA not configured")
         self.assertEqual(len(doc["groups"]), 4, "a reader failure dropped the tiles")
 
+    def test_a_line_the_env_reader_refuses_is_named_and_the_tiles_still_list(self):
+        """sd:10424: the `.env` reader refuses a line `.` reads past; the page names it, never the token."""
+        (self.config / "ha-mcp").mkdir()
+        (self.config / "ha-mcp" / ".env").write_text("HA_TOKEN=s3cr3t>t0k\n", encoding="utf-8")
+        doc = self.doc({"SYSTEM_TOOLS_CONFIG": str(self.config)})
+        self.assertFalse(doc["reader"]["available"])
+        self.assertIn("EnvFileError", doc["reader"]["reason"])
+        self.assertNotIn("s3cr3t", json.dumps(doc))
+        self.assertEqual(self.tile(doc, "lock.front_door")["error"], "HA not configured")
+
     def test_a_refused_token_is_named_on_every_tile(self):
         stub = self.stub(lambda path: (401, {"message": "Unauthorized"}, {}))
         doc = self.doc(self.env(stub.url))

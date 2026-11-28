@@ -199,7 +199,7 @@ def _settings(environ) -> tuple[str, str]:
 
     try:
         saved = system_tools_config.read_env("ha-mcp", environ)
-    except (OSError, UnicodeDecodeError) as error:
+    except (OSError, ValueError) as error:  # ValueError: a bad byte, or a line the reader refuses (sd:10424)
         raise _Failed("HA not configured", f"<config>/ha-mcp/.env was not read: {error.__class__.__name__}") from None
     values = {}
     for name in ("HA_TOKEN", "HA_MCP_URL"):

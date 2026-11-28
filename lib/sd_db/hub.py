@@ -5,7 +5,11 @@ A machine whose home holds this file is a satellite: `sd_db.connect` sends
 every open of the default database to the hub the file names, and
 `sd_db.default_path` answers with a `HubPath`, whose `exists()` asks the hub.
 
-    {"hub": "hub.example.test", "port": 8769}
+    {"hub": "hub.example.test", "port": 8769, "address": "100.64.0.1"}
+
+`address`, optional, is the hub's tailnet IP: the dial uses it in place of
+the name (sd:10979), as a sandbox proxy that allows only an IP literal
+needs. `hub` stays the name: promote, hub-ready and `build.hub_host` read it.
 
 The selector is a file and not an environment variable. Cron and launchd
 read no shell profile, and a satellite must refuse the same way from every
@@ -32,6 +36,7 @@ identity (step 7), so a satellite's `hub.json` names no `token_file`.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sqlite3
@@ -109,6 +114,8 @@ class Hub:
     port: int
     config: Path
     token_file: Path | None = None
+    #: The hub's IP literal the dial uses in place of `host`, or None (sd:10979).
+    address: str | None = None
 
     def token(self) -> str:
         """The loopback server's token, read when the socket is up."""
@@ -133,7 +140,8 @@ class Hub:
         try:
             return remote.connect(self.host, self.port, None, token=self.token, write=write,
                                   busy_timeout=busy_timeout, timeout=CONNECT_TIMEOUT,
-                                  answer_timeout=ANSWER_TIMEOUT + busy_timeout / 1000)
+                                  answer_timeout=ANSWER_TIMEOUT + busy_timeout / 1000,
+                                  address=self.address)
         except remote.HubUnreachable as error:
             raise remote.HubUnreachable(
                 self.host, self.port, f"{error.reason} (named in {self.config})"
@@ -171,12 +179,23 @@ def read(home: Path | str | None = None) -> Hub | None:
         token_file = data.get("token_file")
         if token_file is not None and (not isinstance(token_file, str) or not token_file):
             raise ValueError('"token_file" is not a path')
+        address = data.get("address")
+        if address is not None and not ip_literal(address):
+            raise ValueError(f'"address" {address!r} is not an IP address')
     except KeyError as missing:
         raise HubConfigError(f"{path} names no {missing.args[0]!r}; {expected}") from None
     except ValueError as problem:
         raise HubConfigError(f"{path} is not a hub config: {problem}; {expected}") from None
     return Hub(host=host.strip(), port=port, config=path,
-               token_file=Path(token_file).expanduser() if token_file else None)
+               token_file=Path(token_file).expanduser() if token_file else None, address=address)
+
+
+def ip_literal(value) -> bool:
+    """`value` is an IPv4 or IPv6 address as text, nothing around it."""
+    try:
+        return isinstance(value, str) and str(ipaddress.ip_address(value)) == value
+    except ValueError:
+        return False
 
 
 class HubPath(type(Path())):

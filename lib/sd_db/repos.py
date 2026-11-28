@@ -1191,8 +1191,9 @@ def jira_project(connection: sqlite3.Connection, path: Path | str) -> str | None
 #: The kinds `repo.declarations` holds: the first four each the object a `.github/sd-<kind>.json`
 #: file held before migration 37 (sd:5109), and `experiment` a research repository's Notion
 #: experiment page (sd:5302), and `policy` the repository's rules for agents (sd:6715,
-#: `bin/sd_repo_policy.py`). The pack's readers validate each value.
-DECLARATION_KINDS = ("review", "gate_reuse", "check_scope", "status", "experiment", "policy")
+#: `bin/sd_repo_policy.py`), and `generated` the paths the repository's own tools write, which a merged
+#: worktree's cleanup deletes (sd:10752). The pack's readers validate each value.
+DECLARATION_KINDS = ("review", "gate_reuse", "check_scope", "status", "experiment", "policy", "generated")
 #: The longest declarations object, as compact JSON: the largest file moved was under 1 KiB.
 DECLARATION_BYTES = 16384
 #: The word `repo declare` takes to remove a kind; the kind leaves the object.
@@ -1232,6 +1233,47 @@ def experiment_problems(value: Any) -> list[str]:
     return problems
 
 
+#: The `generated` declaration's bounds (sd:10752): entries, and characters in one.
+GENERATED_MAX, GENERATED_TEXT = 64, 200
+
+
+def generated_problems(value: Any) -> list[str]:
+    """Why `value` is not a `generated` declaration, `{"paths": [...]}`; empty when it is one (sd:10752).
+
+    Each path is relative to the checkout's root, with `/` between names: a
+    file (`reports/junit.xml`), a folder ending in `/` (`.venv-check/`), and
+    `*`, `?` or `[...]` matching within one name (`*.csproj`, root files
+    alone). Refused: an absolute path, `.` or `..`, a `.git` start, a
+    backslash or a control character, which could name a file outside the
+    root or one git owns.
+    """
+    where = "the generated declaration"
+    if not isinstance(value, dict) or set(value) != {"paths"}:
+        return [f'{where} is {{"paths": [PATH, ...]}}']
+    named = value["paths"]
+    if not isinstance(named, list) or not 0 < len(named) <= GENERATED_MAX:
+        return [f"{where}: paths is a list of 1 to {GENERATED_MAX} paths"]
+    problems = []
+    for entry in named:
+        names = entry.removesuffix("/").split("/") if isinstance(entry, str) else []
+        if (not isinstance(entry, str) or not 0 < len(entry) <= GENERATED_TEXT or entry.startswith("/")
+                or "\\" in entry or any(ord(char) < 32 or ord(char) == 127 for char in entry)
+                or any(name in ("", ".", "..") for name in names) or names[0] == ".git"):
+            problems.append(f"{where}: {entry!r} is no relative path of at most {GENERATED_TEXT} characters "
+                            f"inside the checkout and outside .git")
+    return problems
+
+
+def generated_paths(connection: sqlite3.Connection, path: Path | str) -> tuple[str, ...]:
+    """The paths `path`'s `generated` declaration names; none when it declares none or does not read."""
+    try:
+        held = declarations(connection, path) or {}
+    except SdDbError:
+        return ()
+    value = held.get("generated")
+    return () if value is None or generated_problems(value) else tuple(value["paths"])
+
+
 def set_declaration(connection: sqlite3.Connection, path: Path | str, kind: str,
                     value: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
     """Set or remove (`None`) one registered repository's `kind` declaration. Returns `(path, before)`.
@@ -1248,6 +1290,8 @@ def set_declaration(connection: sqlite3.Connection, path: Path | str, kind: str,
     if value is not None and not isinstance(value, dict):
         raise RepoRefusal(f"a {kind} declaration is a JSON object, not {type(value).__name__}")
     if kind == "experiment" and value is not None and (problems := experiment_problems(value)):
+        raise RepoRefusal("; ".join(problems))
+    if kind == "generated" and value is not None and (problems := generated_problems(value)):
         raise RepoRefusal("; ".join(problems))
     given = str(Path(path).expanduser().resolve())
     probe = paths.keys(given)

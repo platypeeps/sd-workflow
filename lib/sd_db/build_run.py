@@ -40,6 +40,7 @@ The hub's tick and each satellite's act only on their own lanes' runs
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import functools
 import glob
 import hashlib
@@ -632,14 +633,106 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
     return done.stdout
 
 
-def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
+def kept_files(git: Collection[str], work: str, *, env: dict | None = None,
+               generated: Collection[str] = ()) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go.
+
+    `generated` (sd:10752) is the paths the repository declares its tools write: an ignored file one names
+    is no kept line. This only reads. `git worktree remove` is the one delete, so a declared file goes with
+    its tree or not at all: a tree git refuses (locked, a submodule) or a later check keeps loses nothing.
+    A line git quotes, or an ignored folder git lists whole, is never a declared file.
+    """
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
-    return "\n".join(line for line in lines.splitlines() if line.strip() and not (
+    # `split`, not `splitlines`: git ends a line at "\n" alone, and U+2028 in a name is part of it.
+    return "\n".join(line for line in lines.split("\n") if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
-        line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+        line.startswith("!! ") and (DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1]) or (
+            not line.startswith('!! "') and not line.endswith("/") and _declared(line[3:], generated)))))
+
+
+#: What a worktree's folder is named while it is being removed: beside it, so the move is one rename.
+ASIDE = ".sd-removing"
+
+
+def put_back(git: Collection[str], repo: str, work: str, *, env: dict | None = None) -> None:
+    """Have the worktree at `work` both on disk and in git's record, whichever a removal left elsewhere.
+
+    A removal moves the tree to `work + ASIDE`, and a move is two writes: the folder's rename, and git's
+    record of where the tree is. A killed `git worktree move`, or a killed run of this, leaves them at any
+    of four pairs, so neither is read from the other: the folder is renamed back when it is aside, and
+    `git worktree repair` then sets the record from the folder, a no-op when it is right already.
+    Each step is safe to repeat, so a pass killed anywhere here is finished by the next one.
+    `Unread` when either fails: the tree stays where it is, and the next pass asks again.
+    """
+    aside = work + ASIDE
+    if Path(aside, ".git").is_file() and not os.path.lexists(work):
+        try:
+            os.rename(aside, work)
+        except OSError as error:
+            raise Unread(f"{aside} could not be moved back: {error}") from None
+    if Path(work, ".git").is_file():  # a worktree, not a clone: its record may still name the aside path
+        _read([*git, "-C", repo, "worktree", "repair", work], env=env)
+
+
+def holds_on(connection, work: str, *, exclude: tuple[str, ...] = ()) -> str:
+    """Why a session keeps `work`, by either name the tree goes by: `work`, or `work + ASIDE` while it is
+    being removed; "" when none does. A beat names the path its hook found, which a move can outdate."""
+    return sessions.describe([*sessions.holders(connection, work, machine=this_host(), exclude=exclude),
+                              *sessions.holders(connection, work + ASIDE, machine=this_host(), exclude=exclude)])
+
+
+def remove_unheld(connection, git: Collection[str], repo: str, work: str, *, exclude: tuple[str, ...] = (),
+                  generated: Collection[str] = (), env: dict | None = None) -> str:
+    """`git worktree remove` `work` unless a session holds it or it is not clean: "" when removed, else why not.
+
+    The hold check and the delete are one step only under a lock, and no lock lasts a slow delete: a hub
+    closes a satellite's transaction silent for `serve.IDLE_TIMEOUT`. So the lock covers a rename alone:
+
+    1. In one write transaction the hold is read and `git worktree move` renames the tree to `work + ASIDE`.
+       A session registers a tree with a write (`sessions.beat`) and finds it by its `.git` file
+       (`sessions.worktree_of`): a beat before the move is seen, one after it finds no tree at `work`.
+       The commit must succeed: a lost lock proves no hold, so the tree is put back and the error raised.
+    2. Aside, the hold, under both names, and `kept_files` are read again: a file or a session that reached
+       the tree while the caller's checks ran is seen now, as is a beat whose hook found the tree at `work`
+       before the move and committed after it. Either puts the tree back.
+    3. `git worktree remove` deletes it. A refusal puts the tree back and raises `Unread`.
+
+    A crash after 1 leaves the tree aside; `put_back` restores it on the next pass. A path already at
+    `work + ASIDE` keeps the tree: git would move it inside. git refuses to move a
+    locked tree or one with a submodule, as it refuses to remove one: `Unread`, and nothing moved.
+    """
+    aside = work + ASIDE
+    if os.path.lexists(aside):  # git would move the tree into it, under its own name, where none looks
+        return f"{aside} is in the way"
+    try:
+        with transaction(connection):
+            holds = holds_on(connection, work, exclude=exclude)
+            if holds:
+                return holds
+            _read([*git, "-C", repo, "worktree", "move", work, aside], env=env)
+        # ponytail: a beat whose hook found `work` before the move but commits only after this read is
+        # missed; closing that needs a lock over the delete, which no hub transaction lasts.
+        holds = holds_on(connection, work, exclude=exclude)
+        dirty = holds or kept_files(git, aside, env=env, generated=generated).split("\n")[0]
+        if not dirty:
+            _read([*git, "-C", repo, "worktree", "remove", aside], env=env)
+        return dirty
+    finally:  # whatever moved, even by a move that failed after its rename; a removed tree leaves none
+        put_back(git, repo, work, env=env)
+
+
+def _declared(path: str, patterns: Collection[str]) -> bool:
+    """Whether `path`, as git names it from the root, is one `patterns` declares (`repos.generated_problems`):
+    name by name, so `*` never crosses a `/`; a pattern ending in `/` takes every path under that folder."""
+    names = path.split("/")
+    for pattern in patterns:
+        wanted = pattern.removesuffix("/").split("/")
+        if (len(names) > len(wanted) if pattern.endswith("/") else len(names) == len(wanted)) and all(
+                fnmatch.fnmatchcase(name, want) for name, want in zip(names[:len(wanted)], wanted, strict=True)):
+            return True
+    return False
 
 
 def ruleable(row: dict) -> bool:
@@ -958,12 +1051,14 @@ def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> l
 
 
 def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, branch: str | None = None,
-               env: dict | None = None) -> dict | None:
+               env: dict | None = None, branchless: bool = True) -> dict | None:
     """The newest lane entry of any of `items` by enqueue order, from `sd-ship lane list`; None when there is none.
 
     Any member: the entry's item is the first member the branch delivers. With `branch`, only that branch's
     entries: a rebuild of a lane-failed bundle shares its items, and can share its head, with the failed
-    branch's entry (review of build/sd-1808). A row that names no branch, an earlier version's import, counts.
+    branch's entry (review of build/sd-1808). A row that names no branch, an earlier version's import, counts
+    unless `branchless` is False: a rebuild's own entry always names its branch, so a branchless one at its head
+    is the failed bundle's, never its own (sd:10960).
     """
     try:
         answer = json.loads(_read([*ship, "-C", str(cwd), "lane", "list"], env=env))
@@ -973,7 +1068,7 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, bran
     if not isinstance(entries, list):
         raise Unread("sd-ship lane list gave no entries")
     mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items
-            and (branch is None or not row.get("branch") or row.get("branch") == branch)]
+            and (branch is None or (branchless and not row.get("branch")) or row.get("branch") == branch)]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
 
 
@@ -1043,7 +1138,8 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
     may land the same items; the lane squash-merges, so the branch reads
     unpushed forever (pack sd:6909). Kept: an unreleased run on the path, an
     item of any run on it not done, a dirty or unread worktree, one holding an
-    ignored or untracked file outside a `DISPOSABLE` cache, a locked one, a
+    ignored or untracked file outside a `DISPOSABLE` cache that its repository
+    does not declare generated (sd:10752, `kept_files`), a locked one, a
     live session other than a builder's. The paths removed.
 
     An item marked done is no proof its commits landed: a squash merge leaves
@@ -1075,16 +1171,23 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
             entry["lead"] = row["item"]
     removed = []
     for work, entry in paths_.items():
-        if entry["keep"] or not Path(work).is_dir():
+        if entry["keep"]:
             continue
+        repo = str(paths.expand(entry["repo"]))
         try:
-            if kept_files(git, work):
+            put_back(git, repo, work)  # a sweep that died mid-removal left the tree aside
+        except Unread:
+            continue
+        if not Path(work).is_dir():
+            continue
+        if holds_on(connection, work, exclude=tuple(filter(None, entry["sessions"]))):
+            continue
+        generated = repos.generated_paths(connection, repo)
+        try:
+            if kept_files(git, work, generated=generated):
                 continue
         except Unread:
             continue
-        if sessions.holders(connection, work, machine=this_host(), exclude=tuple(filter(None, entry["sessions"]))):
-            continue
-        repo = str(paths.expand(entry["repo"]))
         kept = f"refs/sd-swept/{entry['branch']}"
         try:
             head = _read([*git, "-C", work, "rev-parse", "--verify", "HEAD"]).strip()
@@ -1094,7 +1197,9 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
         except Unread:
             continue
         try:
-            _read([*git, "-C", repo, "worktree", "remove", work])
+            if remove_unheld(connection, git, repo, work, exclude=tuple(filter(None, entry["sessions"])),
+                             generated=generated):
+                continue  # a session or a file came while the checks ran: the tree stays, its head at `kept`
         except Unread:
             continue
         removed.append(work)
@@ -1456,6 +1561,13 @@ def _checks_environ(env: dict) -> dict:
     return {**env, "GITHUB_TOKEN": env["GITHUB_PERSONAL_ACCESS_TOKEN"]}
 
 
+def target_kib(target: Path) -> int:
+    """`du -sk` of `target`, bounded: the supervisor beats no heartbeat while it runs."""
+    out = subprocess.run(["du", "-sk", str(target)], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                         timeout=build.STALE_SECONDS // 2, check=True).stdout
+    return int(out.split()[0])
+
+
 class Supervisor:
     """One run's supervisor: `run()` walks its steps and returns how it ended."""
 
@@ -1740,11 +1852,31 @@ class Supervisor:
 
     def finish(self, outcome: str, detail: str, *, question: str | None = None) -> dict:
         self.ending = (outcome, detail, question)  # kept: a hub fault here must not lose how the run ended
+        if outcome in ("blocked", "done"):
+            self.note_target()
         ended = build.end(self.db, self.ident, outcome, detail, question=question)
         return ended or {"run": self.ident, "outcome": None, "why": "the run ended or moved before its last write"}
 
     def fresh(self) -> dict:
         return build.run(self.db, self.ident)
+
+    def note_target(self) -> None:
+        """A note on the lead naming the size of the kept worktree's Rust `target/` (sd:10384: one held 106 GiB).
+
+        It deletes nothing (ruling #91707 on #89515): no file test tells a capture under `target/debug/` from
+        cargo's output, and the lane may still hold the worktree. One note per run: a replayed end adds none.
+        """
+        manifest, target = self.work / "Cargo.toml", self.work / "target"
+        if not manifest.is_file() or target.is_symlink() or not target.is_dir():
+            return
+        try:
+            size = f"{target_kib(target) / 2**20:.1f} GiB"
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError) as fault:
+            size = f"size unread ({type(fault).__name__})"
+        body = (f"Build run {self.ident}: its kept worktree {self.work} holds a Rust target/ of {size}, "
+                f"not cleaned: cargo clean deletes every file in it, a capture saved there too, "
+                f"so move out any file you keep first")
+        self.once("target-size", lambda: add_note(self.db, self.lead, "comment", body))
 
     def enter(self, step: str, **fields) -> None:
         if self.fresh()["cancel_requested"] and step in build.CANCELLABLE:
@@ -3035,7 +3167,8 @@ class Supervisor:
             return self.finish("blocked", "the branch delivers no item: no commit has a `Closes: sd:N` trailer "
                                           "for one of the run's items")
         if not unmanaged:
-            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env,
+                               branchless=build.lane_failed_start(self.db, self.row["assignment"]) is None)
             # Only this run's branch's entry is its own (`lane_entry`): a rebuild that starts at a failed
             # bundle's head (`start_point`) shares that head with the old failed entry (review of build/sd-1808).
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
@@ -3076,7 +3209,8 @@ class Supervisor:
             # pack sd:10420: the enqueue imports an earlier version's queue file first, and then refuses an item
             # that file queued or ended at this head; the shared queue says whether that entry is this head, read
             # as before the enqueue: an entry the lane failed is the run's, for the watch to end, not to requeue.
-            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env)
+            entry = lane_entry(self.tools.ship, self.work, delivered, branch=self.row["branch"], env=self.env,
+                               branchless=build.lane_failed_start(self.db, self.row["assignment"]) is None)
             if entry and entry.get("status") != "cancelled" and entry.get("expected_head") == head:
                 return self.lane_done(entry, delivered)
             reason = answer.get("error") if isinstance(answer, dict) else "no JSON answer"
@@ -3265,27 +3399,40 @@ class Supervisor:
 
     def cleaning(self) -> dict:
         self.enter("cleaning")
+        try:  # a run that died mid-removal left the tree aside
+            put_back(self.tools.git, str(self.repo), str(self.work), env=self.env)
+        except Unread as unread:
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is aside ({unread})")
+            return self.finish("done", f"worktree {self.work} kept: aside")
         if not self.work.is_dir():
             return self.finish("done", f"worktree {self.work} was already removed")
+        # A session other than this run's builder works in it (pack sd:6024): it stays, and keeps every file.
+        own = self.fresh()["session_id"]
+        holds = holds_on(self.db, str(self.work), exclude=(own,) if own else ())
+        if holds:
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: {holds}")
+            return self.finish("done", f"worktree {self.work} kept: {holds}")
+        generated = repos.generated_paths(self.db, self.repo)
         try:
-            dirty = kept_files(self.tools.git, str(self.work), env=self.env)
+            # sd:10752: a file the repository declares its tools write keeps no tree; any other file does.
+            dirty = kept_files(self.tools.git, str(self.work), env=self.env, generated=generated)
         except Unread as unread:
             dirty = f"unread: {unread}"
         if dirty:
-            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is not clean "
-                                 f"({dirty.splitlines()[0]})")
+            first = dirty.split("\n")[0]
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is not clean ({first})")
             return self.finish("done", f"worktree {self.work} kept: not clean")
-        # A session other than this run's builder works in it (pack sd:6024): it stays.
-        own = self.fresh()["session_id"]
-        held = sessions.describe(sessions.holders(self.db, str(self.work), machine=this_host(),
-                                                  exclude=(own,) if own else ()))
+        try:
+            # The hold and the clean check read above went stale meanwhile: both are read again with the remove.
+            held = remove_unheld(self.db, self.tools.git, str(self.repo), str(self.work),
+                                 exclude=(own,) if own else (), generated=generated, env=self.env)
+        except Unread as unread:
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed "
+                                 f"({unread})")
+            return self.finish("done", f"worktree {self.work} kept: removal failed")
         if held:
             self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: {held}")
             return self.finish("done", f"worktree {self.work} kept: {held}")
-        if self.child([*self.tools.git, "-C", str(self.repo), "worktree", "remove", str(self.work)], cwd=self.repo,
-                      name="cleaning") != 0:
-            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed")
-            return self.finish("done", f"worktree {self.work} kept: removal failed")
         return self.finish("done", f"worktree {self.work} removed")
 
     # ------------------------------------------------------------ helpers
@@ -3351,12 +3498,36 @@ class Supervisor:
             f"SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? UNION ALL "
             f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ?)",
             (lead, *items, f"Build assignment {lead} queued %")).fetchone()[0]
+        # A member's window opens at its own assignment's queue note in this bundle: a fresh member queued with
+        # its finding before a later item that leads. Its own alone, not the bundle's earliest nor the earlier of
+        # its own and the lead's: each took in the finding of a member's cancelled build (review of
+        # build/sd-1782, rounds 2 and 3). The lead keeps `first`; a member with no queue note falls back to it.
+        # A window opens after its queue note's id, not at its timestamp: timestamps have whole seconds, and a
+        # finding cancelled in the second of the next queue note read as inside (round 4; for the lead, the lane
+        # review). Every finding a queue writes follows its queue note (`build._queue_members`, `queue_again`).
+        opens = dict.fromkeys(items, first)
+        after: dict[int, int] = {}
+        # The lead's window also opens at `first`: both bounds hold for it.
+        queued = self.db.execute(f"SELECT MIN(id) FROM note WHERE item IN ({', '.join('?' for _ in items)}) "
+                                 f"AND body LIKE ?", (*items, f"Build assignment {lead} queued %")).fetchone()[0]
+        for row in self.db.execute("SELECT id, item FROM assignment WHERE parent = ?", (lead,)):
+            own = self.db.execute("SELECT MIN(id) FROM note WHERE item = ? AND body LIKE ?",
+                                  (row["item"], f"Build assignment {row['id']} queued %")).fetchone()[0]
+            if row["item"] in opens and row["item"] != self.lead and own is not None:
+                after[row["item"]] = own
+
+        def inside(note: sqlite3.Row) -> bool:
+            if note["item"] in after:
+                return note["id"] > after[note["item"]]
+            if note["item"] == self.lead and queued is not None and note["id"] <= queued:
+                return False
+            return opens[note["item"]] is not None and note["timestamp"] >= opens[note["item"]]
 
         def listed(prefix: str, *, latest: bool = False) -> str:
-            notes = self.db.execute(
-                f"SELECT item, body FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ? "
-                f"AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
-                (*items, prefix + "%", first, self.row["created_at"])).fetchall()
+            notes = [note for note in self.db.execute(
+                f"SELECT id, item, body, timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) "
+                f"AND body LIKE ? AND timestamp <= ? ORDER BY timestamp, id",
+                (*items, prefix + "%", self.row["created_at"])).fetchall() if inside(note)]
             # Only the latest park's blockers (pack sd:9593): one Retry notes the same text on each member, so the
             # newest note's text names them, whatever runs a recovery started since.
             if latest and notes:
