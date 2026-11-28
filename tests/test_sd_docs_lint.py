@@ -724,6 +724,15 @@ class PullRequestPrivacyTests(LintFixture):
         blanking both first bytes at once erased it before the next read."""
         self.assertEqual(self.own_repo("shop\nhop/shop\n", "- read shop/shop/config\n"), self.line(3))
 
+    def test_a_longer_match_at_the_masked_start_fails(self) -> None:
+        """sd:10778: the mask's byte is the start of the match grep reported, so a longer match from that
+        start would be erased unread; grep reports the longest (POSIX leftmost-longest), whatever the
+        pattern order or alternation."""
+        for patterns in ("shop\nshop/keys\n", "shop|shop/keys\n", "shop(/keys)?\n"):
+            with self.subTest(patterns=patterns):
+                self.assertEqual(self.own_repo(patterns, "- see shop/keys\n"), self.line(3))
+            self.git("remote", "remove", "origin")
+
     def test_a_pattern_that_matches_nothing_at_all_still_fails_every_line(self) -> None:
         """An empty match selects each line and reports no text: nothing shows it lies inside the name."""
         self.assertEqual(self.own_repo("shop|x*\n", "- the shop-web image\n"), self.line(1, 2, 3))

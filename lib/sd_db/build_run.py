@@ -1034,8 +1034,10 @@ def statement(lines: list[str], index: int) -> list[str]:
     # The count reads text, so a `)` in a string or a comment ends it early, and a string or a backslash
     # over lines opens nothing: an indented line belongs to the last line above that is not indented, and
     # the statement runs on over indented lines, blank ones and closing brackets (class pass, sd:10286).
+    # A comment at column 0 is no statement's first line, so the walk steps over it (sd:10806).
     if lines[start].strip() and lines[start][:1].isspace():
-        start = next((row for row in range(start, -1, -1) if lines[row].strip() and not lines[row][:1].isspace()), 0)
+        start = next((row for row in range(start, -1, -1) if lines[row].strip() and not lines[row][:1].isspace()
+                      and not lines[row].startswith("#")), 0)
     stop = end
     while end < len(lines) and (not lines[end].strip() or lines[end][:1].isspace()
                                 or lines[end].startswith((")", "]", "}", '"""', "'''"))):
