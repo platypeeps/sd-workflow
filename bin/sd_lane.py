@@ -1052,6 +1052,21 @@ def _lines(patch: bytes, sign: bytes) -> set[bytes]:
             if line.startswith(sign) and not line.startswith(sign * 3 + b" ") and line[1:].strip()}
 
 
+def _held(worktree: pathlib.Path, commit: str, names: Iterable[str]) -> set[bytes] | None:
+    """The stripped lines the files `names` hold at `commit`, pooled as `_lines` pools a patch's; a file
+    absent there holds none. None for a failed read."""
+    held: set[bytes] = set()
+    for name in names:
+        try:
+            show = subprocess.run(["git", "show", f"{commit}:{name}"], cwd=worktree, capture_output=True,
+                                  timeout=PUBLISH_SECONDS, check=False, env=sd_lib.without_fsmonitor(os.environ))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if show.returncode == 0:
+            held |= {text.strip() for text in show.stdout.splitlines() if text.strip()}
+    return held
+
+
 def _present(worktree: pathlib.Path, patch: bytes, commit: str) -> bool | None:
     """Whether `commit`'s tree holds `patch`'s change: True when it applies in reverse there, False when it
     applies forward, None when neither does or a read fails. A scratch index, so no checkout moves."""
@@ -1088,7 +1103,6 @@ def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[st
     revert = commits[since][0]
     if _present(worktree, patch, f"{revert}^") is not True or _present(worktree, patch, revert) is not False:
         return None
-    import sd_ship_body  # noqa: PLC0415
     names = _changed(worktree, sha)
     gone = True
     # Oldest first, so the last restore or undo decides: a restore taken out again leaves the fix gone
@@ -1098,26 +1112,39 @@ def _undone(worktree: pathlib.Path, sha: str, since: int, commits: list[tuple[st
         if not later:
             continue
         if gone:
-            # A line of it back, added or taken out again, or the whole patch back: a deletion adds no line,
-            # and a binary or mode-only change has none to match (ruling round, review of build/sd-1654).
-            gone = not (_lines(patch, b"+") & _lines(later, b"+") or _lines(patch, b"-") & _lines(later, b"-")
-                        or (_present(worktree, patch, f"{commit}^") is False
-                            and _present(worktree, patch, commit)))
-            continue
-        # Taken out again: a revert, or a commit that adds nothing anywhere, takes a line of it out, or
-        # the whole patch; or one that takes out nothing puts back a line it took out. ponytail: a commit
-        # that takes the fix out and adds other lines reads as a move, so its item closes as restored.
-        whole = _patch(worktree, commit) or b""
-        if _lines(patch, b"-") & _lines(later, b"+"):
-            silent = not _lines(whole, b"-")
-        elif _lines(patch, b"+") & _lines(later, b"-") or (
-                _present(worktree, patch, f"{commit}^") is True and _present(worktree, patch, commit) is False):
-            silent = not _lines(whole, b"+")
-        else:
-            continue
-        gone = bool(sd_ship_body.REVERT_SUBJECT.match(message)) or silent
+            gone = not _puts_back(worktree, patch, later, commit)
+        elif (taken := _takes_out(worktree, patch, later, commit, names)) is not None:
+            import sd_ship_body  # noqa: PLC0415
+            gone = taken[0] and (bool(sd_ship_body.REVERT_SUBJECT.match(message)) or taken[1])
     return gone
 
+
+def _puts_back(worktree: pathlib.Path, patch: bytes, later: bytes, commit: str) -> bool:
+    """Whether `commit`, whose change to the side's files is `later`, puts the side's `patch` back: a line
+    of it, added or taken out again, or the whole patch: a deletion adds no line, and a binary or mode-only
+    change has none to match (ruling round, review of build/sd-1654)."""
+    return bool(_lines(patch, b"+") & _lines(later, b"+") or _lines(patch, b"-") & _lines(later, b"-")
+                or (_present(worktree, patch, f"{commit}^") is False and _present(worktree, patch, commit)))
+
+
+def _takes_out(worktree: pathlib.Path, patch: bytes, later: bytes, commit: str,
+               names: list[str]) -> tuple[bool, bool] | None:
+    """How `commit` takes a restored side `patch` out again, as (none of it is left, it adds nothing
+    anywhere); None when it takes nothing of it out. It undoes the restore when none is left and it is a
+    revert or adds nothing. It takes a line of the fix out, or the whole patch; or puts back a line the fix
+    took out. One line is no proof of the rest (last round, review of build/sd-1654, sd_lane.py:1113): the
+    files must then hold no line the fix added, or, for a fix that only took lines out, every one again.
+    ponytail: a commit that takes the fix out and adds other lines reads as a move, and a fix line the file
+    holds elsewhere reads as kept, so the item closes as restored."""
+    whole = _patch(worktree, commit) or b""
+    added, cut = _lines(patch, b"+"), _lines(patch, b"-")
+    if _present(worktree, patch, f"{commit}^") is True and _present(worktree, patch, commit) is False:
+        return True, not _lines(whole, b"+" if added else b"-")
+    if not (cut & _lines(later, b"+") or added & _lines(later, b"-")):
+        return None
+    held = _held(worktree, commit, names)
+    rest = held is not None and (not added & held if added else cut <= held)
+    return rest, not _lines(whole, b"+" if added & _lines(later, b"-") else b"-")
 
 def publish_parents(worktree: pathlib.Path, sha: str) -> list[str]:
     """The parents of `sha`; none for a failed read."""
