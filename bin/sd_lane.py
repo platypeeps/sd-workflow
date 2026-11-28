@@ -880,14 +880,13 @@ def refuse_unruled(connection: Any, repository: str, item: int, last: dict[str, 
                    head: str | None = None) -> None:
     """Refuse `UNRULED` a re-prepare of a head the lane's review blocked, past `ROUND_CAP` rounds (sd:10287).
 
-    `last` is the item's newest entry; it counts only when a review blocked it (`review_blocking`) and
-    `head`, the head queued now (None: a retry, at `last`'s head), is its head. A new head is a fix, which
-    queues. The blocked review is the last pass of the item's ship receipt on `last`'s branch; an accepted
-    adjudication of that pass's head lets it through (`ruled`), and prepare then runs the gate alone.
+    `last` is the item's newest entry; it counts only when a review blocked it (`review_blocking`). The
+    blocked review is the last pass of the item's ship receipt on `last`'s branch, at `last`'s head or at
+    prepare's catch-up of it. `head`, the head queued now (None: a retry, at `last`'s head), counts when it
+    is either one; another head is a fix, which queues. An accepted adjudication of that very review lets it
+    through (`ruled`), and prepare then runs the gate alone.
     """
     if last is None or last.get("code") != "review_blocking" or last.get("status") not in BLOCKED:
-        return
-    if head is not None and head != last.get("expected_head"):
         return
     require_sd_db()
     from sd_db import reads  # noqa: PLC0415
@@ -895,6 +894,8 @@ def refuse_unruled(connection: Any, repository: str, item: int, last: dict[str, 
     if rounds <= ROUND_CAP:
         return
     reviewed, done = ruled(connection, repository, item, str(last.get("branch")), str(last.get("expected_head")))
+    if head is not None and head not in (last.get("expected_head"), reviewed):
+        return
     if not done:
         raise LaneError(f"sd:{item} has had {rounds} review rounds, past {ROUND_CAP}, and its lane review blocked "
                         f"at {reviewed}; nothing was queued. Rule each blocker with `sd-ship adjudicate --item "
@@ -903,9 +904,13 @@ def refuse_unruled(connection: Any, repository: str, item: int, last: dict[str, 
 
 def ruled(connection: Any, repository: str, item: int, branch: str, head: str) -> tuple[str, bool]:
     """The head `item`'s newest ship receipt on `branch` last reviewed (`head` when none says), and whether an
-    accepted adjudication binds that head. An unreadable receipt or ruling is no ruling."""
+    accepted adjudication binds that review: its head and its passes, as `sd-ship adjudicate` binds them, so
+    a later report at the same head is not ruled by an earlier one's ruling. An unreadable receipt or ruling
+    is no ruling."""
+    import sd_ship_dispositions  # noqa: PLC0415
     from sd_db import ship  # noqa: PLC0415
     from sd_db.workflow import WorkflowError  # noqa: PLC0415
+    from sd_ship_remote import Refusal  # noqa: PLC0415
     for (key,) in connection.execute("SELECT key FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship:%' "
                                      "GROUP BY key ORDER BY MAX(id) DESC").fetchall():
         try:
@@ -921,7 +926,12 @@ def ruled(connection: Any, repository: str, item: int, branch: str, head: str) -
         reviewed = last["head"] if isinstance(last.get("head"), str) else head
         proposal = ruling.get("proposal") if isinstance(ruling.get("proposal"), dict) else {}
         bindings = proposal.get("bindings") if isinstance(proposal.get("bindings"), dict) else {}
-        return reviewed, ruling.get("decision") == "accepted" and bindings.get("head") == reviewed
+        try:
+            seen = sd_ship_dispositions.digest(receipt.get("passes"))
+        except Refusal:  # passes no digest reads: no ruling can name them
+            return reviewed, False
+        return reviewed, (ruling.get("decision") == "accepted" and bindings.get("head") == reviewed
+                          and bindings.get("passes_digest") == seen)
     return head, False
 
 
