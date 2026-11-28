@@ -54,6 +54,7 @@ import re
 import socket
 import sqlite3
 import struct
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -623,6 +624,11 @@ _SOCKS_REPLIES = {
 }
 
 
+#: Each `hub.json` address this process found refused and reached the hub
+#: past by name (sd:10994): later dials go by name, and it is reported once.
+_stale: set[str] = set()
+
+
 class ProxyRefused(OSError):
     """The SOCKS5 proxy `ALL_PROXY` names refused or broke the connect."""
 
@@ -748,8 +754,35 @@ def dial(host: str, port: int, timeout: float | None,
     direct connect. A `socks5://` name is tried at each address it
     resolves to, as `create_connection` tries them, and the last refusal
     is raised. Every failure is an `OSError` whose text names the proxy.
+
+    An `address` that refuses or times out is dialled past by `host`, once
+    (sd:10994): after a promote moves the name to the standby, `hub.json`
+    still names the dead hub's IP until the satellite stage runs again.
+    The stale address is reported once on stderr, and this process dials
+    by name from then on. When the name fails too, both reasons are named.
     """
-    target = address or host
+    if not address or address == host:
+        return _dial(host, port, timeout)
+    if address not in _stale:
+        try:
+            return _dial(address, port, timeout)
+        except OSError as error:
+            first = error
+        try:
+            found = _dial(host, port, timeout)
+        except OSError as error:
+            raise OSError(f"at {address}: {first.strerror or first}; by the name {host}: "
+                          f"{error.strerror or error}") from error
+        _stale.add(address)
+        print(f"sd: hub.json's address {address} is stale ({first.strerror or first});"
+              f" reached the hub as {host}. Run the machine-setup satellite stage to rewrite it.",
+              file=sys.stderr)
+        return found
+    return _dial(host, port, timeout)
+
+
+def _dial(target: str, port: int, timeout: float | None) -> tuple[socket.socket, str | None]:
+    """`dial` to one host or address."""
     proxy = socks_proxy(target)
     if proxy is None:
         return socket.create_connection((target, port), timeout=timeout), None

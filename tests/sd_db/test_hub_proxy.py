@@ -7,6 +7,7 @@ this it ignored the proxy and the sandbox refused the direct connect.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -372,6 +373,47 @@ class TheHubAddress(Proxied):
         os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
         self.open_named(self.name_hub())
         self.assertEqual(fake.requests, [(3, HUB, self.served.port)])
+
+    def test_a_refused_address_dials_the_hub_name_once(self):
+        """sd:10994: after a promote moves the name, `address` holds the dead
+        hub's IP; the dial falls back to the name and says the address is stale."""
+        fake = self.proxy(unreachable=(self.ADDRESS,))
+        os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
+        home = self.name_hub(address=self.ADDRESS)
+        with mock.patch.object(remote, "_stale", set()), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.open_named(home)
+            self.open_named(home)
+        self.assertEqual(fake.requests, [(1, self.ADDRESS, self.served.port), (3, HUB, self.served.port),
+                                         (3, HUB, self.served.port)])
+        self.assertEqual(err.getvalue().count(self.ADDRESS), 1)
+        self.assertIn("stale", err.getvalue())
+
+    def test_a_refused_direct_address_dials_the_hub_name(self):
+        real = socket.create_connection
+        tried = []
+
+        def connect(where, *args, **kwargs):
+            tried.append(where[0])
+            if where[0] == self.ADDRESS:
+                raise ConnectionRefusedError(61, "Connection refused")
+            return real(where, *args, **kwargs)
+
+        with mock.patch.object(remote, "_stale", set()), mock.patch("sys.stderr", new_callable=io.StringIO), \
+                mock.patch.object(remote.socket, "create_connection", side_effect=connect):
+            self.open_named(self.name_hub(address=self.ADDRESS))
+        self.assertEqual(tried, [self.ADDRESS, HUB])
+
+    def test_when_the_name_also_refuses_both_reasons_are_named(self):
+        fake = self.proxy(unreachable=(self.ADDRESS, HUB))
+        os.environ["ALL_PROXY"] = f"socks5h://127.0.0.1:{fake.port}"
+        with mock.patch.object(remote, "_stale", set()), mock.patch("sys.stderr", new_callable=io.StringIO) as err, \
+                self.assertRaises(remote.HubUnreachable) as raised:
+            hub.read(self.name_hub(address=self.ADDRESS)).open(
+                Path("absent.db"), write=False, create=False, busy_timeout=1000)
+        self.assertIn(self.ADDRESS, raised.exception.reason)
+        self.assertIn(HUB, raised.exception.reason)
+        self.assertEqual(err.getvalue(), "")
 
     def test_the_host_stays_the_name(self):
         named = hub.read(self.name_hub(address=self.ADDRESS))
