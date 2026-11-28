@@ -649,6 +649,25 @@ class EditSectionTests(unittest.TestCase):
                 after = self.edit(text, "Score", "written")
                 self.assertEqual(after, f"## Tip\n\n{fenced}## Score\n\nwritten\n")
 
+    def test_text_the_write_guard_accepts_reads_back_as_one_section(self) -> None:
+        # sd:10962 review: the reader may call a line a heading only when `parse_sections` refuses it. A tab
+        # after `##` passed the guard, which reads the line as written, and the reader's tab-expanded copy
+        # took it for a heading, so the saved section ended early.
+        sd = sd_module()
+        texts = ["##\tScore", " ##\tScore\nmore", "- a\n  ##\tScore", "- a\n\t##\tScore", "x\n   ##\tProvenance\ny",
+                 "-\t##\tScore", "##\t", "\t## Score", " \t## Score", "- a\n\t## Score\n\t```\n\t## Score",
+                 # An item's fence the text leaves open ends at the next section's column-0 heading.
+                 "- ```", "-\t```\n\tx", "1. ~~~\n   y", "- a\n  - b\n\t```"]
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertEqual(sd.parse_sections([f"Tip={text}"]), {"Tip": text}, "the guard accepts it")
+                after = self.edit("## Tip\n\nold\n\n## Score\n\nreal\n", "Tip", text)
+                lines = after.splitlines(keepends=True)
+                headings = sd.note_heading_lines(lines, 0)
+                self.assertEqual([name for _, name in headings], ["Tip", "Score"])
+                start, end = sd.section_span(lines, headings, "Tip")
+                self.assertEqual("".join(lines[start + 1:end]).strip("\r\n"), text)
+
     def test_an_indented_heading_is_the_section_it_looks_like(self) -> None:
         text = "## Tip\n\nt\n\n   ## Score\n\nindented\n"
         after = self.edit(text, "Score", "written")

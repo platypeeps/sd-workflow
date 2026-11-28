@@ -1847,7 +1847,10 @@ def note_heading_lines(lines: list[str], start: int) -> list[tuple[int, str]]:
                 fence = ""
             # A fence line is never a heading, opener, closer or neither.
             continue
-        if not fence and SMUGGLED_HEADING.match(line):
+        # The line as written, never the expanded copy: `parse_sections`
+        # refuses section text by this same match, and a heading found here
+        # that it accepts (`##<tab>Score`) would end a saved section early.
+        if not fence and SMUGGLED_HEADING.match(lines[index]):
             found.append((index, lines[index].lstrip()[3:].strip()))
     return found
 
