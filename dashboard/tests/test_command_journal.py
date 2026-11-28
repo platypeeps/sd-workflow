@@ -245,7 +245,7 @@ class TheSteps(ScreenCase):
                          command_journal.UNKNOWN)
 
     def test_the_holder_item_is_made_once(self):
-        first, second = self.opened(), self.opened("/api/shared-upload/regenerate", {}, {"url": "https://example.test"})
+        first, second = self.opened(), self.opened("/api/health/cleanup", {"row": "r1"}, (200, {}))
         items = {row[0] for row in self.connection.execute("SELECT item FROM note WHERE id IN (?, ?)", (first, second))}
         self.assertEqual(len(items), 1)
         [holder] = items

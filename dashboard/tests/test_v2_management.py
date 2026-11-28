@@ -16,8 +16,6 @@ is a manual check recorded on the pull request.
 
 from __future__ import annotations
 
-import base64
-import datetime
 import json
 import re
 import subprocess
@@ -26,7 +24,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sd_dashboard import management_screen, queue_screen, server, upload_link, v2
+from sd_dashboard import management_screen, queue_screen, server, v2
 from sd_db import repos, upsert_repo, upsert_shadow, workflow, writes
 from sd_db.errors import SdDbError
 from support import NOW, ScreenCase
@@ -152,7 +150,7 @@ class TheDocument(ScreenCase):
         doc = self.document()
         # pack sd:7115: the lane's assignments moved to Queue, so the page reads no lane.
         self.assertEqual(doc["sources"], {k: "" for k in ("repos", "pulls", "deep", "git", "sessions",
-                                                          "claude", "services", "jobs", "satellites", "upload")})
+                                                          "claude", "services", "jobs", "satellites")})
         self.assertEqual(doc["read"], NOW)
         # sd:3041: the runner stopped, so no archive refresh from runner.sh and no runner heartbeat.
         self.assertNotIn("archive", doc)
@@ -751,155 +749,14 @@ class TheDocument(ScreenCase):
         self.assertEqual(seen, ["database is locked"])
 
 
-SECRET = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+class NoSharedUpload(ScreenCase):
+    """sd:10854: Management no longer reads a shared upload link; nothing reads its config or row."""
 
-
-def keys(profile, **more):
-    """A stand-in for `shared_upload.credentials`: no `aws` runs, nothing reaches AWS."""
-    return {"AccessKeyId": "AKIDEXAMPLE", "SecretAccessKey": SECRET, **more}
-
-
-def no_keys(profile):
-    raise RuntimeError(f"aws configure export-credentials --profile {profile} exited 255: Unable to locate credentials")
-
-
-def upload_config(case, text="SHARED_UPLOAD_BUCKET=example-bucket\nSHARED_UPLOAD_REGION=us-east-1\n"
-                             "SHARED_UPLOAD_PROFILE=example-uploader\n"):
-    """`<config>/shared-upload/.env` in the case's scratch config folder (support.ScreenCase points there)."""
-    folder = Path(case.tmp.name) / "config" / "shared-upload"
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / ".env").write_text(text, encoding="utf-8")
-    return folder / ".env"
-
-
-class TheSharedUploadDocument(ScreenCase):
-    """sd:5405: the shared bucket's console link, the current upload link (one setting row) and Regenerate."""
-
-    MOMENT = datetime.datetime(2026, 9, 6, 11, 0, tzinfo=datetime.timezone.utc)
-
-    def document(self):
-        return management_screen.document(self.connection, now=NOW, fleet=fleet, jobs=JobsBackend(self.tmp.name, jobs=[]),
+    def test_the_document_has_no_upload_source_or_section(self):
+        doc = management_screen.document(self.connection, now=NOW, fleet=fleet, jobs=JobsBackend(self.tmp.name, jobs=[]),
                                           services=NoServices())
-
-    def regenerate(self, credentials=keys, moment=None):
-        return upload_link.regenerate(self.connection, now=moment or self.MOMENT, credentials=credentials)
-
-    def rows(self):
-        return self.connection.execute("SELECT count(*) FROM state WHERE kind = 'setting' AND key = ?",
-                                       (upload_link.KEY,)).fetchone()[0]
-
-    def test_no_config_file_is_not_set_up_and_names_the_path(self):
-        doc = self.document()
-        self.assertEqual(doc["sources"]["upload"], "")
-        up = doc["upload"]
-        path = str(Path(self.tmp.name) / "config" / "shared-upload" / ".env")
-        self.assertEqual((up["set_up"], up["config"], up["link"]), (False, path, None))
-        self.assertIn(path, up["remedy"])
-        self.assertIn("SHARED_UPLOAD_BUCKET and SHARED_UPLOAD_REGION and SHARED_UPLOAD_PROFILE are not set", up["remedy"])
-        with self.assertRaisesRegex(ValueError, "not set up"):
-            self.regenerate()
-        self.assertEqual(self.rows(), 0)
-
-    def test_a_change_me_value_is_unset_and_an_exported_value_wins(self):
-        upload_config(self, "SHARED_UPLOAD_BUCKET=change-me\nSHARED_UPLOAD_REGION=us-east-1\nSHARED_UPLOAD_PROFILE=p\n")
-        self.assertEqual(self.document()["upload"]["remedy"].split(" is not set")[0], "SHARED_UPLOAD_BUCKET")
-        with patch.dict("os.environ", {"SHARED_UPLOAD_BUCKET": "exported-bucket"}):
-            up = self.document()["upload"]
-        self.assertEqual((up["set_up"], up["bucket"]), (True, "exported-bucket"))
-
-    def test_a_config_file_that_does_not_read_is_the_source_s_reason_not_unset(self):
-        path = upload_config(self)
-        path.write_bytes(b"SHARED_UPLOAD_BUCKET=\xff\n")
-        doc = self.document()
-        self.assertIsNone(doc["upload"])
-        self.assertIn("utf-8", doc["sources"]["upload"])
-
-    def test_set_up_with_no_link_shows_the_console_and_the_public_pattern(self):
-        upload_config(self)
-        up = self.document()["upload"]
-        self.assertEqual((up["set_up"], up["bucket"], up["region"], up["prefix"]), (True, "example-bucket", "us-east-1", "inbox/"))
-        self.assertEqual(up["console"], "https://s3.console.aws.amazon.com/s3/buckets/example-bucket?region=us-east-1&tab=objects")
-        self.assertEqual(up["public"], "https://example-bucket.s3.us-east-1.amazonaws.com/inbox/<file name>")
-        self.assertEqual((up["link_state"], up["link"], up["link_reason"]), ("none", None, ""))
-
-    def test_regenerate_signs_with_the_tool_stores_one_row_and_answers_no_link(self):
-        upload_config(self)
-        calls = []
-        status, answer = self.regenerate(lambda profile: calls.append(profile) or keys(profile))
-        self.assertEqual(calls, ["example-uploader"])
-        self.assertEqual((status, answer), (200, {"prefix": "inbox/", "expiry": "2026-09-13T11:00:00Z", "temporary": None}))
-        self.assertEqual(self.rows(), 1)
-        up = self.document()["upload"]
-        self.assertEqual(up["link_state"], "current")
-        link = up["link"]
-        tool = upload_link._tool()
-        url, fields, expiry = tool.presigned_post("example-bucket", "us-east-1", "inbox/", keys("p"), 7 * 24 * 3600,
-                                                  500 * 1024 * 1024, self.MOMENT)
-        self.assertEqual((link["url"], link["fields"], link["expiry"]), (url, fields, expiry))
-        self.assertEqual(link["curl"], tool.curl_line(url, fields))
-        self.assertEqual(link["public"], "https://example-bucket.s3.us-east-1.amazonaws.com/inbox/<file name>")
-        policy = json.loads(base64.b64decode(fields["policy"]))
-        self.assertIn(["starts-with", "$key", "inbox/"], policy["conditions"])
-        self.assertIn({"bucket": "example-bucket"}, policy["conditions"])
-        # The answer and the toast built from it never hold what grants the upload.
-        self.assertNotIn(fields["x-amz-signature"], json.dumps(answer))
-        self.assertNotIn(fields["policy"], json.dumps(answer))
-
-    def test_a_second_regenerate_replaces_the_shown_link(self):
-        upload_config(self)
-        self.regenerate()
-        first = self.document()["upload"]["link"]
-        self.regenerate(moment=self.MOMENT + datetime.timedelta(minutes=5))
-        second = self.document()["upload"]["link"]
-        self.assertEqual(self.rows(), 2)
-        self.assertNotEqual(first["fields"]["x-amz-signature"], second["fields"]["x-amz-signature"])
-        self.assertEqual(second["expiry"], "2026-09-13T11:05:00Z")
-
-    def test_keys_the_profile_cannot_give_are_a_502_and_write_nothing(self):
-        upload_config(self)
-        status, answer = self.regenerate(no_keys)
-        self.assertEqual(status, 502)
-        self.assertIn("No link was signed: aws configure export-credentials --profile example-uploader exited 255",
-                      answer["error"])
-        self.assertEqual(self.rows(), 0)
-        self.assertEqual(self.document()["upload"]["link_state"], "none")
-
-    def test_temporary_keys_say_when_the_link_stops(self):
-        upload_config(self)
-        status, answer = self.regenerate(lambda p: keys(p, SessionToken="token", Expiration="2026-09-06T18:00:00+00:00"))
-        self.assertEqual(answer["temporary"], "2026-09-06T18:00:00+00:00")
-        self.assertEqual(self.document()["upload"]["link"]["temporary"], "2026-09-06T18:00:00+00:00")
-
-    def test_a_bad_size_cap_is_refused_before_any_keys_are_read(self):
-        upload_config(self, "SHARED_UPLOAD_BUCKET=b\nSHARED_UPLOAD_REGION=us-east-1\nSHARED_UPLOAD_PROFILE=p\n"
-                            "SHARED_UPLOAD_MAX_MB=lots\n")
-        with self.assertRaisesRegex(ValueError, "SHARED_UPLOAD_MAX_MB"):
-            self.regenerate(no_keys)
-        self.assertEqual(self.rows(), 0)
-
-    def test_a_link_signed_for_another_bucket_is_not_the_current_link(self):
-        upload_config(self)
-        self.regenerate()
-        upload_config(self, "SHARED_UPLOAD_BUCKET=other-bucket\nSHARED_UPLOAD_REGION=us-east-1\n"
-                            "SHARED_UPLOAD_PROFILE=example-uploader\n")
-        up = self.document()["upload"]
-        self.assertEqual((up["link_state"], up["link"]), ("other", None))
-        self.assertIn("signed for example-bucket in us-east-1 under inbox/", up["link_reason"])
-
-    def test_an_expired_link_says_so(self):
-        upload_config(self)
-        self.regenerate(moment=self.MOMENT - datetime.timedelta(days=8))
-        up = self.document()["upload"]
-        self.assertEqual((up["link_state"], up["link"]["expiry"]), ("expired", "2026-09-05T11:00:00Z"))
-
-    def test_a_row_that_does_not_read_is_unknown_not_none_signed(self):
-        upload_config(self)
-        for body in ("not json", json.dumps({"bucket": "example-bucket"}), json.dumps([1])):
-            writes.set_setting(self.connection, upload_link.KEY, body)
-            up = self.document()["upload"]
-            with self.subTest(body=body):
-                self.assertEqual((up["link_state"], up["link"]), ("unread", None))
-                self.assertIn("does not read; Regenerate replaces it", up["link_reason"])
+        self.assertNotIn("upload", doc)
+        self.assertNotIn("upload", doc["sources"])
 
 
 class ThePage(BrowserSession):
@@ -1031,24 +888,9 @@ class ThePage(BrowserSession):
         doc = json.loads(self.request("/api/management", headers={"Cookie": self.cookie})[2])
         self.assertEqual(doc["satellites"]["request"], second)
 
-    def test_regenerate_signs_through_the_route_and_takes_no_values(self):
-        """sd:5405: the post carries nothing; the answer holds the expiry, the document the link."""
-        status, _, got = self.post("/api/shared-upload/regenerate", {})
-        self.assertEqual(status, 400)
-        self.assertIn("Shared upload is not set up", got["error"])
-        upload_config(self)
-        status, _, got = self.post("/api/shared-upload/regenerate", {"prefix": "other/"})
-        self.assertEqual(status, 400)
-        self.assertIn("takes no values", got["error"])
-        with patch.object(upload_link._tool(), "credentials", keys):
-            status, _, got = self.post("/api/shared-upload/regenerate", {})
-        self.assertEqual((status, sorted(got)), (200, ["expiry", "prefix", "temporary"]))
-        doc = json.loads(self.request("/api/management", headers={"Cookie": self.cookie})[2])
-        self.assertEqual((doc["upload"]["link_state"], doc["upload"]["link"]["expiry"]), ("current", got["expiry"]))
-        with patch.object(upload_link._tool(), "credentials", no_keys):
-            status, _, got = self.post("/api/shared-upload/regenerate", {})
-        self.assertEqual(status, 502)
-        self.assertIn("No link was signed", got["error"])
+    def test_the_regenerate_route_is_gone(self):
+        """sd:10854: the Shared upload section and its Regenerate route were removed."""
+        self.assertEqual(self.post("/api/shared-upload/regenerate", {})[0], 404)
 
     def test_the_repo_write_is_refused_on_a_satellite(self):
         """sd:1629: the POST passes the session and CSRF checks, then the verb refuses: a 400 naming the hub, no change."""
@@ -1142,7 +984,6 @@ class TheScript(PageScript):
             ["svc.start", "service", "safe", "a", None, False],
             ["repos.refresh", "git state", "safe", None, True, False],
             ["sats.refresh", "satellite refresh", "confirm", None, True, False],
-            ["upload.regenerate", "upload link", "confirm", None, True, False],
             ["jobs.retry", "job", "safe", "t", None, False],
             ["jobs.cancel", "job", "confirm", "x", None, False],
             ["jobs.log", "job", "safe", "l", False, False],
@@ -2656,68 +2497,14 @@ class TheSatellites(PageScript):
         self.assertEqual(out["gets"], ["/api/management", "/api/management"])
 
 
-class TheSharedUpload(PageScript):
-    """sd:5405: Deploys shows the bucket's console link, the current upload link and Regenerate."""
+class NoSharedUploadOnThePage(PageScript):
+    """sd:10854: Deploys shows no Shared upload section and offers no Regenerate."""
 
-    LINK = {"url": "https://example-bucket.s3.us-east-1.amazonaws.com/", "expiry": "2026-09-13T11:00:00Z",
-            "signed": "2026-09-06T11:00:00+00:00", "temporary": None,
-            "fields": {"key": "inbox/${filename}", "x-amz-signature": "f00dfeed"},
-            "curl": "curl --form-string 'key=inbox/${filename}' --form-string 'x-amz-signature=f00dfeed' -F file=@/path/to/file "
-                    "https://example-bucket.s3.us-east-1.amazonaws.com/",
-            "public": "https://example-bucket.s3.us-east-1.amazonaws.com/inbox/<file name>"}
-
-    def up(self, **over):
-        up = {"config": "/config/shared-upload/.env", "set_up": True, "remedy": "", "prefix": "inbox/", "lifetime": "168h",
-              "bucket": "example-bucket", "region": "us-east-1",
-              "console": "https://s3.console.aws.amazon.com/s3/buckets/example-bucket?region=us-east-1&tab=objects",
-              "public": "https://example-bucket.s3.us-east-1.amazonaws.com/inbox/<file name>",
-              "link": self.LINK, "link_state": "current", "link_reason": ""}
-        return dict(self.doc, upload={**up, **over})
-
-    def test_a_current_link_shows_its_console_link_curl_line_and_expiry(self):
-        out = self.run_page("R.dep = ELS['view-deploys'].html; selectRow('upload:link', false); R.det = ELS.details.html;",
-                            doc=self.up(), search="?view=deploys")
-        dep, det = out["R"]["dep"], out["R"]["det"]
-        self.assertIn('<h2 id="up-h">Shared upload', dep)
-        self.assertIn('href="https://s3.console.aws.amazon.com/s3/buckets/example-bucket?region=us-east-1&amp;tab=objects"', dep)
-        self.assertIn('<tr data-id="upload:link">', dep)
-        self.assertIn('<time class="rel" datetime="2026-09-13T11:00:00Z" data-future data-long></time>', dep)
-        self.assertIn("Links handed out before keep working until they expire.", dep)
-        self.assertIn('data-copy="curl --form-string', dep)
-        self.assertIn("x-amz-signature=f00dfeed", dep)
-        self.assertIn("inbox/&lt;file name&gt;", dep)
-        self.assertIn("<dt>Config</dt><dd class=\"mono\">/config/shared-upload/.env</dd>", det)
-        self.assertIn("deactivate the uploader's access key in IAM", det)
-
-    def test_not_set_up_is_a_plain_line_naming_the_config_path(self):
-        remedy = "SHARED_UPLOAD_BUCKET is not set. Export it, or copy local-shared-upload/.env.example to /config/shared-upload/.env and fill it in."
-        out = self.run_page("R.dep = ELS['view-deploys'].html; R.has = !!C.get('upload:link');",
-                            doc=self.up(set_up=False, remedy=remedy, link=None, link_state="none"), search="?view=deploys")
-        self.assertIn(f'<p class="empty">Not set up. {remedy}</p>', out["R"]["dep"])
-        self.assertNotIn('data-id="upload:link"', out["R"]["dep"])
-        self.assertFalse(out["R"]["has"])
-
-    def test_an_unread_link_and_an_unread_source_are_unknown(self):
-        out = self.run_page("R.dep = ELS['view-deploys'].html;", search="?view=deploys",
-                            doc=self.up(link=None, link_state="unread", link_reason="the dashboard.shared_upload_link row does not read; Regenerate replaces it"))
-        self.assertIn('<td class="g g-unknown">▨<span class="sr">unread</span></td>', out["R"]["dep"])
-        self.assertIn("row does not read; Regenerate replaces it", out["R"]["dep"])
-        doc = dict(self.doc, upload=None, sources=dict(self.doc["sources"], upload="UnicodeDecodeError: utf-8"))
-        out = self.run_page("R.dep = ELS['view-deploys'].html;", doc=doc, search="?view=deploys")
-        self.assertIn("Shared upload was not read", out["R"]["dep"])
-        self.assertIn("UnicodeDecodeError: utf-8", out["R"]["dep"])
-
-    def test_regenerate_confirms_then_posts_and_toasts_the_expiry_not_the_link(self):
-        out = self.run_page("R.why = cmd('upload.regenerate').consequence(C.get('upload:link'));"
-                            " C.run(cmd('upload.regenerate'), C.get('upload:link')); R.early = OUT.toasts.length; await flush();",
-                            doc=self.up(), search="?view=deploys",
-                            answer="(p, b) => [200, {prefix: 'inbox/', expiry: '2026-09-13T11:05:00Z', temporary: null}]")
-        self.assertEqual(out["confirms"], ["upload.regenerate"])
-        self.assertIn("Links already handed out keep working until they expire.", out["R"]["why"])
-        self.assertEqual([(p, b) for p, b, _ in out["posts"]], [("/api/shared-upload/regenerate", {})])
-        self.assertEqual(out["R"]["early"], 0, "the toast came before the write landed")
-        self.assertEqual(out["toasts"][0], ["Upload link signed · expires 2026-09-13 11:05 UTC", False])
-        self.assertEqual(out["gets"], ["/api/management", "/api/management"])
+    def test_deploys_has_no_shared_upload(self):
+        out = self.run_page("R.dep = ELS['view-deploys'].html; R.cmd = typeof cmd('upload.regenerate');",
+                            search="?view=deploys")
+        self.assertNotIn("Shared upload", out["R"]["dep"])
+        self.assertEqual(out["R"]["cmd"], "undefined")
 
 
 class TheRegistration(Registers, unittest.TestCase):

@@ -21,9 +21,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 from unittest import mock
 
-from sd_db import hub, initialise, satellite
+from sd_db import hub, initialise, registry, satellite
+from sd_db.database import Patient
 from sd_db.errors import RegistryError
 
 from .test_wire import SD_DB, Served, environment
@@ -97,6 +99,19 @@ class TheRegistryOverTheWire(unittest.TestCase):
         wire = self.served.connect(None)
         self.addCleanup(wire.close)
         self.assertEqual(wire.registry_bytes(), REGISTRY.encode())
+
+    def test_a_read_on_a_session_takes_the_hubs_file_not_a_local_path(self):
+        """sd:10400: a satellite's session answers the hub's database path, which names no file on the
+        satellite, so a builder's cost row lost its provider and bill. The read goes over the session."""
+        (self.root / "providers.yaml").write_text(REGISTRY)
+        wire = self.served.connect(None)
+        self.addCleanup(wire.close)
+        elsewhere = self.root / "satellite" / "providers.yaml"  # where the hub's path points on a satellite
+        with mock.patch.object(registry, "beside", return_value=elsewhere):
+            read = registry.read(connection=cast(Any, wire))
+            self.assertEqual(sorted(read.providers), ["one", "two"])
+            self.assertEqual(read.providers["one"].bill, "fixture")
+            self.assertEqual(sorted(registry.read(connection=cast(Any, Patient(wire))).providers), ["one", "two"])
 
     def test_a_hub_without_a_registry_names_the_path(self):
         wire = self.served.connect(None)

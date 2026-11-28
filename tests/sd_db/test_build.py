@@ -808,6 +808,9 @@ class DesignRulings(Case):
             "SELECT result FROM assignment WHERE scope = ? AND item IN (?, ?) ORDER BY id", (build.SCOPE, code, item))]
         self.assertTrue(all(f"waits on design question note #{asked}" in (result or "") for result in results),
                         results)
+        # Review of sd:10819: the reopened question predates the build, so it leaves no member out; the
+        # design's own ruling check refuses the whole Retry, as before.
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE id = ?", (asked,))
         with self.assertRaisesRegex(build.BuildRefused, "waits on design question"):
             build.retry(self.db, bundle["assignment"], who="operator")
 
@@ -2187,6 +2190,74 @@ class Park(Case):
         for tail in ("", "sd:4,sd:5", "sd:4, and more", "sd:4; sd:5", "sd:x", "sd:4, "):
             self.assertFalse(build.asked(row, build._blocked(row, build.ASKED + tail)), tail)
         self.assertFalse(build.asked(row, "quoted: " + build._blocked(row, build.ASKED + "sd:4")))
+
+    def test_a_retry_leaves_out_a_member_whose_question_waits(self):
+        """sd:10819: a bundle Retry queued again a member whose question still waited on the operator, so its
+        builder skipped it once more. It leaves the bundle, ready and parked; an answered one rides again."""
+        for answered in (False, True):
+            with self.subTest(answered=answered):
+                self.setUp()
+                build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+                build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+                asked = add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
+                if answered:
+                    add_note(self.db, self.items[1], "decision", f"Ruling on note #{asked}: A")
+                lead, child = (m["id"] for m in build.run(self.db, self.bundle["id"])["members"])
+                queued = build.retry(self.db, lead, who="operator")["queued"]
+                self.assertEqual([row["item"] for row in queued], self.items if answered else self.items[:1])
+                self.assertEqual(runner.queue_state(self.db, child)["status"], "queued" if answered else "cancelled")
+                self.assertEqual((self.statuses(self.items), self.parked()),
+                                 (["ready", "ready"], [False, not answered]))
+
+    def backdate(self, note):
+        """Move question `note` to before the run's claim: asked before the build, still unanswered."""
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE id = ?", (note,))
+
+    def test_a_question_from_before_the_build_leaves_no_member_out(self):
+        """Review of sd:10819 (build.py:1477, :920, :931, :1465): Retry read every unanswered question, whenever
+        asked, so one that predates the build dropped a member the run built. Only the run's own count."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.backdate(add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B"))
+        lead, child = (m["id"] for m in build.run(self.db, self.bundle["id"])["members"])
+        self.assertEqual([row["item"] for row in build.retry(self.db, lead, who="operator")["queued"]], self.items)
+        self.assertEqual(self.parked(), [False, False])
+
+    def test_an_old_question_ahead_of_the_lead_still_builds_fresh(self):
+        """The same class on the `ahead` path (build.py:920): a member the lead waits on, with a question
+        from before the build, leaves to build fresh, unparked."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        workflow.edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        self.backdate(add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B"))
+        lead = build.run(self.db, self.bundle["id"])["members"][0]["id"]
+        self.assertEqual([row["item"] for row in build.retry(self.db, lead, who="operator")["queued"]],
+                         [self.items[1]])
+        self.assertEqual(self.parked()[1], False)
+
+    def test_build_by_item_press_checks_a_member_with_an_old_question(self):
+        """The same class in `_retry_takes` (build.py:1465): an old question skipped the member's press check,
+        so Build by item chose a Retry that refuses. It is checked; a question the run raised is not."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        outside = self.item(status="planning")
+        workflow.edit_item(self.db, self.items[1], {"blocked_by": [outside]}, who="operator")
+        asked = add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
+        lead = build.run(self.db, self.bundle["id"])["members"][0]["id"]
+        self.assertTrue(build._retry_takes(self.db, lead, "blocked"), "the run's own question: left out")
+        self.backdate(asked)
+        self.assertFalse(build._retry_takes(self.db, lead, "blocked"), "an old question: press-checked")
+
+    def test_a_retry_parks_a_member_its_lead_waits_on_while_its_question_waits(self):
+        """sd:10819, the `ahead` path: a member the lead waits on leaves to build fresh, but not while its
+        question waits: it stays ready and parked, queued by no one."""
+        build.end(self.db, self.bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        workflow.edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
+        lead = build.run(self.db, self.bundle["id"])["members"][0]["id"]
+        self.assertEqual(build.retry(self.db, lead, who="operator")["queued"], [])
+        self.assertEqual((self.statuses(self.items)[1], self.parked()[1]), ("ready", True))
 
     def test_a_run_that_ends_done_parks_nothing(self):
         build.end(self.db, self.bundle["id"], "done", "the lane merged it")
