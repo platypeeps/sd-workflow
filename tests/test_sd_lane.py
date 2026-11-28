@@ -5216,6 +5216,11 @@ class LineLimits(SharedQueue):
                       f"commit {first[:12]} line 1 is 73 characters (limit 72); "
                       f"commit {first[:12]} line 4 is 80 characters (limit 72); nothing was queued", str(refused))
 
+    def test_a_long_comment_line_git_kept_is_refused(self) -> None:
+        """pack sd:10220: under -m git keeps a `#` line; the commit-msg hook cannot tell, so this check does."""
+        tree, [head] = self.committed("topic", "fix: a subject\n\n# " + "k" * 75)
+        self.assertIn(f"commit {head[:12]} line 3 is 77 characters (limit 72)", str(self.refused(tree, "fix: a title")))
+
     def test_lines_at_the_limit_a_fence_and_a_bare_url_are_queued(self) -> None:
         url = "https://example.test/" + "p" * 80
         tree, _ = self.committed("topic", "s" * 72 + "\n\n" + url + "\n\n```\n" + "c" * 90 + "\n```")

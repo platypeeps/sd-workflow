@@ -450,6 +450,70 @@ def end(process):
     process.wait()
 
 
+@contextlib.contextmanager
+def lost_lock(connection):
+    """A write transaction whose commit the hub refuses: its session was closed while the body ran."""
+    yield connection
+    raise remote.TransactionLost("01LOST")
+
+
+def arriving_file(path: Path):
+    """`kept_files`, with an ignored file written at `path` just after its first answer."""
+    read = build_run.kept_files
+    calls: list[tuple] = []
+
+    def kept(*args, **kwargs):
+        answer = read(*args, **kwargs)
+        if not calls:
+            path.write_text("mine\n")
+        calls.append(args)
+        return answer
+    return kept
+
+
+def late_beat(db, work: Path):
+    """`_read`, with a session's beat for `work`, found before the move aside, committed just after it:
+    a hook that read the tree's path, then waited for the move's lock (review of build/sd-2103)."""
+    read, found = build_run._read, sessions.worktrees([str(work)])
+
+    def answer(argv, *args, **kwargs):
+        said = read(argv, *args, **kwargs)
+        if "move" in argv and argv[-2] == str(work):
+            sessions.beat(db, "session-late", machine=this_host(), cwd=None, found=found)
+        return said
+    return answer
+
+
+def killed_move(work: Path):
+    """`_read`, whose `git worktree move` of `work` dies after its rename, before git records the move."""
+    read = build_run._read
+
+    def answer(argv, *args, **kwargs):
+        if "move" in argv and argv[-2] == str(work):
+            os.rename(argv[-2], argv[-1])
+            raise build_run.Unread("git worktree move gave no answer: killed")
+        return read(argv, *args, **kwargs)
+    return answer
+
+
+def registered(repo: Path, work: Path) -> bool:
+    """Whether git lists `work` as a worktree of `repo`, at that path."""
+    return f"worktree {work}" in support.git(repo, "worktree", "list", "--porcelain").splitlines()
+
+
+def refused_once(word: str, when=lambda: True):
+    """`_read`, whose first git call naming `word` once `when()` holds dies: a recovery interrupted there."""
+    read = build_run._read
+    seen: list[list[str]] = []
+
+    def answer(argv, *args, **kwargs):
+        if word in argv and not seen and when():
+            seen.append(argv)
+            raise build_run.Unread(f"git worktree {word} gave no answer: killed")
+        return read(argv, *args, **kwargs)
+    return answer
+
+
 class Refuses:
     """A connection whose `at`th statement raises `fault`; `seen` lists every statement, so a new read is covered."""
 
@@ -4619,6 +4683,105 @@ class Supervise(Case):
         first = build_run.BRIEF.format(**self.supervisor(self.bundle["id"]).brief())
         self.assertNotIn("Send to builder", first)
 
+    def test_a_fresh_build_with_a_finding_briefs_it(self):
+        """sd:10320: `sd assignments build N --finding TEXT` on a ready item with no build refused: "would be a
+        fresh build, with no builder to send it to". It queues the build and its builder reads TEXT."""
+        item = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        queued = build.queue_again(self.db, [item], who="operator", finding="pin the clock\n<b>naïve</b>")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in queued], [(item, "queued")])
+        with self.assertRaises(build.BuildRefused):  # a press repeated: no second build, no second note
+            build.queue_again(self.db, [item], who="operator", finding="pin the clock\n<b>naïve</b>")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE ?",
+                                         (item, build.FINDING + "%")).fetchone()[0], 1)
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{item}: pin the clock\n<b>naïve</b>", prompt)
+
+    def test_a_fresh_finding_reaches_a_bundle_a_later_item_leads(self):
+        """Review of build/sd-1782: the brief read findings from its lead's queue note on; a later-queued item of a
+        higher priority led the bundle, so the earlier member's finding note was dropped."""
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        build.queue_again(self.db, [member], who="operator", finding="pin the clock")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (member,))
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{member}: pin the clock", prompt)
+
+    def test_a_member_queued_earlier_does_not_revive_another_item_s_older_finding(self):
+        """Class pass, review of build/sd-1782: one window for the bundle, opened by its earliest member, took in
+        the finding of another member's cancelled build. Each item's window opens at its own queue note."""
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        build.queue_again(self.db, [member], who="operator", finding="pin the clock")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (member,))
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        gone = build.queue_again(self.db, [lead], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        self.db.execute("UPDATE note SET timestamp = '2026-01-02T00:00:00+00:00' WHERE item = ?", (lead,))
+        build.queue(self.db, [lead], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{member}: pin the clock", prompt)
+        self.assertNotIn("a cancelled build's order", prompt)
+
+    def test_a_lead_queued_earlier_does_not_revive_a_member_s_cancelled_finding(self):
+        """Review of build/sd-1782, round 3: a member's window opened at the earlier of its own queue note and the
+        lead's, so a lead queued first took in the finding of the member's cancelled build."""
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (lead,))
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        gone = build.queue_again(self.db, [member], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        self.db.execute("UPDATE note SET timestamp = '2026-01-02T00:00:00+00:00' WHERE item = ?", (member,))
+        build.queue(self.db, [member], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertNotIn("a cancelled build's order", prompt)
+
+    def test_a_member_requeued_in_the_same_second_does_not_revive_its_cancelled_finding(self):
+        """Review of build/sd-1782, round 4: note timestamps have whole seconds, so a member cancelled and queued
+        again in the second of its cancelled finding read that finding as inside its window."""
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        gone = build.queue_again(self.db, [member], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        build.queue(self.db, [member], who="operator")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (member,))
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertNotIn("a cancelled build's order", prompt)
+
+    def test_a_lead_requeued_in_the_same_second_does_not_revive_its_cancelled_finding(self):
+        """Lane review of build/sd-1782: the lead's window opened at its queue note's whole-second timestamp, so
+        a replacement build queued in the second of a cancelled build's finding read it as the operator's."""
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready")
+        gone = build.queue_again(self.db, [lead], who="operator", finding="a cancelled build's order")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (gone,))
+        build.queue(self.db, [lead], who="operator")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (lead,))
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertNotIn("a cancelled build's order", prompt)
+
     def test_a_plain_retry_briefs_review_blockers_as_the_reviewer_s_not_the_operator_s(self):
         """Lead review of pack sd:9498: a plain Retry noted the parked run's blockers as Send to builder, which the
         brief presents as the operator's findings. They are the reviewer's text; only Send to builder is the
@@ -4869,6 +5032,37 @@ class Supervise(Case):
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("?? notes.txt", note["body"])
 
+    def test_cleaning_deletes_declared_generated_paths_then_removes_the_tree(self):
+        """sd:10752: after the merge a declared gate stub is no reason to keep the worktree."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, ".ci/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        repos.set_declaration(self.db, self.repo, "generated", {"paths": [".ci/bin/launchctl"]})
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(work.exists())
+
+    def test_cleaning_a_tree_git_refuses_to_remove_keeps_its_declared_files(self):
+        """sd:10752 class pass: a locked worktree stays after the merge, with its declared gate stub."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, ".ci/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        repos.set_declaration(self.db, self.repo, "generated", {"paths": [".ci/bin/launchctl"]})
+        support.git(self.repo, "worktree", "lock", str(work))
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / ".ci" / "bin" / "launchctl").read_text(), "stub\n")
+
     def test_cleaning_removes_a_clean_worktree(self):
         self.press()
         self.write_pr()
@@ -4935,6 +5129,132 @@ class Supervise(Case):
     def hold(self, session: str) -> None:
         work = Path(self.bundle["work_path"])
         sessions.beat(self.db, session, machine=this_host(), cwd=None, found=sessions.worktrees([str(work)]))
+
+    def test_a_session_that_holds_the_tree_during_the_clean_check_keeps_it(self):
+        """Review of build/sd-2103: a session that registers the tree after the first hold check, while
+        git status runs, still keeps it; the hold is read again with the remove."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        read = build_run.kept_files
+
+        def arriving(*args, **kwargs):
+            self.hold("session-other")
+            return read(*args, **kwargs)
+
+        self.merge_to_cleaning()
+        with mock.patch.object(build_run, "kept_files", arriving):
+            ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "done")
+        self.assertTrue(Path(self.bundle["work_path"]).is_dir())
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("a live session holds it: session-", note["body"])
+
+    def to_cleaning(self) -> Path:
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        self.merge_to_cleaning()
+        return Path(self.bundle["work_path"])
+
+    def test_cleaning_whose_lock_is_lost_at_the_commit_keeps_the_tree(self):
+        """Class pass, build/sd-2103: a hub closes a satellite's transaction after `serve.IDLE_TIMEOUT`, so
+        the lock may be gone before git answers; a commit that fails proves no hold, and the tree stays."""
+        work = self.to_cleaning()
+        real = build_run.transaction
+        back: list[bool | None] = []
+
+        @contextlib.contextmanager
+        def lost_once(connection):
+            if back:  # the walk runs again after the hub fault, and its lock holds this time
+                back.append((work / ".git").is_file())
+                with real(connection):
+                    yield connection
+                return
+            back.append(None)
+            yield connection
+            raise remote.TransactionLost("01LOST")
+
+        with mock.patch.object(build_run, "transaction", lost_once):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual(back[:2], [None, True], "put back after the lost lock, for the next walk to judge")
+
+    def test_cleaning_keeps_a_tree_an_ignored_file_reaches_after_the_clean_check(self):
+        """Class pass: the clean check is read again once the tree is aside, before git deletes it."""
+        work = self.to_cleaning()
+        exclude(work, "late.cfg\n")
+        with mock.patch.object(build_run, "kept_files", arriving_file(work / "late.cfg")):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertEqual((work / "late.cfg").read_text(), "mine\n")
+
+    def test_cleaning_keeps_a_tree_a_hold_reaches_after_the_move(self):
+        """Review of build/sd-2103: a beat found under the tree's first name, committed once it is aside."""
+        work = self.to_cleaning()
+        with mock.patch.object(build_run, "_read", late_beat(self.db, work)):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / ".git").is_file())
+
+    def test_cleaning_keeps_a_tree_held_by_its_aside_name(self):
+        """Class pass: a session that found the tree aside holds it by that name once it is put back."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
+                      found=sessions.worktrees([str(aside)]))
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / ".git").is_file())
+
+    def test_cleaning_puts_back_a_tree_git_never_recorded_aside_and_removes_it(self):
+        """Review of build/sd-2103: a move killed after its rename left git's record at the first name."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        os.rename(work, aside)
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_cleaning_whose_move_dies_after_the_rename_puts_the_tree_back(self):
+        """Class pass: the move that fails is the one cleaning ran, so no later pass is needed."""
+        work = self.to_cleaning()
+        with mock.patch.object(build_run, "_read", killed_move(work)):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / ".git").is_file())
+        self.assertTrue(registered(self.repo, work))
+
+    def test_cleaning_that_cannot_put_a_tree_back_says_it_kept_it(self):
+        """Class pass: a tree left aside that git will not repair is kept and named, not called removed."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        os.rename(work, aside)
+        read = build_run._read
+
+        def refused(argv, *args, **kwargs):
+            if "repair" in argv:
+                raise build_run.Unread("git worktree repair failed: exit 1")
+            return read(argv, *args, **kwargs)
+
+        with mock.patch.object(build_run, "_read", refused):
+            self.assertEqual(self.supervisor().run()["outcome"], "done")
+        note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
+        self.assertIn("kept worktree", note["body"])
+
+    def test_cleaning_repairs_a_tree_put_back_on_disk_but_recorded_aside(self):
+        """Review of build/sd-2103: a put-back killed after its rename left git's record at the aside name."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        os.rename(aside, work)
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_cleaning_puts_back_a_tree_a_crash_left_aside_and_removes_it(self):
+        """Class pass: a run that died between the move aside and the remove left the tree aside."""
+        work = self.to_cleaning()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertFalse(aside.exists() or work.exists())
 
     def test_a_held_build_worktree_is_kept(self):
         """pack sd:6024: a session other than the run's builder holds the worktree, so cleaning keeps it."""
@@ -6712,6 +7032,154 @@ class Sweep(Case):
         self.assertTrue(work.is_dir())
         self.assertNotEqual(self.branches(), "")
 
+    def test_a_session_that_holds_the_tree_during_the_sweep_keeps_it(self):
+        """Review of build/sd-2103: a hold registered after the sweep's first check still keeps the tree."""
+        work = self.blocked()
+        self.done()
+        read = build_run.kept_files
+
+        def arriving(*args, **kwargs):
+            sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
+                          found=sessions.worktrees([str(work)]))
+            return read(*args, **kwargs)
+
+        with mock.patch.object(build_run, "kept_files", arriving):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue(work.is_dir())
+
+    def test_a_sweep_whose_lock_is_lost_at_the_commit_keeps_the_tree(self):
+        """Class pass, build/sd-2103: a lost satellite transaction proves no hold; the tree stays."""
+        work = self.blocked()
+        self.done()
+        with mock.patch.object(build_run, "transaction", lost_lock), self.assertRaises(remote.TransactionLost):
+            build_run.sweep(self.db)
+        self.assertTrue((work / ".git").is_file())
+
+    def test_a_sweep_keeps_a_tree_an_ignored_file_reaches_after_the_clean_check(self):
+        """Class pass: the clean check is read again once the tree is aside, before git deletes it."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "late.cfg\n")
+        with mock.patch.object(build_run, "kept_files", arriving_file(work / "late.cfg")):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "late.cfg").read_text(), "mine\n")
+
+    def test_a_hold_committed_after_the_sweep_moves_the_tree_keeps_it(self):
+        """Review of build/sd-2103: a beat found under the tree's first name, committed once it is aside."""
+        work = self.blocked()
+        self.done()
+        with mock.patch.object(build_run, "_read", late_beat(self.db, work)):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+
+    def test_a_hold_on_the_aside_name_a_crash_left_keeps_the_tree(self):
+        """Class pass: a session that found the tree aside holds it by that name once it is put back."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
+                      found=sessions.worktrees([str(aside)]))
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+
+    def test_a_sweep_puts_back_a_tree_git_never_recorded_aside_and_removes_it(self):
+        """Review of build/sd-2103: a move killed after its rename left git's record at the first name."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        os.rename(work, aside)
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_a_sweep_whose_move_dies_after_the_rename_puts_the_tree_back(self):
+        """Class pass: the move that fails is the one the sweep ran, so no later pass is needed."""
+        work = self.blocked()
+        self.done()
+        with mock.patch.object(build_run, "_read", killed_move(work)):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+        self.assertTrue(registered(self.repo, work))
+
+    def test_a_sweep_moves_no_tree_into_a_folder_in_the_way(self):
+        """Class pass: git moves a tree into an existing folder, under its own name, where none looks."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        aside.mkdir()
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+        self.assertFalse((aside / work.name).exists())
+
+    def test_a_sweep_repairs_a_tree_put_back_on_disk_but_recorded_aside(self):
+        """Review of build/sd-2103: a put-back killed after its rename left git's record at the aside name."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        os.rename(aside, work)
+        self.assertFalse(registered(self.repo, work))
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_a_sweep_after_a_put_back_killed_at_its_repair_removes_the_tree(self):
+        """Class pass: every state a killed put-back leaves is one the next pass recovers from."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        with mock.patch.object(build_run, "_read", refused_once("repair")):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue((work / ".git").is_file())
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
+    def test_a_tree_kept_after_a_put_back_killed_at_its_repair_is_repaired(self):
+        """Class pass: the put-back on the way out of a removal that kept the tree is recovered the same."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "late.cfg\n")
+        with mock.patch.object(build_run, "kept_files", arriving_file(work / "late.cfg")), \
+                mock.patch.object(build_run, "_read", refused_once("repair", (work / "late.cfg").exists)):
+            self.assertEqual(build_run.sweep(self.db), [])
+        self.assertFalse(registered(self.repo, work), "the state the killed repair left")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue(registered(self.repo, work))
+        self.assertEqual((work / "late.cfg").read_text(), "mine\n")
+
+    def test_a_tree_half_removed_aside_is_put_back_and_kept(self):
+        """Class pass: a `git worktree remove` killed mid-delete left part of the tree; it is no clean tree."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        tracked = support.git(aside, "ls-files", "--deduplicate").splitlines()[0]
+        (aside / tracked).unlink()
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertTrue(registered(self.repo, work))
+        self.assertFalse(aside.exists())
+
+    def test_what_a_killed_removal_left_aside_is_not_deleted(self):
+        """Class pass: a folder at the aside name that is no worktree is no tree to put back or remove."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "remove", str(work))
+        aside.mkdir()
+        (aside / "left.txt").write_text("mine\n")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((aside / "left.txt").read_text(), "mine\n")
+        self.assertFalse(work.exists())
+
+    def test_a_sweep_puts_back_a_tree_a_crash_left_aside_and_removes_it(self):
+        """Class pass: a sweep that died between the move aside and the remove left the tree aside."""
+        work = self.blocked()
+        self.done()
+        aside = Path(str(work) + build_run.ASIDE)
+        support.git(self.repo, "worktree", "move", str(work), str(aside))
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(aside.exists() or work.exists())
+
     def test_a_dirty_or_held_or_open_worktree_is_kept(self):
         work = self.blocked()
         self.done()
@@ -6821,6 +7289,121 @@ class Sweep(Case):
         (work / ".env").unlink()
         self.assertEqual(build_run.sweep(self.db), [str(work)])
         self.assertFalse(work.exists())
+
+    def generated(self, *patterns):
+        repos.set_declaration(self.db, self.repo, "generated", {"paths": list(patterns)})
+
+    def test_a_declared_generated_path_goes_and_the_clean_tree_with_it(self):
+        """sd:10752: the sweep deletes the paths the repo declares its tools write, then removes the tree."""
+        work = self.blocked()
+        self.done()
+        exclude(work, ".ci/\n.venv-check/\n*.csproj\nreports/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        (work / ".venv-check").mkdir()
+        (work / ".venv-check" / ".gitignore").write_text("*\n")
+        (work / "Assembly-CSharp-Editor.csproj").write_text("<x/>\n")
+        (work / "reports").mkdir()
+        (work / "reports" / "junit.xml").write_text("<x/>\n")
+        self.assertEqual(build_run.sweep(self.db), [], "nothing declared: each keeps the tree")
+        self.generated(".ci/bin/launchctl", ".venv-check/", "*.csproj", "reports/junit.xml")
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(work.exists())
+
+    def test_an_undeclared_ignored_file_keeps_the_tree_and_every_declared_path(self):
+        """sd:10752: one ignored file the repo does not declare keeps the tree whole; nothing is deleted."""
+        work = self.blocked()
+        self.done()
+        self.generated("reports/junit.xml", "*.csproj")
+        exclude(work, "reports/\n*.csproj\n.env\n")
+        (work / "reports").mkdir()
+        (work / "reports" / "junit.xml").write_text("<x/>\n")
+        (work / "reports" / "notes.xml").write_text("mine\n")
+        (work / "sub").mkdir()
+        (work / "sub" / "Hand.csproj").write_text("mine\n")
+        self.assertEqual(build_run.sweep(self.db), [], "a glob matches the root alone, a path exactly")
+        self.assertTrue((work / "reports" / "junit.xml").exists(), "nothing goes while the tree stays")
+        (work / "reports" / "notes.xml").unlink()
+        (work / "sub" / "Hand.csproj").unlink()
+        (work / ".env").write_text("TOKEN=change-me\n")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
+        self.assertTrue((work / "reports" / "junit.xml").exists())
+
+    def stub(self, work):
+        """A declared, ignored gate stub in `work`: the one file that would go with the tree."""
+        exclude(work, ".ci/\n")
+        (work / ".ci" / "bin").mkdir(parents=True)
+        (work / ".ci" / "bin" / "launchctl").write_text("stub\n")
+        self.generated(".ci/bin/launchctl")
+        return work / ".ci" / "bin" / "launchctl"
+
+    def test_a_tree_git_refuses_to_remove_keeps_its_declared_files(self):
+        """sd:10752 class pass: a declared file goes only with its tree; a locked worktree loses nothing."""
+        work = self.blocked()
+        self.done()
+        stub = self.stub(work)
+        support.git(self.repo, "worktree", "lock", str(work))
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual(stub.read_text(), "stub\n")
+        support.git(self.repo, "worktree", "unlock", str(work))
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+
+    def test_a_tree_off_its_branch_keeps_its_declared_files(self):
+        """sd:10752 class pass: a detached HEAD off its branch keeps the tree, so no declared file goes."""
+        work = self.blocked()
+        self.done()
+        stub = self.stub(work)
+        support.git(work, "-c", "user.name=operator", "-c", "user.email=operator@example.test", "commit",
+                    "--allow-empty", "-m", "ahead")
+        support.git(work, "checkout", "--detach", "HEAD~1")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual(stub.read_text(), "stub\n")
+
+    def test_reading_what_keeps_a_tree_deletes_nothing(self):
+        """sd:10752 class pass: `kept_files` only reads; git's own remove is the one delete."""
+        work = self.blocked()
+        stub = self.stub(work)
+        (work / ".ci" / "bin" / "mine").write_text("x\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work), generated=(".ci/bin/launchctl",)),
+                         "!! .ci/bin/mine")
+        (work / ".ci" / "bin" / "mine").unlink()
+        self.assertEqual(build_run.kept_files(("git",), str(work), generated=(".ci/bin/launchctl",)), "")
+        self.assertEqual(stub.read_text(), "stub\n")
+
+    def test_a_name_ending_in_a_unicode_line_end_still_keeps_the_tree(self):
+        """sd:10752 ruling: git ends a status line at "\\n" alone; `splitlines` also cut at U+2028 and
+        the like, so an undeclared name read as a declared one and its tree went."""
+        work = self.blocked()
+        self.stub(work)
+        for end in (" ", " ", "\x85"):
+            with self.subTest(end=repr(end)):
+                odd = work / ".ci" / "bin" / f"launchctl{end}"
+                odd.write_text("x\n")
+                self.assertEqual(build_run.kept_files(("git",), str(work), generated=(".ci/bin/launchctl",)),
+                                 f"!! .ci/bin/launchctl{end}")
+                odd.unlink()
+
+    def test_a_declared_path_behind_a_symlink_is_not_followed(self):
+        """sd:10752: a declared path whose folder links outside the tree deletes nothing there."""
+        work = self.blocked()
+        self.done()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "junit.xml").write_text("keep\n")
+        (work / "reports").symlink_to(outside, target_is_directory=True)
+        exclude(work, "reports\n")
+        self.generated("reports/junit.xml", "reports")
+        build_run.sweep(self.db)
+        self.assertEqual((outside / "junit.xml").read_text(), "keep\n")
+
+    def test_a_generated_declaration_out_of_shape_is_refused(self):
+        value: Any
+        for value in ({"paths": ["/etc/passwd"]}, {"paths": ["../x"]}, {"paths": ["a/../b"]}, {"paths": [".git/x"]},
+                      {"paths": ["a\nb"]}, {"paths": [""]}, {"paths": []}, {"paths": "x"}, {"paths": [1]},
+                      {"paths": ["a\\b"]}, {"other": 1}, {"paths": ["x" * 300]}):
+            with self.subTest(value=value), self.assertRaises(repos.RepoRefusal):
+                repos.set_declaration(self.db, self.repo, "generated", value)
 
     def test_an_ignored_file_named_like_a_cache_still_keeps_the_tree(self):
         """Lane review of pack sd:6979: only a folder of that name is disposable, not a file."""

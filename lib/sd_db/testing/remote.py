@@ -61,6 +61,7 @@ class PullRequest:
     review_decision: str = ""
     merge_commit_sha: str | None = None
     checks: list[dict] = field(default_factory=list)
+    author: str = "operator"
 
     def head_sha(self, remote: FixtureRemote) -> str:
         return remote.rev_parse(self.head)

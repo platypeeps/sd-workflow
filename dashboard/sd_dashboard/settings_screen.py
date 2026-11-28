@@ -38,7 +38,7 @@ __all__ = ["FLEET", "document", "request", "request_list", "request_row", "rows"
 SD_SECONDS = 5.0
 
 #: The pack's `sd_lib.FLEET_KEYS`, in the order the page lists them; `test_v2_settings` pins the two equal.
-FLEET = ("fleet_owners", "copilot_review", "hub_name", "status_companions",
+FLEET = ("fleet_owners", "copilot_review", "review_tool_changes", "hub_name", "status_companions",
          "notion_private_folder", "notion_team_folder", "notion_experiments", "notion_experiment_tasks")
 
 #: Plain names for the deep review's settings, where the key's last word is not one.

@@ -793,13 +793,18 @@ class Ship(SharedReview):
         linted and squashed a description nobody wrote. More than one open
         for the branch is left to the refusal the publish step makes.
         """
+        self.body_author = None
         if self.args.body_file:
             return self.args.body_file.read_text(encoding="utf-8"), "file"
         pull = self.state.get("pull_request") or {}
         number = pull.get("number") if type(pull.get("number")) is int else self.open_pull_number()
         if number is not None:
-            live = str(self.api.pull(number).get("body") or "").replace("\r\n", "\n")
+            answer = self.api.pull(number)
+            live = str(answer.get("body") or "").replace("\r\n", "\n")
             if live.strip():
+                user = answer.get("user")
+                login = user.get("login") if isinstance(user, dict) else None
+                self.body_author = login if isinstance(login, str) else None
                 return live, "live_pr"
         if self.state.get("body"):
             return self.state["body"], "state"
@@ -1644,7 +1649,8 @@ class Ship(SharedReview):
         # to satisfy the rest. The claim-support reading is off: it is advisory,
         # takes minutes through the local Kev, and this call reruns on the base
         # (sd:2762). An author's own run keeps it.
-        lint_warnings = sd_ship_body.docs_lint(self.root, body, base)
+        lint_warnings = sd_ship_body.docs_lint(
+            self.root, body, base, foreign=getattr(self, "body_author", None) == sd_ship_body.DEPENDABOT)
         # Before the review, so a duplicate is named before it costs a pass (sd:1151).
         claims = [] if self.args.no_item else self.claim_lines(base, head)
         for line in claims:

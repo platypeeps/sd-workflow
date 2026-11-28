@@ -57,6 +57,7 @@ case "$1 $2" in
     value() { if [ -f "$SD_STUB/$1" ]; then printf '"%s", "source": "database"' "$(cat "$SD_STUB/$1")"; else printf 'null, "source": "default"'; fi; }
     printf '{"copilot_review": {"description": "When sd-ship requests a Copilot review.", "pattern": "deep|never|always", "value": %s},\n' "$(value copilot_review)"
     printf ' "fleet_owners": {"description": "Comma-separated GitHub logins.", "pattern": "[A-Za-z0-9](-?[A-Za-z0-9])*(,[A-Za-z0-9](-?[A-Za-z0-9])*)*", "value": %s},\n' "$(value fleet_owners)"
+    printf ' "review_tool_changes": {"description": "What a review-tool change does to a review.", "pattern": "keep|strict", "value": %s},\n' "$(value review_tool_changes)"
     printf ' "hub_name": {"description": "The hub node name.", "pattern": "", "value": %s},\n' "$(value hub_name)"
     printf ' "status_companions": {"description": "Repositories sd-status lists beside its own.", "pattern": "[~/].*", "value": %s},\n' "$(value status_companions)"
     for key in notion_private_folder notion_team_folder notion_experiments notion_experiment_tasks; do
@@ -119,7 +120,7 @@ class TheFleetRead(unittest.TestCase):
         self.assertEqual(doc["reason"], "")
         self.assertEqual([(k["key"], k["value"], k["source"], k["choices"]) for k in doc["fleet"]],
                          [("fleet_owners", None, "default", None), ("copilot_review", "never", "database", ["deep", "never", "always"]),
-                          ("hub_name", None, "default", None), ("status_companions", None, "default", None),
+                          ("review_tool_changes", None, "default", ["keep", "strict"]), ("hub_name", None, "default", None), ("status_companions", None, "default", None),
                           ("notion_private_folder", None, "default", None), ("notion_team_folder", None, "default", None),
                           ("notion_experiments", None, "default", None), ("notion_experiment_tasks", None, "default", None)])
         self.assertEqual(doc["fleet"][1]["description"], "When sd-ship requests a Copilot review.")

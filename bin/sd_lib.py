@@ -115,15 +115,20 @@ def lead_review_key(repository: str, branch: str) -> str:
 LEAD_REVIEW_SOURCE = "lead-review"
 
 
-#: Operator 2026-11-27: while the pack and system tools change daily, a change to the
-#: review tools alone keeps a review and its rebuttals; a policy change still re-reviews.
-#: False restores the strict reading (any tool change re-reviews).
-TOOL_CHANGES_KEEP_REVIEWS = True
+def tool_changes_keep_reviews(environ: Mapping[str, str] | None = None) -> bool:
+    """`sd.review_tool_changes` (sd:10929): `keep`, the default (operator 2026-11-27), keeps a review and
+    its rebuttals across a change to the review tools alone; a policy change still re-reviews. `strict`,
+    as does a value or a database that does not read, is the reading before sd:10928: a tool change
+    voids rebuttals and re-reviews unless the sd:1397 replay asks the reviewers the same."""
+    try:
+        return core_setting("review_tool_changes", environ) != "strict"
+    except ConfigError:
+        return False
 
 
 def same_review_binding(stored: object, current: object) -> bool:
     """Two lead-review bindings agree; the `tools` entry counts only under the strict reading."""
-    if TOOL_CHANGES_KEEP_REVIEWS and isinstance(stored, dict) and isinstance(current, dict):
+    if isinstance(stored, dict) and isinstance(current, dict) and tool_changes_keep_reviews():
         return {k: v for k, v in stored.items() if k != "tools"} == {k: v for k, v in current.items() if k != "tools"}
     return stored == current
 
@@ -151,6 +156,12 @@ NOTION_DATA_SOURCE = rf"(?:collection://)?{NOTION_ID}"
 CORE_CONFIG = {
     "external_reviews": {"pattern": "configured|deny",
                          "description": "Standing private-code/context review authorization; unset uses local consent."},
+    "review_tool_changes": {"pattern": "keep|strict",
+                            "description": "What a change to the review tools alone does to a recorded review and "
+                                           "its rebuttals. keep (the default): both stand, and a policy change "
+                                           "still re-reviews; strict: a tool change voids rebuttals and "
+                                           "re-reviews unless the reviewers would be asked the same "
+                                           "(sd:1397, sd:10929)."},
     "copilot_review": {"pattern": "|".join(COPILOT_REVIEW_POLICIES),
                        "description": "When a merge asks GitHub for a Copilot review on its own. deep (the default): only "
                                       "changes that get a deep review; always: every reviewed change; never: none. "
@@ -768,7 +779,7 @@ def review_slot(result: dict[str, Any], environ: Mapping[str, str], root: pathli
 #: workflow database, not `config.json` (sd:3989). `external_reviews` stays per
 #: machine until each machine's value is known to match: it is the consent to
 #: send private code out, and the work satellite holds the work repositories.
-FLEET_KEYS = ("fleet_owners", "copilot_review", "hub_name", "status_companions",
+FLEET_KEYS = ("fleet_owners", "copilot_review", "review_tool_changes", "hub_name", "status_companions",
               "notion_private_folder", "notion_team_folder", "notion_experiments", "notion_experiment_tasks")
 
 
@@ -1376,8 +1387,8 @@ def repo_ci(connection: Any, root: pathlib.Path | str) -> str:
 
 #: The kinds a repository row declares (sd:5109), the library's `repos.DECLARATION_KINDS`:
 #: the first four each the object a `.github/sd-<kind>.json` file held before migration 37;
-#: `policy` the repository's rules for agents (sd:6715).
-DECLARATION_KINDS = ("review", "gate_reuse", "check_scope", "status", "experiment", "policy")
+#: `policy` the repository's rules for agents (sd:6715); `generated` the paths its tools write (sd:10752).
+DECLARATION_KINDS = ("review", "gate_reuse", "check_scope", "status", "experiment", "policy", "generated")
 
 
 def repo_declaration(root: pathlib.Path | str, kind: str, environ: Mapping[str, str] | None = None) -> Any:
@@ -1445,13 +1456,13 @@ def declaration_problems(kind: str, value: Any) -> list[str]:
         return []
     if kind == "status":
         return parse_acknowledgements(value)[1]
-    if kind == "experiment":
-        # The dashboard writes this kind through the library, so the library holds its one check.
+    if kind in ("experiment", "generated"):
+        # The library holds these kinds' one check: the dashboard and the worktree cleanup read it there.
         if import_sd_db().module is None:
             return [f"{where} is checked by the workflow library, which is not importable"]
         from sd_db import repos  # noqa: PLC0415 - this commit's lib (sd:3278)
 
-        return repos.experiment_problems(value)
+        return (repos.experiment_problems if kind == "experiment" else repos.generated_problems)(value)
     if kind == "policy":
         return sibling("sd_repo_policy", "sd_repo_policy.py").problems(value)
     return [f"{kind!r} is not a declaration kind; expected {', '.join(DECLARATION_KINDS)}"]
