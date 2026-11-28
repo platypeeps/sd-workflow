@@ -817,6 +817,19 @@ class PriorVerdictTests(unittest.TestCase):
         rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
         self.assertEqual(verified(answer("one"), rebutted=rebutted)["status"], "clean")
 
+    def test_a_rebuttal_at_one_place_never_narrows_a_prior_blocker(self) -> None:
+        """sd:10776: a rebuttal matched before a blocker's lines moved could narrow it to its other places.
+        A rebuttal now holds a prior blocker only at every place it names; else the whole row carries."""
+        prior = [dict(PRIOR[0], instances=["src.py:10", "b.py:40"])]
+        for label, line in (("its own place", 10), ("a moved place", 15)):
+            with self.subTest(label):
+                rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=line))
+                result = sd_review.finish_review({"severity_floor": "high", "requested_reviews": 1}, [answer("one")],
+                                                 ["one"], rebutted, repro=True, prior=prior)
+                [row] = result["findings"]
+                self.assertEqual((result["status"], row["path"], row["line"], row["instances"]),
+                                 ("blocking", "src.py", 10, ["src.py:10", "b.py:40"]))
+
     def test_a_rebuttal_holds_no_open_verdict_that_cites_a_fresh_repro(self) -> None:
         """Review of build/sd-2205 (bin/sd-review:1969), the class: a saved judgment erased fresh evidence.
         A reader's `open` with evidence is a citation, as a finding's is in `dispose`: a plain rebuttal holds
