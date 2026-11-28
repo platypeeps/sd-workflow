@@ -975,6 +975,46 @@ roles:
         self.assertEqual(state["binding"], ship.binding(self.root))
         self.assertEqual(self.merge()["phase"], "merged")
 
+    def fix_under_a_move_re_reviews_in_full(self, move):
+        """sd:10222 review: only a review-tool move narrows the pass to the fix.
+
+        A policy move, a receipt with no manifest, or a normalizer move that
+        hides a policy change can judge the code already reviewed
+        differently, so the whole branch is reviewed again."""
+        program, payload = self.blocking_review()
+        with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
+            self.prepare()
+        self.fix_and_clear(program, payload)
+        operation = self.operation()
+        operation.state["binding"] = "a review policy changed on the default branch"
+        move(operation.state)
+        operation.save()
+        self.assertEqual(self.prepare()["phase"], "ready_to_send")
+        fresh = self.operation().state["passes"][-1]
+        self.assertIsNone(fresh["base"], "the whole branch, not the fix")
+        self.assertIn("review_binding_change", fresh)
+        self.assertNotIn("review_binding_fix", fresh)
+
+    @staticmethod
+    def move_policy(state):
+        name = next(iter(state["binding_manifest"]["policy"]))
+        state["binding_manifest"]["policy"][name] = "policy before"
+
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
+    def test_a_fix_under_a_moved_policy_re_reviews_in_full(self):
+        self.fix_under_a_move_re_reviews_in_full(self.move_policy)
+
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
+    def test_a_fix_under_a_receipt_with_no_manifest_re_reviews_in_full(self):
+        self.fix_under_a_move_re_reviews_in_full(lambda state: state.pop("binding_manifest"))
+
+    @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
+    def test_a_fix_under_a_normalizer_move_hiding_policy_re_reviews_in_full(self):
+        def move(state):
+            self.move_policy(state)
+            state["binding_manifest"]["normalizer"] = "normalizer before"
+        self.fix_under_a_move_re_reviews_in_full(move)
+
     @unittest.mock.patch.object(ship.sd_lib, "tool_changes_keep_reviews", lambda *_: False)  # the strict reading
     def test_a_moved_binding_after_an_incomplete_pass_still_re_reviews_in_full(self):
         # sd:10222. No completed pass to verify from, so the range cannot be

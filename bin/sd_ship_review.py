@@ -844,20 +844,29 @@ class SharedReview:
         return (self.state.get("binding") == self.runtime.binding(self.root) or self.tools_only_moved()
                 or self.request_unchanged())
 
+    def tools_only_change(self) -> dict | None:
+        """The current manifest when only review tools moved, never policy; None otherwise or unread.
+
+        Read by `tools_only_moved` and by a moved binding's fix verification (sd:10222)."""
+        changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
+        if (manifest is None or not changed
+                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)):
+            return None
+        # A normalizer move reports alone and hides the policy entries, so policy is compared here too.
+        current = manifest(self.root)
+        if (self.state.get("binding_manifest") or {}).get("policy") != current["policy"]:
+            return None
+        return current
+
     def tools_only_moved(self, *, save: bool = True) -> bool:
         """Operator 2026-11-27: only review tools moved, so the receipt is rebound and kept, no pass spent.
 
         `save=False` only answers: the held-review path records its result first, and a rebind saved
         before it would strand that result if the process stopped between the two writes."""
-        changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
-        if (manifest is None or not changed
-                or any(kind not in ("verdict", "gate", "check") for _, kind in changed)
-                or not sd_lib.tool_changes_keep_reviews()):
+        current = self.tools_only_change() if sd_lib.tool_changes_keep_reviews() else None
+        if current is None:
             return False
-        # A normalizer move reports alone and hides the policy entries, so policy is compared here too.
-        current = manifest(self.root)
-        if (self.state.get("binding_manifest") or {}).get("policy") != current["policy"]:
-            return False
+        changed = self.binding_changes()
         if not save:
             return True
         passes = self.history.native(self.state)
@@ -1120,9 +1129,12 @@ class SharedReview:
         carries every earlier blocker into the verification. Where either
         cannot be established -- no completed pass, the same head, an
         imported history that needs a continuation -- the pass stays full.
+        So does any move but review tools: a policy, a legacy receipt or an
+        unread manifest can judge the code already reviewed differently.
         """
         return (bool(passes) and not self.history.requires_continuation(self.state)
-                and completed_depth(prior) and passes[-1].get("head") != head)
+                and completed_depth(prior) and passes[-1].get("head") != head
+                and self.tools_only_change() is not None)
 
     @staticmethod
     def verified_pass(passes: list[dict], additional: bool) -> dict:
