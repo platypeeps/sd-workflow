@@ -89,6 +89,78 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertEqual(list(self.connection.execute("SELECT * FROM state")), before)
 
+    def test_a_lead_review_finding_takes_a_rebuttal_with_no_ship_review(self):
+        """sd:10926: the lead rejected a blocker of its own `sd-review --scope branch`, and adjudicate refused
+        it ('no completed local review receipt for this head'), so the lane raised it again. With no ship
+        pass of the head, adjudicate answers the lead's blocking review there, in the store `sd-review` reads."""
+        from sd_db.writes import record_state
+        operation = self.operation()
+        self.head = fixture._git(self.root, "rev-parse", "HEAD")
+        self.proposal_file = self.directory / "dispositions.json"
+        blocker = {"path": "src.py", "line": 1, "severity": "high", "summary": "fixture lead finding",
+                   "family": "correctness", "evidence": "python3 src.py: Traceback", "disposition": "blocking"}
+        record = {"repository": operation.repository, "branch": operation.branch, "head": self.head,
+                  "status": "blocking", "findings": [blocker, dict(blocker, disposition="advisory", line=2)]}
+        lead_key = ship.sd_lib.lead_review_key(operation.repository, operation.branch)
+        record_state(self.connection, "checkpoint", key=lead_key, body=dict(record, head="0" * 40))
+        self.assertIn("no completed local review receipt", self.command().stdout, "a lead review of another head")
+        record_state(self.connection, "checkpoint", key=lead_key, body=record)
+        proposal = self.filled()
+        self.assertEqual([row["raw_finding"] for row in proposal["findings"]], [blocker])
+        self.assertEqual(proposal["bindings"]["source"], "lead-review")
+        self.accepted(proposal)
+        [(key, body)] = self.connection.execute(
+            "SELECT key, body FROM state WHERE key LIKE 'ship-adjudication:%'").fetchall()
+        self.assertTrue(key.startswith("ship-adjudication:lead:"), key)
+        bindings = json.loads(body)["proposal"]["bindings"]
+        self.assertEqual((bindings["repository"], bindings["branch"], bindings["head"]),
+                         (operation.repository, operation.branch, self.head))
+        forged = dict(proposal, findings=[dict(proposal["findings"][0], lead=True)])
+        self.rejected_proposal(forged)
+
+    def test_a_lead_review_is_answered_past_an_incomplete_ship_pass_and_never_parked(self):
+        """sd:10926 ruling round. A prepare that failed with no valid receipt keeps its reserved pass at the
+        head: it is no review, so the lead's still answers. And `parked` clears nothing in the lead's store,
+        which `sd-review` reads for rebuttals alone: the template offers `rebutted`, and a parked row refuses."""
+        from sd_db.writes import record_state
+        operation = self.operation()
+        self.head = fixture._git(self.root, "rev-parse", "HEAD")
+        self.proposal_file = self.directory / "dispositions.json"
+        blocker = {"path": "src.py", "line": 1, "severity": "high", "summary": "fixture lead finding",
+                   "family": "correctness", "evidence": "python3 src.py: Traceback", "disposition": "blocking"}
+        record_state(self.connection, "checkpoint", key=ship.sd_lib.lead_review_key(operation.repository, operation.branch),
+                     body={"repository": operation.repository, "branch": operation.branch, "head": self.head,
+                           "status": "blocking", "findings": [blocker]})
+        operation.save(passes=[{"head": self.head, "execution_error": {"code": "invalid_receipt"}, "exit_code": 1}])
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        template = json.loads(result.stdout)["proposal"]
+        self.assertEqual([row["response_disposition"] for row in template["findings"]], ["rebutted"])
+        template["findings"][0].update(response_disposition="parked", reason="a risk the lead accepts")
+        self.rejected_proposal(template)
+
+    def test_a_lead_review_is_answered_past_a_ship_pass_one_reviewer_timed_out(self):
+        """sd:10926 lead ruling. Two reviewers ran at the head and one timed out: the ship pass holds a
+        report, but at 1/2 depth the review loader refuses it, so the lead's complete review answers."""
+        from sd_db.writes import record_state
+        operation = self.operation()
+        self.head = fixture._git(self.root, "rev-parse", "HEAD")
+        blocker = {"path": "src.py", "line": 1, "severity": "high", "summary": "fixture lead finding",
+                   "family": "correctness", "evidence": "python3 src.py: Traceback", "disposition": "blocking"}
+        record_state(self.connection, "checkpoint", key=ship.sd_lib.lead_review_key(operation.repository, operation.branch),
+                     body={"repository": operation.repository, "branch": operation.branch, "head": self.head,
+                           "status": "blocking", "findings": [blocker]})
+        report = {"status": "blocking", "scope": "branch", "subject": {"head": self.head}, "findings": [blocker],
+                  "check": {"status": "not_run", "exit_code": None}, "requested_reviews": 2, "completed_reviews": 1,
+                  "outcomes": [{"backend": "first", "status": "findings"}, {"backend": "second", "status": "timeout"}],
+                  "reviewed_by": ["first"]}
+        operation.save(passes=[{"head": self.head, "report": report, "exit_code": 1}])
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        proposal = json.loads(result.stdout)["proposal"]
+        self.assertEqual(proposal["bindings"]["source"], ship.sd_lib.LEAD_REVIEW_SOURCE)
+        self.assertEqual([row["raw_finding"]["summary"] for row in proposal["findings"]], ["fixture lead finding"])
+
     def test_a_blocking_refusal_names_the_head_its_review_saw(self):
         """sd:9966 review: prepare's catch-up moves the head past the queued one, and adjudicate takes only the
         reviewed head, so the answer names it for Reject and enqueue."""
@@ -771,7 +843,7 @@ class DispositionTests(unittest.TestCase):
             with self.subTest(name=name), patch.object(pathlib.Path, "read_bytes", changed):
                 self.operation().check_review(self.head)
 
-    @patch.object(importlib.import_module("sd_lib"), "TOOL_CHANGES_KEEP_REVIEWS", False)
+    @patch.object(importlib.import_module("sd_lib"), "tool_changes_keep_reviews", lambda *_: False)
     def test_review_tool_adjudicator_tool_and_policy_changes_refuse(self):
         self.blocked()
         self.accepted()

@@ -375,7 +375,46 @@ class TheSections(TodayCase):
 
     def test_the_batch_marker_is_the_one_the_review_store_files(self):
         self.assertIn(f"item.source IS '{review.REF_SOURCE}'", reads.REVIEW_BATCH)
-        self.assertIn("substr(item.external_id, 1, 7) IS 'review:'", reads.REVIEW_BATCH)
+        self.assertEqual(reads.REVIEW_BATCH_SOURCE, review.REF_SOURCE)
+        self.assertEqual(reads.REVIEW_BATCH_HEADER, review.HEADER)
+
+    def test_a_review_slug_work_item_is_no_batch_and_its_question_is_a_decision(self):
+        """sd:10755: a review-finding item carries `review:<slug>`; only `review:<queue>:<batch>` is a batch."""
+        batch = self.batch("B1", questions=1)
+        slug = self.item("UX terms", source="task-ref", external_id="review:mws-20261124-6acb55b9-ux-terms")
+        asked = add_note(self.connection, slug, "question", "Rename it?\nOption: Yes (Recommended)\nOption: No")
+        self.assertEqual([row["note"] for row in today.decisions(self.connection)], [asked])
+        self.assertEqual(today.review_questions(self.connection), 1)
+        self.assertNotIn(batch, [row["id"] for row in today.decisions(self.connection)])
+        cases = {"review:labels:B7": True, "review:mws-ux-terms": False, "review:a:": False, "review::b": False,
+                 "review:a:b:c": False, "Review:a:b": False, "review:": False, "": False, None: False}
+        for ref, want in cases.items():
+            with self.subTest(ref=ref):
+                held = self.item(f"Ref {ref!r}", source="task-ref", external_id=ref)
+                add_note(self.connection, held, "comment", f"{review.HEADER}\nQueue: labels")
+                self.assertEqual(bool(reads.review_batches(self.connection, [held])), want)
+        jira = self.item("Jira", source="jira", external_id="review:labels:B2")
+        add_note(self.connection, jira, "comment", review.HEADER)
+        self.assertEqual(reads.review_batches(self.connection, [jira]), set())
+
+    def test_a_review_ref_with_no_header_is_no_batch(self):
+        """sd:10981: a lane review files findings under a `review:` ref with no header (sd:10097); the header tells a
+        batch, so its question is a decision and Today counts it outside the batches."""
+        batch = self.batch("B1", questions=1)
+        bare = self.item("Lane findings", source="task-ref", external_id="review:lane:B9")
+        add_note(self.connection, bare, "comment", "Lane review of example.test")
+        asked = add_note(self.connection, bare, "question", "Fix it?\nOption: Yes (Recommended)\nOption: No")
+        self.assertEqual([row["note"] for row in today.decisions(self.connection)], [asked])
+        self.assertEqual(today.review_questions(self.connection), 1)
+        self.assertEqual(reads.review_batches(self.connection, [batch, bare]), {batch})
+        # The first comment's first line alone: CRLF, a one-line header and a near miss.
+        for body, want in {f"{review.HEADER}\r\nQueue: q": True, review.HEADER: True,
+                           f"{review.HEADER}s\nQueue: q": False, f" {review.HEADER}": False}.items():
+            with self.subTest(body=body):
+                held = self.item("Header", source="task-ref", external_id=f"review:labels:H{len(body)}{want}")
+                add_note(self.connection, held, "comment", body)
+                add_note(self.connection, held, "comment", review.HEADER)
+                self.assertEqual(bool(reads.review_batches(self.connection, [held])), want)
 
     def grill(self, ref="grill:2026-09-07", repo=APP, questions=2):
         """A weekly grill as the KISS audit files it: `sd task add --ref grill:<date>`, then question notes."""
@@ -417,6 +456,42 @@ class TheSections(TodayCase):
     def test_the_owning_assignment_states_are_the_workflows_and_a_teammates(self):
         """Unscheduled skips an item the runner or a teammate run owns (pack sd:7221)."""
         self.assertEqual(today.OWNING, (*workflow.ACTIVE_ASSIGNMENTS, "in_session"))
+
+
+class TheStrandedItems(TodayCase):
+    """Pack sd:10167: items sat in_progress for days after a bundle drop, with no build and no lane entry left to
+    move them, and nothing listed them. Attention lists each, naming its last assignment and last lane status."""
+
+    def stuck(self, title, hours=3, assignment="blocked"):
+        number = self.item(title, repo=APP)
+        since = (datetime.datetime(2026, 9, 6, 12, tzinfo=datetime.timezone.utc)
+                 - datetime.timedelta(hours=hours)).isoformat(timespec="seconds")
+        self.connection.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (number,))
+        self.connection.execute("DELETE FROM note WHERE item = ?", (number,))  # its filing note is stamped now
+        self.connection.execute("INSERT INTO note (item, timestamp, kind, body) VALUES (?, ?, 'status_change', ?)",
+                                (number, since, "ready -> in_progress by build"))
+        if assignment:
+            create_assignment(self.connection, role="author", status=assignment, item=number)
+        return number
+
+    def listed(self):
+        return {row["id"]: row["why"] for row in today.sections(self.connection, now=NOW)["attention"]}
+
+    def test_an_item_nothing_moves_is_listed_with_its_last_assignment_and_lane_status(self):
+        dropped, failed = self.stuck("Dropped from a bundle"), self.stuck("Its lane entry failed")
+        self.lane("example-owner/app", "e1", item=failed, status="failed")
+        found = self.listed()
+        self.assertEqual(sorted(found), sorted([dropped, failed]))
+        self.assertRegex(found[dropped], r"^in_progress 3 h, .*last assignment \d+ blocked, no lane entry$")
+        self.assertTrue(found[failed].endswith("last lane status failed"), found[failed])
+
+    def test_a_moving_recent_or_hand_worked_item_is_not_listed(self):
+        building = self.stuck("Building", assignment="running")
+        recent = self.stuck("Just claimed", hours=1)
+        by_hand = self.stuck("A session holds it", assignment=None)
+        landing, member = self.stuck("In the lane"), self.stuck("Bundled in the lane")
+        self.lane("example-owner/app", "e2", item=landing, status="pending", closes=[member])
+        self.assertFalse({building, recent, by_hand, landing, member} & set(self.listed()))
 
 
 class TheOperations(TodayCase):

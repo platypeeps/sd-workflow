@@ -726,7 +726,7 @@ class CitedIdTests(unittest.TestCase):
     def test_a_listed_merge_leaves_its_sides_to_the_file_check(self) -> None:
         """pack sd:9666 review, round 8: a listed merge with no `This reverts commit` trailer names no
         mainline, and the first-parent guess undid the wrong side of a `-m 2` revert. The merge alone is
-        undone here; `sd_lane.unreverted` reads each side's files at the head. With the trailer, `-m 1`
+        undone here; `sd_lane.unreverted` reads each side commit by its own patch. With the trailer, `-m 1`
         drops the side commit."""
         base, side, main, merge = (c * 40 for c in "abce")
         work = [(merge, "Merge branch 'side'"), (main, "fix: mainline\n\nCloses: sd:4"),
@@ -856,6 +856,24 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(f"Opened by hand.\n\nCI/review scope: none.\n\nWork: sd:{self.item}\n",
                          self.operation().state["body"])
         self.assertEqual(pull.number, self.operation().state["pull_request"]["number"])
+
+    def hand_opened(self, body: str, author: str = "operator") -> None:
+        _git(self.root, "push", "-q", "origin", "HEAD:refs/heads/topic")
+        self.remote.open_pull_request("topic", title="by hand", body=body).author = author
+
+    def test_a_long_body_line_refuses_as_line_too_long(self) -> None:
+        """pack sd:10220: it came back as a retryable `docs_lint_failed` that named no remedy."""
+        self.hand_opened("Opened by hand.\n\n" + "w" * 80 + "\n")
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        self.assertEqual("line_too_long", caught.exception.workflow["blocker"]["code"])
+        self.assertIn("body line 3 is 80 characters (limit 72)", str(caught.exception))
+
+    def test_a_dependabot_body_is_exempt_from_the_line_limit(self) -> None:
+        """pack sd:10220: Dependabot writes 140-character lines, and the lane exempts its commits (sd:8191)."""
+        self.hand_opened("Bumps [a-package](https://example.test/a) " + "d" * 80 + "\n",
+                         author="dependabot[bot]")
+        self.assertEqual("ready_to_send", self.prepare()["phase"])
 
     def test_a_blank_hand_opened_body_falls_back_to_the_default(self) -> None:
         _git(self.root, "push", "-q", "origin", "HEAD:refs/heads/topic")

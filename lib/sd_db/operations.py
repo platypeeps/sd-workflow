@@ -580,7 +580,10 @@ def lane_state(connection: sqlite3.Connection, item: int) -> dict | None:
     `sd assignments get --wait --until merged` waits while it is pending or running (pack sd:8798). A cancelled one
     counts: it is the current attempt's end, and an older merge must not stand in for it."""
     found = [entry for _, _, entry in reads.item_lane_entries(connection, item)]
-    return {key: found[-1].get(key) for key in ("id", "status", "reason", "merge_commit")} if found else None
+    if not found:
+        return None
+    held = {"delivery_pending": True} if found[-1].get("delivery_pending") is True else {}  # pack sd:9923
+    return {**{key: found[-1].get(key) for key in ("id", "status", "reason", "merge_commit")}, **held}
 
 
 def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expected_revision: str, who) -> dict:

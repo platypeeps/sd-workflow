@@ -24,7 +24,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 
-from . import review, workflow
+from . import reads, review, workflow
 from .errors import SdDbError
 
 QUEUE = "priority"
@@ -39,12 +39,11 @@ SUBJECT = re.compile(r"sd:(\d+)")
 
 
 def unranked(connection: sqlite3.Connection) -> list[dict]:
-    """Open work items with no priority, oldest first; a review batch's row is not one."""
+    """Open work items with no priority, oldest first; a review batch's row is not one, by its header (sd:10981)."""
     marks = ",".join("?" * len(KINDS))
     rows = connection.execute(
         f"SELECT id, kind, title, repo, due, created_at FROM item WHERE status != 'done' AND priority IS NULL "
-        f"AND kind IN ({marks}) AND NOT (source IS ? AND external_id LIKE 'review:%') ORDER BY created_at, id",
-        (*KINDS, review.REF_SOURCE)).fetchall()
+        f"AND kind IN ({marks}) AND NOT {reads.REVIEW_BATCH} ORDER BY created_at, id", KINDS).fetchall()
     return [dict(row) for row in rows]
 
 
