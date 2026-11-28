@@ -2480,8 +2480,6 @@ def rendered_body(kind: dict[str, object], root: pathlib.Path, args: argparse.Na
             resolve_pair_files(args.section or [], "--section-file", sequences=False)))
 
     order = declared_sections(kind)
-    # The fill moves no heading: a fence one section leaves open would hide or expose another's.
-    refuse_moved_headings(titled, body, [])
     # The template's own headings, read before the fill and with no fence model: section text may hold
     # a fenced `## ` line, which `parse_sections` has vetted, and a `## ` line of the template counts
     # fenced or not, as it did before sd:10784.
@@ -2493,6 +2491,9 @@ def rendered_body(kind: dict[str, object], root: pathlib.Path, args: argparse.Na
         # clean and stayed wrong silently.
         raise Refusal(
             f"`sections.order` declares {order} but the template renders {rendered}")
+    # The fill moves no heading: a fence one section leaves open would hide or expose another's.
+    # Checked after the order, whose refusal names a template fault the fence scan only guesses at.
+    refuse_moved_headings(titled, body, [])
     return body
 
 
