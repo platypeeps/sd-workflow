@@ -4135,6 +4135,62 @@ class CitedCloses(SharedQueue):
         git(tree, "commit", "-q", "-m", "chore: drop the rest")
         self.assertEqual(self._closes(tree), [b])
 
+    def test_a_listed_merge_mixed_side_restored_then_its_added_line_reverted_keeps_it(self) -> None:
+        """Ruling round, review of build/sd-1654 (sd_lane.py:1146): the side took an obsolete fallback out
+        and added a diagnostic; the branch restored both, then took only the diagnostic out. The rest check
+        read a mixed patch by its added lines alone, so the citation dropped though the fallback stays
+        deleted. Gone needs no added line left and every line it took out back."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-mixed-partly")
+        (tree / "side.txt").write_text("fallback\nkeep\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", "chore: a file with a fallback")
+        git(tree, "switch", "-q", "-c", "topic-mixed-partly-side")
+        (tree / "side.txt").write_text("keep\ndiagnostic\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-mixed-partly")
+        (tree / "a.txt").write_text("guard\n", encoding="utf-8")
+        git(tree, "add", "a.txt")
+        git(tree, "commit", "-q", "-m", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-mixed-partly-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        (tree / "side.txt").write_text("keep\ndiagnostic\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "fix: put the side back")
+        (tree / "side.txt").write_text("keep\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "revert: the diagnostic only")
+        self.assertEqual(self._closes(tree), sorted([b, c]))
+
+    def test_a_listed_merge_side_line_the_file_holds_elsewhere_closes_as_on_the_base(self) -> None:
+        """Ruling round, review of build/sd-1654 (sd_lane.py:1146), rejected: the side's one line is also
+        elsewhere in its file; the branch restores the fix, edits context beside it, then takes the restored
+        line out. The duplicate reads as the fix kept, and the item closes. The base closes it too: it never
+        file-checks a commit cited only by a review fix line. This pins that reading."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-duplicate-line")
+        (tree / "side.txt").write_text("one:\nenabled = True\ntwo:\nend\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", "chore: two sections")
+        git(tree, "switch", "-q", "-c", "topic-duplicate-line-side")
+        (tree / "side.txt").write_text("one:\nenabled = True\ntwo:\nenabled = True\nend\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: side\n\nLane review fix, pack sd:{c}: y.")
+        git(tree, "switch", "-q", "topic-duplicate-line")
+        (tree / "a.txt").write_text("guard\n", encoding="utf-8")
+        git(tree, "add", "a.txt")
+        git(tree, "commit", "-q", "-m", f"fix: guard\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "topic-duplicate-line-side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        (tree / "side.txt").write_text("one:\nenabled = True\ntwo:\nenabled = True\nend\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "fix: put the side back")
+        (tree / "side.txt").write_text("one:\nenabled = True\nsecond:\nenabled = True\nfinish\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "refactor: rename the context")
+        (tree / "side.txt").write_text("one:\nenabled = True\nsecond:\nfinish\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "revert: the restored line only")
+        self.assertEqual(self._closes(tree), sorted([b, c]))
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open

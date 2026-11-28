@@ -1133,7 +1133,7 @@ def _takes_out(worktree: pathlib.Path, patch: bytes, later: bytes, commit: str,
     anywhere); None when it takes nothing of it out. It undoes the restore when none is left and it is a
     revert or adds nothing. It takes a line of the fix out, or the whole patch; or puts back a line the fix
     took out. One line is no proof of the rest (last round, review of build/sd-1654, sd_lane.py:1113): the
-    files must then hold no line the fix added, or, for a fix that only took lines out, every one again.
+    files must then hold no line the fix added and every line it took out again (a mixed fix needs both).
     ponytail: a commit that takes the fix out and adds other lines reads as a move, and a fix line the file
     holds elsewhere reads as kept, so the item closes as restored."""
     whole = _patch(worktree, commit) or b""
@@ -1143,7 +1143,7 @@ def _takes_out(worktree: pathlib.Path, patch: bytes, later: bytes, commit: str,
     if not (cut & _lines(later, b"+") or added & _lines(later, b"-")):
         return None
     held = _held(worktree, commit, names)
-    rest = held is not None and (not added & held if added else cut <= held)
+    rest = held is not None and not added & held and cut <= held
     return rest, not _lines(whole, b"+" if added & _lines(later, b"-") else b"-")
 
 def publish_parents(worktree: pathlib.Path, sha: str) -> list[str]:
