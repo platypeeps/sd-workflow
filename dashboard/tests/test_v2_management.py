@@ -870,6 +870,25 @@ class TheSharedUploadDocument(ScreenCase):
         self.assertEqual(answer["temporary"], "2026-09-06T18:00:00+00:00")
         self.assertEqual(self.document()["upload"]["link"]["temporary"], "2026-09-06T18:00:00+00:00")
 
+    def test_a_link_whose_temporary_keys_expired_is_expired(self):
+        """Review of build/sd-2328: a link signed with temporary keys stops when they expire, yet the section
+        offered it as current until its own 7-day expiry. Its expiry is the earlier of the two; keys whose
+        expiry is unknown or does not read give no current link."""
+        upload_config(self)
+        before = datetime.datetime.fromisoformat(NOW.replace("Z", "+00:00")) - datetime.timedelta(hours=1)
+        stopped = before.isoformat(timespec="seconds")
+        status, answer = self.regenerate(lambda p: keys(p, SessionToken="token", Expiration=stopped),
+                                         moment=before - datetime.timedelta(hours=1))
+        self.assertEqual((status, answer["expiry"]), (200, stopped))
+        up = self.document()["upload"]
+        self.assertEqual((up["link_state"], up["link"]["expiry"]), ("expired", stopped))
+        for unknown in (None, "soon"):
+            with self.subTest(expiration=unknown):
+                self.regenerate(lambda p, u=unknown: keys(p, SessionToken="token", **({"Expiration": u} if u else {})))
+                up = self.document()["upload"]
+                self.assertEqual(up["link_state"], "expired")
+                self.assertIn("temporary keys", up["link_reason"])
+
     def test_a_bad_size_cap_is_refused_before_any_keys_are_read(self):
         upload_config(self, "SHARED_UPLOAD_BUCKET=b\nSHARED_UPLOAD_REGION=us-east-1\nSHARED_UPLOAD_PROFILE=p\n"
                             "SHARED_UPLOAD_MAX_MB=lots\n")

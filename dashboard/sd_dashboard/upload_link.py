@@ -83,6 +83,18 @@ def _moment(text) -> datetime.datetime:
     return moment
 
 
+def _stops(expiry: str, temporary) -> tuple[str | None, str]:
+    """`(when, problem)`: the moment a link stops, the earlier of its own `expiry` and its temporary keys' expiry
+    (review of build/sd-2328). Temporary keys whose expiry is unknown or does not read give no moment: unknown,
+    so the link is not offered as current."""
+    if temporary is None:
+        return expiry, ""
+    try:
+        return min((expiry, str(temporary)), key=_moment), ""
+    except (ValueError, TypeError):
+        return None, f"it was signed with temporary keys whose expiry is {temporary!r}; Regenerate signs a new one"
+
+
 def _stored(connection) -> tuple[dict | None, str]:
     """`(body, problem)`: the latest row's body, None when none was ever signed; a problem means the row is unknown."""
     from sd_db import writes
@@ -131,9 +143,10 @@ def document(connection, *, now: str, environ=None) -> dict:
         out.update(link_state="other", link_reason=f"the stored link was signed for {body['bucket']} in {body['region']} "
                    f"under {body['prefix']}, not this bucket; Regenerate signs one for it")
     else:
-        expired = _moment(body["expiry"]) <= _moment(now)
-        out["link_state"] = "expired" if expired else "current"
-        out["link"] = {"url": body["url"], "fields": body["fields"], "expiry": body["expiry"], "signed": body["signed"],
+        stops, unknown = _stops(body["expiry"], body.get("temporary"))
+        expired = stops is None or _moment(stops) <= _moment(now)
+        out.update(link_state="expired" if expired else "current", link_reason=unknown)
+        out["link"] = {"url": body["url"], "fields": body["fields"], "expiry": stops or body["expiry"], "signed": body["signed"],
                        "temporary": body.get("temporary"), "curl": tool.curl_line(body["url"], body["fields"]),
                        "public": tool.public_url(body["bucket"], body["region"], body["prefix"]) + "<file name>"}
     return out
@@ -168,4 +181,4 @@ def regenerate(connection, *, environ=None, now: datetime.datetime | None = None
 
     # Unsorted: the fields keep the order the form sends them in, `key` first, as the tool prints them.
     writes.set_setting(connection, KEY, json.dumps(body))
-    return 200, {"prefix": PREFIX, "expiry": expiry, "temporary": temporary}
+    return 200, {"prefix": PREFIX, "expiry": _stops(expiry, temporary)[0] or expiry, "temporary": temporary}
