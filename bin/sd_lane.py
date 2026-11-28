@@ -5749,6 +5749,8 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
     try:
         entry = sent_train_settled(queue, settle_mark(queue, entry, token, root), token, root)
         found = train_reconciled(entry) or checkout_for(root, queue, entry)
+        if found.get("code") == HEAD_MOVED:
+            entry, found = followed_rebase(root, queue, entry, token, found)
     except Stop as stop:
         return None, record_hub_stop(queue, token, stop, entry)
     except LaneError as error:
@@ -5765,6 +5767,31 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
         # interrupt) may have merged with its delivery pending, so the worktree stays: the next claim reuses it.
         if tree is not None and found.get("made") and ran[0] is not None and not delivery_owed(ran[0], entry):
             drop_lane_worktree(sd_lib.main_worktree_root(root), tree, found.get("branch_made"), made=True)
+
+
+def followed_rebase(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: str,
+                    skipped: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The claimed `entry` moved to the rebase its prepare pushed, and where it runs; else `skipped` (sd:10312).
+
+    A put-back with no answer from the hub, or a reclaim, leaves the row at
+    the pre-prepare head while `origin/<branch>` holds prepare's rewrite of
+    it. The ship receipt's `rebase_tip` proves that rewrite
+    (`prepared_rebase`), so the queued commit need not be fetchable. A read
+    that fails raises `PUBLISH_UNKNOWN`: unknown is not a skip.
+    """
+    branch, expected = str(entry.get("branch") or ""), str(entry["expected_head"])
+    tip = fetched_tip(sd_lib.main_worktree_root(root), branch)
+    try:
+        rewritten = prepared_rebase(queue, branch, entry["item"], expected, tip)
+    except Stop:
+        raise
+    except LaneError as error:
+        raise LaneError(str(error), code=PUBLISH_UNKNOWN) from None
+    if not rewritten:
+        return entry, skipped
+    runner_write(queue, lambda entries: held(entries, entry, token).update(expected_head=tip))
+    moved = {**entry, "expected_head": tip}
+    return moved, checkout_for(root, queue, moved)
 
 
 def delivery_owed(row: dict[str, Any], entry: dict[str, Any]) -> bool:

@@ -7118,6 +7118,64 @@ class AnyHost(SharedQueue):
                 want = rewrites[0] if case in ("retryable", "moved") else queued
                 self.assertEqual((entry["item"], entry["status"], entry["expected_head"]), (item, "pending", want))
 
+    def rewritten(self, tree: pathlib.Path, branch: str, item: int) -> str:
+        """`tree` rebased on a main that moved and force-pushed to `branch`, as a rebase policy's prepare does."""
+        self.commit_file(self.repo, f"moved-main-{item}.txt")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(tree, "rebase", "-q", "main")
+        git(tree, "commit", "-q", "--amend", "--allow-empty", "-m", f"the tip\n\nDelivers: sd:{item}")
+        git(tree, "push", "-q", "--force", "origin", f"HEAD:refs/heads/{branch}")
+        return git(tree, "rev-parse", "HEAD")
+
+    def test_a_claim_follows_the_rebase_its_prepare_pushed(self) -> None:
+        """sd:10312: a rewrite prepare pushed before a reclaim, or on another host, skipped `head_moved`.
+
+        The claim reads the receipt's `rebase_tip`, so it runs at the rewrite without the queued commit:
+        in the builder's own worktree prepare left there, and in a lane clone from origin. A receipt of
+        another head still skips.
+        """
+        for case in ("own", "elsewhere", "other_head"):
+            with self.subTest(case=case):
+                item = {"own": 1, "elsewhere": 2, "other_head": 3}[case]
+                branch = f"claimed{item}"
+                if case == "own":
+                    tree, [queued] = self.committed(branch, "work")
+                    sd_lane.enqueue_entry(tree, item, "fix: t", self.body, self.environ, manual=True,
+                                          claim="deliver")
+                else:
+                    [queued] = self.enqueued_elsewhere(item, branch, "work")
+                    tree = self.tmp / f"scratch{item}"
+                    git(self.repo, "worktree", "add", "-q", "--detach", str(tree), queued)
+                rewrite = self.rewritten(tree, branch, item)
+                if case != "own":
+                    git(self.repo, "worktree", "remove", "--force", str(tree))
+                self.saved_rebase(branch, item, rewrite, "f" * 40 if case == "other_head" else queued)
+                seen: list[str] = []
+
+                def ship(argv: list[str], log: pathlib.Path, seen: list[str] = seen) -> dict:
+                    seen.append(git(pathlib.Path(argv[1]), "rev-parse", "HEAD"))
+                    return self.ship(argv, log)
+                self.calls.clear()
+                sd_lane.run_lane(self.repo, self.environ, ship)
+                entry = self.entries()[-1]
+                if case == "other_head":
+                    self.assertEqual((entry["status"], entry.get("code"), seen), ("skipped", sd_lane.HEAD_MOVED, []))
+                else:
+                    self.assertEqual((entry["status"], entry["expected_head"], seen[:1]), ("merged", rewrite, [rewrite]))
+
+    def test_a_claim_whose_rebase_receipt_cannot_be_read_stays_pending(self) -> None:
+        """sd:10312, unknown reads: the receipt read failed; the moved entry is not skipped."""
+        tree, _ = self.committed("unread", "work")
+        sd_lane.enqueue_entry(tree, 1, "fix: t", self.body, self.environ, manual=True, claim="deliver")
+        self.rewritten(tree, "unread", 1)
+
+        def unread(*args: Any) -> bool:
+            raise sd_lane.LaneError("the hub database did not answer", code=sd_lane.HUB_UNAVAILABLE)
+        with mock.patch.object(sd_lane, "prepared_rebase", unread):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        entry = self.entries()[0]
+        self.assertEqual((entry["status"], "holder" in entry, self.calls), ("pending", False, []))
+
     def test_an_own_worktree_that_moved_on_its_branch_skips_head_moved(self) -> None:
         """sd:3413. The builder committed or amended after enqueue; the run never advises removing its branch."""
         for amended in (False, True):
